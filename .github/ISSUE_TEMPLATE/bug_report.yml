@@ -1,0 +1,31 @@
+name: Ошибка
+description: Воспроизводимая ошибка в работе бота
+body:
+  - type: markdown
+    attributes:
+      value: Не прикладывайте токены, файлы .env, персональные данные или историю переписки.
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Шаги воспроизведения
+      description: Команды, режим бесед и минимальные условия возникновения ошибки.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое и фактическое поведение
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Окружение
+      description: ОС, версия Node.js, commit, запуск локально или Docker.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Обезличенная диагностика
+      description: Стек ошибки или код VK API без секретов и личных данных.

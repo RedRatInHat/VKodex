@@ -1,0 +1,24 @@
+name: Изменение
+description: Функция или улучшение с проверяемым результатом
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу решаем
+      description: Пользовательский сценарий и текущая проблема.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Границы изменения
+      description: Что должно измениться и что остаётся за рамками.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: Как проверить результат; влияние на доступ, файлы и хранение сессий.
+    validations:
+      required: true
