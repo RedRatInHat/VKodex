@@ -1,0 +1,127 @@
+export interface TaskRef {
+  readonly hostId: string;
+  readonly threadId: string;
+  readonly sourceId?: string;
+  readonly rolloutPath?: string;
+}
+
+export interface DesktopTask extends TaskRef {
+  readonly sourceLabel?: string;
+  /** null means no project; undefined means project membership could not be read. */
+  readonly projectId?: string | null;
+  readonly title: string;
+  readonly workspace: string;
+  readonly updatedAt: number;
+}
+
+export interface DesktopProject {
+  readonly id: string;
+  readonly title: string;
+  readonly workspace: string;
+  readonly workspaceRoots?: readonly string[];
+}
+
+export interface CreateTaskRequest {
+  readonly operationId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly prompt: string;
+  readonly model?: string;
+}
+
+export interface SubmitTaskRequest {
+  readonly operationId: string;
+  readonly task: TaskRef;
+  readonly text: string;
+}
+
+export interface DesktopModel {
+  readonly id: string;
+  readonly title: string;
+  readonly efforts: readonly string[];
+  readonly defaultEffort: string;
+}
+
+export interface TaskDetails {
+  readonly title?: string | null;
+  readonly status: "running" | "idle" | "failed" | "interrupted" | "approval" | "unavailable";
+  readonly workspace: string | null;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly nextModel: string | null;
+  readonly nextEffort: string | null;
+  readonly context: { readonly used: number; readonly window: number; readonly percent: number } | null;
+}
+
+export interface DesktopMetadata {
+  rename(task: TaskRef, title: string): Promise<void>;
+  archive(task: TaskRef): Promise<void>;
+  markdown(task: TaskRef): Promise<string>;
+}
+
+export interface TaskRenameResult {
+  /** The catalog is already confirmed; the open desktop window is checked separately. */
+  readonly liveTitleUpdated: boolean;
+}
+
+export type TaskEvent =
+  // Only visible agent commentary; commands, tool output and file changes are excluded.
+  | { readonly type: "progress"; readonly id: string; readonly turnId: string; readonly text: string }
+  | { readonly type: "final"; readonly id: string; readonly turnId: string; readonly text: string }
+  | { readonly type: "user"; readonly id: string; readonly turnId: string; readonly text: string; readonly operationId?: string }
+  | { readonly type: "status"; readonly id: string; readonly turnId: string; readonly status: "running" | "completed" | "failed" | "interrupted" | "approval" };
+
+export interface DesktopCapabilities {
+  readonly createTask: boolean;
+  readonly startTurn: boolean;
+  readonly steerTurn: boolean;
+  readonly interruptTurn: boolean;
+  readonly selectModel: boolean;
+  readonly renameTask?: boolean;
+  readonly archiveTask?: boolean;
+  readonly exportMarkdown?: boolean;
+}
+
+export interface DesktopTasks {
+  readonly capabilities: DesktopCapabilities;
+  listTasks(): Promise<readonly DesktopTask[]>;
+  listProjects(): Promise<readonly DesktopProject[]>;
+  catalogWarnings?(): readonly string[];
+  createTask(request: CreateTaskRequest): Promise<DesktopTask>;
+  submit(request: SubmitTaskRequest): Promise<void>;
+  interrupt(task: TaskRef): Promise<void>;
+  inspectTask(task: TaskRef): Promise<TaskDetails>;
+  listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
+  selectModel(task: TaskRef, model: string, effort: string): Promise<void>;
+  renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
+  archiveTask(task: TaskRef): Promise<void>;
+  exportMarkdown(task: TaskRef): Promise<string>;
+}
+
+export function taskKey(task: TaskRef): string {
+  return JSON.stringify(task.sourceId ? [task.hostId, task.threadId, task.sourceId] : [task.hostId, task.threadId]);
+}
+
+export function sameTask(left: TaskRef, right: TaskRef): boolean { return taskKey(left) === taskKey(right); }
+
+export class DesktopUnavailableError extends Error {
+  constructor(message = "Подключение к десктопу Codex недоступно.") {
+    super(message);
+    this.name = "DesktopUnavailableError";
+  }
+}
+
+/** A rejection known to have happened before the requested action was applied. */
+export class ActionRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ActionRejectedError";
+  }
+}
+
+export class UncertainActionError extends Error {
+  constructor() {
+    super("Результат операции неизвестен. Автоматический повтор отключён, чтобы не создать дубликат.");
+    this.name = "UncertainActionError";
+  }
+}
