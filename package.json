@@ -13,6 +13,11 @@
     "dev": "node --env-file=.env --import tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file=.env dist/src/index.js",
+    "runtime:prepare": "node --import tsx src/desktop/launch.ts prepare",
+    "desktop:probe": "node --import tsx src/desktop/launch.ts probe",
+    "desktop:dev": "node --import tsx src/desktop/launch.ts dev",
+    "desktop:start": "node dist/src/desktop/launch.js start",
+    "vk:check": "node --import tsx src/desktop/launch.ts check",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build"
