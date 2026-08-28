@@ -5,6 +5,7 @@
   "license": "MIT",
   "description": "Run Codex tasks from VK conversations",
   "type": "module",
+  "packageManager": "npm@11.12.1",
   "engines": {
     "node": ">=22"
   },

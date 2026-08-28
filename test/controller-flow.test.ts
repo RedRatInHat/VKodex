@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -149,7 +149,7 @@ function message(peerId: number, text: string, isChat: boolean): IncomingMessage
 }
 
 test("owner bootstraps main chat, creates a dedicated session, then runs an agent turn", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-root-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vkodex-root-")));
   const workspace = path.join(root, "repo");
   await mkdir(workspace);
 

@@ -39,6 +39,7 @@ CODEX_APPROVAL_POLICY=never
 ## 2. Локальная проверка
 
 ```bash
+npm install --global npm@11.12.1
 npm ci
 npm run check
 npm run dev

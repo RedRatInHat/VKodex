@@ -9,10 +9,11 @@
 
 ## Запуск
 
-Понадобятся Node.js 22 или 24, сообщество VK с сообщениями и Bots Long Poll
+Понадобятся актуальный выпуск Node.js 22 или 24, сообщество VK с сообщениями и Bots Long Poll
 (`message_new`), токен сообщества с доступом к сообщениям и доступ к Codex.
 
 ```sh
+npm install --global npm@11.12.1
 npm ci
 npm run check
 ```
