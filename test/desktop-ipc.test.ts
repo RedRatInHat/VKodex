@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Duplex } from "node:stream";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, UncertainActionError } from "../src/desktop/contracts.js";
@@ -9,6 +9,9 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject }
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
+import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
+import { BridgeStore } from "../src/bridge/store.js";
+import type { BridgeChat, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
 const state = (items: IpcObject[] = [], status = "inProgress"): IpcObject => ({ id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
@@ -69,6 +72,31 @@ class Server extends Duplex {
   }
 }
 
+function runtimeSetup(t: TestContext) {
+  const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  const store = new BridgeStore(); const binding = store.ensureBinding(task);
+  store.setChat(binding.id, peerId, 17);
+  const participants = [access.ownerId, -access.groupId];
+  const sent: { peerId: number; view: View }[] = [];
+  const chat: BridgeChat = {
+    members: async () => [...participants],
+    send: async (peerId, view) => { sent.push({ peerId, view }); return { peerId, conversationMessageId: sent.length }; },
+    edit: async () => { throw new Error("Unexpected edit"); },
+    createConversation: async () => { throw new Error("Unexpected chat creation"); },
+    renameConversation: async () => { throw new Error("Unexpected chat rename"); },
+    inviteLink: async () => { throw new Error("Unexpected invitation"); },
+    uploadDocument: async () => { throw new Error("Unexpected upload"); },
+  };
+  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client);
+  let now = 100_000;
+  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, client, () => now);
+  t.after(async () => { await runtime.stop(); store.close(); });
+  const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
+  return { access, peerId, server, store, binding, participants, sent, runtime, follows, advance: () => { now += 30_001; } };
+}
+
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
   const decoder = new FrameDecoder(); const one = encodeFrame({ type: "one" }); const two = encodeFrame({ type: "two" });
   assert.deepEqual(decoder.push(one.subarray(0, 2)), []);
@@ -115,6 +143,48 @@ test("closing a subscription during connection, discovery or its first snapshot 
     const follows = server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
     assert.deepEqual(follows, phase === "snapshot" ? [true, false] : []);
   }
+});
+
+test("runtime immediately unsubscribes after departure and never interrupts or reattaches the task", async t => {
+  const s = runtimeSetup(t);
+  await s.runtime.tick(); assert.deepEqual(s.follows(), [true]);
+  await s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:leave", removedMemberId: s.access.ownerId });
+  assert.deepEqual(s.follows(), [true, false]);
+  assert.equal(s.store.getBinding(s.binding.id)!.attached, false);
+  s.server.dataState = state([{ id: "later", type: "agentMessage", phase: "commentary", text: "Do not mirror" }]);
+  s.server.snapshot();
+  await s.runtime.tick();
+  await s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:return" });
+  await s.runtime.tick();
+  assert.deepEqual(s.follows(), [true, false]);
+  assert.equal(s.sent.filter(item => item.peerId === s.peerId).length, 0);
+  assert.equal(s.sent.length, 1);
+  assert.ok(s.server.received.every(message => ["initialize", "thread-owner-discovery", "thread-stream-following-changed"].includes(String(message.method))));
+});
+
+test("periodic membership checks catch a missed departure even when the task sends no new events", async t => {
+  const s = runtimeSetup(t);
+  await s.runtime.tick();
+  s.participants.splice(0, 1);
+  s.advance(); await s.runtime.tick();
+  assert.equal(s.store.getBinding(s.binding.id)!.attached, false);
+  assert.deepEqual(s.follows(), [true, false]);
+  assert.equal(s.sent.filter(item => item.peerId === s.peerId).length, 0);
+  s.store.recover(); await s.runtime.tick();
+  assert.deepEqual(s.follows(), [true, false]);
+});
+
+test("departure before the first Codex snapshot cancels startup without unavailable alerts or retries", async t => {
+  const s = runtimeSetup(t); let departure: Promise<void> | undefined;
+  s.server.onFollow = () => {
+    departure = s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:leave", removedMemberId: s.access.ownerId });
+  };
+  await s.runtime.tick(); await departure;
+  assert.deepEqual(s.follows(), [true, false]);
+  assert.equal(s.sent.length, 1);
+  assert.match(s.sent[0]!.view.text, /отключена/u);
+  s.advance(); await s.runtime.tick();
+  assert.deepEqual(s.follows(), [true, false]);
 });
 
 test("unsupported stream version fails closed without silently accepting state", async t => {
