@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ${HOST_WORKSPACES_DIR:-./workspaces}:/workspaces
