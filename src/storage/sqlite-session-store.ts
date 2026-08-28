@@ -43,6 +43,7 @@ export class SqliteSessionStore implements SessionStore {
 
   async initialize(): Promise<void> {
     await mkdir(this.dataDir, { recursive: true, mode: 0o700 });
+    // Keep the filename so existing deployments retain their sessions after the rename.
     const database = new DatabaseConstructor(path.join(this.dataDir, "vk-codex-hub.sqlite"));
     database.pragma("journal_mode = WAL");
     database.pragma("foreign_keys = ON");

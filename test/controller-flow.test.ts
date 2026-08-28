@@ -149,7 +149,7 @@ function message(peerId: number, text: string, isChat: boolean): IncomingMessage
 }
 
 test("owner bootstraps main chat, creates a dedicated session, then runs an agent turn", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vk-codex-root-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-root-"));
   const workspace = path.join(root, "repo");
   await mkdir(workspace);
 

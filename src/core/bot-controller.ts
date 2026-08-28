@@ -71,13 +71,13 @@ export class BotController {
 
     if (command === "bootstrap") {
       this.assertOwner(message.senderId);
-      const conversation = await this.gateway.createConversation("[Codex] Main", this.config.vk.mainUserIds);
+      const conversation = await this.gateway.createConversation("[VKodex] Main", this.config.vk.mainUserIds);
       await this.store.setSetting(MAIN_PEER_SETTING, String(conversation.peerId));
       await this.sendChunks(
         message.peerId,
         `Главный чат создан: peer_id=${conversation.peerId}. Дальше используйте /new в нём.`,
       );
-      await this.sendChunks(conversation.peerId, "Это главный чат VK Codex Hub. Используйте /help.");
+      await this.sendChunks(conversation.peerId, "Это главный чат VKodex. Используйте /help.");
       return;
     }
 
@@ -193,7 +193,7 @@ export class BotController {
         ? this.config.vk.mainUserIds
         : [message.senderId];
       try {
-        const conversation = await this.gateway.createConversation(`[Codex] ${title}`, members);
+        const conversation = await this.gateway.createConversation(`[VKodex] ${title}`, members);
         dedicatedPeerId = conversation.peerId;
         dedicatedChatId = conversation.chatId;
       } catch (error) {
@@ -304,7 +304,7 @@ export class BotController {
 }
 
 const MAIN_HELP = [
-  "VK Codex Hub — главный чат",
+  "VKodex — главный чат",
   "",
   "/bootstrap — создать отдельный главный VK-чат",
   "/new <workspace> | <название> — создать Codex-сессию",
@@ -317,7 +317,7 @@ const MAIN_HELP = [
 ].join("\n");
 
 const SESSION_HELP = [
-  "VK Codex Hub — чат сессии",
+  "VKodex — чат сессии",
   "",
   "Обычный текст — новый ход Codex",
   "Фото — structured local_image для Codex",

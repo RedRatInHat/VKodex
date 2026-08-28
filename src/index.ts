@@ -23,7 +23,7 @@ const controller = new BotController(config, gateway, store, agent, logger);
 gateway.onMessage((message) => controller.handleMessage(message));
 
 const shutdown = async (signal: string): Promise<void> => {
-  logger.info({ signal }, "Stopping VK Codex Hub");
+  logger.info({ signal }, "Stopping VKodex");
   await gateway.stop().catch((error) => logger.error({ err: error }, "VK stop failed"));
   await store.close();
   process.exit(0);
@@ -38,7 +38,7 @@ logger.info(
     conversationMode: config.vk.conversationMode,
     workspaceRoots: config.workspaceRoots,
   },
-  "Starting VK Codex Hub",
+  "Starting VKodex",
 );
 
 await gateway.start();
