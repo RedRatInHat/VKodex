@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Run Codex tasks from VK conversations",
+  "description": "Open-source VK bot for remote control of OpenAI Codex. Бот для удалённого управления Codex через ВКонтакте.",
   "type": "module",
   "packageManager": "npm@11.12.1",
   "engines": {
