@@ -55,7 +55,11 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         const text = userText(item.content);
         if (text) emit({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) });
       } else if (item.type === "agentMessage" && typeof item.text === "string") {
-        if (item.phase === "commentary") emit({ type: "progress", id, turnId, text: item.text }, turn.status === "inProgress");
+        // The first snapshot is a baseline even when the turn is already active.
+        // Replaying its accumulated commentary would flood a newly linked VK chat
+        // with progress that happened before the user connected it. A later edit
+        // to the same item (or a new item) has a different digest and is emitted.
+        if (item.phase === "commentary") emit({ type: "progress", id, turnId, text: item.text });
         else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") emit({ type: "final", id, turnId, text: item.text });
       }
     }

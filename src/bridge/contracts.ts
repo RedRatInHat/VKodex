@@ -1,28 +1,29 @@
 import type { DesktopTask, TaskRef } from "../desktop/contracts.js";
+import type { RemoteAttachment } from "../domain/models.js";
 
 export interface MessageHandle { readonly peerId: number; readonly conversationMessageId: number }
 export interface Button { readonly label: string; readonly action: string }
 export interface View { readonly text: string; readonly buttons?: readonly Button[]; readonly silent?: boolean; readonly attachments?: readonly string[] }
 
+export const VK_MAX_INLINE_BUTTONS = 10;
+export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
+export class ChatRateLimitError extends Error {
+  constructor(readonly retryAfterMs: number) { super("VK временно ограничил частоту запросов. Отправка продолжится после паузы."); }
+}
+
 export const taskChatTitle = (title: string): string => `[VKodex] ${title}`.slice(0, 200);
 
 export interface BridgeChat {
-  members(peerId: number): Promise<readonly number[]>;
   createConversation(title: string): Promise<{ readonly peerId: number; readonly chatId: number }>;
   renameConversation(peerId: number, title: string, beforeWrite: () => Promise<void>): Promise<void>;
   inviteLink(peerId: number): Promise<string>;
   send(peerId: number, view: View, randomId: number): Promise<MessageHandle>;
   edit(handle: MessageHandle, view: View): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
+  uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string>;
 }
 
 export interface OwnerAccess { readonly ownerId: number; readonly groupId: number }
-
-export interface ChatMembershipChange {
-  readonly peerId: number;
-  readonly eventId?: string;
-  readonly removedMemberId?: number;
-}
 
 export interface BridgeInput {
   readonly eventId: string;
@@ -31,6 +32,8 @@ export interface BridgeInput {
   readonly text: string;
   readonly action?: string;
   readonly hasAttachments?: boolean;
+  readonly attachments?: readonly RemoteAttachment[];
+  readonly attachmentError?: string;
 }
 
 export interface Binding extends TaskRef {
@@ -56,6 +59,10 @@ export type ManagerAction =
   | { readonly type: "open"; readonly task: DesktopTask }
   | { readonly type: "new" }
   | { readonly type: "project"; readonly id: string; readonly title: string }
+  | { readonly type: "newEnvironment"; readonly environment: "local" | "worktree" }
+  | { readonly type: "newModels"; readonly page: number }
+  | { readonly type: "newModel"; readonly model: string }
+  | { readonly type: "newEffort"; readonly model: string; readonly effort: string }
   | { readonly type: "create"; readonly draftId: string }
   | { readonly type: "cancel" }
   | { readonly type: "resume"; readonly bindingId: string }
@@ -65,21 +72,24 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "projects" | "moveProject" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;
   readonly title?: string;
+  readonly projectId?: string | null;
 }
 
 export interface NewTaskDraft {
   readonly id: string;
-  readonly stage: "project" | "title" | "prompt" | "confirm" | "creating" | "uncertain" | "created";
+  readonly stage: "project" | "environment" | "title" | "prompt" | "model" | "effort" | "confirm" | "creating" | "uncertain" | "created";
   readonly projectId?: string;
   readonly projectTitle?: string;
   readonly title?: string;
   readonly prompt?: string;
   readonly model?: string;
+  readonly effort?: string;
+  readonly environment?: "local" | "worktree";
   readonly task?: DesktopTask;
 }
 
@@ -88,7 +98,7 @@ export interface Delivery {
   readonly key: string;
   readonly bindingId: string | null;
   readonly peerId: number;
-  readonly kind: "send" | "commentary" | "panel";
+  readonly kind: "send" | "commentary" | "panel" | "activity";
   readonly view: View;
   readonly firstView: View | null;
   readonly handle: MessageHandle | null;

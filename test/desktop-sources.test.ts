@@ -54,10 +54,33 @@ test("an unreadable extra source does not hide readable tasks and exposes a stat
     if (home === extra) throw new Error("PRIVATE_PATH_OR_SECRET");
     return [task];
   } }));
-  assert.equal((await combined.listTasks()).length, 1);
+  const tasks = await combined.listTasks();
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0]!.sourceLabel, undefined);
   assert.equal(combined.catalogWarnings().length, 1);
   assert.doesNotMatch(combined.catalogWarnings()[0]!, /PRIVATE_PATH_OR_SECRET/u);
   await assert.rejects(new MultiDesktopCatalog([primary], home => ({ ...catalog(home), listTasks: async () => { throw new Error("offline"); } })).listTasks(), DesktopUnavailableError);
+});
+
+test("an empty configured source adds no task or project prefixes", async () => {
+  const combined = new MultiDesktopCatalog([primary, extra], home => ({
+    ...catalog(home),
+    listTasks: async () => home === extra ? [] : [{ ...task, rolloutPath: path.join(home, "sessions", "fixture.jsonl") }],
+  }));
+  const tasks = await combined.listTasks();
+  assert.equal(tasks.length, 1); assert.equal(tasks[0]!.sourceLabel, undefined);
+  const projects = await combined.listProjects();
+  assert.equal(projects.length, 1); assert.equal(projects[0]!.title, "Fixture project");
+});
+
+test("tasks from active sources are merged by recency instead of source order", async () => {
+  const combined = new MultiDesktopCatalog([primary, extra], home => ({
+    ...catalog(home),
+    listTasks: async () => [{ ...task, threadId: home === primary ? "older" : "newer", updatedAt: home === primary ? 1 : 2, rolloutPath: path.join(home, "sessions", "fixture.jsonl") }],
+  }));
+  const tasks = await combined.listTasks();
+  assert.deepEqual(tasks.map(item => item.threadId), ["newer", "older"]);
+  assert.deepEqual(tasks.map(item => item.sourceLabel), [path.basename(extra), path.basename(primary)]);
 });
 
 test("models and project identities stay with the selected source", async () => {
@@ -68,6 +91,8 @@ test("models and project identities stay with the selected source", async () => 
   assert.equal(combined.sourceHome(tasks[1]!), extra);
   const projects = await combined.listProjects();
   assert.notEqual(projects[0]!.id, projects[1]!.id);
+  assert.match(projects[0]!.title, new RegExp(`^\\[${path.basename(primary).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`));
+  assert.match(projects[1]!.title, new RegExp(`^\\[${path.basename(extra).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`));
   assert.equal(tasks[0]!.projectId, projects[0]!.id);
   assert.equal(tasks[1]!.projectId, projects[1]!.id);
   await assert.rejects(combined.listModels({ ...task, sourceId: "removed-source" }), DesktopUnavailableError);
@@ -78,7 +103,7 @@ test("metadata uses the configured source home for rename, archive and export", 
   const calls: string[] = [];
   const metadata = new ProfileDesktopMetadata(ref => combined.sourceHome(ref), home => {
     calls.push(home);
-    return { rename: async () => {}, archive: async () => {}, markdown: async () => "fixture" } satisfies DesktopMetadata;
+    return { rename: async () => {}, archive: async () => {}, markdown: async () => "fixture", assignProject: async () => {} } satisfies DesktopMetadata;
   });
   await metadata.rename(selected, "New title");
   await metadata.archive(selected); await metadata.markdown(selected);

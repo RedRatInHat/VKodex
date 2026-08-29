@@ -98,3 +98,14 @@ test("native metadata refuses other hosts and mismatched export responses", asyn
   assert.equal(calls, 0);
   await assert.rejects(metadata.markdown({ hostId: "local", threadId: "fixture" }), DesktopUnavailableError);
 });
+
+test("native project assignment uses thread metadata and clears with an empty project id", async () => {
+  const calls: { method: string; params: IpcObject }[] = [];
+  const metadata = new NativeDesktopMetadata({ call: async (method, params) => { calls.push({ method, params }); return {}; } });
+  const task = { hostId: "local", threadId: "fixture" };
+  await metadata.assignProject(task, "project-a"); await metadata.assignProject(task, null);
+  assert.deepEqual(calls, [
+    { method: "thread/metadata/update", params: { threadId: "fixture", projectId: "project-a" } },
+    { method: "thread/metadata/update", params: { threadId: "fixture", projectId: "" } },
+  ]);
+});

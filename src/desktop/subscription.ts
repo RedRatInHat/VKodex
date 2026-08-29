@@ -1,4 +1,4 @@
-import { DesktopUnavailableError, type TaskRef } from "./contracts.js";
+import { DesktopUnavailableError, TaskNotOpenError, type TaskRef } from "./contracts.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { RevisionedState } from "./state.js";
 import { comparablePath } from "./paths.js";
@@ -35,16 +35,15 @@ export class TaskSubscription {
       checkActive();
       const reply = await this.client.request("thread-owner-discovery", 1, {
         hostId: this.task.hostId, conversationId: this.task.threadId,
-      });
+      }, { timeoutMs });
       checkActive();
-      if (typeof reply.handledByClientId !== "string") throw new DesktopUnavailableError("Задача не открыта в десктопе.");
+      if (typeof reply.handledByClientId !== "string") throw new TaskNotOpenError();
       this.ownerId = reply.handledByClientId;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { this.close(new DesktopUnavailableError("Не получено состояние задачи.")); }, timeoutMs);
         let ready = false;
         this.cancelStart = error => { clearTimeout(timer); reject(error); };
-        this.disconnect = this.client.onDisconnect(() => {
-          const error = new DesktopUnavailableError();
+        this.disconnect = this.client.onDisconnect(error => {
           clearTimeout(timer);
           this.close(error);
           if (ready) this.onError(error); else reject(error);

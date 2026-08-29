@@ -1,76 +1,22 @@
-import type { BridgeChat, ChatMembershipChange, Delivery, OwnerAccess } from "./contracts.js";
+import type { BridgeChat, Delivery, OwnerAccess } from "./contracts.js";
+import { ChatRateLimitError } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 
 export class AccessGate {
-  constructor(private readonly access: OwnerAccess, private readonly chat: BridgeChat, private readonly store: BridgeStore) {}
+  constructor(private readonly access: OwnerAccess, private readonly store: BridgeStore) {}
 
-  async check(peerId: number): Promise<boolean> {
+  async check(peerId: number, _fresh = false): Promise<boolean> {
     if (peerId === this.access.ownerId) return true;
     if (peerId < 2_000_000_000) return false;
     const binding = this.store.byPeer(peerId);
-    if (!binding || !binding.attached || binding.paused) return false;
-    if (!await this.verifyMembers(peerId, binding.id)) return false;
-    const current = this.store.getBinding(binding.id);
-    return !!current?.attached && !current.paused;
+    return !!binding?.attached;
   }
 
-  async membershipChanged(change: ChatMembershipChange): Promise<boolean> {
-    const binding = this.store.byPeer(change.peerId);
-    if (!binding || change.peerId < 2_000_000_000) return false;
-    if (change.removedMemberId === this.access.ownerId || change.removedMemberId === -this.access.groupId) {
-      this.store.atomic(() => {
-        const key = change.eventId ? JSON.stringify([change.peerId, change.eventId]) : null;
-        if (key && !this.store.claimInput(key)) return;
-        this.stopStreaming(binding.id);
-        if (key) this.store.finishInput(key);
-      });
-      return false;
-    }
-    return this.check(change.peerId);
-  }
-
-  private stopStreaming(bindingId: string): void {
+  async clearLegacyPause(peerId: number, bindingId: string): Promise<boolean> {
     const binding = this.store.getBinding(bindingId);
-    if (!binding) return;
-    this.store.atomic(() => {
-      this.store.stopStreaming(bindingId);
-      if (!binding.attached) return;
-      const key = `departure-episode:${bindingId}`;
-      const episode = (this.store.getValue<number>(key) ?? 0) + 1;
-      this.store.setValue(key, episode);
-      this.store.enqueue(`departure:${bindingId}:${episode}`, this.access.ownerId, {
-        text: `Трансляция задачи «${binding.title.slice(0, 200)}» отключена: ты или бот больше не участвуете в VK-беседе. Очередь отменена; задача Codex продолжает работать. Для повторного подключения выбери задачу в менеджере.`,
-        silent: true,
-      });
-    });
-  }
-
-  async verifyMembers(peerId: number, bindingId: string): Promise<boolean> {
-    const generation = this.store.streamGeneration(bindingId);
-    const state = await this.inspectMembers(peerId);
-    if (generation !== this.store.streamGeneration(bindingId)) return false;
-    if (state === "ready") return true;
-    if (state === "owner_missing") { this.stopStreaming(bindingId); return false; }
-    if (!this.store.getBinding(bindingId)?.attached) return false;
-    const previouslyPaused = this.store.getBinding(bindingId)?.paused;
-    this.store.setPaused(bindingId, true);
-    const episodeKey = `privacy-episode:${bindingId}`;
-    const episode = (this.store.getValue<number>(episodeKey) ?? 0) + (previouslyPaused ? 0 : 1);
-    this.store.setValue(episodeKey, episode);
-    this.store.enqueue(`privacy:${bindingId}:${episode}`, this.access.ownerId, {
-      text: "Трансляция задачи приостановлена: не удалось подтвердить, что в беседе только ты и бот. После проверки участников нажми «Возобновить» в менеджере.",
-      buttons: [{ label: "Возобновить", action: this.store.action({ type: "resume", bindingId }) }],
-    });
-    return false;
-  }
-
-  async inspectMembers(peerId: number): Promise<"ready" | "owner_missing" | "unsafe"> {
-    try {
-      const members = await this.chat.members(peerId);
-      if (members.length === 1 && members[0] === -this.access.groupId) return "owner_missing";
-      const allowed = new Set([this.access.ownerId, -this.access.groupId]);
-      return members.length === 2 && new Set(members).size === 2 && members.every(member => allowed.has(member)) ? "ready" : "unsafe";
-    } catch { return "unsafe"; }
+    if (!binding?.attached || binding.peerId !== peerId) return false;
+    if (binding.paused) this.store.setPaused(binding.id, false);
+    return true;
   }
 }
 
@@ -99,10 +45,11 @@ export class DeliveryWorker {
     if (!this.store.isPending(delivery)) return false;
     if (!delivery.bindingId) return true;
     const binding = this.store.getBinding(delivery.bindingId);
-    return !!binding?.attached && !binding.paused && binding.peerId === delivery.peerId;
+    return !!binding?.attached && binding.peerId === delivery.peerId;
   }
 
   private async deliver(): Promise<void> {
+    if (this.now() < (this.store.getValue<number>("vk-delivery-paused-until") ?? 0)) return;
     for (const delivery of this.store.pendingDeliveries()) {
       if (this.now() < (this.retries.get(delivery.id)?.after ?? 0)) continue;
       if (!this.active(delivery)) continue;
@@ -116,11 +63,18 @@ export class DeliveryWorker {
         if (handle.peerId !== delivery.peerId || !Number.isSafeInteger(handle.conversationMessageId) || handle.conversationMessageId <= 0) throw new Error("Invalid message handle");
         this.store.saveHandle(delivery.id, handle);
         if (!this.active(delivery)) continue;
-        if (delivery.handle || JSON.stringify(firstView) !== JSON.stringify(delivery.view)) await this.chat.edit(handle, delivery.view);
+        const view = JSON.stringify(delivery.view);
+        const knownView = this.store.getValue<string>(`delivered-view:${delivery.key}`);
+        if ((delivery.handle || JSON.stringify(firstView) !== view) && knownView !== view) await this.chat.edit(handle, delivery.view);
+        this.store.setValue(`delivered-view:${delivery.key}`, view);
         this.store.delivered(delivery, handle);
         this.retries.delete(delivery.id);
         if (delivery.kind !== "send") this.lastCommentaryEdit.set(delivery.key, this.now());
-      } catch {
+      } catch (error) {
+        if (error instanceof ChatRateLimitError) {
+          this.store.setValue("vk-delivery-paused-until", this.now() + error.retryAfterMs);
+          return;
+        }
         // Keep the same random_id/handle after a timeout. Never turn a failed edit into a new message.
         const attempts = (this.retries.get(delivery.id)?.attempts ?? 0) + 1;
         this.retries.set(delivery.id, { attempts, after: this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6)) });

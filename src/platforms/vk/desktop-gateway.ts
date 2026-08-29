@@ -1,14 +1,17 @@
 import { APIError, VK, type MessageContext, type MessageEventContext } from "vk-io";
-import type { BridgeChat, BridgeInput, ChatMembershipChange, MessageHandle, View } from "../../bridge/contracts.js";
+import type { BridgeChat, BridgeInput, MessageHandle, View } from "../../bridge/contracts.js";
+import { ChatRateLimitError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../desktop/contracts.js";
 import { isObject } from "../../desktop/ipc-client.js";
+import type { RemoteAttachment } from "../../domain/models.js";
+import { safeFileName } from "../../lib/files.js";
 
 export function vkKeyboard(view: View): string {
   const buttons = (view.buttons ?? []).map(button => ({
     action: { type: "callback", label: button.label, payload: JSON.stringify({ action: button.action }) }, color: "secondary",
   }));
-  if (buttons.length > 12) throw new Error("Inline keyboard exceeds six rows");
+  if (buttons.length > VK_MAX_INLINE_BUTTONS) throw new Error("Inline keyboard exceeds ten buttons");
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
   return JSON.stringify({ inline: true, buttons: rows });
@@ -32,14 +35,57 @@ export function hasVkAttachments(message: unknown): boolean {
     if (!isObject(node) || visited.has(node)) continue;
     visited.add(node);
     if (visited.size > 100) return true;
-    if (Array.isArray(node.attachments) && node.attachments.length > 0) return true;
+    if (Array.isArray(node.attachments) && node.attachments.some(attachment => {
+      if (!isObject(attachment) || attachment.type !== "link") return true;
+      const url = typeof attachment.url === "string" ? attachment.url : isObject(attachment.link) ? attachment.link.url : undefined;
+      // VK adds previews to plain URLs. The URL itself already reaches Codex
+      // in the text; standalone cards and actual files need separate handling.
+      return typeof url !== "string" || !url || typeof node.text !== "string" || !node.text.includes(url);
+    })) return true;
     if (Array.isArray(node.forwards)) pending.push(...node.forwards);
     if (node.replyMessage) pending.push(node.replyMessage);
   }
   return false;
 }
 
+export async function collectVkFiles(message: unknown): Promise<RemoteAttachment[]> {
+  const pending = [message]; const visited = new Set<object>(); const seen = new Set<string>(); const result: RemoteAttachment[] = [];
+  while (pending.length) {
+    const node = pending.pop();
+    if (!isObject(node) || visited.has(node)) continue;
+    visited.add(node);
+    if (visited.size > 100) throw new ActionRejectedError("Слишком много пересланных сообщений.");
+    for (const value of Array.isArray(node.attachments) ? node.attachments : []) {
+      if (!isObject(value)) throw new ActionRejectedError("Не удалось прочитать вложение VK.");
+      if (value.type === "link" && !hasVkAttachments({ text: node.text, attachments: [value] })) continue;
+      if (!["photo", "doc", "document"].includes(String(value.type))) throw new ActionRejectedError("Поддерживаются фотографии и документы. Другие вложения пришли как файл.");
+      if (typeof value.loadAttachmentPayload === "function") await value.loadAttachmentPayload();
+      const payload = isObject(value.photo) ? value.photo : isObject(value.doc) ? value.doc : value;
+      const sizes = (Array.isArray(payload.sizes) ? payload.sizes : []).filter(isObject).sort((a, b) => Number(b.width) * Number(b.height) - Number(a.width) * Number(a.height));
+      // vk-io's largeSizeUrl getter throws when a small photo has no y/z/w size.
+      const url = value.type === "photo" ? sizes[0]?.url ?? payload.largeSizeUrl : payload.url;
+      if (typeof url !== "string" || !url) throw new ActionRejectedError("VK не предоставил ссылку для загрузки вложения.");
+      if (seen.has(url)) continue; seen.add(url);
+      const fileName = value.type === "photo" ? `photo-${result.length + 1}.jpg` : safeFileName(String(payload.title ?? "document"), "document");
+      result.push({ key: String(result.length), url, fileName,
+        kind: value.type === "photo" || /\.(?:png|jpe?g|webp|gif)$/iu.test(fileName) ? "image" : "file",
+        ...(typeof payload.size === "number" ? { sizeBytes: payload.size } : {}) });
+      if (result.length > 10) throw new ActionRejectedError("За одно сообщение можно передать до 10 файлов.");
+    }
+    if (Array.isArray(node.forwards)) pending.push(...node.forwards);
+    if (node.replyMessage) pending.push(node.replyMessage);
+  }
+  return result;
+}
+
 export class DesktopVkGateway implements BridgeChat {
+  private async write<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation(); }
+    catch (error) {
+      if (error instanceof APIError && [6, 9, 29].includes(Number(error.code))) throw new ChatRateLimitError(Number(error.code) === 6 ? 1_000 : 120_000);
+      throw error;
+    }
+  }
   constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 })) {
     // vk-io's default middleware error handler prints the full exception.
     this.vk.updates.use(async (_context, next) => {
@@ -48,23 +94,20 @@ export class DesktopVkGateway implements BridgeChat {
     });
   }
 
-  async start(onInput: (input: BridgeInput) => Promise<void>, onMembershipChange: (change: ChatMembershipChange) => Promise<void>): Promise<void> {
-    // vk-io replaces message_new with chat_kick_user (etc.) for service messages.
+  async start(onInput: (input: BridgeInput) => Promise<void>): Promise<void> {
+    // Membership service messages are irrelevant: a linked task chat accepts
+    // prompts from every sender except the community itself.
     this.vk.updates.on("message", async (context: MessageContext) => {
-      if (context.eventType) {
-        const id = context.conversationMessageId;
-        const validId = typeof id === "number" && Number.isSafeInteger(id) && id > 0;
-        await onMembershipChange({ peerId: context.peerId,
-          ...(validId ? { eventId: `membership:${id}` } : {}),
-          ...(validId && context.eventType === "chat_kick_user" && Number.isSafeInteger(context.eventMemberId) ? { removedMemberId: context.eventMemberId! } : {}),
-        });
-        return;
-      }
+      if (context.eventType) return;
       if (!context.is(["message_new"]) || context.isOutbox) return;
-      if (context.senderId !== this.config.access.ownerId) return;
+      if ([this.config.access.groupId, -this.config.access.groupId].includes(context.senderId)) return;
       const id = context.conversationMessageId;
       if (!Number.isSafeInteger(id) || !id || id <= 0) return;
-      await onInput({ eventId: `message:${id}`, peerId: context.peerId, senderId: context.senderId, text: context.text ?? "", hasAttachments: hasVkAttachments(context) });
+      let attachments: RemoteAttachment[] = []; let attachmentError: string | undefined;
+      try { attachments = await collectVkFiles(context); }
+      catch (error) { attachmentError = error instanceof ActionRejectedError ? error.message : "Не удалось получить вложения из VK. Сообщение не отправлено."; }
+      await onInput({ eventId: `message:${id}`, peerId: context.peerId, senderId: context.senderId, text: context.text ?? "", attachments,
+        ...(attachmentError ? { hasAttachments: true, attachmentError } : {}) });
     });
     this.vk.updates.on("message_event", async (context: MessageEventContext) => {
       if (context.userId !== this.config.access.ownerId) return;
@@ -79,14 +122,6 @@ export class DesktopVkGateway implements BridgeChat {
 
   async stop(): Promise<void> { await this.vk.updates.stop(); }
 
-  async members(peerId: number): Promise<readonly number[]> {
-    const response = await this.vk.api.messages.getConversationMembers({ peer_id: peerId, group_id: this.config.access.groupId });
-    if (response.count !== response.items.length) throw new Error("Incomplete VK membership response");
-    const members = response.items.map(item => item.member_id);
-    if (members.some(id => !Number.isSafeInteger(id))) throw new Error("Invalid VK membership response");
-    return members;
-  }
-
   async createConversation(title: string): Promise<{ peerId: number; chatId: number }> {
     let response: unknown;
     try {
@@ -97,7 +132,7 @@ export class DesktopVkGateway implements BridgeChat {
     }
     const chatId = typeof response === "number" ? response : isObject(response) ? response.chat_id : undefined;
     if (!Number.isSafeInteger(chatId) || (chatId as number) <= 0) throw new Error("Invalid VK chat response");
-    // Save the known chat even if an invitation failed. The membership gate will pause it.
+    // The invite link is returned separately; VK may or may not add the owner automatically.
     return { chatId: chatId as number, peerId: 2_000_000_000 + (chatId as number) };
   }
 
@@ -132,18 +167,30 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async send(peerId: number, view: View, randomId: number): Promise<MessageHandle> {
-    const response: unknown = await this.vk.api.messages.send(vkSendParams(peerId, view, randomId));
+    const response: unknown = await this.write(() => this.vk.api.messages.send(vkSendParams(peerId, view, randomId)));
     const item: unknown = Array.isArray(response) ? response[0] : undefined;
     if (!isObject(item) || item.peer_id !== peerId || !Number.isSafeInteger(item.conversation_message_id) || (item.conversation_message_id as number) <= 0) throw new Error("Invalid VK message response");
     return { peerId, conversationMessageId: item.conversation_message_id as number };
   }
 
   async edit(handle: MessageHandle, view: View): Promise<void> {
-    await this.vk.api.messages.edit({ peer_id: handle.peerId, cmid: handle.conversationMessageId, message: view.text, ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}), ...(view.attachments?.length ? { attachment: view.attachments.join(",") } : {}), dont_parse_links: 1, disable_mentions: 1 });
+    await this.write(() => this.vk.api.messages.edit({ peer_id: handle.peerId, cmid: handle.conversationMessageId, message: view.text, ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}), ...(view.attachments?.length ? { attachment: view.attachments.join(",") } : {}), dont_parse_links: 1, disable_mentions: 1 }));
   }
 
   async uploadDocument(peerId: number, name: string, contents: string): Promise<string> {
     const attachment = await this.vk.upload.messageDocument({ peer_id: peerId, title: name, source: { value: Buffer.from(contents, "utf8"), filename: name } });
     return attachment.toString();
+  }
+
+  async uploadFile(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string> {
+    const source = { value: contents, filename: name };
+    let attachment: string | undefined;
+    if (kind === "image") {
+      try { attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString(); }
+      catch { /* Preserve unsupported image formats as documents. */ }
+    }
+    attachment ??= (await this.vk.upload.messageDocument({ peer_id: peerId, title: name, source })).toString();
+    if (!/^(?:photo|doc)-?\d+_\d+(?:_[a-zA-Z0-9_-]+)?$/u.test(attachment)) throw new ActionRejectedError("VK не подтвердил загрузку файла. Повтори /files позже.");
+    return attachment;
   }
 }

@@ -73,7 +73,7 @@ export class TaskPanels {
       } catch { this.catalogCount = null; }
     }
     for (const binding of this.store.bindings()) {
-      if (!binding.attached || binding.paused || binding.peerId === null) this.live.delete(binding.id);
+      if (!binding.attached || binding.peerId === null) this.live.delete(binding.id);
     }
   }
 
@@ -111,11 +111,32 @@ export class TaskPanels {
     const binding = this.bound(input.peerId, state.bindingId);
     switch (action.command) {
       case "moveProject": {
+        if (!this.desktop.capabilities.moveTask) throw new ActionRejectedError("Перенос между проектами недоступен в текущем подключении.");
+        const projects = await this.desktop.listProjects();
+        const page = Math.max(0, Math.min(Math.floor(action.page ?? 0), Math.max(0, Math.ceil(projects.length / 6) - 1)));
+        const visible = projects.slice(page * 6, page * 6 + 6);
         const next = this.newState(input.peerId, binding.id, "moveProject");
+        next.page = page;
+        const buttons = visible.map(project => this.button(input.peerId, next, project.title, "moveProjectApply", { projectId: project.id }));
+        buttons.push(this.button(input.peerId, next, "Без проекта", "moveProjectApply", { projectId: null }));
+        if (page > 0) buttons.push(this.button(input.peerId, next, "Предыдущие", "moveProject", { page: page - 1 }));
+        if ((page + 1) * 6 < projects.length) buttons.push(this.button(input.peerId, next, "Следующие", "moveProject", { page: page + 1 }));
+        buttons.push(this.button(input.peerId, next, "Назад", "home"));
         this.show(input.peerId, next, {
-          text: `Переместить «${short(binding.title)}» в проект\n\nАвтоматический перенос через VK пока недоступен: текущее подключение не управляет проектами десктопа.\n\nОткрой эту задачу в Codex → меню задачи → «Переместить в проект» → выбери проект. Новую задачу создавать не нужно.\n\nПеренос может менять рабочую папку и доступные проекту каталоги — проверь подтверждение в Codex. Сам мост здесь ничего не меняет.`,
-          buttons: [this.button(input.peerId, next, "Диплинк", "link"), this.button(input.peerId, next, "Назад", "home")],
+          text: `Переместить «${short(binding.title)}» в проект · ${page + 1}/${Math.max(1, Math.ceil(projects.length / 6))}\n\n${visible.map(project => `${short(project.title)}\n${project.workspace}`).join("\n\n") || "Проектов нет."}\n\nМеняется принадлежность задачи проекту в Codex. Рабочая директория текущей задачи не переносится.`,
+          buttons,
         }); break;
+      }
+      case "moveProjectApply": {
+        if (!this.desktop.capabilities.moveTask || state.view !== "moveProject" || action.projectId === undefined) throw new ActionRejectedError("Выбор проекта устарел.");
+        this.consume(input); this.waiting(binding, "Проверяю перенос задачи в Codex…");
+        await this.desktop.moveTask(binding, action.projectId);
+        const moved = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+        if (!moved || moved.projectId !== action.projectId) throw new UncertainActionError();
+        this.store.ensureBinding(moved);
+        const project = action.projectId === null ? null : (await this.desktop.listProjects()).find(item => item.id === action.projectId);
+        await this.home(input.peerId, project ? `Задача перемещена в проект «${short(project.title)}».` : "Задача теперь без проекта.");
+        break;
       }
       case "models": await this.models(binding, action.page ?? 0); break;
       case "efforts": {
@@ -190,7 +211,7 @@ export class TaskPanels {
         if (!this.desktop.capabilities.exportMarkdown) throw new ActionRejectedError("Экспорт недоступен в этом подключении.");
         this.consume(input); this.waiting(binding, "Готовлю Markdown-файл видимой переписки…");
         const markdown = await this.desktop.exportMarkdown(binding);
-        if (!await this.gate.check(input.peerId)) throw new ActionRejectedError("Экспорт остановлен: изменился доступ к беседе.");
+        if (!await this.gate.check(input.peerId, true)) throw new ActionRejectedError("Экспорт остановлен: изменился доступ к беседе.");
         const attachment = await this.chat.uploadDocument(input.peerId, "codex-conversation.md", markdown);
         // Persist the upload result before sending. Delivery retries never upload a second document.
         this.reply(input, { text: "Видимая переписка Codex в Markdown. Снимок на момент запроса; без команд и скрытых рассуждений.", attachments: [attachment] });
@@ -223,8 +244,8 @@ export class TaskPanels {
   }
   private async renameVk(binding: Binding, title: string, generation: number): Promise<void> {
     const beforeWrite = async () => {
-      if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(binding.peerId!)) {
-        throw new ActionRejectedError("Имя сохранено в Codex, но VK-беседа не изменена: трансляция отключена или проверка участников не пройдена.");
+      if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(binding.peerId!, true)) {
+        throw new ActionRejectedError("Имя сохранено в Codex, но VK-беседа не изменена: трансляция отключена.");
       }
       this.bound(binding.peerId!, binding.id);
       if (generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Трансляция отключена во время переименования. VK-беседа не изменена.");
@@ -242,7 +263,7 @@ export class TaskPanels {
   }
   private bound(peerId: number, bindingId: string | null): Binding {
     const binding = bindingId && this.store.getBinding(bindingId);
-    if (!binding || binding.peerId !== peerId || !binding.attached || binding.paused) throw new ActionRejectedError("Эта кнопка не относится к активной связи беседы.");
+    if (!binding || binding.peerId !== peerId || !binding.attached) throw new ActionRejectedError("Эта кнопка не относится к активной связи беседы.");
     return binding;
   }
   private consume(input: BridgeInput): void {
@@ -264,7 +285,7 @@ export class TaskPanels {
     }
     return { label: short(label, 40), action: token.id };
   }
-  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title">> = {}): Button {
+  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId">> = {}): Button {
     return this.token(peerId, state, label, { type: "panel", screenId: state.id, command, ...(state.bindingId ? { bindingId: state.bindingId } : {}), ...extra });
   }
   private show(peerId: number, state: PanelState, view: View): void {
@@ -278,7 +299,7 @@ export class TaskPanels {
     const buttons = [button("Модель / рассуждение", "models"), button("Обновить", "home")];
     if (this.desktop.capabilities.renameTask) buttons.push(button("Переименовать", "rename"));
     if (this.desktop.capabilities.archiveTask) buttons.push(button("Архивировать", "archive"));
-    buttons.push(button("Переместить в проект", "moveProject"));
+    if (this.desktop.capabilities.moveTask) buttons.push(button("Переместить в проект", "moveProject"));
     buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"), button("Диплинк", "link"));
     if (this.desktop.capabilities.exportMarkdown) buttons.push(button("Markdown-файл", "export"));
     const rename = this.renameState(binding);
@@ -290,21 +311,22 @@ export class TaskPanels {
     this.show(binding.peerId, state, { text: [taskCardText(binding, this.details(binding.id)), renameStatus, state.note].filter(Boolean).join("\n\n"), buttons });
   }
   private renderManager(state: PanelState): void {
-    const bindings = this.store.bindings(); const active = bindings.filter(binding => binding.attached && !binding.paused && binding.peerId !== null);
+    const bindings = this.store.bindings(); const active = bindings.filter(binding => binding.attached && binding.peerId !== null);
     const text = [
       "VKodex · менеджер",
       `Процесс: ${path.basename(process.execPath)}`,
       `Мост работает: ${number((Date.now() - this.startedAt) / 60_000)} мин`,
       `Задач в каталоге: ${this.catalogCount ?? "нет данных"}`,
       `Связанных бесед: ${bindings.filter(binding => binding.peerId !== null).length}`,
-      `Трансляция включена: ${active.length} · на паузе: ${bindings.filter(binding => binding.paused).length}`,
+      `Трансляция включена: ${active.length}`,
       `Подключено к Codex: ${active.filter(binding => this.live.has(binding.id)).length}`,
       `Сообщений в очереди: ${this.store.pendingCount()}`, "",
+      ...(this.desktop.compatibility ? [`Live API: ${this.desktop.compatibility().state}`, this.desktop.compatibility().message, ""] : []),
       ...(this.desktop.catalogWarnings?.() ?? []),
       "Комментарии — тихо; готовые ответы — с уведомлением.", "Команды и изменения файлов не пересылаются.", "",
       "Выбери проект, затем задачу, чтобы открыть связанную VK-беседу. /menu — открыть меню снова.",
     ];
-    this.show(this.access.ownerId, state, { text: text.join("\n"), buttons: [this.token(this.access.ownerId, state, "Задачи Codex", { type: "browseProjects", page: 0 }), this.token(this.access.ownerId, state, "Новая задача", { type: "new" }), this.token(this.access.ownerId, state, "Проекты", { type: "browseProjects", page: 0 }), this.button(this.access.ownerId, state, "Обновить", "home")] });
+    this.show(this.access.ownerId, state, { text: text.join("\n"), buttons: [this.token(this.access.ownerId, state, "Задачи Codex", { type: "browseProjects", page: 0 }), this.token(this.access.ownerId, state, "Новая задача", { type: "new" }), this.button(this.access.ownerId, state, "Проекты", "projects"), this.button(this.access.ownerId, state, "Обновить", "home")] });
   }
   private waiting(binding: Binding, note: string): void { const state = this.newState(binding.peerId!, binding.id, "home"); state.note = note; this.renderTask(binding, state); }
   private async home(peerId: number, note?: string): Promise<void> {
@@ -316,7 +338,7 @@ export class TaskPanels {
 
   failure(peerId: number, error: unknown): void {
     const state = this.state(peerId); const binding = this.store.byPeer(peerId);
-    if (state?.view !== "home" || !binding || !binding.attached || binding.paused) return;
+    if (state?.view !== "home" || !binding || !binding.attached) return;
     state.note = error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError ? error.message : "Операция не подтверждена. Проверь результат в Codex; автоматического повтора не будет.";
     this.renderTask(binding, state);
   }

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type TaskRef } from "../desktop/contracts.js";
 import type { Binding, Delivery, ManagerAction, MessageHandle, NewTaskDraft, View } from "./contracts.js";
+import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../desktop/paths.js";
 
 const bindingColumns = `id TEXT PRIMARY KEY, host_id TEXT NOT NULL, thread_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -84,6 +85,21 @@ export class BridgeStore {
       this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE kind = 'technical'").run();
       // Menus are requested snapshots. Do not resurrect queued panels on restart.
       this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE kind = 'panel'").run();
+      // Navigation now lives in replies; retire unsent standalone welcome cards.
+      this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE key = 'welcome:manager' OR key LIKE 'welcome:task:%'").run();
+      // Resume indicators only after a fresh, source-verified desktop snapshot.
+      this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE kind = 'activity'").run();
+      for (const binding of this.bindings()) {
+        const indicator = this.getValue<{ key: string; kind?: string }>(`activity:${binding.id}`);
+        const base = indicator?.kind === "commentary" ? this.getValue<View>(`commentary-base:${indicator.key}`) : null;
+        if (base && indicator && binding.attached && binding.peerId !== null) this.enqueue(indicator.key, binding.peerId, base, binding.id, true);
+      }
+      // Older middle pages exceeded VK's button limit and can never be sent.
+      // Retire them without changing frozen payloads, message IDs or task output.
+      this.db.prepare(`UPDATE bridge_delivery SET delivered_revision = revision
+        WHERE kind = 'send' AND binding_id IS NULL AND handle IS NULL AND revision > delivered_revision
+          AND json_array_length(view, '$.buttons') > ?
+          AND (first_view IS NULL OR json_array_length(first_view, '$.buttons') > ?)`).run(VK_MAX_INLINE_BUTTONS, VK_MAX_INLINE_BUTTONS);
       this.db.prepare("UPDATE bridge_bindings SET chat_state = 'uncertain' WHERE chat_state = 'creating'").run();
       this.db.prepare("UPDATE bridge_inbox SET state = 'uncertain' WHERE state = 'processing'").run();
       this.db.prepare("UPDATE bridge_operations SET state = 'uncertain' WHERE state = 'sending'").run();
@@ -176,13 +192,26 @@ export class BridgeStore {
   finishOperation(id: string, uncertain: boolean): void { this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "accepted", id); }
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
   rememberEvent(bindingId: string, eventId: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_events(binding_id, event_id) VALUES (?, ?)").run(bindingId, eventId).changes === 1; }
+  deliveryOrder(key: string): number { return (this.db.prepare("SELECT id FROM bridge_delivery WHERE key = ?").get(key) as { id: number } | undefined)?.id ?? 0; }
+  deliveryMessageId(key: string): number | null {
+    return (this.db.prepare("SELECT json_extract(handle, '$.conversationMessageId') AS id FROM bridge_delivery WHERE key = ?").get(key) as { id: number | null } | undefined)?.id ?? null;
+  }
+  observePeerMessage(peerId: number, messageId: number): void {
+    if (!Number.isSafeInteger(messageId) || messageId <= 0) return;
+    const key = `peer-message:${peerId}`;
+    if (messageId > (this.getValue<number>(key) ?? 0)) this.setValue(key, messageId);
+  }
+  latestPeerMessage(peerId: number): number {
+    const sent = (this.db.prepare("SELECT MAX(json_extract(handle, '$.conversationMessageId')) AS id FROM bridge_delivery WHERE peer_id = ?").get(peerId) as { id: number | null }).id ?? 0;
+    return Math.max(sent, this.getValue<number>(`peer-message:${peerId}`) ?? 0);
+  }
 
-  enqueue(key: string, peerId: number, view: View, bindingId: string | null = null, commentary: boolean | "panel" = false): void {
+  enqueue(key: string, peerId: number, view: View, bindingId: string | null = null, commentary: boolean | "panel" | "activity" = false): void {
     const serialized = JSON.stringify(view);
     if (commentary) {
       this.db.prepare(`INSERT INTO bridge_delivery(key, binding_id, peer_id, kind, view) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET view = excluded.view, revision = bridge_delivery.revision + 1
-        WHERE bridge_delivery.view <> excluded.view`).run(key, bindingId, peerId, commentary === "panel" ? "panel" : "commentary", serialized);
+        WHERE bridge_delivery.view <> excluded.view`).run(key, bindingId, peerId, commentary === true ? "commentary" : commentary, serialized);
     } else this.db.prepare("INSERT OR IGNORE INTO bridge_delivery(key, binding_id, peer_id, kind, view) VALUES (?, ?, ?, 'send', ?)").run(key, bindingId, peerId, serialized);
   }
 
@@ -195,8 +224,23 @@ export class BridgeStore {
       WHERE key = ? AND kind = 'commentary' AND view <> ?`).run(replacement, key, replacement);
   }
 
+  settleActivity(key: string, text: string, refresh = false): void {
+    const view = JSON.stringify({ text, silent: true } satisfies View);
+    this.db.prepare(`UPDATE bridge_delivery SET view = ?, revision = revision + 1,
+      delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END
+      WHERE key = ? AND kind = 'activity' AND (view <> ? OR ? = 1)`).run(view, key, view, Number(refresh));
+  }
+
+  activateActivity(key: string): void {
+    this.db.prepare("UPDATE bridge_delivery SET revision = revision + 1 WHERE key = ? AND kind = 'activity' AND delivered_revision = revision").run(key);
+  }
+
+  retireActivity(key: string): void {
+    this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE key = ? AND kind = 'activity'").run(key);
+  }
+
   pendingDeliveries(): Delivery[] {
-    const rows = this.db.prepare("SELECT * FROM bridge_delivery WHERE revision > delivered_revision AND kind IN ('send', 'commentary', 'panel') ORDER BY id").all() as {
+    const rows = this.db.prepare("SELECT * FROM bridge_delivery WHERE revision > delivered_revision AND kind IN ('send', 'commentary', 'panel', 'activity') ORDER BY CASE WHEN kind = 'activity' THEN 1 ELSE 0 END, id").all() as {
       id: number; key: string; binding_id: string | null; peer_id: number; kind: Delivery["kind"]; view: string; first_view: string | null; handle: string | null; revision: number; delivered_revision: number;
     }[];
     return rows.map(row => ({ id: row.id, key: row.key, bindingId: row.binding_id, peerId: row.peer_id, kind: row.kind, view: JSON.parse(row.view) as View, firstView: row.first_view ? JSON.parse(row.first_view) as View : null, handle: row.handle ? JSON.parse(row.handle) as MessageHandle : null, revision: row.revision, deliveredRevision: row.delivered_revision }));
@@ -206,6 +250,7 @@ export class BridgeStore {
     this.db.prepare("UPDATE bridge_delivery SET first_view = COALESCE(first_view, ?) WHERE id = ?").run(JSON.stringify(delivery.view), delivery.id);
   }
   isPending(delivery: Delivery): boolean {
+    if (delivery.kind === "activity") return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND revision = ? AND delivered_revision < ?").get(delivery.id, delivery.revision, delivery.revision));
     return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND delivered_revision < ?").get(delivery.id, delivery.revision));
   }
   saveHandle(id: number, handle: MessageHandle): void {

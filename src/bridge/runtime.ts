@@ -1,43 +1,86 @@
 import { DesktopIpcClient } from "../desktop/ipc-client.js";
-import { projectSnapshot, type ProjectionCheckpoint } from "../desktop/projector.js";
+import { projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { TaskSubscription } from "../desktop/subscription.js";
-import type { BridgeChat, BridgeInput, ChatMembershipChange, OwnerAccess } from "./contracts.js";
+import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { sameTask, type DesktopTasks } from "../desktop/contracts.js";
+import { DesktopUnavailableError, sameTask, taskKey, type DesktopTasks, type DirectTaskUpdate } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
+import { TaskActivity } from "./activity.js";
+import { TaskFiles } from "./files.js";
 
 export class DesktopBridgeRuntime {
   private readonly gate: AccessGate;
   private readonly delivery: DeliveryWorker;
   private readonly manager: TaskManager;
   private readonly mirror: TaskMirror;
+  private readonly activity: TaskActivity;
+  private readonly files: TaskFiles | undefined;
   private readonly subscriptions = new Map<string, TaskSubscription>();
   private readonly retryAfter = new Map<string, number>();
-  private readonly membershipCheckAfter = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = false;
+  private unsubscribeDirect: (() => void) | null = null;
+  private readonly pendingDirect = new Map<string, DirectTaskUpdate[]>();
+  private compatibilityChecking = false;
+  private lastCompatibilityAt = 0;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now) {
+    private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string) {
     store.assertOwner(access.ownerId, access.groupId);
-    this.gate = new AccessGate(access, chat, store);
-    this.delivery = new DeliveryWorker(chat, store, this.gate);
-    this.manager = new TaskManager(access, desktop, chat, store, this.gate);
+    this.gate = new AccessGate(access, store);
+    this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate) : undefined;
+    this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
+    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files);
     this.mirror = new TaskMirror(store);
+    this.activity = new TaskActivity(store, now);
+    this.unsubscribeDirect = desktop.onDirectUpdate?.(update => this.acceptDirect(update)) ?? null;
   }
 
   start(): void {
     if (this.timer || this.stopped) throw new Error("Bridge runtime can only be started once");
+    for (const binding of this.store.bindings()) if (binding.attached && binding.paused) this.store.setPaused(binding.id, false);
     this.store.recover();
+    void this.checkCompatibility();
     this.timer = setInterval(() => {
+      try { this.activity.tick(); } catch { /* Retry next tick without interrupting delivery. */ }
       // A slow/offline task must not hold up delivery from other subscriptions.
       void this.delivery.flush().catch(() => {});
+      void this.files?.tick().catch(() => {});
       void this.tick().catch(() => {});
     }, 1_000);
+  }
+
+  private acceptDirect(update: DirectTaskUpdate): void {
+    const binding = this.store.bindings().find(candidate => sameTask(candidate, update.task));
+    if (!binding?.attached || binding.peerId === null) {
+      const key = taskKey(update.task); const queued = this.pendingDirect.get(key) ?? [];
+      queued.push(update); this.pendingDirect.set(key, queued.slice(-100)); return;
+    }
+    this.store.atomic(() => {
+      this.mirror.accept(binding.id, update.event);
+      this.manager.panels.observe(binding.id, update.details);
+      this.files?.observe(binding.id, update.details.status);
+      this.activity.observe(binding.id, update.details.status, update.details.status === "running" ? update.event.turnId : null);
+    });
+  }
+
+  private flushDirect(binding: Binding): void {
+    const key = taskKey(binding); const queued = this.pendingDirect.get(key);
+    if (!queued) return;
+    this.pendingDirect.delete(key);
+    for (const update of queued) this.acceptDirect(update);
+  }
+
+  private async checkCompatibility(): Promise<void> {
+    if (!this.desktop.checkCompatibility || this.compatibilityChecking || this.stopped) return;
+    this.compatibilityChecking = true; this.lastCompatibilityAt = this.now();
+    try { await this.desktop.checkCompatibility(); }
+    catch { /* The manager exposes the adapter's last safe status. */ }
+    finally { this.compatibilityChecking = false; }
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -46,25 +89,19 @@ export class DesktopBridgeRuntime {
     this.closeInactiveSubscriptions();
     if (!this.stopped) await this.delivery.flush();
   }
-  async membershipChanged(change: ChatMembershipChange): Promise<void> {
-    if (this.stopped) return;
-    await this.gate.membershipChanged(change);
-    this.closeInactiveSubscriptions();
-    if (!this.stopped) await this.delivery.flush();
-  }
-
   private closeSubscription(bindingId: string): void {
     this.subscriptions.get(bindingId)?.close();
     this.subscriptions.delete(bindingId);
     this.retryAfter.delete(bindingId);
-    this.membershipCheckAfter.delete(bindingId);
     this.manager.panels.disconnected(bindingId);
+    this.activity.disconnected(bindingId);
+    this.files?.observe(bindingId, "unavailable");
   }
 
   private closeInactiveSubscriptions(): void {
     for (const id of this.subscriptions.keys()) {
       const binding = this.store.getBinding(id);
-      if (!binding?.attached || binding.paused || binding.peerId === null) this.closeSubscription(id);
+      if (!binding?.attached || binding.peerId === null) this.closeSubscription(id);
     }
   }
 
@@ -77,56 +114,84 @@ export class DesktopBridgeRuntime {
   private async update(): Promise<void> {
     if (this.stopped) return;
     this.closeInactiveSubscriptions();
+    this.activity.tick();
+    if (this.now() - this.lastCompatibilityAt > 10 * 60_000) void this.checkCompatibility();
     await this.manager.panels.tick();
-    for (const binding of this.store.bindings()) {
+    for (const listed of this.store.bindings()) {
+      let binding = listed;
       const existing = this.subscriptions.get(binding.id);
-      if (!binding.attached || binding.paused || binding.peerId === null) {
+      if (!binding.attached || binding.peerId === null) {
         this.closeSubscription(binding.id); continue;
       }
-      if (!existing && this.now() < (this.retryAfter.get(binding.id) ?? 0)) continue;
-      // Long Poll events can be missed while the bridge is offline, including in idle tasks.
-      if (!existing || this.now() >= (this.membershipCheckAfter.get(binding.id) ?? 0)) {
-        if (!await this.gate.check(binding.peerId)) { this.closeSubscription(binding.id); continue; }
-        this.membershipCheckAfter.set(binding.id, this.now() + 30_000);
+      if (binding.paused) {
+        // Clear privacy pauses left by versions that treated conversation
+        // membership as an authorization boundary.
+        this.store.setPaused(binding.id, false);
+        binding = this.store.getBinding(binding.id)!;
       }
+      if (this.desktop.isDirectlyManaged?.(binding)) {
+        if (existing) {
+          existing.close(); this.subscriptions.delete(binding.id); this.retryAfter.delete(binding.id);
+        }
+        this.flushDirect(binding);
+        try {
+          const details = await this.desktop.inspectTask(binding);
+          this.manager.panels.observe(binding.id, details);
+          this.files?.observe(binding.id, details.status);
+        } catch { /* Direct updates remain authoritative for this local run. */ }
+        continue;
+      }
+      if (!existing && this.now() < (this.retryAfter.get(binding.id) ?? 0)) continue;
       if (existing) continue;
       const task = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
       const current = this.store.getBinding(binding.id);
-      if (this.stopped || !current?.attached || current.paused) { this.closeSubscription(binding.id); continue; }
+      if (this.stopped || !current?.attached) { this.closeSubscription(binding.id); continue; }
       if (!task) {
         this.retryAfter.set(binding.id, this.now() + 30_000);
         this.manager.panels.disconnected(binding.id);
+        this.activity.disconnected(binding.id);
+        this.files?.observe(binding.id, "unavailable");
         continue;
       }
       this.store.ensureBinding(task);
       const checkpointKey = `projection:${binding.id}`;
       const subscription = new TaskSubscription(this.client, task, state => {
         const current = this.store.getBinding(binding.id);
-        if (!current?.attached || current.paused) return;
+        if (!current?.attached) return;
         this.store.atomic(() => {
           const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey));
           for (const event of projected.events) this.mirror.accept(binding.id, event);
           this.store.setValue(checkpointKey, projected.checkpoint);
-          this.manager.panels.observe(binding.id, taskDetails(state));
+          const details = taskDetails(state);
+          this.manager.panels.observe(binding.id, details);
+          this.files?.observe(binding.id, details.status);
+          const activeTurn = turnsFromState(state).filter(turn => turn.status === "inProgress").at(-1);
+          this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
         });
-      }, () => {
+      }, error => {
         this.manager.panels.disconnected(binding.id);
         this.subscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
-        if (this.stopped || !current?.attached || current.paused) return;
+        if (this.stopped || !current?.attached) return;
+        this.activity.disconnected(binding.id);
+        this.files?.observe(binding.id, "unavailable");
         this.retryAfter.set(binding.id, this.now() + 5_000);
-        this.store.enqueue(`disconnected:${binding.id}`, this.access.ownerId, { text: "Связь с одной из задач Codex прервалась. Подключение будет повторено; команды автоматически не повторяются." });
+        const reason = error instanceof DesktopUnavailableError ? error.message : "Подключение к десктопу Codex недоступно.";
+        this.store.enqueue(`disconnected:${binding.id}`, this.access.ownerId, { text: `Связь с задачей «${binding.title.slice(0, 200)}» прервалась. ${reason} Подключение будет повторено; команды автоматически не повторяются.` });
       });
       this.subscriptions.set(binding.id, subscription);
       try { await subscription.start(); }
-      catch {
+      catch (error) {
         this.manager.panels.disconnected(binding.id);
         subscription.close(); this.subscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
-        if (this.stopped || !current?.attached || current.paused) continue;
+        if (this.stopped || !current?.attached) continue;
+        this.activity.disconnected(binding.id);
+        this.files?.observe(binding.id, "unavailable");
         this.retryAfter.set(binding.id, this.now() + 5_000);
+        const reason = error instanceof DesktopUnavailableError ? error.message : "Не удалось получить состояние Codex.";
         this.store.enqueue(`unavailable:${binding.id}`, this.access.ownerId, {
-          text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». Открой её в десктопе Codex. Подключение будет повторено; новая задача вместо неё не создаётся.`,
+          text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
         });
       }
       if (this.stopped) { subscription.close(); this.subscriptions.delete(binding.id); return; }
@@ -137,13 +202,16 @@ export class DesktopBridgeRuntime {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.activity.stop();
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     for (const subscription of this.subscriptions.values()) subscription.close();
     this.subscriptions.clear();
     this.client.close();
+    this.unsubscribeDirect?.(); this.unsubscribeDirect = null;
     await this.ticking?.catch(() => {});
     await this.manager.idle();
+    await this.files?.stop();
     await this.delivery.idle();
   }
 }

@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 import { Duplex } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
+import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
-import { ActionRejectedError, UncertainActionError } from "../src/desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopTask } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
+import { SdkTaskExecutor } from "../src/desktop/sdk-executor.js";
+import type { Codex } from "@openai/codex-sdk";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { BridgeStore } from "../src/bridge/store.js";
-import type { BridgeChat, View } from "../src/bridge/contracts.js";
+import type { BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
 const state = (items: IpcObject[] = [], status = "inProgress"): IpcObject => ({ id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
@@ -65,6 +68,7 @@ class Server extends Duplex {
         this.dataState = { ...this.dataState, latestThreadSettings: (message.params as IpcObject).threadSettings };
         this.snapshot();
       }
+      if (message.method === "thread-follower-interrupt-turn") result = { result: { ok: true, interruptedTurnId: "fixture-turn" } };
       this.send({ type: "response", requestId: message.requestId, resultType: "success", result, handledByClientId: "owner" });
     } else if (message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following) {
       if (this.onFollow) this.onFollow(); else this.snapshot();
@@ -78,12 +82,11 @@ function runtimeSetup(t: TestContext) {
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
   const store = new BridgeStore(); const binding = store.ensureBinding(task);
   store.setChat(binding.id, peerId, 17);
-  const participants = [access.ownerId, -access.groupId];
   const sent: { peerId: number; view: View }[] = [];
+  const edits: { handle: MessageHandle; view: View }[] = [];
   const chat: BridgeChat = {
-    members: async () => [...participants],
     send: async (peerId, view) => { sent.push({ peerId, view }); return { peerId, conversationMessageId: sent.length }; },
-    edit: async () => { throw new Error("Unexpected edit"); },
+    edit: async (handle, view) => { edits.push({ handle, view }); },
     createConversation: async () => { throw new Error("Unexpected chat creation"); },
     renameConversation: async () => { throw new Error("Unexpected chat rename"); },
     inviteLink: async () => { throw new Error("Unexpected invitation"); },
@@ -94,16 +97,76 @@ function runtimeSetup(t: TestContext) {
   const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, client, () => now);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
-  return { access, peerId, server, store, binding, participants, sent, runtime, follows, advance: () => { now += 30_001; } };
+  return { access, peerId, server, store, binding, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
 
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
   const decoder = new FrameDecoder(); const one = encodeFrame({ type: "one" }); const two = encodeFrame({ type: "two" });
   assert.deepEqual(decoder.push(one.subarray(0, 2)), []);
   assert.deepEqual(decoder.push(Buffer.concat([one.subarray(2), two])), [{ type: "one" }, { type: "two" }]);
-  const huge = Buffer.alloc(4); huge.writeUInt32LE(9 * 1024 * 1024);
-  assert.throws(() => new FrameDecoder().push(huge), /frame size/u);
-  assert.throws(() => new FrameDecoder().push(Buffer.from([0, 0, 0, 0])), /frame size/u);
+  const huge = Buffer.alloc(4); huge.writeUInt32LE(256 * 1024 * 1024 + 1);
+  assert.throws(() => new FrameDecoder().push(huge), /256 МиБ/u);
+  assert.throws(() => new FrameDecoder().push(Buffer.from([0, 0, 0, 0])), /размер/u);
+  const invalid = Buffer.from("[]"); const header = Buffer.alloc(4); header.writeUInt32LE(invalid.length);
+  assert.throws(() => new FrameDecoder().push(Buffer.concat([header, invalid])), /Invalid IPC frame/u);
+});
+
+test("IPC decoding accepts large UTF-8 frames in chunks and continues with the next frame", () => {
+  const text = "я".repeat(5 * 1024 * 1024) + "end";
+  const payload = Buffer.from(JSON.stringify({ text })); const header = Buffer.alloc(4); header.writeUInt32LE(payload.length);
+  // Construct the desktop's wire frame independently of the bridge's encoder.
+  const input = Buffer.concat([header, payload, encodeFrame({ type: "after-large-frame" })]);
+  const decoder = new FrameDecoder(); const messages: IpcObject[] = [];
+  for (let offset = 0; offset < input.length; offset += 65_537) messages.push(...decoder.push(input.subarray(offset, offset + 65_537)));
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0]!.text, text);
+  assert.deepEqual(messages[1], { type: "after-large-frame" });
+});
+
+test("runtime connects a large task and mirrors progress without forwarding tool output", async t => {
+  const s = runtimeSetup(t);
+  s.server.dataState = state([
+    { id: "command", type: "commandExecution", output: "x".repeat(24 * 1024 * 1024) },
+    { id: "old-progress", type: "agentMessage", phase: "commentary", text: "Progress before connecting" },
+  ]);
+  await s.runtime.tick();
+  assert.deepEqual(s.follows(), [true]);
+  assert.equal(s.server.destroyed, false);
+  assert.deepEqual(s.sent.map(item => item.view.text), ["думаю..."]);
+  s.server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11, sourceClientId: "owner", targetClientIds: ["bridge-client"], params: {
+    hostId: ref.hostId, conversationId: ref.threadId, change: { type: "patches", baseRevision: 1, revision: 2, patches: [
+      { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 2], value: { id: "progress", type: "agentMessage", phase: "commentary", text: "Progress after connecting" } },
+    ] },
+  } });
+  await new Promise(resolve => setImmediate(resolve));
+  await s.runtime.tick();
+  assert.deepEqual(s.sent.map(item => item.view.text), ["думаю...", "Progress after connecting\n\nдумаю..."]);
+});
+
+test("runtime reports the actual connection failure without leaking malformed IPC contents", async t => {
+  const s = runtimeSetup(t);
+  const oversized = Buffer.alloc(4); oversized.writeUInt32LE(256 * 1024 * 1024 + 1);
+  s.server.onFollow = () => s.server.push(oversized);
+  await s.runtime.tick();
+  assert.equal(s.sent.length, 1);
+  assert.match(s.sent[0]!.view.text, /256 МиБ/u);
+  assert.doesNotMatch(s.sent[0]!.view.text, /Открой её/u);
+
+  const broken = new Server(); const client = new DesktopIpcClient(() => broken, 50); t.after(() => client.close());
+  const content = Buffer.from('{"private-data"'); const header = Buffer.alloc(4); header.writeUInt32LE(content.length);
+  broken.onFollow = () => broken.push(Buffer.concat([header, content]));
+  const subscription = new TaskSubscription(client, ref, () => assert.fail("Malformed state accepted"), () => {});
+  await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /прочитать/u.test(error.message) && !error.message.includes("private-data"));
+});
+
+test("runtime animates an active task between desktop events and stops when its turn completes", async t => {
+  const s = runtimeSetup(t); await s.runtime.tick();
+  s.advance(6_000); await s.runtime.tick();
+  assert.equal(s.edits.at(-1)!.view.text, "думаю..");
+  s.server.dataState = state([], "completed"); s.server.snapshot();
+  await new Promise(resolve => setImmediate(resolve)); s.advance(3_000); await s.runtime.tick();
+  assert.equal(s.edits.at(-1)!.view.text, "Готово.");
+  const count = s.edits.length; s.advance(); await s.runtime.tick(); assert.equal(s.edits.length, count);
 });
 
 test("revision patches apply atomically and reject gaps, invalid paths, and prototype pollution", () => {
@@ -145,46 +208,20 @@ test("closing a subscription during connection, discovery or its first snapshot 
   }
 });
 
-test("runtime immediately unsubscribes after departure and never interrupts or reattaches the task", async t => {
-  const s = runtimeSetup(t);
-  await s.runtime.tick(); assert.deepEqual(s.follows(), [true]);
-  await s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:leave", removedMemberId: s.access.ownerId });
-  assert.deepEqual(s.follows(), [true, false]);
-  assert.equal(s.store.getBinding(s.binding.id)!.attached, false);
-  s.server.dataState = state([{ id: "later", type: "agentMessage", phase: "commentary", text: "Do not mirror" }]);
-  s.server.snapshot();
-  await s.runtime.tick();
-  await s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:return" });
-  await s.runtime.tick();
-  assert.deepEqual(s.follows(), [true, false]);
-  assert.equal(s.sent.filter(item => item.peerId === s.peerId).length, 0);
-  assert.equal(s.sent.length, 1);
-  assert.ok(s.server.received.every(message => ["initialize", "thread-owner-discovery", "thread-stream-following-changed"].includes(String(message.method))));
-});
-
-test("periodic membership checks catch a missed departure even when the task sends no new events", async t => {
+test("periodic ticks keep an attached task subscribed", async t => {
   const s = runtimeSetup(t);
   await s.runtime.tick();
-  s.participants.splice(0, 1);
   s.advance(); await s.runtime.tick();
-  assert.equal(s.store.getBinding(s.binding.id)!.attached, false);
-  assert.deepEqual(s.follows(), [true, false]);
-  assert.equal(s.sent.filter(item => item.peerId === s.peerId).length, 0);
-  s.store.recover(); await s.runtime.tick();
-  assert.deepEqual(s.follows(), [true, false]);
+  assert.equal(s.store.getBinding(s.binding.id)!.attached, true);
+  assert.deepEqual(s.follows(), [true]);
 });
 
-test("departure before the first Codex snapshot cancels startup without unavailable alerts or retries", async t => {
-  const s = runtimeSetup(t); let departure: Promise<void> | undefined;
-  s.server.onFollow = () => {
-    departure = s.runtime.membershipChanged({ peerId: s.peerId, eventId: "membership:leave", removedMemberId: s.access.ownerId });
-  };
-  await s.runtime.tick(); await departure;
-  assert.deepEqual(s.follows(), [true, false]);
-  assert.equal(s.sent.length, 1);
-  assert.match(s.sent[0]!.view.text, /отключена/u);
-  s.advance(); await s.runtime.tick();
-  assert.deepEqual(s.follows(), [true, false]);
+test("runtime clears a legacy privacy pause without checking membership", async t => {
+  const s = runtimeSetup(t);
+  s.store.setPaused(s.binding.id, true);
+  await s.runtime.tick();
+  assert.equal(s.store.getBinding(s.binding.id)!.paused, false);
+  assert.deepEqual(s.follows(), [true]);
 });
 
 test("unsupported stream version fails closed without silently accepting state", async t => {
@@ -257,6 +294,32 @@ test("active-task submit uses the existing task and inherits its model and permi
   assert.ok(server.destroyed);
 });
 
+test("desktop submits image and document attachments in both active and idle tasks", async () => {
+  for (const status of ["inProgress", "completed"]) {
+    const server = new Server(); server.dataState = state([], status);
+    const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+    const imagePath = path.resolve("fixture-image.png"), filePath = path.resolve("fixture-notes.txt"), outboxDir = path.resolve("fixture-outbox");
+    await adapter.submit({ task: ref, operationId: "files-fixture", text: "", outboxDir, inputFiles: [
+      { path: imagePath, originalName: "image.png", kind: "image", sizeBytes: 1 },
+      { path: filePath, originalName: "notes.txt", kind: "file", sizeBytes: 1 },
+    ] });
+    const request = server.received.find(message => message.method === (status === "inProgress" ? "thread-follower-steer-turn" : "thread-follower-start-turn"))!;
+    const params = request.params as IpcObject;
+    const input = (status === "inProgress" ? params.input : ((params.turnStart as IpcObject).request as IpcObject).input) as IpcObject[];
+    assert.deepEqual(input[1], { type: "localImage", path: imagePath });
+    assert.ok(String(input[0]!.text).includes(JSON.stringify(filePath))); assert.ok(String(input[0]!.text).includes(JSON.stringify(outboxDir)));
+    if (status === "inProgress") assert.deepEqual(params.attachments, [{ label: "notes.txt", path: filePath, fsPath: filePath }]);
+  }
+});
+
+test("desktop rechecks access immediately before forwarding a prepared request", async () => {
+  const server = new Server(); const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.submit({ task: ref, operationId: "fixture", text: "Text", beforeSend: async () => { throw new ActionRejectedError("Detached"); } }), /Detached/u);
+  assert.equal(server.received.some(message => /thread-follower-(?:start|steer)-turn/u.test(String(message.method))), false);
+});
+
 test("model choice updates only next-turn model and effort through the actual owner", async () => {
   const server = new Server(); const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [], listModels: async () => [{ id: "fixture-model", title: "Fixture", efforts: ["high"], defaultEffort: "high" }] }, () => new DesktopIpcClient(() => server, 50));
@@ -287,7 +350,7 @@ test("rename confirms the catalog and live title separately without executing a 
       rename: async (_ref, title) => {
         writes++; task = { ...task, title };
         if (liveUpdate) { server.dataState = { ...server.dataState, title }; server.snapshot(); }
-      }, archive: async () => {}, markdown: async () => "",
+      }, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
     });
     assert.deepEqual(await adapter.renameTask(ref, "New title"), { liveTitleUpdated: liveUpdate });
     assert.equal(writes, 1);
@@ -300,7 +363,7 @@ test("rename rejects an unconfirmed catalog or a mismatched source without chang
     const server = new Server(); server.dataState = { ...state(), title: "Old title", rolloutPath: "/primary/history.jsonl" };
     const task = { ...ref, title: "Old title", workspace: "/fixture", updatedAt: 1, rolloutPath: sourceMismatch ? "/extra/history.jsonl" : "/primary/history.jsonl" }; let writes = 0;
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50), {
-      rename: async () => { writes++; }, archive: async () => {}, markdown: async () => "",
+      rename: async () => { writes++; }, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
     });
     await assert.rejects(adapter.renameTask(task, "New title"));
     assert.equal(writes, sourceMismatch ? 0 : 1);
@@ -309,15 +372,76 @@ test("rename rejects an unconfirmed catalog or a mismatched source without chang
 
 test("metadata archive refuses an active desktop turn without invoking metadata or interruption", async () => {
   const server = new Server(); const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }; let archives = 0;
-  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50), { rename: async () => {}, archive: async () => { archives++; }, markdown: async () => "" });
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50), { rename: async () => {}, archive: async () => { archives++; }, markdown: async () => "", assignProject: async () => {} });
   await assert.rejects(adapter.archiveTask(ref), ActionRejectedError);
   assert.equal(archives, 0);
   assert.equal(server.received.some(message => String(message.method).includes("interrupt")), false);
 });
 
-test("an idle task starts the next turn through its owner with inherited settings", async () => {
-  for (const status of ["completed", "interrupted", "failed"]) {
-    const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: "idle" } };
+test("interrupt targets the active desktop turn and requires a confirmed turn id", async () => {
+  const server = new Server(); const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  await adapter.interrupt(ref);
+  const request = server.received.find(message => message.method === "thread-follower-interrupt-turn")!;
+  assert.equal(request.version, 4); assert.equal(request.targetClientId, "owner");
+  assert.deepEqual(request.params, { conversationId: ref.threadId, mode: "user-stop", expectedTurnId: "fixture-turn" });
+});
+
+test("project move writes Codex metadata and confirms the catalog without starting a turn", async () => {
+  const server = new Server(); server.dataState = state([], "completed");
+  let task: DesktopTask = { ...ref, title: "Fixture", workspace: "/fixture", projectId: "project-a", updatedAt: 1 };
+  const writes: (string | null)[] = [];
+  const adapter = new ConnectedDesktopTasks({
+    listTasks: async () => [task], listProjects: async () => [],
+    resolveProject: async id => ({ rawProjectId: id, sourceId: "" }),
+  }, () => new DesktopIpcClient(() => server, 50), {
+    rename: async () => {}, archive: async () => {}, markdown: async () => "",
+    assignProject: async (_ref, projectId) => { writes.push(projectId); task = { ...task, projectId }; },
+  });
+  await adapter.moveTask(ref, "project-b");
+  assert.deepEqual(writes, ["project-b"]); assert.equal(task.projectId, "project-b");
+  assert.equal(server.received.some(message => /turn/u.test(String(message.method))), false);
+});
+
+test("compatibility canary confirms stream protocol v11 through an open task", async () => {
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }; const servers: Server[] = [];
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server(); servers.push(server); return new DesktopIpcClient(() => server, 100);
+  });
+  const status = await adapter.checkCompatibility();
+  assert.equal(status.state, "ok"); assert.match(status.message, /v11/u); assert.equal(servers.length, 2);
+});
+
+test("SDK executor creates a user task with the selected worktree and streams its answer", async () => {
+  async function* events(): AsyncGenerator<unknown> {
+    yield { type: "thread.started", thread_id: "sdk-thread" };
+    yield { type: "turn.started" };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "SDK answer" } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
+  }
+  const homes: string[] = []; const worktrees: string[] = []; const metadata: string[] = []; const updates: string[] = [];
+  const codex = { startThread: () => ({ runStreamed: async () => ({ events: events() }) }) } as unknown as Codex;
+  const catalog = {
+    resolveProject: async () => ({ project: { id: "project", title: "Project", workspace: "D:\\repo" }, rawProjectId: "raw-project", sourceHome: "D:\\codex-home", sourceLabel: ".codex" }),
+    sourceHome: () => "D:\\codex-home", listTasks: async () => [],
+  };
+  const executor = new SdkTaskExecutor(catalog, {
+    rename: async (_task, title) => { metadata.push(`rename:${title}`); },
+    assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
+    archive: async () => {}, markdown: async () => "",
+  }, home => { homes.push(home); return codex; }, async (_project, operationId) => { worktrees.push(operationId); return "D:\\repo_VKodex_fixture_worktree"; });
+  executor.onUpdate(update => updates.push(update.event.type));
+  const task = await executor.createTask({ operationId: "operation", projectId: "project", title: "New SDK task", prompt: "Start", model: "model", effort: "high", environment: "worktree" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(task.threadId, "sdk-thread"); assert.equal(task.workspace, "D:\\repo_VKodex_fixture_worktree");
+  assert.deepEqual(homes, ["D:\\codex-home"]); assert.deepEqual(worktrees, ["operation"]);
+  assert.deepEqual(metadata, ["project:raw-project", "rename:New SDK task"]);
+  assert.ok(updates.includes("final")); assert.equal(executor.details(task)?.status, "idle");
+});
+
+test("an idle or unloaded task starts the next turn through its owner with inherited settings", async () => {
+  for (const [status, runtimeStatus] of [["completed", "idle"], ["interrupted", "idle"], ["failed", "idle"], ["completed", "notLoaded"]] as const) {
+    const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: runtimeStatus } };
     const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
     await adapter.submit({ operationId: "message", task: ref, text: "Continue" });
@@ -349,6 +473,15 @@ test("starting placeholders without a turn ID are steered rather than mistaken f
     assert.equal(server.received.filter(message => message.method === "thread-follower-steer-turn").length, 1);
     assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
   }
+});
+
+test("pending desktop requests reject input even while a turn is active", async () => {
+  const server = new Server(); server.dataState = { ...state(), requests: [{ id: "pending-approval" }] };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.submit({ operationId: "message", task: ref, text: "Continue" }), error => error instanceof ActionRejectedError && /подтверждение или вопрос/u.test(error.message));
+  assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn" || message.method === "thread-follower-start-turn"), false);
+  assert.ok(server.destroyed);
 });
 
 test("unconfirmed idle state and pending questions never start a new turn", async () => {
@@ -392,7 +525,7 @@ test("invalid text is rejected before opening a desktop connection", async () =>
   assert.equal(connections, 0);
 });
 
-test("snapshot projection skips initial history and reasoning, then emits stable final and user events", () => {
+test("snapshot projection baselines all initial history and reasoning, then emits stable new events", () => {
   const initial = state([
     { type: "userMessage", id: "initial", content: [{ type: "text", text: "Initial prompt" }] },
     { type: "reasoning", id: "private", content: "Never mirror reasoning" },
@@ -400,7 +533,7 @@ test("snapshot projection skips initial history and reasoning, then emits stable
     { type: "agentMessage", id: "answer", phase: "final_answer", text: "Partial" },
   ]);
   const first = projectSnapshot(initial, null, 200);
-  assert.equal(first.events.some(event => event.type === "user" || event.type === "final"), false);
+  assert.equal(first.events.some(event => event.type === "user" || event.type === "progress" || event.type === "final"), false);
   assert.equal(JSON.stringify(first.events).includes("reasoning"), false);
   assert.equal(projectSnapshot(initial, first.checkpoint).events.length, 0);
   const completed = state([

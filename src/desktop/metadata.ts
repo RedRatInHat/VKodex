@@ -6,8 +6,8 @@ import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopMetadata, type TaskRef } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
-type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive";
-const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive"]);
+type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update";
+const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update"]);
 
 export function nativeCodexPath(): string {
   const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
@@ -124,6 +124,10 @@ export class NativeDesktopMetadata implements DesktopMetadata {
     if (!isObject(response.thread) || response.thread.id !== task.threadId) throw new DesktopUnavailableError("Codex вернул другую задачу; экспорт отменён.");
     return conversationMarkdown(response.thread);
   }
+  async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
+    this.local(task);
+    await this.rpc.call("thread/metadata/update", { threadId: task.threadId, projectId: projectId ?? "" });
+  }
 }
 
 export class ProfileDesktopMetadata implements DesktopMetadata {
@@ -134,4 +138,5 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   rename(task: TaskRef, title: string): Promise<void> { return this.createMetadata(this.sourceHome(task)).rename(task, title); }
   archive(task: TaskRef): Promise<void> { return this.createMetadata(this.sourceHome(task)).archive(task); }
   markdown(task: TaskRef): Promise<string> { return this.createMetadata(this.sourceHome(task)).markdown(task); }
+  assignProject(task: TaskRef, projectId: string | null): Promise<void> { return this.createMetadata(this.sourceHome(task)).assignProject(task, projectId); }
 }

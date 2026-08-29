@@ -27,12 +27,17 @@ export interface CreateTaskRequest {
   readonly title: string;
   readonly prompt: string;
   readonly model?: string;
+  readonly effort?: string;
+  readonly environment: "local" | "worktree";
 }
 
 export interface SubmitTaskRequest {
   readonly operationId: string;
   readonly task: TaskRef;
   readonly text: string;
+  readonly inputFiles?: readonly LocalInputFile[];
+  readonly outboxDir?: string;
+  readonly beforeSend?: () => Promise<void>;
 }
 
 export interface DesktopModel {
@@ -57,6 +62,7 @@ export interface DesktopMetadata {
   rename(task: TaskRef, title: string): Promise<void>;
   archive(task: TaskRef): Promise<void>;
   markdown(task: TaskRef): Promise<string>;
+  assignProject(task: TaskRef, projectId: string | null): Promise<void>;
 }
 
 export interface TaskRenameResult {
@@ -80,6 +86,27 @@ export interface DesktopCapabilities {
   readonly renameTask?: boolean;
   readonly archiveTask?: boolean;
   readonly exportMarkdown?: boolean;
+  readonly moveTask?: boolean;
+}
+
+export interface DirectTaskUpdate {
+  readonly task: TaskRef;
+  readonly event: TaskEvent;
+  readonly details: TaskDetails;
+}
+
+export interface DirectTaskExecutor {
+  createTask(request: CreateTaskRequest): Promise<DesktopTask>;
+  submit(request: SubmitTaskRequest): Promise<void>;
+  interrupt(task: TaskRef): Promise<boolean>;
+  details(task: TaskRef): TaskDetails | null;
+  isRunning(task: TaskRef): boolean;
+  onUpdate(listener: (update: DirectTaskUpdate) => void): () => void;
+}
+
+export interface DesktopCompatibility {
+  readonly state: "checking" | "ok" | "unverified" | "failed";
+  readonly message: string;
 }
 
 export interface DesktopTasks {
@@ -90,12 +117,17 @@ export interface DesktopTasks {
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;
   interrupt(task: TaskRef): Promise<void>;
+  moveTask(task: TaskRef, projectId: string | null): Promise<void>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
   archiveTask(task: TaskRef): Promise<void>;
   exportMarkdown(task: TaskRef): Promise<string>;
+  isDirectlyManaged?(task: TaskRef): boolean;
+  onDirectUpdate?(listener: (update: DirectTaskUpdate) => void): () => void;
+  checkCompatibility?(): Promise<DesktopCompatibility>;
+  compatibility?(): DesktopCompatibility;
 }
 
 export function taskKey(task: TaskRef): string {
@@ -108,6 +140,14 @@ export class DesktopUnavailableError extends Error {
   constructor(message = "Подключение к десктопу Codex недоступно.") {
     super(message);
     this.name = "DesktopUnavailableError";
+  }
+}
+
+/** Discovery confirmed that no desktop client currently owns this task. */
+export class TaskNotOpenError extends DesktopUnavailableError {
+  constructor() {
+    super("Задача не открыта в десктопе Codex. Продолжаю её через локальный Codex SDK.");
+    this.name = "TaskNotOpenError";
   }
 }
 
@@ -125,3 +165,4 @@ export class UncertainActionError extends Error {
     this.name = "UncertainActionError";
   }
 }
+import type { LocalInputFile } from "../domain/models.js";

@@ -52,7 +52,7 @@ test("the most specific unique root wins when no explicit assignment exists", ()
   assert.equal(assignTaskProjects([{ ...task, workspace: "D:/Fixture/First/Nested/src" }], projects)[0]!.projectId, "nested");
 });
 
-test("a CLI-only source stays projectless instead of inheriting another source's projects", async () => {
+test("a CLI-only source inherits an unambiguous shared desktop project by workspace", async () => {
   const combined = new MultiDesktopCatalog(["D:/Fixture/Home", "D:/Fixture/OtherHome"], home => ({
     listModels: async () => [],
     listTasks: async () => assignTaskProjects([task], home.endsWith("OtherHome") ? {} : state),
@@ -60,8 +60,16 @@ test("a CLI-only source stays projectless instead of inheriting another source's
   }));
   const tasks = await combined.listTasks();
   assert.equal(tasks[0]!.projectId, "first");
-  assert.equal(tasks[1]!.projectId, null);
+  assert.equal(tasks[1]!.projectId, "first");
   assert.notEqual(tasks[0]!.sourceId, tasks[1]!.sourceId);
+  assert.equal((await combined.listProjects())[0]!.title, "First");
+
+  const unmatched = new MultiDesktopCatalog(["D:/Fixture/Home", "D:/Fixture/OtherHome"], home => ({
+    listModels: async () => [],
+    listTasks: async () => assignTaskProjects([{ ...task, workspace: home.endsWith("OtherHome") ? "D:/Outside" : task.workspace }], home.endsWith("OtherHome") ? {} : state),
+    listProjects: async () => desktopProjects(home.endsWith("OtherHome") ? {} : state),
+  }));
+  assert.equal((await unmatched.listTasks()).find(item => item.sourceId)!.projectId, null);
 });
 
 test("stored project IDs are read without modifying the Codex database", t => {

@@ -4,35 +4,57 @@ import type { Duplex } from "node:stream";
 import { DesktopUnavailableError, UncertainActionError } from "./contracts.js";
 
 export type IpcObject = Record<string, unknown>;
-const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+// Match the desktop IPC limit: a task snapshot includes its full loaded history.
+const MAX_FRAME_BYTES = 256 * 1024 * 1024;
+
+function validateFrameSize(size: number): void {
+  if (size === 0) throw new DesktopUnavailableError("Codex прислал некорректный размер пакета состояния.");
+  if (size > MAX_FRAME_BYTES) throw new DesktopUnavailableError("Пакет состояния Codex превышает лимит подключения 256 МиБ.");
+}
 
 export function isObject(value: unknown): value is IpcObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export class FrameDecoder {
-  private pending: Buffer = Buffer.alloc(0);
+  private readonly header = Buffer.alloc(4);
+  private headerBytes = 0;
+  private payload: Buffer | null = null;
+  private payloadBytes = 0;
 
   push(chunk: Buffer): IpcObject[] {
-    this.pending = Buffer.concat([this.pending, chunk]);
     const messages: IpcObject[] = [];
-    while (this.pending.length >= 4) {
-      const size = this.pending.readUInt32LE(0);
-      if (size === 0 || size > MAX_FRAME_BYTES) throw new Error("Invalid IPC frame size");
-      if (this.pending.length < size + 4) break;
-      const parsed: unknown = JSON.parse(this.pending.subarray(4, size + 4).toString("utf8"));
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (!this.payload) {
+        const bytes = Math.min(4 - this.headerBytes, chunk.length - offset);
+        chunk.copy(this.header, this.headerBytes, offset, offset + bytes);
+        this.headerBytes += bytes; offset += bytes;
+        if (this.headerBytes < 4) break;
+        const size = this.header.readUInt32LE(0);
+        validateFrameSize(size);
+        this.headerBytes = 0;
+        // Copy each byte once, instead of repeatedly concatenating the entire
+        // snapshot whenever the pipe supplies another small chunk.
+        this.payload = Buffer.allocUnsafe(size);
+      }
+      const payload = this.payload;
+      const bytes = Math.min(payload.length - this.payloadBytes, chunk.length - offset);
+      chunk.copy(payload, this.payloadBytes, offset, offset + bytes);
+      this.payloadBytes += bytes; offset += bytes;
+      if (this.payloadBytes < payload.length) break;
+      this.payload = null; this.payloadBytes = 0;
+      const parsed: unknown = JSON.parse(payload.toString("utf8"));
       if (!isObject(parsed)) throw new Error("Invalid IPC frame");
       messages.push(parsed);
-      this.pending = this.pending.subarray(size + 4);
     }
-    if (this.pending.length > MAX_FRAME_BYTES + 4) throw new Error("IPC buffer limit exceeded");
     return messages;
   }
 }
 
 export function encodeFrame(message: IpcObject): Buffer {
   const payload = Buffer.from(JSON.stringify(message), "utf8");
-  if (payload.length === 0 || payload.length > MAX_FRAME_BYTES) throw new Error("Invalid IPC frame size");
+  validateFrameSize(payload.length);
   const frame = Buffer.allocUnsafe(payload.length + 4);
   frame.writeUInt32LE(payload.length);
   payload.copy(frame, 4);
@@ -57,7 +79,7 @@ export class DesktopIpcClient {
   private clientId: string | null = null;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly listeners = new Set<(message: IpcObject) => void>();
-  private readonly disconnectListeners = new Set<() => void>();
+  private readonly disconnectListeners = new Set<(error: DesktopUnavailableError) => void>();
   private connecting: Promise<void> | null = null;
 
   constructor(
@@ -78,7 +100,11 @@ export class DesktopIpcClient {
     const decoder = new FrameDecoder();
     stream.on("data", (chunk: Buffer) => {
       try { for (const message of decoder.push(chunk)) this.receive(message); }
-      catch { this.close(); }
+      catch (error) {
+        // JSON parser errors can quote private task content. Expose only our
+        // own fixed diagnostics, never the raw parser or socket exception.
+        this.close(error instanceof DesktopUnavailableError ? error : new DesktopUnavailableError("Не удалось прочитать состояние Codex: несовместимый или повреждённый пакет IPC."));
+      }
     });
     stream.once("error", () => this.close());
     stream.once("close", () => this.disconnected(stream));
@@ -99,7 +125,7 @@ export class DesktopIpcClient {
     return () => { this.listeners.delete(listener); };
   }
 
-  onDisconnect(listener: () => void): () => void {
+  onDisconnect(listener: (error: DesktopUnavailableError) => void): () => void {
     this.disconnectListeners.add(listener);
     return () => { this.disconnectListeners.delete(listener); };
   }
@@ -160,22 +186,22 @@ export class DesktopIpcClient {
     }
   }
 
-  close(): void {
+  close(error = new DesktopUnavailableError()): void {
     const stream = this.stream;
     if (!stream) return;
-    this.disconnected(stream);
+    this.disconnected(stream, error);
     stream.destroy();
   }
 
-  private disconnected(stream: Duplex): void {
+  private disconnected(stream: Duplex, error = new DesktopUnavailableError()): void {
     if (this.stream !== stream) return;
     this.stream = null;
     this.clientId = null;
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
-      request.reject(request.mutating ? new UncertainActionError() : new DesktopUnavailableError());
+      request.reject(request.mutating ? new UncertainActionError() : error);
     }
     this.pending.clear();
-    for (const listener of this.disconnectListeners) listener();
+    for (const listener of this.disconnectListeners) listener(error);
   }
 }
