@@ -419,22 +419,23 @@ test("SDK executor creates a user task with the selected worktree and streams it
     yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "SDK answer" } };
     yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
   }
+  const projectWorkspace = path.resolve("fixture-repo"); const codexHome = path.resolve("fixture-codex-home"); const worktreeWorkspace = path.resolve("fixture-worktree");
   const homes: string[] = []; const worktrees: string[] = []; const metadata: string[] = []; const updates: string[] = [];
   const codex = { startThread: () => ({ runStreamed: async () => ({ events: events() }) }) } as unknown as Codex;
   const catalog = {
-    resolveProject: async () => ({ project: { id: "project", title: "Project", workspace: "D:\\repo" }, rawProjectId: "raw-project", sourceHome: "D:\\codex-home", sourceLabel: ".codex" }),
-    sourceHome: () => "D:\\codex-home", listTasks: async () => [],
+    resolveProject: async () => ({ project: { id: "project", title: "Project", workspace: projectWorkspace }, rawProjectId: "raw-project", sourceHome: codexHome, sourceLabel: ".codex" }),
+    sourceHome: () => codexHome, listTasks: async () => [],
   };
   const executor = new SdkTaskExecutor(catalog, {
     rename: async (_task, title) => { metadata.push(`rename:${title}`); },
     assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
     archive: async () => {}, markdown: async () => "",
-  }, home => { homes.push(home); return codex; }, async (_project, operationId) => { worktrees.push(operationId); return "D:\\repo_VKodex_fixture_worktree"; });
+  }, home => { homes.push(home); return codex; }, async (_project, operationId) => { worktrees.push(operationId); return worktreeWorkspace; });
   executor.onUpdate(update => updates.push(update.event.type));
   const task = await executor.createTask({ operationId: "operation", projectId: "project", title: "New SDK task", prompt: "Start", model: "model", effort: "high", environment: "worktree" });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(task.threadId, "sdk-thread"); assert.equal(task.workspace, "D:\\repo_VKodex_fixture_worktree");
-  assert.deepEqual(homes, ["D:\\codex-home"]); assert.deepEqual(worktrees, ["operation"]);
+  assert.equal(task.threadId, "sdk-thread"); assert.equal(task.workspace, worktreeWorkspace);
+  assert.deepEqual(homes, [codexHome]); assert.deepEqual(worktrees, ["operation"]);
   assert.deepEqual(metadata, ["project:raw-project", "rename:New SDK task"]);
   assert.ok(updates.includes("final")); assert.equal(executor.details(task)?.status, "idle");
 });

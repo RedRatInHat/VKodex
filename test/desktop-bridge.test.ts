@@ -917,6 +917,13 @@ test("VK flood control pauses the whole delivery queue across worker restart", a
   assert.deepEqual(s.chat.sent.map(item => item.view.text), ["First", "Second"]);
 });
 
+test("final answers and manager replies are delivered before backlogged commentary", t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.enqueue("old-comment", peerId, { text: "Progress" }, binding.id, true);
+  s.store.enqueue("final", peerId, { text: "Final answer" }, binding.id);
+  assert.deepEqual(s.store.pendingDeliveries().map(item => item.kind), ["send", "commentary"]);
+});
+
 test("gateway translates VK flood errors to a safe retry interval", async t => {
   const vk = new VK({ token: "fixture-token" });
   const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);

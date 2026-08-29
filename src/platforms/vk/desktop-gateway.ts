@@ -79,14 +79,28 @@ export async function collectVkFiles(message: unknown): Promise<RemoteAttachment
 }
 
 export class DesktopVkGateway implements BridgeChat {
+  private writeTail: Promise<void> = Promise.resolve();
+  private nextWriteAt = 0;
+
   private async write<T>(operation: () => Promise<T>): Promise<T> {
-    try { return await operation(); }
-    catch (error) {
-      if (error instanceof APIError && [6, 9, 29].includes(Number(error.code))) throw new ChatRateLimitError(Number(error.code) === 6 ? 1_000 : 120_000);
-      throw error;
+    let release!: () => void;
+    const previous = this.writeTail;
+    this.writeTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try {
+      const delay = Math.max(0, this.nextWriteAt - Date.now());
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      try { return await operation(); }
+      catch (error) {
+        if (error instanceof APIError && [6, 9, 29].includes(Number(error.code))) throw new ChatRateLimitError(Number(error.code) === 6 ? 1_000 : 120_000);
+        throw error;
+      }
+    } finally {
+      this.nextWriteAt = Date.now() + this.writeIntervalMs;
+      release();
     }
   }
-  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 })) {
+  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 750) {
     // vk-io's default middleware error handler prints the full exception.
     this.vk.updates.use(async (_context, next) => {
       try { await next(); }

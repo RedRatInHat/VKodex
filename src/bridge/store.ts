@@ -240,7 +240,9 @@ export class BridgeStore {
   }
 
   pendingDeliveries(): Delivery[] {
-    const rows = this.db.prepare("SELECT * FROM bridge_delivery WHERE revision > delivered_revision AND kind IN ('send', 'commentary', 'panel', 'activity') ORDER BY CASE WHEN kind = 'activity' THEN 1 ELSE 0 END, id").all() as {
+    const rows = this.db.prepare(`SELECT * FROM bridge_delivery WHERE revision > delivered_revision
+      AND kind IN ('send', 'commentary', 'panel', 'activity')
+      ORDER BY CASE kind WHEN 'send' THEN 0 WHEN 'panel' THEN 1 WHEN 'commentary' THEN 2 ELSE 3 END, id`).all() as {
       id: number; key: string; binding_id: string | null; peer_id: number; kind: Delivery["kind"]; view: string; first_view: string | null; handle: string | null; revision: number; delivered_revision: number;
     }[];
     return rows.map(row => ({ id: row.id, key: row.key, bindingId: row.binding_id, peerId: row.peer_id, kind: row.kind, view: JSON.parse(row.view) as View, firstView: row.first_view ? JSON.parse(row.first_view) as View : null, handle: row.handle ? JSON.parse(row.handle) as MessageHandle : null, revision: row.revision, deliveredRevision: row.delivered_revision }));
