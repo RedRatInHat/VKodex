@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopTasks, type TaskDetails } from "../desktop/contracts.js";
-import type { Binding, BridgeChat, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, View } from "./contracts.js";
+import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
+import { formatHealthSummary } from "./health.js";
 
 interface PanelState {
   id: string;
@@ -46,7 +47,8 @@ export class TaskPanels {
   private lastCatalogAt = 0;
   private catalogCount: number | null = null;
 
-  constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore, private readonly gate: AccessGate) {}
+  constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore,
+    private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>) {}
 
   observe(bindingId: string, details: TaskDetails): void {
     this.live.set(bindingId, details);
@@ -79,7 +81,9 @@ export class TaskPanels {
 
   async text(input: BridgeInput): Promise<boolean> {
     const text = input.text.trim();
-    if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/help"].includes(text))) {
+    const healthRequested = input.peerId === this.access.ownerId && text === "/health";
+    if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/help", "/health"].includes(text))) {
+      if (healthRequested) await this.healthCheck?.();
       const binding = this.store.byPeer(input.peerId);
       const state = this.newState(input.peerId, binding?.id ?? null, "home", true);
       if (binding) { await this.refresh(binding); this.renderTask(binding, state); }
@@ -103,6 +107,12 @@ export class TaskPanels {
     if (!state || state.id !== action.screenId || state.expiresAt <= Date.now()) throw new ActionRejectedError("Это меню устарело. Открой /menu заново.");
     if ((action.bindingId ?? null) !== state.bindingId) throw new ActionRejectedError("Кнопка относится к другой задаче.");
     if (action.command === "home") { await this.home(input.peerId); return; }
+    if (action.command === "health" && input.peerId === this.access.ownerId) {
+      if (!this.healthCheck) throw new ActionRejectedError("Активная health-проверка недоступна в этом запуске.");
+      await this.healthCheck();
+      this.renderManager(state);
+      return;
+    }
     if (action.command === "projects" && input.peerId === this.access.ownerId) {
       const projects = await this.desktop.listProjects();
       const next = this.newState(input.peerId, null, "projects");
@@ -312,6 +322,7 @@ export class TaskPanels {
   }
   private renderManager(state: PanelState): void {
     const bindings = this.store.bindings(); const active = bindings.filter(binding => binding.attached && binding.peerId !== null);
+    const health = this.store.getValue<BridgeHealthSnapshot>("health:latest");
     const text = [
       "VKodex · менеджер",
       `Процесс: ${path.basename(process.execPath)}`,
@@ -321,12 +332,15 @@ export class TaskPanels {
       `Трансляция включена: ${active.length}`,
       `Подключено к Codex: ${active.filter(binding => this.live.has(binding.id)).length}`,
       `Сообщений в очереди: ${this.store.pendingCount()}`, "",
-      ...(this.desktop.compatibility ? [`Live API: ${this.desktop.compatibility().state}`, this.desktop.compatibility().message, ""] : []),
+      ...(health ? [formatHealthSummary(health), ""] : this.desktop.compatibility ? [`Health: ещё не запускался`, `Live API: ${this.desktop.compatibility().state}`, this.desktop.compatibility().message, ""] : ["Health: ещё не запускался", ""]),
       ...(this.desktop.catalogWarnings?.() ?? []),
       "Комментарии — тихо; готовые ответы — с уведомлением.", "Команды и изменения файлов не пересылаются.", "",
       "Выбери проект, затем задачу, чтобы открыть связанную VK-беседу. /menu — открыть меню снова.",
     ];
-    this.show(this.access.ownerId, state, { text: text.join("\n"), buttons: [this.token(this.access.ownerId, state, "Задачи Codex", { type: "browseProjects", page: 0 }), this.token(this.access.ownerId, state, "Новая задача", { type: "new" }), this.button(this.access.ownerId, state, "Проекты", "projects"), this.button(this.access.ownerId, state, "Обновить", "home")] });
+    const buttons = [this.token(this.access.ownerId, state, "Задачи Codex", { type: "browseProjects", page: 0 }), this.token(this.access.ownerId, state, "Новая задача", { type: "new" }), this.button(this.access.ownerId, state, "Проекты", "projects")];
+    if (this.healthCheck) buttons.push(this.button(this.access.ownerId, state, "Проверить здоровье", "health"));
+    buttons.push(this.button(this.access.ownerId, state, "Обновить", "home"));
+    this.show(this.access.ownerId, state, { text: text.join("\n"), buttons });
   }
   private waiting(binding: Binding, note: string): void { const state = this.newState(binding.peerId!, binding.id, "home"); state.note = note; this.renderTask(binding, state); }
   private async home(peerId: number, note?: string): Promise<void> {

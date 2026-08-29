@@ -18,6 +18,7 @@
     "desktop:dev": "node --import tsx src/desktop/launch.ts dev",
     "desktop:start": "node dist/src/desktop/launch.js start",
     "vk:check": "node --import tsx src/desktop/launch.ts check",
+    "health:check": "node --env-file=.env --import tsx src/desktop/health-check.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build"

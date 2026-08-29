@@ -17,7 +17,8 @@ const gateway = new DesktopVkGateway(config);
 const catalog = new MultiDesktopCatalog(config.codexHomes);
 const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
 const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata));
-const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined, path.join(config.dataDir, "files"));
+const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
+  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs);
 let stopping = false;
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
@@ -29,9 +30,9 @@ const shutdown = async (): Promise<void> => {
 process.once("SIGINT", () => { void shutdown(); });
 process.once("SIGTERM", () => { void shutdown(); });
 try {
-  runtime.start();
   process.stdout.write("VKodex desktop bridge: starting (experimental).\n");
   await gateway.start(input => runtime.handle(input));
+  runtime.start();
   process.stdout.write("VKodex desktop bridge: VK Long Poll started.\n");
 } catch {
   process.stderr.write("VKodex desktop bridge could not start. Check the local configuration and connections.\n");

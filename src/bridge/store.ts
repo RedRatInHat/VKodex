@@ -28,6 +28,20 @@ export function migrateBindingSources(db: Database): void {
 }
 
 interface BindingRow { id: string; host_id: string; thread_id: string; title: string; peer_id: number | null; chat_id: number | null; chat_state: Binding["chatState"]; attached: number; paused: number; source_id: string; source_label: string | null; rollout_path: string | null }
+export interface DeliveryFailure {
+  readonly at: number;
+  readonly type: "rate_limit" | "transient";
+  readonly kind: Delivery["kind"];
+  readonly operation: "send" | "edit";
+  readonly retryAfterMs?: number;
+}
+export interface DeliveryHealthStats {
+  readonly activePending: number;
+  readonly inactivePending: number;
+  readonly pauseRemainingMs: number;
+  readonly lastFailure: DeliveryFailure | null;
+  readonly lastSuccessAt: number | null;
+}
 function binding(row: BindingRow): Binding {
   return { id: row.id, hostId: row.host_id, threadId: row.thread_id, title: row.title, peerId: row.peer_id, chatId: row.chat_id, chatState: row.chat_state, attached: row.attached === 1, paused: row.paused === 1,
     ...(row.source_id ? { sourceId: row.source_id } : {}), ...(row.source_label ? { sourceLabel: row.source_label } : {}), ...(row.rollout_path ? { rolloutPath: row.rollout_path } : {}) };
@@ -169,6 +183,25 @@ export class BridgeStore {
     return this.db.prepare("UPDATE bridge_actions SET consumed = 1 WHERE id = ? AND peer_id = ? AND expires_at > ? AND consumed = 0").run(id, peerId, now).changes === 1;
   }
   pendingCount(): number { return (this.db.prepare("SELECT COUNT(*) AS count FROM bridge_delivery WHERE revision > delivered_revision AND kind IN ('send', 'commentary')").get() as { count: number }).count; }
+  quickCheck(): boolean { return this.db.pragma("quick_check", { simple: true }) === "ok"; }
+  deliveryHealth(now = Date.now()): DeliveryHealthStats {
+    const row = this.db.prepare(`SELECT
+      SUM(CASE WHEN d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id) THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN d.binding_id IS NOT NULL AND (b.id IS NULL OR b.attached <> 1 OR b.peer_id <> d.peer_id) THEN 1 ELSE 0 END) AS inactive
+      FROM bridge_delivery d LEFT JOIN bridge_bindings b ON b.id = d.binding_id
+      WHERE d.revision > d.delivered_revision AND d.kind IN ('send', 'commentary', 'panel', 'activity')`).get() as { active: number | null; inactive: number | null };
+    return {
+      activePending: row.active ?? 0,
+      inactivePending: row.inactive ?? 0,
+      pauseRemainingMs: Math.max(0, (this.getValue<number>("vk-delivery-paused-until") ?? 0) - now),
+      lastFailure: this.getValue<DeliveryFailure>("vk-delivery-last-failure"),
+      lastSuccessAt: this.getValue<number>("vk-delivery-last-success-at"),
+    };
+  }
+  recordDeliveryFailure(delivery: Delivery, type: DeliveryFailure["type"], retryAfterMs?: number, now = Date.now()): void {
+    this.setValue("vk-delivery-last-failure", { at: now, type, kind: delivery.kind, operation: delivery.handle ? "edit" : "send", ...(retryAfterMs ? { retryAfterMs } : {}) } satisfies DeliveryFailure);
+  }
+  recordDeliverySuccess(now = Date.now()): void { this.setValue("vk-delivery-last-success-at", now); }
   getDraft(): NewTaskDraft | null { return this.getValue<NewTaskDraft>("draft"); }
   saveDraft(value: NewTaskDraft | null): void { this.setValue("draft", value); }
   claimDraft(id: string): NewTaskDraft | null {

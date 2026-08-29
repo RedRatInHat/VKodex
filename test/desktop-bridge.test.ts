@@ -118,19 +118,27 @@ class Desktop implements DesktopTasks {
   }
 }
 
-function setup(t: { after(fn: () => void): void }) {
+function setup(t: { after(fn: () => void): void }, enableHealth = false) {
   const store = new BridgeStore(); t.after(() => store.close());
   const chat = new Chat(); const desktop = new Desktop();
   let time = 100_000;
   const gate = new AccessGate(access, store);
-  const manager = new TaskManager(access, desktop, chat, store, gate);
+  let healthChecks = 0;
+  const healthCheck = enableHealth ? async () => {
+    healthChecks++;
+    const report = { state: "ok" as const, checkedAt: time, pid: 42, uptimeSeconds: 60,
+      checks: [{ name: "fixture", state: "ok" as const, detail: "All components respond." }] };
+    store.setValue("health:latest", report); return report;
+  } : undefined;
+  const manager = new TaskManager(access, desktop, chat, store, gate, undefined, healthCheck);
   const worker = new DeliveryWorker(chat, store, gate, 3_000, () => time);
   const mirror = new TaskMirror(store);
   let sequence = 0;
   const input = (text: string, peer = access.ownerId, action?: string): BridgeInput => ({ eventId: `e${sequence++}`, senderId: access.ownerId, peerId: peer, text, ...(action ? { action } : {}) });
   const handle = async (text: string, peer = access.ownerId, action?: string) => { await manager.handle(input(text, peer, action)); await worker.flush(); };
   const attach = () => { const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17); return store.getBinding(binding.id)!; };
-  return { store, chat, desktop, gate, manager, worker, mirror, input, handle, attach, now: () => time, advance: (ms = 6_000) => { time += ms; } };
+  return { store, chat, desktop, gate, manager, worker, mirror, input, handle, attach, now: () => time,
+    healthChecks: () => healthChecks, advance: (ms = 6_000) => { time += ms; } };
 }
 
 function panelView(s: ReturnType<typeof setup>, peer = peerId): View {
@@ -193,6 +201,18 @@ test("manager menu separates the project overview from task browsing", async t =
   assert.doesNotMatch(s.chat.sent.at(-1)!.view.text, /Existing desktop task/u);
   await clickPanel(s, "1. Project", access.ownerId);
   assert.match(s.chat.sent.at(-1)!.view.text, /Existing desktop task/u);
+});
+
+test("manager health button runs a fresh check and renders its component report", async t => {
+  const s = setup(t, true);
+  await s.handle("/menu");
+  assert.equal(s.healthChecks(), 0);
+  assert.ok(panelView(s, access.ownerId).buttons!.some(button => button.label === "Проверить здоровье"));
+  await clickPanel(s, "Проверить здоровье", access.ownerId);
+  assert.equal(s.healthChecks(), 1);
+  assert.match(panelView(s, access.ownerId).text, /Health: OK[\s\S]*fixture: All components respond/u);
+  await s.handle("/health");
+  assert.equal(s.healthChecks(), 2);
 });
 
 test("task card only refreshes on request and never replaces an open model chooser", async t => {
@@ -1342,6 +1362,8 @@ test("config accepts one owner and never includes private values in validation e
   assert.throws(() => loadDesktopBridgeConfig(env), error => error instanceof Error && !error.message.includes("private-id-fixture") && !error.message.includes("private-token-fixture"));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101,102" }));
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101" }).access.ownerId, 101);
+  assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "30000" }).healthIntervalMs, 30_000);
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "29999" }));
 });
 
 test("callback payloads contain opaque tokens, not identity, thread IDs, or paths", () => {

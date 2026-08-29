@@ -1,11 +1,12 @@
 import { APIError, VK, type MessageContext, type MessageEventContext } from "vk-io";
-import type { BridgeChat, BridgeInput, MessageHandle, View } from "../../bridge/contracts.js";
+import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
 import { ChatRateLimitError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../desktop/contracts.js";
 import { isObject } from "../../desktop/ipc-client.js";
 import type { RemoteAttachment } from "../../domain/models.js";
 import { safeFileName } from "../../lib/files.js";
+import { checkVkReadiness } from "./readiness.js";
 
 export function vkKeyboard(view: View): string {
   const buttons = (view.buttons ?? []).map(button => ({
@@ -81,26 +82,40 @@ export async function collectVkFiles(message: unknown): Promise<RemoteAttachment
 export class DesktopVkGateway implements BridgeChat {
   private writeTail: Promise<void> = Promise.resolve();
   private nextWriteAt = 0;
+  private queuedWrites = 0;
+  private writeStartedAt = 0;
+  private lastWriteSuccessAt = 0;
+  private lastWriteFailureAt = 0;
+  private pollingStarted = false;
 
   private async write<T>(operation: () => Promise<T>): Promise<T> {
     let release!: () => void;
     const previous = this.writeTail;
     this.writeTail = new Promise<void>(resolve => { release = resolve; });
+    this.queuedWrites++;
     await previous;
+    this.writeStartedAt = Date.now();
     try {
       const delay = Math.max(0, this.nextWriteAt - Date.now());
       if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-      try { return await operation(); }
+      try {
+        const result = await operation();
+        this.lastWriteSuccessAt = Date.now();
+        return result;
+      }
       catch (error) {
+        this.lastWriteFailureAt = Date.now();
         if (error instanceof APIError && [6, 9, 29].includes(Number(error.code))) throw new ChatRateLimitError(Number(error.code) === 6 ? 1_000 : 120_000);
         throw error;
       }
     } finally {
       this.nextWriteAt = Date.now() + this.writeIntervalMs;
+      this.writeStartedAt = 0;
+      this.queuedWrites--;
       release();
     }
   }
-  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 750) {
+  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000) {
     // vk-io's default middleware error handler prints the full exception.
     this.vk.updates.use(async (_context, next) => {
       try { await next(); }
@@ -131,10 +146,36 @@ export class DesktopVkGateway implements BridgeChat {
       await context.answer({ type: "show_snackbar", text: "Проверяю запрос…" }).catch(() => {});
       await onInput({ eventId: `callback:${context.eventId}`, peerId: context.peerId, senderId: context.userId, text: "", action: payload.action });
     });
-    await this.vk.updates.startPolling();
+    try {
+      await this.vk.updates.startPolling();
+      this.pollingStarted = true;
+    } catch (error) {
+      this.pollingStarted = false;
+      throw error;
+    }
   }
 
-  async stop(): Promise<void> { await this.vk.updates.stop(); }
+  async stop(): Promise<void> {
+    this.pollingStarted = false;
+    await this.vk.updates.stop();
+  }
+
+  async health(): Promise<readonly HealthCheckResult[]> {
+    const readiness = await checkVkReadiness({
+      tokenPermissions: () => this.write(() => this.vk.api.groups.getTokenPermissions({})),
+      longPollSettings: () => this.write(() => this.vk.api.groups.getLongPollSettings({ group_id: this.config.access.groupId })),
+      longPollServer: () => this.write(() => this.vk.api.groups.getLongPollServer({ group_id: this.config.access.groupId })),
+    });
+    const failed = readiness.filter(check => !check.ok);
+    const writeAge = this.writeStartedAt ? Date.now() - this.writeStartedAt : 0;
+    const writesState = writeAge > 30_000 ? "failed" : this.queuedWrites > 10 || this.lastWriteFailureAt > this.lastWriteSuccessAt ? "degraded" : "ok";
+    const pollingActive = this.pollingStarted && this.vk.updates.isStarted;
+    return [
+      { name: "vk_long_poll", state: pollingActive ? "ok" : "failed", detail: pollingActive ? "Локальный Bots Long Poll запущен." : "Внутренний polling-цикл vk-io не работает." },
+      { name: "vk_api", state: failed.length ? "failed" : "ok", detail: failed.length ? failed.map(check => check.detail).join(" ").slice(0, 500) : "Токен, сообщения, события и Long Poll server подтверждены VK." },
+      { name: "vk_writes", state: writesState, detail: `Запросов на запись в очереди: ${this.queuedWrites}${writeAge ? `; текущий выполняется ${Math.round(writeAge / 1_000)} с` : ""}.` },
+    ];
+  }
 
   async createConversation(title: string): Promise<{ peerId: number; chatId: number }> {
     let response: unknown;

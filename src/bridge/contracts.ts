@@ -11,6 +11,20 @@ export class ChatRateLimitError extends Error {
   constructor(readonly retryAfterMs: number) { super("VK временно ограничил частоту запросов. Отправка продолжится после паузы."); }
 }
 
+export type HealthState = "ok" | "degraded" | "failed";
+export interface HealthCheckResult {
+  readonly name: string;
+  readonly state: HealthState;
+  readonly detail: string;
+}
+export interface BridgeHealthSnapshot {
+  readonly state: HealthState;
+  readonly checkedAt: number;
+  readonly pid: number;
+  readonly uptimeSeconds: number;
+  readonly checks: readonly HealthCheckResult[];
+}
+
 export const taskChatTitle = (title: string): string => `[VKodex] ${title}`.slice(0, 200);
 
 export interface BridgeChat {
@@ -21,6 +35,8 @@ export interface BridgeChat {
   edit(handle: MessageHandle, view: View): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
   uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string>;
+  /** Read-only operational checks. Implementations must never expose credentials in details. */
+  health?(): Promise<readonly HealthCheckResult[]>;
 }
 
 export interface OwnerAccess { readonly ownerId: number; readonly groupId: number }
@@ -72,7 +88,7 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "health" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;

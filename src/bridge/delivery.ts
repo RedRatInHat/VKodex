@@ -68,13 +68,16 @@ export class DeliveryWorker {
         if ((delivery.handle || JSON.stringify(firstView) !== view) && knownView !== view) await this.chat.edit(handle, delivery.view);
         this.store.setValue(`delivered-view:${delivery.key}`, view);
         this.store.delivered(delivery, handle);
+        this.store.recordDeliverySuccess(this.now());
         this.retries.delete(delivery.id);
         if (delivery.kind !== "send") this.lastCommentaryEdit.set(delivery.key, this.now());
       } catch (error) {
         if (error instanceof ChatRateLimitError) {
+          this.store.recordDeliveryFailure(delivery, "rate_limit", error.retryAfterMs, this.now());
           this.store.setValue("vk-delivery-paused-until", this.now() + error.retryAfterMs);
           return;
         }
+        this.store.recordDeliveryFailure(delivery, "transient", undefined, this.now());
         // Keep the same random_id/handle after a timeout. Never turn a failed edit into a new message.
         const attempts = (this.retries.get(delivery.id)?.attempts ?? 0) + 1;
         this.retries.set(delivery.id, { attempts, after: this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6)) });

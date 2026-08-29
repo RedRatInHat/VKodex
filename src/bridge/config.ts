@@ -10,6 +10,7 @@ export interface DesktopBridgeConfig {
   readonly dataDir: string;
   readonly codexHome: string;
   readonly codexHomes: readonly string[];
+  readonly healthIntervalMs: number;
 }
 
 export function configuredCodexHomes(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -40,11 +41,13 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
   };
   const token = env.VK_GROUP_TOKEN?.trim();
   if (!token) throw new Error("VK_GROUP_TOKEN is required");
+  const healthIntervalMs = Number(env.HEALTH_CHECK_INTERVAL_MS?.trim() || "60000");
+  if (!Number.isSafeInteger(healthIntervalMs) || healthIntervalMs < 30_000 || healthIntervalMs > 60 * 60_000) throw new Error("HEALTH_CHECK_INTERVAL_MS must be between 30000 and 3600000");
   const codexHomes = configuredCodexHomes(env);
   return {
     token,
     access: { ownerId: id("VK_OWNER_ID"), groupId: id("VK_GROUP_ID") },
     dataDir: path.resolve(env.BOT_DATA_DIR || "./data/desktop"),
-    codexHome: codexHomes[0]!, codexHomes,
+    codexHome: codexHomes[0]!, codexHomes, healthIntervalMs,
   };
 }

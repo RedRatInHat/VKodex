@@ -6,10 +6,12 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, sameTask, taskKey, type DesktopTasks, type DirectTaskUpdate } from "../desktop/contracts.js";
+import { DesktopUnavailableError, sameTask, taskKey, type DesktopTasks, type DirectTaskUpdate, type TaskDetails } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles } from "./files.js";
+import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
+import type { BridgeHealthSnapshot } from "./contracts.js";
 
 export class DesktopBridgeRuntime {
   private readonly gate: AccessGate;
@@ -18,23 +20,30 @@ export class DesktopBridgeRuntime {
   private readonly mirror: TaskMirror;
   private readonly activity: TaskActivity;
   private readonly files: TaskFiles | undefined;
+  private readonly health: BridgeHealthMonitor;
   private readonly subscriptions = new Map<string, TaskSubscription>();
+  private readonly readySubscriptions = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = false;
   private unsubscribeDirect: (() => void) | null = null;
   private readonly pendingDirect = new Map<string, DirectTaskUpdate[]>();
-  private compatibilityChecking = false;
-  private lastCompatibilityAt = 0;
+  private readonly startedAt: number;
+  private lastTickAt: number;
+  private updateStartedAt: number | null = null;
+  private lastHealthAt = 0;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string) {
+    private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string,
+    healthFile?: string, private readonly healthIntervalMs = 60_000) {
     store.assertOwner(access.ownerId, access.groupId);
+    this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
-    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files);
+    this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
+    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true));
     this.mirror = new TaskMirror(store);
     this.activity = new TaskActivity(store, now);
     this.unsubscribeDirect = desktop.onDirectUpdate?.(update => this.acceptDirect(update)) ?? null;
@@ -44,14 +53,18 @@ export class DesktopBridgeRuntime {
     if (this.timer || this.stopped) throw new Error("Bridge runtime can only be started once");
     for (const binding of this.store.bindings()) if (binding.attached && binding.paused) this.store.setPaused(binding.id, false);
     this.store.recover();
-    void this.checkCompatibility();
+    this.lastHealthAt = this.now();
     this.timer = setInterval(() => {
+      this.lastTickAt = this.now();
       try { this.activity.tick(); } catch { /* Retry next tick without interrupting delivery. */ }
       // A slow/offline task must not hold up delivery from other subscriptions.
       void this.delivery.flush().catch(() => {});
       void this.files?.tick().catch(() => {});
       void this.tick().catch(() => {});
     }, 1_000);
+    // Establish subscriptions before the first report so a healthy restart does
+    // not look degraded merely because its first one-second tick has not run.
+    void this.tick().then(() => this.checkHealth(true), () => this.checkHealth(true)).catch(() => {});
   }
 
   private acceptDirect(update: DirectTaskUpdate): void {
@@ -75,12 +88,18 @@ export class DesktopBridgeRuntime {
     for (const update of queued) this.acceptDirect(update);
   }
 
-  private async checkCompatibility(): Promise<void> {
-    if (!this.desktop.checkCompatibility || this.compatibilityChecking || this.stopped) return;
-    this.compatibilityChecking = true; this.lastCompatibilityAt = this.now();
-    try { await this.desktop.checkCompatibility(); }
-    catch { /* The manager exposes the adapter's last safe status. */ }
-    finally { this.compatibilityChecking = false; }
+  private runtimeHealth(): RuntimeHealthState {
+    const active = this.store.bindings().filter(binding => binding.attached && binding.peerId !== null);
+    const isConnected = (binding: Binding): boolean => !!this.desktop.isDirectlyManaged?.(binding) || this.readySubscriptions.has(binding.id);
+    const connected = active.filter(isConnected).length;
+    const required = active.filter(binding => ["running", "approval"].includes(this.store.getValue<TaskDetails>(`task-details:${binding.id}`)?.status ?? ""));
+    return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
+      activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length };
+  }
+
+  private checkHealth(force = false): Promise<BridgeHealthSnapshot> {
+    this.lastHealthAt = this.now();
+    return this.health.check(force);
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -92,6 +111,7 @@ export class DesktopBridgeRuntime {
   private closeSubscription(bindingId: string): void {
     this.subscriptions.get(bindingId)?.close();
     this.subscriptions.delete(bindingId);
+    this.readySubscriptions.delete(bindingId);
     this.retryAfter.delete(bindingId);
     this.manager.panels.disconnected(bindingId);
     this.activity.disconnected(bindingId);
@@ -107,7 +127,8 @@ export class DesktopBridgeRuntime {
 
   tick(): Promise<void> {
     if (this.ticking) return this.ticking;
-    this.ticking = this.update().finally(() => { this.ticking = null; });
+    this.updateStartedAt = this.now();
+    this.ticking = this.update().finally(() => { this.ticking = null; this.updateStartedAt = null; });
     return this.ticking;
   }
 
@@ -115,7 +136,7 @@ export class DesktopBridgeRuntime {
     if (this.stopped) return;
     this.closeInactiveSubscriptions();
     this.activity.tick();
-    if (this.now() - this.lastCompatibilityAt > 10 * 60_000) void this.checkCompatibility();
+    if (this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth();
     await this.manager.panels.tick();
     for (const listed of this.store.bindings()) {
       let binding = listed;
@@ -131,7 +152,7 @@ export class DesktopBridgeRuntime {
       }
       if (this.desktop.isDirectlyManaged?.(binding)) {
         if (existing) {
-          existing.close(); this.subscriptions.delete(binding.id); this.retryAfter.delete(binding.id);
+          existing.close(); this.subscriptions.delete(binding.id); this.readySubscriptions.delete(binding.id); this.retryAfter.delete(binding.id);
         }
         this.flushDirect(binding);
         try {
@@ -159,6 +180,7 @@ export class DesktopBridgeRuntime {
         const current = this.store.getBinding(binding.id);
         if (!current?.attached) return;
         this.store.atomic(() => {
+          this.readySubscriptions.add(binding.id);
           const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey));
           for (const event of projected.events) this.mirror.accept(binding.id, event);
           this.store.setValue(checkpointKey, projected.checkpoint);
@@ -171,6 +193,7 @@ export class DesktopBridgeRuntime {
       }, error => {
         this.manager.panels.disconnected(binding.id);
         this.subscriptions.delete(binding.id);
+        this.readySubscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !current?.attached) return;
         this.activity.disconnected(binding.id);
@@ -180,10 +203,10 @@ export class DesktopBridgeRuntime {
         this.store.enqueue(`disconnected:${binding.id}`, this.access.ownerId, { text: `Связь с задачей «${binding.title.slice(0, 200)}» прервалась. ${reason} Подключение будет повторено; команды автоматически не повторяются.` });
       });
       this.subscriptions.set(binding.id, subscription);
-      try { await subscription.start(); }
+      try { await subscription.start(); this.readySubscriptions.add(binding.id); }
       catch (error) {
         this.manager.panels.disconnected(binding.id);
-        subscription.close(); this.subscriptions.delete(binding.id);
+        subscription.close(); this.subscriptions.delete(binding.id); this.readySubscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !current?.attached) continue;
         this.activity.disconnected(binding.id);
@@ -194,7 +217,7 @@ export class DesktopBridgeRuntime {
           text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
         });
       }
-      if (this.stopped) { subscription.close(); this.subscriptions.delete(binding.id); return; }
+      if (this.stopped) { subscription.close(); this.subscriptions.delete(binding.id); this.readySubscriptions.delete(binding.id); return; }
       this.closeInactiveSubscriptions();
     }
     await this.delivery.flush();
@@ -207,6 +230,7 @@ export class DesktopBridgeRuntime {
     this.timer = null;
     for (const subscription of this.subscriptions.values()) subscription.close();
     this.subscriptions.clear();
+    this.readySubscriptions.clear();
     this.client.close();
     this.unsubscribeDirect?.(); this.unsubscribeDirect = null;
     await this.ticking?.catch(() => {});

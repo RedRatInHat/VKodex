@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopProject, type DesktopTask, type DesktopTasks } from "../desktop/contracts.js";
-import type { Binding, BridgeChat, BridgeInput, Button, ManagerAction, OwnerAccess, TaskListFilter, View } from "./contracts.js";
+import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
@@ -26,7 +26,8 @@ export class TaskManager {
     private readonly store: BridgeStore,
     private readonly gate: AccessGate,
     private readonly files?: TaskFiles,
-  ) { this.panels = new TaskPanels(access, desktop, chat, store, gate); }
+    healthCheck?: () => Promise<BridgeHealthSnapshot>,
+  ) { this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck); }
 
   handle(input: BridgeInput): Promise<void> {
     // Each VK conversation is ordered independently. A disconnected Codex task
@@ -148,7 +149,7 @@ export class TaskManager {
       await this.newModels(input, 0);
       return;
     }
-    this.reply(input, { text: "Это менеджер задач. /menu — меню и состояние моста, /list — задачи по проектам, /new — новая задача, /cancel — отмена ввода.", buttons: [MENU_BUTTON] });
+    this.reply(input, { text: "Это менеджер задач. /menu — меню и состояние моста, /health — полная проверка, /list — задачи по проектам, /new — новая задача, /cancel — отмена ввода.", buttons: [MENU_BUTTON] });
   }
 
   private button(label: string, action: ManagerAction): Button { return { label: label.slice(0, 40), action: this.store.action(action, Date.now(), this.access.ownerId) }; }
