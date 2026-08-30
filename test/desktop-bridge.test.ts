@@ -1047,7 +1047,7 @@ test("desktop user messages are labeled; accepted VK input is not echoed", async
   s.mirror.accept(binding.id, { type: "user", id: "echo", turnId: "turn", text: "From VK", operationId });
   s.mirror.accept(binding.id, { type: "user", id: "desktop-user", turnId: "turn", text: "From desktop" });
   await s.worker.flush();
-  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["## user request\n\nFrom desktop"]);
+  assert.deepEqual(s.chat.sent.map(item => item.view), [{ text: "## user request\n\nFrom desktop", silent: true }]);
 });
 
 test("every long user-message fragment is labeled and restart does not resend it", async t => {
@@ -1057,6 +1057,7 @@ test("every long user-message fragment is labeled and restart does not resend it
   mirror.accept(binding.id, event); mirror.accept(binding.id, event);
   await s.worker.flush();
   assert.equal(s.chat.sent.length, 5);
+  assert.ok(s.chat.sent.every(item => item.view.silent === true));
   assert.ok(s.chat.sent.every(item => item.view.text.startsWith(prefix) && item.view.text.length <= 40));
   assert.equal(s.chat.sent.map(item => item.view.text.slice(prefix.length)).join(""), event.text);
   s.store.recover();

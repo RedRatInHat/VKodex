@@ -58,6 +58,7 @@ export class TaskMirror {
       chunks.forEach((chunk, index) => {
         this.store.enqueue(`event:${binding.id}:${event.id}:${index}`, peerId, {
           text: `${prefix}${chunk}${index === chunks.length - 1 ? footer : ""}`,
+          ...(event.type === "user" ? { silent: true } : {}),
           ...(event.type === "final" && index === chunks.length - 1 ? { buttons: [MENU_BUTTON] } : {}),
         }, binding.id);
       });
