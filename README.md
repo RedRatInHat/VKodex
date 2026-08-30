@@ -1,14 +1,14 @@
 <p align="center">
+  <strong>Русский</strong> · <a href="README_EN.md">English</a>
+</p>
+
+<p align="center">
   <img src="docs/logo.png" width="112" alt="Логотип VKodex">
 </p>
 
 # VKodex
 
-**VKodex is an open-source VK bot for remotely controlling OpenAI Codex from VK conversations.**
-
 **VKodex — открытый бот для удалённого управления OpenAI Codex через сообщения и беседы ВКонтакте.**
-
-Connect to existing local Codex sessions or create a new one from VK, browse tasks by project, and continue each task in its own conversation. Follow progress without notification spam, exchange photos and documents, stop a running turn, and select the model and reasoning level for the next turn.
 
 Продолжайте существующие задачи Codex или создавайте новые с телефона: выбирайте проект в менеджерском диалоге, открывайте связанную VK-беседу, отправляйте уточнения и вложения в тот же контекст.
 
