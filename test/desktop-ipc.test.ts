@@ -674,6 +674,29 @@ test("snapshot projection baselines all initial history and reasoning, then emit
   assert.equal(projectSnapshot(completed, next.checkpoint).events.length, 0);
 });
 
+test("a reconnected subscription baselines missed history and emits only later updates", () => {
+  const attached = projectSnapshot(state([], "completed"), null, 100);
+  const missed = {
+    id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
+      missed: { turnId: "missed", turnStartedAtMs: 200, status: "completed", items: Array.from({ length: 100 }, (_, index) => (
+        { type: "agentMessage", id: `old-${index}`, phase: index === 99 ? "final_answer" : "commentary", text: `Old ${index}` }
+      )) },
+      current: { turnId: "current", turnStartedAtMs: 300, status: "inProgress", items: [
+        { type: "agentMessage", id: "accumulated", phase: "commentary", text: "Accumulated while offline" },
+      ] },
+    } } },
+  };
+  const reconnected = projectSnapshot(missed, attached.checkpoint, 400, { rebaseline: true });
+  assert.equal(reconnected.events.some(event => event.type === "progress" || event.type === "final" || event.type === "user"), false);
+  const updated = structuredClone(missed);
+  const current = (updated.turnHistory as IpcObject).history as IpcObject;
+  const entities = current.entitiesByKey as IpcObject;
+  (entities.current as IpcObject).items = [...((entities.current as IpcObject).items as unknown[]),
+    { type: "agentMessage", id: "fresh", phase: "commentary", text: "Fresh after reconnect" }];
+  const next = projectSnapshot(updated, reconnected.checkpoint, 500);
+  assert.deepEqual(next.events.filter(event => event.type === "progress").map(event => event.text), ["Fresh after reconnect"]);
+});
+
 test("accepted steering metadata correlates a server message with the originating VK operation", () => {
   const initial = projectSnapshot(state(), null, 200);
   const next = projectSnapshot(state([

@@ -15,7 +15,10 @@ export class TaskMirror {
   }
 
   accept(bindingId: string, event: TaskEvent): void {
-    if (event.type === "status") return;
+    if (event.type === "status") {
+      if (event.status !== "running") this.store.retireTurnCommentary(bindingId, event.turnId);
+      return;
+    }
     const binding = this.store.getBinding(bindingId);
     if (!binding?.attached || binding.peerId === null) return;
     const peerId = binding.peerId;
@@ -43,6 +46,9 @@ export class TaskMirror {
         this.store.setValue(key, chunks.length);
         return;
       }
+      // Retire stale progress even when this final was already recorded before
+      // a crash and is being observed again during recovery.
+      if (event.type === "final") this.store.retireTurnCommentary(binding.id, event.turnId);
       if (!this.store.rememberEvent(binding.id, event.id)) return;
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
       const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";

@@ -31,7 +31,12 @@ export class DeliveryWorker {
     private readonly gate: AccessGate,
     private readonly editIntervalMs = 20_000,
     private readonly now: () => number = Date.now,
-  ) {}
+    private readonly maxDeliveriesPerFlush = 5,
+  ) {
+    if (!Number.isSafeInteger(maxDeliveriesPerFlush) || maxDeliveriesPerFlush < 1 || maxDeliveriesPerFlush > 100) {
+      throw new RangeError("Delivery batch size must be between 1 and 100");
+    }
+  }
 
   flush(): Promise<void> {
     if (this.flushing) return this.flushing;
@@ -50,12 +55,15 @@ export class DeliveryWorker {
 
   private async deliver(): Promise<void> {
     if (this.now() < (this.store.getValue<number>("vk-delivery-paused-until") ?? 0)) return;
+    let attempted = 0;
     for (const delivery of this.store.pendingDeliveries()) {
       const streamed = delivery.kind === "commentary" || delivery.kind === "activity";
       if (this.now() < (this.retries.get(delivery.id)?.after ?? 0)) continue;
       if (!this.active(delivery)) continue;
       if (streamed && delivery.handle && !this.store.isPriorityDelivery(delivery) && this.now() - (this.lastCommentaryEdit.get(delivery.key) ?? -Infinity) < this.editIntervalMs) continue;
       if (!await this.gate.check(delivery.peerId) || !this.active(delivery)) continue;
+      if (attempted >= this.maxDeliveriesPerFlush) return;
+      attempted++;
       try {
         if (delivery.id > 2_147_483_647) throw new Error("VK random_id range exhausted");
         const firstView = delivery.firstView ?? delivery.view;

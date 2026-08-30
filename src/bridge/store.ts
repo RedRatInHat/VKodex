@@ -271,6 +271,13 @@ export class BridgeStore {
       WHERE key = ? AND kind = 'commentary' AND view <> ?`).run(replacement, key, replacement);
   }
 
+  retireTurnCommentary(bindingId: string, turnId: string): void {
+    const prefix = `commentary:${bindingId}:${turnId}:`;
+    this.db.prepare(`UPDATE bridge_delivery SET delivered_revision = revision
+      WHERE binding_id = ? AND kind = 'commentary' AND delivered_revision < revision
+        AND substr(key, 1, ?) = ?`).run(bindingId, prefix.length, prefix);
+  }
+
   settleActivity(key: string, text: string, refresh = false): void {
     const view = JSON.stringify({ text, silent: true } satisfies View);
     this.db.prepare(`UPDATE bridge_delivery SET view = ?, revision = revision + 1,

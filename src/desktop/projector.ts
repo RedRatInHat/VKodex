@@ -5,7 +5,18 @@ import { isObject, type IpcObject } from "./ipc-client.js";
 export interface ProjectionCheckpoint {
   readonly since: number;
   readonly activeAtAttach: readonly string[];
+  /** Turns that were running in the last accepted live snapshot. */
+  readonly active?: readonly string[];
   readonly seen: Readonly<Record<string, string>>;
+}
+
+export interface ProjectionOptions {
+  /**
+   * The snapshot is the first one from a new subscription. Treat its history
+   * as a baseline, except for the final result of a turn observed running
+   * before the disconnect.
+   */
+  readonly rebaseline?: boolean;
 }
 
 export function turnsFromState(state: IpcObject): IpcObject[] {
@@ -25,16 +36,18 @@ function userText(input: unknown): string {
   return input.filter(isObject).filter(item => item.type === "text" && typeof item.text === "string").map(item => item.text).join("\n");
 }
 
-export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint | null, now = Date.now()): { checkpoint: ProjectionCheckpoint; events: TaskEvent[] } {
+export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint | null, now = Date.now(), options: ProjectionOptions = {}): { checkpoint: ProjectionCheckpoint; events: TaskEvent[] } {
   const turns = turnsFromState(state);
   const since = previous?.since ?? now;
   const activeAtAttach = previous?.activeAtAttach ?? turns.filter(turn => turn.status === "inProgress").map(turn => String(turn.turnId));
+  const previouslyActive = new Set(previous?.active ?? []);
+  const rebaseline = previous !== null && options.rebaseline === true;
   const seen: Record<string, string> = { ...previous?.seen };
   const events: TaskEvent[] = [];
-  const emit = (event: TaskEvent, allowInitial = false): void => {
+  const emit = (event: TaskEvent, allowInitial = false, allowRebaseline = false): void => {
     const key = JSON.stringify([event.turnId, event.type, event.id]);
     const digest = createHash("sha256").update(JSON.stringify(event)).digest("hex");
-    if (seen[key] !== digest && (previous !== null || allowInitial)) events.push(event);
+    if (seen[key] !== digest && (previous !== null || allowInitial) && (!rebaseline || allowRebaseline)) events.push(event);
     seen[key] = digest;
   };
   for (const turn of turns) {
@@ -60,11 +73,14 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         // with progress that happened before the user connected it. A later edit
         // to the same item (or a new item) has a different digest and is emitted.
         if (item.phase === "commentary") emit({ type: "progress", id, turnId, text: item.text });
-        else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") emit({ type: "final", id, turnId, text: item.text });
+        else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") {
+          emit({ type: "final", id, turnId, text: item.text }, false, previouslyActive.has(turnId));
+        }
       }
     }
     const status = turn.status === "inProgress" ? "running" : turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "interrupted" : turn.status === "failed" ? "failed" : null;
     if (status) emit({ type: "status", id: `status:${turnId}`, turnId, status }, turn.status === "inProgress");
   }
-  return { checkpoint: { since, activeAtAttach, seen }, events };
+  const active = turns.filter(turn => turn.status === "inProgress").map(turn => String(turn.turnId));
+  return { checkpoint: { since, activeAtAttach, active, seen }, events };
 }

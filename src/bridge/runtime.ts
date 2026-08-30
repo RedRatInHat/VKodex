@@ -176,12 +176,12 @@ export class DesktopBridgeRuntime {
       }
       this.store.ensureBinding(task);
       const checkpointKey = `projection:${binding.id}`;
-      const subscription = new TaskSubscription(this.client, task, state => {
+      const subscription = new TaskSubscription(this.client, task, (state, initial) => {
         const current = this.store.getBinding(binding.id);
         if (!current?.attached) return;
         this.store.atomic(() => {
           this.readySubscriptions.add(binding.id);
-          const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey));
+          const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey), this.now(), { rebaseline: initial });
           for (const event of projected.events) this.mirror.accept(binding.id, event);
           this.store.setValue(checkpointKey, projected.checkpoint);
           const details = taskDetails(state);

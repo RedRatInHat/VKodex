@@ -141,7 +141,9 @@ function setup(t: { after(fn: () => void): void }, enableHealth = false) {
     store.setValue("health:latest", report); return report;
   } : undefined;
   const manager = new TaskManager(access, desktop, chat, store, gate, undefined, healthCheck);
-  const worker = new DeliveryWorker(chat, store, gate, 3_000, () => time);
+  // Most unit tests assert a completely drained fixture queue. Production uses
+  // the default bounded batch, covered by a dedicated backlog test below.
+  const worker = new DeliveryWorker(chat, store, gate, 3_000, () => time, 100);
   const mirror = new TaskMirror(store);
   let sequence = 0;
   const input = (text: string, peer = access.ownerId, action?: string): BridgeInput => ({ eventId: `e${sequence++}`, senderId: access.ownerId, peerId: peer, text, ...(action ? { action } : {}) });
@@ -1211,7 +1213,7 @@ test("native final_answer recovers after reconnect, notifies once, and does not 
   await s.worker.flush(); assert.equal(s.chat.sent.length, 0);
   // The process disconnects while Codex finishes; the saved checkpoint survives.
   const completed = { turns: [old], turnHistory: { history: { entitiesByKey: { current: { ...active, status: "completed", items: [{ ...active.items[0], text: "Complete answer" }] } } } } };
-  const recovered = projectSnapshot(completed, JSON.parse(JSON.stringify(initial.checkpoint)));
+  const recovered = projectSnapshot(completed, JSON.parse(JSON.stringify(initial.checkpoint)), 300, { rebaseline: true });
   for (const event of recovered.events) s.mirror.accept(binding.id, event);
   await s.worker.flush();
   assert.equal(s.chat.sent.length, 1); assert.equal(s.chat.sent[0]!.view.text, "Complete answer\n\nМеню задачи:");
@@ -1223,15 +1225,37 @@ test("native final_answer recovers after reconnect, notifies once, and does not 
   await s.worker.flush(); assert.equal(s.chat.sent.length, 1);
 });
 
-test("unseen native finals from an existing checkpoint are recovered on upgrade", async t => {
+test("a reconnect does not replay an unseen completed turn from desktop history", async t => {
   const s = setup(t); const binding = s.attach();
   const checkpoint = { since: 100, activeAtAttach: [], seen: {} };
   const snapshot = { turns: [{ turnId: "missed", turnStartedAtMs: 101, status: "completed", items: [{ type: "agentMessage", id: "missed-final", phase: "final_answer", text: "Missed final" }] }] };
-  const recovered = projectSnapshot(snapshot, checkpoint);
+  const recovered = projectSnapshot(snapshot, checkpoint, 200, { rebaseline: true });
   for (const event of recovered.events) s.mirror.accept(binding.id, event);
   s.store.recover(); await s.worker.flush();
-  assert.equal(s.chat.sent.length, 1); assert.equal(s.chat.sent[0]!.view.text, "Missed final\n\nМеню задачи:");
+  assert.equal(s.chat.sent.length, 0);
   assert.equal(projectSnapshot(snapshot, recovered.checkpoint).events.length, 0);
+});
+
+test("a final retires unsent commentary from the same turn before delivery", async t => {
+  const s = setup(t); const binding = s.attach();
+  for (let index = 0; index < 100; index++) s.mirror.accept(binding.id, { type: "progress", id: `old-${index}`, turnId: "turn", text: `Old ${index}` });
+  s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "Current answer" });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  assert.equal(s.chat.sent[0]!.view.text, "Current answer\n\nМеню задачи:");
+  assert.equal(s.store.pendingDeliveries().filter(delivery => delivery.kind === "commentary").length, 0);
+  s.mirror.accept(binding.id, { type: "progress", id: "recovered-old", turnId: "turn", text: "Recovered old progress" });
+  s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "Current answer" });
+  assert.equal(s.store.pendingDeliveries().filter(delivery => delivery.kind === "commentary").length, 0);
+});
+
+test("delivery flushes are bounded so a large stream backlog cannot hold the runtime loop", async t => {
+  const s = setup(t); const binding = s.attach();
+  for (let index = 0; index < 20; index++) s.store.enqueue(`backlog:${index}`, peerId, { text: `Progress ${index}`, silent: true }, binding.id, true);
+  const bounded = new DeliveryWorker(s.chat, s.store, s.gate, 0, s.now, 3);
+  await bounded.flush();
+  assert.equal(s.chat.sent.length, 3);
+  assert.equal(s.store.pendingDeliveries().length, 17);
 });
 
 test("long comments retain their text in silent chunks and stable handles", async t => {
