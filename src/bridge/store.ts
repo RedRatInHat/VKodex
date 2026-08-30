@@ -68,13 +68,16 @@ export class BridgeStore {
       CREATE TABLE IF NOT EXISTS bridge_delivery (
         id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, binding_id TEXT REFERENCES bridge_bindings(id),
         peer_id INTEGER NOT NULL, kind TEXT NOT NULL, view TEXT NOT NULL, first_view TEXT, handle TEXT,
-        revision INTEGER NOT NULL DEFAULT 1, delivered_revision INTEGER NOT NULL DEFAULT 0
+        revision INTEGER NOT NULL DEFAULT 1, delivered_revision INTEGER NOT NULL DEFAULT 0,
+        priority_revision INTEGER NOT NULL DEFAULT 0
       );
     `);
     migrateBindingSources(this.db);
     const actionColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_actions)").all() as { name: string }[]).map(column => column.name));
     if (!actionColumns.has("peer_id")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN peer_id INTEGER");
     if (!actionColumns.has("consumed")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
+    const deliveryColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_delivery)").all() as { name: string }[]).map(column => column.name));
+    if (!deliveryColumns.has("priority_revision")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN priority_revision INTEGER NOT NULL DEFAULT 0");
   }
 
   close(): void { this.db.close(); }
@@ -277,6 +280,14 @@ export class BridgeStore {
 
   activateActivity(key: string): void {
     this.db.prepare("UPDATE bridge_delivery SET revision = revision + 1 WHERE key = ? AND kind = 'activity' AND delivered_revision = revision").run(key);
+  }
+
+  prioritizeDelivery(key: string): void {
+    this.db.prepare("UPDATE bridge_delivery SET priority_revision = revision WHERE key = ?").run(key);
+  }
+
+  isPriorityDelivery(delivery: Delivery): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND priority_revision >= ?").get(delivery.id, delivery.revision));
   }
 
   retireActivity(key: string): void {

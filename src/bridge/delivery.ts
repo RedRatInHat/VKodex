@@ -29,7 +29,7 @@ export class DeliveryWorker {
     private readonly chat: BridgeChat,
     private readonly store: BridgeStore,
     private readonly gate: AccessGate,
-    private readonly editIntervalMs = 3_000,
+    private readonly editIntervalMs = 20_000,
     private readonly now: () => number = Date.now,
   ) {}
 
@@ -51,9 +51,10 @@ export class DeliveryWorker {
   private async deliver(): Promise<void> {
     if (this.now() < (this.store.getValue<number>("vk-delivery-paused-until") ?? 0)) return;
     for (const delivery of this.store.pendingDeliveries()) {
+      const streamed = delivery.kind === "commentary" || delivery.kind === "activity";
       if (this.now() < (this.retries.get(delivery.id)?.after ?? 0)) continue;
       if (!this.active(delivery)) continue;
-      if (delivery.kind !== "send" && delivery.handle && this.now() - (this.lastCommentaryEdit.get(delivery.key) ?? -Infinity) < this.editIntervalMs) continue;
+      if (streamed && delivery.handle && !this.store.isPriorityDelivery(delivery) && this.now() - (this.lastCommentaryEdit.get(delivery.key) ?? -Infinity) < this.editIntervalMs) continue;
       if (!await this.gate.check(delivery.peerId) || !this.active(delivery)) continue;
       try {
         if (delivery.id > 2_147_483_647) throw new Error("VK random_id range exhausted");
@@ -70,7 +71,7 @@ export class DeliveryWorker {
         this.store.delivered(delivery, handle);
         this.store.recordDeliverySuccess(this.now());
         this.retries.delete(delivery.id);
-        if (delivery.kind !== "send") this.lastCommentaryEdit.set(delivery.key, this.now());
+        if (streamed) this.lastCommentaryEdit.set(delivery.key, this.now());
       } catch (error) {
         if (error instanceof ChatRateLimitError) {
           this.store.recordDeliveryFailure(delivery, "rate_limit", error.retryAfterMs, this.now());

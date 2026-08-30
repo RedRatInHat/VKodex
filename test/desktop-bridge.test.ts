@@ -952,6 +952,22 @@ test("final answers and manager replies are delivered before backlogged commenta
   assert.deepEqual(s.store.pendingDeliveries().map(item => item.kind), ["send", "commentary"]);
 });
 
+test("stream edits are coalesced for twenty seconds while requested panels stay immediate", async t => {
+  const s = setup(t); const binding = s.attach(); const worker = new DeliveryWorker(s.chat, s.store, s.gate, 20_000, s.now);
+  s.store.enqueue("comment", peerId, { text: "Progress 1", silent: true }, binding.id, true);
+  s.store.enqueue("panel", peerId, { text: "Panel 1", silent: true }, binding.id, "panel");
+  await worker.flush();
+  s.store.enqueue("comment", peerId, { text: "Progress 2", silent: true }, binding.id, true);
+  s.store.enqueue("panel", peerId, { text: "Panel 2", silent: true }, binding.id, "panel");
+  await worker.flush();
+  assert.deepEqual(s.chat.edits.map(item => item.view.text), ["Panel 2"]);
+  s.advance(19_999); await worker.flush(); assert.deepEqual(s.chat.edits.map(item => item.view.text), ["Panel 2"]);
+  s.advance(1); await worker.flush(); assert.deepEqual(s.chat.edits.map(item => item.view.text), ["Panel 2", "Progress 2"]);
+  s.store.enqueue("comment", peerId, { text: "Готово.", silent: true }, binding.id, true);
+  s.store.prioritizeDelivery("comment"); await worker.flush();
+  assert.deepEqual(s.chat.edits.map(item => item.view.text), ["Panel 2", "Progress 2", "Готово."]);
+});
+
 test("gateway translates VK flood errors to a safe retry interval", async t => {
   const vk = new VK({ token: "fixture-token" });
   const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
