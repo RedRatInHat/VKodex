@@ -72,6 +72,10 @@ export interface AccountRateLimit {
 }
 
 export interface AccountUsage {
+  /** Human-readable account identity only; never an access token or account ID. */
+  readonly accountLabel: string | null;
+  /** Basename of the configured CODEX_HOME that supplied these limits. */
+  readonly sourceLabel: string | null;
   readonly planType: string | null;
   readonly limits: readonly AccountRateLimit[];
   readonly credits: { readonly hasCredits: boolean; readonly unlimited: boolean; readonly balance: string | null } | null;
@@ -79,7 +83,7 @@ export interface AccountUsage {
 }
 
 export interface AccountUsageProvider {
-  read(): Promise<AccountUsage>;
+  read(task?: TaskRef): Promise<readonly AccountUsage[]>;
 }
 
 export interface DesktopMetadata {
@@ -149,7 +153,7 @@ export interface DesktopTasks {
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
   archiveTask(task: TaskRef): Promise<void>;
   exportMarkdown(task: TaskRef): Promise<string>;
-  accountUsage?(): Promise<AccountUsage>;
+  accountUsage?(task?: TaskRef): Promise<readonly AccountUsage[]>;
   isDirectlyManaged?(task: TaskRef): boolean;
   onDirectUpdate?(listener: (update: DirectTaskUpdate) => void): () => void;
   checkCompatibility?(): Promise<DesktopCompatibility>;

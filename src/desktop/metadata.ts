@@ -6,8 +6,8 @@ import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopMetadata, type TaskRef } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
-type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "account/rateLimits/read";
-const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "account/rateLimits/read"]);
+type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "account/read" | "account/rateLimits/read";
+const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "account/read", "account/rateLimits/read"]);
 
 export function nativeCodexPath(): string {
   const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
@@ -41,7 +41,7 @@ export class MetadataRpc {
   async call(method: MetadataMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
-    const mutating = !["thread/read", "account/rateLimits/read"].includes(method);
+    const mutating = !["thread/read", "account/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
       let buffer = ""; let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
@@ -99,7 +99,7 @@ function rateLimit(value: unknown): AccountRateLimit | null {
   return { id: value.limitId, name, primary, secondary };
 }
 
-export function parseAccountUsage(response: IpcObject): AccountUsage {
+export function parseAccountUsage(response: IpcObject, accountLabel: string | null = null, sourceLabel: string | null = null): AccountUsage {
   const overall = isObject(response.rateLimits) ? response.rateLimits : null;
   const byId = isObject(response.rateLimitsByLimitId) ? Object.values(response.rateLimitsByLimitId).map(rateLimit).filter((limit): limit is AccountRateLimit => !!limit) : [];
   const fallback = rateLimit(overall); const candidates = fallback ? [fallback, ...byId] : byId;
@@ -111,12 +111,43 @@ export function parseAccountUsage(response: IpcObject): AccountUsage {
     ? { hasCredits: rawCredits.hasCredits, unlimited: rawCredits.unlimited, balance: typeof rawCredits.balance === "string" && /^\d+(?:[.,]\d+)?$/u.test(rawCredits.balance) ? rawCredits.balance : null } : null;
   const reset = isObject(response.rateLimitResetCredits) ? response.rateLimitResetCredits.availableCount : null;
   const resetCredits = typeof reset === "number" && Number.isSafeInteger(reset) && reset >= 0 ? reset : null;
-  return { planType, limits, credits, resetCredits };
+  return { accountLabel, sourceLabel, planType, limits, credits, resetCredits };
 }
 
-export class NativeAccountUsage implements AccountUsageProvider {
+export function parseAccountLabel(response: IpcObject): string | null {
+  if (!isObject(response.account)) return null;
+  const clean = (value: unknown, max: number): string | null => typeof value === "string" && value.trim().length > 0 && value.trim().length <= max
+    && !/[\r\n\x00-\x1f]/u.test(value) ? value.trim() : null;
+  const name = clean(response.account.name, 120);
+  const email = clean(response.account.email, 254);
+  if (name && email) return `${name} · ${email}`;
+  if (email) return email;
+  if (name) return name;
+  return response.account.type === "apiKey" ? "API key" : response.account.type === "chatgpt" ? "ChatGPT" : null;
+}
+
+export class NativeAccountUsage {
   constructor(private readonly rpc: Pick<MetadataRpc, "call">) {}
-  async read(): Promise<AccountUsage> { return parseAccountUsage(await this.rpc.call("account/rateLimits/read", {})); }
+  async read(): Promise<AccountUsage> {
+    const [account, limits] = await Promise.allSettled([
+      this.rpc.call("account/read", { refreshToken: false }),
+      this.rpc.call("account/rateLimits/read", {}),
+    ]);
+    if (limits.status === "rejected") throw limits.reason;
+    return parseAccountUsage(limits.value, account.status === "fulfilled" ? parseAccountLabel(account.value) : null);
+  }
+}
+
+export class ProfileAccountUsage implements AccountUsageProvider {
+  constructor(
+    private readonly homes: readonly string[],
+    private readonly sourceHome: (task: TaskRef) => string,
+    private readonly createReader: (home: string) => Pick<NativeAccountUsage, "read"> = home => new NativeAccountUsage(new MetadataRpc(home)),
+  ) {}
+  async read(task?: TaskRef): Promise<readonly AccountUsage[]> {
+    const homes = task ? [this.sourceHome(task)] : this.homes;
+    return Promise.all(homes.map(async home => ({ ...await this.createReader(home).read(), sourceLabel: path.basename(home) })));
+  }
 }
 
 export function conversationMarkdown(thread: IpcObject): string {

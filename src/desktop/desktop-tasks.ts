@@ -69,9 +69,9 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   listTasks() { return this.catalog.listTasks(); }
   listProjects() { return this.catalog.listProjects(); }
   catalogWarnings() { return this.catalog.catalogWarnings?.() ?? []; }
-  async accountUsage() {
+  async accountUsage(task?: TaskRef) {
     if (!this.usage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
-    return this.usage.read();
+    return this.usage.read(task);
   }
 
   async listModels(task?: TaskRef) {

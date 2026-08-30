@@ -38,19 +38,23 @@ export const taskDeepLink = (threadId: string): string => `codex://threads/${enc
 
 const duration = (minutes: number): string => minutes % 1_440 === 0 ? `${minutes / 1_440} дн.` : minutes % 60 === 0 ? `${minutes / 60} ч.` : `${minutes} мин.`;
 const resetTime = (seconds: number): string => new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(seconds * 1_000));
-export function accountUsageText(usage: AccountUsage): string {
-  const lines = ["Лимиты Codex", `Тариф: ${usage.planType ?? "не указан"}`];
-  for (const limit of usage.limits) {
-    const reserve = limit.id === "base_model_inference";
-    const label = limit.id === "codex" ? "Codex" : reserve ? "Luna Reserve" : limit.name ?? limit.id;
-    lines.push("", label);
-    if (reserve) lines.push("Резерв GPT-5.6 Luna после исчерпания обычного лимита.");
-    for (const window of [limit.primary, limit.secondary].filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => left.windowMinutes - right.windowMinutes)) {
-      lines.push(`${duration(window.windowMinutes)}: использовано ${window.usedPercent.toFixed(1)}% · осталось ${(100 - window.usedPercent).toFixed(1)}%`, `Сброс: ${resetTime(window.resetsAt)}`);
+export function accountUsageText(usages: readonly AccountUsage[]): string {
+  const lines = ["Лимиты Codex"];
+  for (const [index, usage] of usages.entries()) {
+    if (index > 0) lines.push("", "────────");
+    lines.push("", `Каталог: ${usage.sourceLabel ?? "не указан"}`, `Аккаунт: ${usage.accountLabel ?? "не определён"}`, `Тариф: ${usage.planType ?? "не указан"}`);
+    for (const limit of usage.limits) {
+      const reserve = limit.id === "base_model_inference";
+      const label = limit.id === "codex" ? "Codex" : reserve ? "Luna Reserve" : limit.name ?? limit.id;
+      lines.push("", label);
+      if (reserve) lines.push("Резерв GPT-5.6 Luna после исчерпания обычного лимита.");
+      for (const window of [limit.primary, limit.secondary].filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => left.windowMinutes - right.windowMinutes)) {
+        lines.push(`${duration(window.windowMinutes)}: использовано ${window.usedPercent.toFixed(1)}% · осталось ${(100 - window.usedPercent).toFixed(1)}%`, `Сброс: ${resetTime(window.resetsAt)}`);
+      }
     }
+    if (usage.credits) lines.push("", usage.credits.unlimited ? "Кредиты: без ограничений" : usage.credits.hasCredits ? `Кредиты: ${usage.credits.balance ?? "доступны"}` : "Кредиты: нет");
+    if (usage.resetCredits !== null) lines.push(`Доступных сбросов лимита: ${usage.resetCredits}`);
   }
-  if (usage.credits) lines.push("", usage.credits.unlimited ? "Кредиты: без ограничений" : usage.credits.hasCredits ? `Кредиты: ${usage.credits.balance ?? "доступны"}` : "Кредиты: нет");
-  if (usage.resetCredits !== null) lines.push(`Доступных сбросов лимита: ${usage.resetCredits}`);
   lines.push("", "Это аккаунтные лимиты Codex. Заполнение контекста конкретной задачи показывается в её меню отдельно.");
   return lines.join("\n");
 }
@@ -428,8 +432,9 @@ export class TaskPanels {
   private waiting(binding: Binding, note: string): void { const state = this.newState(binding.peerId!, binding.id, "home"); state.note = note; this.renderTask(binding, state); }
   private async renderLimits(peerId: number, state: PanelState): Promise<void> {
     if (!this.desktop.capabilities.accountUsage || !this.desktop.accountUsage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
-    const usage = await this.desktop.accountUsage();
-    this.show(peerId, state, { text: accountUsageText(usage), buttons: [this.button(peerId, state, "Обновить лимиты", "limits"), this.button(peerId, state, "Меню", "home")] });
+    const task = state.bindingId ? this.bound(peerId, state.bindingId) : undefined;
+    const usages = await this.desktop.accountUsage(task);
+    this.show(peerId, state, { text: accountUsageText(usages), buttons: [this.button(peerId, state, "Обновить лимиты", "limits"), this.button(peerId, state, "Меню", "home")] });
   }
   private async home(peerId: number, note?: string): Promise<void> {
     const binding = this.store.byPeer(peerId); const state = this.newState(peerId, binding?.id ?? null, "home");

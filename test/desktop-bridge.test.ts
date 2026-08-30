@@ -86,10 +86,11 @@ class Desktop implements DesktopTasks {
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
   usageReads = 0;
+  readonly usageTasks: (TaskRef | undefined)[] = [];
   usage: AccountUsage = { planType: "pro", limits: [
     { id: "codex", name: null, primary: { usedPercent: 9, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
     { id: "base_model_inference", name: "gpt-reserve", primary: { usedPercent: 0, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
-  ], credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
+  ], accountLabel: "owner@example.com", sourceLabel: ".codex", credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
   selectError: Error | null = null;
   renameError: Error | null = null;
   liveTitleUpdated = true;
@@ -110,7 +111,7 @@ class Desktop implements DesktopTasks {
   }
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
   async exportMarkdown(): Promise<string> { this.exportHook?.(); return "# Fixture\n\nVisible conversation"; }
-  async accountUsage(): Promise<AccountUsage> { this.usageReads++; return this.usage; }
+  async accountUsage(task?: TaskRef): Promise<readonly AccountUsage[]> { this.usageReads++; this.usageTasks.push(task); return [this.usage]; }
   async listTasks() { return this.tasks; }
   async listProjects() { if (this.projectsError) throw this.projectsError; return this.projects; }
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
@@ -263,13 +264,15 @@ test("account limits are available from the manager and task chat without reachi
   const s = setup(t); s.attach(); await s.handle("/menu");
   await clickPanel(s, "Лимиты Codex", access.ownerId);
   assert.equal(s.desktop.usageReads, 1);
-  assert.match(panelView(s, access.ownerId).text, /Лимиты Codex[\s\S]*Тариф: pro[\s\S]*7 дн\.: использовано 9\.0% · осталось 91\.0%/u);
+  assert.match(panelView(s, access.ownerId).text, /Лимиты Codex[\s\S]*Каталог: \.codex[\s\S]*Аккаунт: owner@example\.com[\s\S]*Тариф: pro[\s\S]*7 дн\.: использовано 9\.0% · осталось 91\.0%/u);
   assert.match(panelView(s, access.ownerId).text, /Luna Reserve[\s\S]*Резерв GPT-5\.6 Luna после исчерпания обычного лимита/u);
   assert.doesNotMatch(panelView(s, access.ownerId).text, /Базовые модели/u);
   assert.deepEqual(panelView(s, access.ownerId).buttons!.map(button => button.label), ["Обновить лимиты", "Меню"]);
   await clickPanel(s, "Обновить лимиты", access.ownerId); assert.equal(s.desktop.usageReads, 2);
   await s.handle("/limits", peerId);
   assert.equal(s.desktop.usageReads, 3); assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.desktop.usageTasks[0], undefined); assert.equal(s.desktop.usageTasks[1], undefined);
+  assert.equal(s.desktop.usageTasks[2]!.threadId, task.threadId);
   assert.match(panelView(s).text, /Заполнение контекста конкретной задачи/u);
   await clickPanel(s, "Меню"); assert.match(panelView(s).text, /Контекст:/u);
 });
