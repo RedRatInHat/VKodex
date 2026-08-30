@@ -32,6 +32,8 @@ class Chat implements BridgeChat {
   invites = 0;
   readonly renames: { peerId: number; title: string }[] = [];
   renameError: Error | null = null;
+  renameHook: (() => void) | null = null;
+  renameBlock: Promise<void> | null = null;
   createError: Error | null = null;
   inviteError: Error | null = null;
   lostSendResponse = false;
@@ -51,7 +53,8 @@ class Chat implements BridgeChat {
   }
   async inviteLink(): Promise<string> { this.invites++; if (this.inviteError) throw this.inviteError; return "https://vk.me/join/fixture"; }
   async renameConversation(peerId: number, title: string, beforeWrite: () => Promise<void>): Promise<void> {
-    await beforeWrite(); this.renames.push({ peerId, title });
+    if (this.renameBlock) await this.renameBlock;
+    this.renameHook?.(); await beforeWrite(); this.renames.push({ peerId, title });
     if (this.renameError) throw this.renameError;
   }
   async send(peer: number, view: View, randomId: number): Promise<MessageHandle> {
@@ -151,6 +154,8 @@ async function clickPanel(s: ReturnType<typeof setup>, label: string, peer = pee
   assert.ok(button, `Missing button ${label}`);
   s.advance(); await s.handle("", peer, button.action); s.advance(); await s.worker.flush();
 }
+
+const settleTitleSync = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
 test("manager replies carry menu navigation and obsolete standalone greetings are not resumed", async t => {
   const s = setup(t); const binding = s.attach();
@@ -312,6 +317,86 @@ test("a lost model acknowledgment cannot repeat a mutation after recovery", asyn
   const action = panelView(s).buttons!.find(button => button.label === "high")!.action;
   await clickPanel(s, "high"); s.store.recover(); await s.handle("", peerId, action);
   assert.equal(s.desktop.selections.length, 1);
+});
+
+test("a Codex title change automatically renames the linked VK conversation once", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.tasks = [{ ...task, title: "Renamed in Codex" }];
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.equal(s.store.getBinding(binding.id)!.title, "Renamed in Codex");
+  assert.deepEqual(s.chat.renames, [{ peerId, title: "[VKodex] Renamed in Codex" }]);
+  assert.deepEqual(s.store.getValue(`rename:${binding.id}`), {
+    title: "Renamed in Codex", liveTitleUpdated: false, vkTitleUpdated: true, origin: "codex", attempts: 0, retryAt: 0,
+  });
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.equal(s.chat.renames.length, 1);
+  assert.equal(s.chat.sent.length, 0); assert.equal(s.chat.edits.length, 0);
+  assert.equal(s.desktop.renames.length, 0); assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("upgrade verifies an existing linked chat even when the old bridge already cached the Codex title", async t => {
+  const s = setup(t); const binding = s.attach();
+  assert.equal(s.store.getValue(`rename:${binding.id}`), null);
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.deepEqual(s.chat.renames, [{ peerId, title: "[VKodex] Existing desktop task" }]);
+  await s.manager.panels.tick();
+  assert.equal(s.chat.renames.length, 1);
+});
+
+test("a stalled VK title request never blocks the Codex runtime tick", async t => {
+  const s = setup(t); s.attach(); s.desktop.tasks = [{ ...task, title: "Nonblocking rename" }];
+  let release!: () => void;
+  s.chat.renameBlock = new Promise(resolve => { release = resolve; });
+  let timer!: NodeJS.Timeout;
+  try {
+    await Promise.race([
+      s.manager.panels.tick(),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("runtime tick was blocked by VK")), 100); }),
+    ]);
+  } finally { clearTimeout(timer); }
+  assert.equal(s.chat.renames.length, 0);
+  release(); await settleTitleSync();
+  assert.deepEqual(s.chat.renames, [{ peerId, title: "[VKodex] Nonblocking rename" }]);
+});
+
+test("a Codex title changed while the bridge was offline is synchronized after restart", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.tasks = [{ ...task, title: "Offline rename" }];
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  await restarted.panels.tick(); await settleTitleSync();
+  assert.equal(s.store.getBinding(binding.id)!.title, "Offline rename");
+  assert.deepEqual(s.chat.renames, [{ peerId, title: "[VKodex] Offline rename" }]);
+});
+
+test("automatic Codex to VK title sync retries transient failures without duplicate metadata writes", async t => {
+  const s = setup(t); const binding = s.attach(); s.chat.renameError = new Error("offline");
+  s.desktop.tasks = [{ ...task, title: "Retry title" }];
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.equal(s.chat.renames.length, 1);
+  const failed = s.store.getValue<Record<string, unknown>>(`rename:${binding.id}`)!;
+  assert.equal(failed.vkTitleUpdated, false); assert.equal(failed.attempts, 1);
+  assert.ok((failed.retryAt as number) > Date.now());
+  await s.manager.panels.tick(); await settleTitleSync(); assert.equal(s.chat.renames.length, 1);
+  s.store.setValue(`rename:${binding.id}`, { ...failed, retryAt: 0 }); s.chat.renameError = null;
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.equal(s.chat.renames.length, 2); assert.equal(s.desktop.renames.length, 0);
+  assert.equal(s.store.getValue<Record<string, unknown>>(`rename:${binding.id}`)!.vkTitleUpdated, true);
+});
+
+test("an older automatic title cannot overwrite a newer Codex rename", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.tasks = [{ ...task, title: "First rename" }];
+  s.chat.renameHook = () => {
+    s.desktop.tasks = [{ ...task, title: "Latest rename" }];
+    s.store.ensureBinding(s.desktop.tasks[0]!);
+    s.store.setValue(`rename:${binding.id}`, {
+      title: "Latest rename", liveTitleUpdated: true, vkTitleUpdated: false, origin: "codex", attempts: 0, retryAt: 0,
+    });
+  };
+  await s.manager.panels.tick(); await settleTitleSync();
+  assert.equal(s.chat.renames.length, 0);
+  assert.equal(s.store.getBinding(binding.id)!.title, "Latest rename");
+  assert.equal(s.store.getValue<Record<string, unknown>>(`rename:${binding.id}`)!.title, "Latest rename");
 });
 
 test("rename consumes title text without forwarding and requires a fresh confirmation", async t => {

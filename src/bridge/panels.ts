@@ -24,12 +24,16 @@ interface RenameState {
   title: string;
   liveTitleUpdated: boolean;
   vkTitleUpdated: boolean;
+  origin?: "vk" | "codex";
+  attempts?: number;
+  retryAt?: number;
 }
 
 const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
 const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ в Codex", unavailable: "Нет связи с задачей" };
 const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ").trim().slice(0, length);
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
+const renameRetryDelay = (attempts: number): number => Math.min(30 * 60_000, 30_000 * 2 ** Math.min(Math.max(0, attempts - 1), 6));
 export const taskDeepLink = (threadId: string): string => `codex://threads/${encodeURIComponent(threadId)}`;
 
 export function taskCardText(binding: Binding, details: TaskDetails): string {
@@ -44,6 +48,8 @@ export function taskCardText(binding: Binding, details: TaskDetails): string {
 export class TaskPanels {
   private readonly startedAt = Date.now();
   private readonly live = new Map<string, TaskDetails>();
+  private readonly renameSyncing = new Set<string>();
+  private automaticRename: Promise<void> | null = null;
   private lastCatalogAt = 0;
   private catalogCount: number | null = null;
 
@@ -70,10 +76,23 @@ export class TaskPanels {
         const tasks = await this.desktop.listTasks(); this.catalogCount = tasks.length;
         for (const binding of this.store.bindings()) {
           const task = tasks.find(task => sameTask(task, binding));
-          if (task && (task.title !== binding.title || task.sourceLabel !== binding.sourceLabel || task.rolloutPath !== binding.rolloutPath)) this.store.ensureBinding(task);
+          if (!task) continue;
+          const rename = this.store.getValue<RenameState>(`rename:${binding.id}`);
+          if (task.title !== binding.title || !rename || rename.title !== task.title) {
+            this.store.setValue(`rename:${binding.id}`, {
+              title: task.title,
+              liveTitleUpdated: this.live.get(binding.id)?.title === task.title,
+              vkTitleUpdated: false,
+              origin: "codex",
+              attempts: 0,
+              retryAt: 0,
+            } satisfies RenameState);
+          }
+          if (task.title !== binding.title || task.sourceLabel !== binding.sourceLabel || task.rolloutPath !== binding.rolloutPath) this.store.ensureBinding(task);
         }
       } catch { this.catalogCount = null; }
     }
+    this.scheduleAutomaticRename();
     for (const binding of this.store.bindings()) {
       if (!binding.attached || binding.peerId === null) this.live.delete(binding.id);
     }
@@ -175,7 +194,7 @@ export class TaskPanels {
         const renamed = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
         if (!renamed || renamed.title !== action.title) throw new UncertainActionError();
         this.store.ensureBinding(renamed);
-        this.store.setValue(`rename:${binding.id}`, { title: action.title, liveTitleUpdated: result.liveTitleUpdated, vkTitleUpdated: false } satisfies RenameState);
+        this.store.setValue(`rename:${binding.id}`, { title: action.title, liveTitleUpdated: result.liveTitleUpdated, vkTitleUpdated: false, origin: "vk", attempts: 0 } satisfies RenameState);
         await this.renameVk(binding, action.title, generation);
         await this.home(input.peerId); break;
       }
@@ -252,20 +271,54 @@ export class TaskPanels {
     const rename = this.store.getValue<RenameState>(`rename:${binding.id}`);
     return rename?.title === binding.title ? rename : null;
   }
-  private async renameVk(binding: Binding, title: string, generation: number): Promise<void> {
+  private scheduleAutomaticRename(): void {
+    if (this.automaticRename) return;
+    const binding = this.store.bindings().find(candidate => {
+      const rename = this.renameState(candidate);
+      return candidate.attached && candidate.peerId !== null && rename?.origin === "codex" && !rename.vkTitleUpdated && (rename.retryAt ?? 0) <= Date.now();
+    });
+    if (!binding) return;
+    const rename = this.renameState(binding)!;
+    const operation = this.renameVk(binding, rename.title, this.store.streamGeneration(binding.id), true).catch(() => {});
+    const tracked = operation.finally(() => {
+      if (this.automaticRename === tracked) this.automaticRename = null;
+    });
+    this.automaticRename = tracked;
+  }
+  private async renameVk(binding: Binding, title: string, generation: number, automatic = false): Promise<void> {
+    if (this.renameSyncing.has(binding.id)) {
+      if (automatic) return;
+      await this.automaticRename;
+      if (this.renameSyncing.has(binding.id)) throw new ActionRejectedError("Переименование этой беседы уже выполняется. Повтори после его завершения.");
+    }
+    this.renameSyncing.add(binding.id);
     const beforeWrite = async () => {
       if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(binding.peerId!, true)) {
         throw new ActionRejectedError("Имя сохранено в Codex, но VK-беседа не изменена: трансляция отключена.");
       }
-      this.bound(binding.peerId!, binding.id);
+      const currentBinding = this.bound(binding.peerId!, binding.id);
+      const currentRename = this.store.getValue<RenameState>(`rename:${binding.id}`);
+      if (currentBinding.title !== title || currentRename?.title !== title) throw new ActionRejectedError("Имя задачи изменилось во время синхронизации. Старое название не отправлено в VK.");
       if (generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Трансляция отключена во время переименования. VK-беседа не изменена.");
     };
-    await beforeWrite();
-    let vkTitleUpdated = false;
-    try { await this.chat.renameConversation(binding.peerId!, taskChatTitle(title), beforeWrite); vkTitleUpdated = true; }
-    catch { /* Keep the confirmed Codex rename; only VK may be retried explicitly. */ }
+    let vkTitleUpdated = false; let failure: unknown;
+    try {
+      await beforeWrite();
+      await this.chat.renameConversation(binding.peerId!, taskChatTitle(title), beforeWrite);
+      vkTitleUpdated = true;
+    } catch (error) { failure = error; }
+    finally { this.renameSyncing.delete(binding.id); }
     const current = this.store.getValue<RenameState>(`rename:${binding.id}`);
-    if (current?.title === title) this.store.setValue(`rename:${binding.id}`, { ...current, vkTitleUpdated });
+    if (current?.title === title) {
+      const attempts = vkTitleUpdated ? 0 : (current.attempts ?? 0) + 1;
+      this.store.setValue(`rename:${binding.id}`, {
+        ...current,
+        vkTitleUpdated,
+        attempts,
+        ...(vkTitleUpdated ? { retryAt: 0 } : { retryAt: Date.now() + renameRetryDelay(attempts) }),
+      } satisfies RenameState);
+    }
+    if (failure && !automatic && failure instanceof ActionRejectedError) throw failure;
   }
   private details(bindingId: string): TaskDetails { return this.live.get(bindingId) ?? { ...(this.store.getValue<TaskDetails>(`task-details:${bindingId}`) ?? unknownDetails), status: "unavailable" }; }
   private canArchive(binding: Binding): void {
