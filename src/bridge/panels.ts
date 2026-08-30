@@ -126,7 +126,7 @@ export class TaskPanels {
       await this.renderLimits(input.peerId, state);
       return true;
     }
-    if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/help", "/health"].includes(text))) {
+    if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/health"].includes(text))) {
       if (healthRequested) await this.healthCheck?.();
       const binding = this.store.byPeer(input.peerId);
       const state = this.newState(input.peerId, binding?.id ?? null, "home", true);
@@ -134,6 +134,9 @@ export class TaskPanels {
       else { this.lastCatalogAt = 0; await this.tick(); this.renderManager(state); }
       return true;
     }
+    // Help and unknown slash commands belong to TaskManager. In particular,
+    // they must not be consumed as a pending rename value.
+    if (text.startsWith("/") && text !== "/cancel") return false;
     const state = this.state(input.peerId);
     if (!state || !["rename", "renameConfirm"].includes(state.view)) return false;
     if (text === "/cancel") { await this.home(input.peerId); return true; }

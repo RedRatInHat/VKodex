@@ -173,6 +173,39 @@ test("manager replies carry menu navigation and obsolete standalone greetings ar
   assert.equal(s.store.getValue(`panel:${access.ownerId}`), null);
 });
 
+test("help is chat-specific and unknown owner commands redirect to it without reaching Codex", async t => {
+  const s = setup(t); s.attach();
+  await s.handle("/help");
+  assert.match(s.chat.sent.at(-1)!.view.text, /VKodex · команды менеджера[\s\S]*\/health[\s\S]*\/new/u);
+  assert.deepEqual(s.chat.sent.at(-1)!.view.buttons, [MENU_BUTTON]);
+
+  await s.handle("/unknown-manager");
+  assert.match(s.chat.sent.at(-1)!.view.text, /^Команда не найдена\.[\s\S]*команды менеджера/u);
+
+  await s.handle("/help", peerId);
+  assert.equal(s.chat.sent.at(-1)!.peerId, peerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /VKodex · команды задачи[\s\S]*\/files[\s\S]*\/detach/u);
+
+  await s.handle("/unknown-task", peerId);
+  assert.equal(s.chat.sent.at(-1)!.peerId, peerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /^Команда не найдена\.[\s\S]*команды задачи/u);
+  assert.equal(s.desktop.submissions.length, 0);
+
+  await s.manager.handle({ ...s.input("/still-a-prompt", peerId), senderId: 999 });
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.desktop.submissions[0]!.text, "/still-a-prompt");
+});
+
+test("help and unknown commands cannot become a pending rename value", async t => {
+  const s = setup(t); s.attach(); await s.handle("/menu", peerId); await clickPanel(s, "Переименовать");
+  await s.handle("/help", peerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /VKodex · команды задачи/u);
+  await s.handle("/not-a-title", peerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /^Команда не найдена\./u);
+  assert.equal(s.desktop.renames.length, 0);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
 test("final menu shortcut is on the last chunk and opens fresh peer-scoped panels", async t => {
   const s = setup(t); const binding = s.attach(); const mirror = new TaskMirror(s.store, 40);
   const final = { type: "final", id: "final", turnId: "turn", text: "answer".repeat(24) } as const;

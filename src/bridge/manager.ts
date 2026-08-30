@@ -10,6 +10,35 @@ import { TaskFiles } from "./files.js";
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
 
+const managerHelp = [
+  "VKodex · команды менеджера",
+  "",
+  "/menu, /start, /status — меню и состояние моста",
+  "/help — эта справка",
+  "/health — полная проверка моста",
+  "/limits — лимиты аккаунта Codex",
+  "/list — задачи по проектам",
+  "/new — создать новую задачу",
+  "/cancel — отменить мастер создания",
+  "",
+  "Остальные действия доступны кнопками меню.",
+].join("\n");
+
+const taskHelp = [
+  "VKodex · команды задачи",
+  "",
+  "/menu, /status — карточка задачи",
+  "/help — эта справка",
+  "/limits — лимиты аккаунта Codex",
+  "/files — проверить готовые исходящие файлы",
+  "/stop — остановить текущий ход",
+  "/detach — отключить трансляцию, не останавливая задачу",
+  "",
+  "Обычный текст, фотографии и документы продолжают эту задачу.",
+].join("\n");
+
+const unknownCommand = (help: string): string => `Команда не найдена.\n\n${help}`;
+
 function shortTitle(title: string, maxLength: number): string {
   const text = title.replace(/\s+/gu, " ").trim() || "Без названия";
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
@@ -133,9 +162,11 @@ export class TaskManager {
 
   private async handleManager(input: BridgeInput): Promise<void> {
     const text = input.text.trim();
-    if (["/start", "/help", "/list"].includes(text)) { await this.chooseProject(input, 0); return; }
+    if (text === "/help") { this.reply(input, { text: managerHelp }); return; }
+    if (["/start", "/list"].includes(text)) { await this.chooseProject(input, 0); return; }
     if (text === "/new") { await this.newTask(input); return; }
     if (text === "/cancel") { this.cancel(input); return; }
+    if (text.startsWith("/")) { this.reply(input, { text: unknownCommand(managerHelp) }); return; }
     const draft = this.store.getDraft();
     if (draft?.stage === "title") {
       if (!text || text.length > 120) throw new ActionRejectedError("Введи название задачи длиной от 1 до 120 символов.");
@@ -363,6 +394,10 @@ export class TaskManager {
     if (!binding || input.action) return;
     const text = input.text.trim();
     const ownerCommand = input.senderId === this.access.ownerId;
+    if (ownerCommand && text === "/help") {
+      this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: taskHelp, buttons: [MENU_BUTTON] }, binding.id);
+      return;
+    }
     if (ownerCommand && text === "/detach") {
       this.store.stopStreaming(binding.id);
       this.reply(input, { text: "Трансляция отключена; задача Codex продолжает работать." });
@@ -382,7 +417,10 @@ export class TaskManager {
     }
     if (!text && !input.attachments?.length) throw new ActionRejectedError("Пришли текст или вложение для этой задачи.");
     if (text.length > 16_000) throw new ActionRejectedError("Допустим текст до 16000 символов.");
-    if (ownerCommand && text.startsWith("/")) throw new ActionRejectedError("В беседе задачи доступны /menu, /status, /files, /stop и /detach. Менеджер находится в личном диалоге с ботом.");
+    if (ownerCommand && text.startsWith("/")) {
+      this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: unknownCommand(taskHelp), buttons: [MENU_BUTTON] }, binding.id);
+      return;
+    }
     const operationId = randomUUID();
     const generation = this.store.streamGeneration(binding.id);
     const prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []);
