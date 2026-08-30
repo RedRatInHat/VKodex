@@ -719,6 +719,45 @@ test("a reconnected subscription baselines missed history and emits only later u
   assert.deepEqual(next.events.filter(event => event.type === "progress").map(event => event.text), ["Fresh after reconnect"]);
 });
 
+test("editing a Codex message does not replay history rebuilt with new item ids", () => {
+  const attached = projectSnapshot({ id: ref.threadId, hostId: ref.hostId, turns: [] }, null, 100);
+  const beforeEdit = { id: ref.threadId, hostId: ref.hostId, turns: [{
+    turnId: "live-turn", turnStartedAtMs: 200, status: "completed", items: [
+      { type: "userMessage", id: "01a-live-user", content: [{ type: "text", text: "Original request" }] },
+      { type: "agentMessage", id: "msg_live_progress", phase: "commentary", text: "Existing progress" },
+      { type: "agentMessage", id: "msg_live_final", phase: "final_answer", text: "Existing final" },
+    ],
+  }] };
+  const delivered = projectSnapshot(beforeEdit, attached.checkpoint, 300);
+  assert.deepEqual(delivered.events.filter(event => event.type !== "status").map(event => event.type), ["user", "progress", "final"]);
+
+  // The desktop edit route serializes the already delivered live msg_* events
+  // again as canonical item-* events. Only genuinely changed content may pass.
+  const afterEdit = { id: ref.threadId, hostId: ref.hostId, turns: [{
+    turnId: "rebuilt-turn", turnStartedAtMs: 200, status: "completed", items: [
+      { type: "userMessage", id: "item-7597", content: [{ type: "text", text: "Original request" }] },
+      { type: "agentMessage", id: "item-7599", phase: "commentary", text: "Existing progress" },
+      { type: "agentMessage", id: "item-7809", phase: "final_answer", text: "Existing final" },
+    ],
+  }, {
+    turnId: "edited-turn", turnStartedAtMs: 400, status: "completed", items: [
+      { type: "userMessage", id: "01a-edited-user", content: [{ type: "text", text: "Edited request" }] },
+      { type: "agentMessage", id: "msg_edited_final", phase: "final_answer", text: "New final" },
+    ],
+  }] };
+  const rebuilt = projectSnapshot(afterEdit, delivered.checkpoint, 500);
+  assert.deepEqual(rebuilt.events.filter(event => event.type !== "status").map(event => [event.type, event.text]), [
+    ["user", "Edited request"], ["final", "New final"],
+  ]);
+  assert.equal(projectSnapshot(afterEdit, rebuilt.checkpoint, 600).events.length, 0);
+
+  const repeated = structuredClone(afterEdit);
+  repeated.turns.push({ turnId: "legitimate-repeat", turnStartedAtMs: 700, status: "inProgress", items: [
+    { type: "userMessage", id: "new-repeat", content: [{ type: "text", text: "Edited request" }] },
+  ] });
+  assert.deepEqual(projectSnapshot(repeated, rebuilt.checkpoint, 800).events.filter(event => event.type === "user").map(event => event.id), ["new-repeat"]);
+});
+
 test("accepted steering metadata correlates a server message with the originating VK operation", () => {
   const initial = projectSnapshot(state(), null, 200);
   const next = projectSnapshot(state([
