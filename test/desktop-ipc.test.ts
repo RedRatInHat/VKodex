@@ -32,6 +32,8 @@ class Server extends Duplex {
   onFollow: (() => void) | null = null;
   onDiscovery: (() => void) | null = null;
   settingsReply: IpcObject = { ok: true };
+  readonly interruptReplies: ("success" | "error" | "malformed-stopped")[] = [];
+  interruptReply: (() => "success" | "error" | "malformed-stopped") | null = null;
   override _read(): void {}
   override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     for (const message of this.decoder.push(chunk)) {
@@ -68,7 +70,16 @@ class Server extends Duplex {
         this.dataState = { ...this.dataState, latestThreadSettings: (message.params as IpcObject).threadSettings };
         this.snapshot();
       }
-      if (message.method === "thread-follower-interrupt-turn") result = { result: { ok: true, interruptedTurnId: "fixture-turn" } };
+      if (message.method === "thread-follower-interrupt-turn") {
+        const reply = this.interruptReply?.() ?? this.interruptReplies.shift() ?? "success";
+        if (reply === "error") {
+          this.send({ type: "response", requestId: message.requestId, resultType: "error", error: "private backend error" });
+          return;
+        }
+        if (reply === "malformed-stopped") {
+          this.dataState = state([], "interrupted"); this.snapshot(); result = { result: { ok: true } };
+        } else result = { result: { ok: true, interruptedTurnId: "fixture-turn" } };
+      }
       this.send({ type: "response", requestId: message.requestId, resultType: "success", result, handledByClientId: "owner" });
     } else if (message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following) {
       if (this.onFollow) this.onFollow(); else this.snapshot();
@@ -385,6 +396,39 @@ test("interrupt targets the active desktop turn and requires a confirmed turn id
   const request = server.received.find(message => message.method === "thread-follower-interrupt-turn")!;
   assert.equal(request.version, 4); assert.equal(request.targetClientId, "owner");
   assert.deepEqual(request.params, { conversationId: ref.threadId, mode: "user-stop", expectedTurnId: "fixture-turn" });
+});
+
+function interruptSetup(replies: ("success" | "error" | "malformed-stopped")[]) {
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const servers: Server[] = []; const plan = [...replies];
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server();
+    if (servers.length) server.dataState = servers.at(-1)!.dataState;
+    server.interruptReply = () => plan.shift() ?? "success";
+    servers.push(server);
+    return new DesktopIpcClient(() => server, 50);
+  });
+  return { adapter, requests: () => servers.flatMap(server => server.received).filter(message => message.method === "thread-follower-interrupt-turn") };
+}
+
+test("interrupt confirms a stopped turn after losing the operation result", async () => {
+  const s = interruptSetup(["malformed-stopped"]);
+  await s.adapter.interrupt(ref);
+  assert.equal(s.requests().length, 1);
+});
+
+test("interrupt safely retries the same immutable turn after a rejected reply", async () => {
+  const s = interruptSetup(["error", "success"]);
+  await s.adapter.interrupt(ref);
+  const requests = s.requests();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map(message => (message.params as IpcObject).expectedTurnId), ["fixture-turn", "fixture-turn"]);
+});
+
+test("interrupt reports an actionable error when the same turn remains active", async () => {
+  const s = interruptSetup(["error", "error"]);
+  await assert.rejects(s.adapter.interrupt(ref), error => error instanceof ActionRejectedError && /всё ещё выполняется/u.test(error.message));
+  assert.equal(s.requests().length, 2);
 });
 
 test("project move writes Codex metadata and confirms the catalog without starting a turn", async () => {

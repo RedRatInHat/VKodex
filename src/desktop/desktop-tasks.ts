@@ -155,19 +155,65 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.executor.createTask(request);
   }
 
-  async interrupt(task: TaskRef): Promise<void> {
-    if (await this.executor?.interrupt(task)) return;
-    if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
+  private async interruptState(task: TaskRef, expectedTurnId: string | undefined): Promise<"running" | "stopped" | "unknown"> {
+    try {
+      return await this.follow(task, async subscription => {
+        if (expectedTurnId) {
+          return turnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId && turn.status === "inProgress") ? "running" : "stopped";
+        }
+        return taskDetails(subscription.current!).status === "running" ? "running" : "stopped";
+      });
+    } catch {
+      return "unknown";
+    }
+  }
+
+  private async interruptLive(task: TaskRef, expectedTurnId: string | undefined): Promise<void> {
     await this.follow(task, async (subscription, client) => {
-      const running = turnsFromState(subscription.current!).filter(turn => turn.status === "inProgress").at(-1);
-      const expectedTurnId = typeof running?.turnId === "string" && running.turnId ? running.turnId : undefined;
-      if (!running && taskDetails(subscription.current!).status !== "running") throw new ActionRejectedError("В задаче нет выполняющегося хода.");
+      if (expectedTurnId && !turnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId && turn.status === "inProgress")) return;
       const reply = await client.request("thread-follower-interrupt-turn", expectedTurnId ? 4 : 3, {
         conversationId: task.threadId, mode: "user-stop", ...(expectedTurnId ? { expectedTurnId } : {}),
       }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
       const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
       if (!isObject(result) || result.ok !== true || typeof result.interruptedTurnId !== "string" || !result.interruptedTurnId || (expectedTurnId && result.interruptedTurnId !== expectedTurnId)) throw new UncertainActionError();
     });
+  }
+
+  async interrupt(task: TaskRef): Promise<void> {
+    if (await this.executor?.interrupt(task)) return;
+    if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
+    let expectedTurnId: string | undefined;
+    try {
+      await this.follow(task, async (subscription, client) => {
+        const running = turnsFromState(subscription.current!).filter(turn => turn.status === "inProgress").at(-1);
+        expectedTurnId = typeof running?.turnId === "string" && running.turnId ? running.turnId : undefined;
+        if (!running && taskDetails(subscription.current!).status !== "running") throw new ActionRejectedError("В задаче нет выполняющегося хода.");
+        const reply = await client.request("thread-follower-interrupt-turn", expectedTurnId ? 4 : 3, {
+          conversationId: task.threadId, mode: "user-stop", ...(expectedTurnId ? { expectedTurnId } : {}),
+        }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
+        const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+        if (!isObject(result) || result.ok !== true || typeof result.interruptedTurnId !== "string" || !result.interruptedTurnId || (expectedTurnId && result.interruptedTurnId !== expectedTurnId)) throw new UncertainActionError();
+      });
+      return;
+    }
+    catch (error) {
+      if (!(error instanceof UncertainActionError || error instanceof DesktopUnavailableError)) throw error;
+    }
+
+    let state = await this.interruptState(task, expectedTurnId);
+    if (state === "stopped") return;
+    // Protocol v4 scopes interruption to one immutable turn id. Repeating that
+    // request cannot interrupt a later turn, even when the first reply was lost.
+    if (expectedTurnId) {
+      try { await this.interruptLive(task, expectedTurnId); return; }
+      catch (error) {
+        if (!(error instanceof UncertainActionError || error instanceof DesktopUnavailableError)) throw error;
+      }
+      state = await this.interruptState(task, expectedTurnId);
+      if (state === "stopped") return;
+    }
+    if (state === "running") throw new ActionRejectedError("Codex не подтвердил остановку: этот ход всё ещё выполняется. Повтори /stop.");
+    throw new ActionRejectedError("Не удалось проверить состояние после запроса остановки. Посмотри на ход в Codex и повтори /stop, если он всё ещё выполняется.");
   }
 
   async moveTask(task: TaskRef, projectId: string | null): Promise<void> {
