@@ -161,7 +161,7 @@ test("runtime reports the actual connection failure without leaking malformed IP
 
 test("runtime animates an active task between desktop events and stops when its turn completes", async t => {
   const s = runtimeSetup(t); await s.runtime.tick();
-  s.advance(6_000); await s.runtime.tick();
+  s.advance(20_000); await s.runtime.tick();
   assert.equal(s.edits.at(-1)!.view.text, "думаю..");
   s.server.dataState = state([], "completed"); s.server.snapshot();
   await new Promise(resolve => setImmediate(resolve)); s.advance(3_000); await s.runtime.tick();

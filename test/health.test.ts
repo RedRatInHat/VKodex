@@ -59,7 +59,7 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   assert.equal(s.store.pendingDeliveries().length, 0);
 });
 
-test("two failed checks alert once and recovery emits a separate notification", async t => {
+test("failed checks alert after two runs and recovery waits for three healthy runs", async t => {
   const s = setup(t);
   s.chat.checks = [{ name: "vk_api", state: "failed", detail: "VK API unavailable without raw credentials." }];
   assert.equal((await s.monitor.check(true)).state, "failed");
@@ -70,8 +70,11 @@ test("two failed checks alert once and recovery emits a separate notification", 
   assert.equal(pending.length, 1); assert.match(pending[0]!.view.text, /health check FAILED/u);
   s.store.delivered(pending[0]!, { peerId: access.ownerId, conversationMessageId: 1 });
   s.chat.checks = [{ name: "vk_api", state: "ok", detail: "VK API active." }];
-  s.advance(60_000);
-  assert.equal((await s.monitor.check(true)).state, "ok");
+  for (let run = 1; run <= 3; run++) {
+    s.advance(60_000);
+    assert.equal((await s.monitor.check(true)).state, "ok");
+    if (run < 3) assert.equal(s.store.pendingDeliveries().length, 0);
+  }
   pending = s.store.pendingDeliveries();
   assert.equal(pending.length, 1); assert.match(pending[0]!.view.text, /снова OK/u);
 });
@@ -84,6 +87,26 @@ test("a delivery backlog becomes degraded and then failed instead of looking hea
   assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_delivery")!.state, "degraded");
   s.advance(5 * 60_000);
   assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_delivery")!.state, "failed");
+});
+
+test("a stuck activity edit stays degraded and does not page during a short VK throttle", async t => {
+  const s = setup(t);
+  s.store.enqueue("thinking", access.ownerId, { text: "думаю...", silent: true }, null, "activity");
+  const delivery = s.store.pendingDeliveries()[0]!;
+  s.store.recordDeliveryFailure(delivery, "rate_limit", 120_000, 100_000);
+  s.store.setValue("vk-delivery-paused-until", 220_000);
+  for (let run = 1; run <= 9; run++) {
+    const report = await s.monitor.check(true);
+    const check = report.checks.find(item => item.name === "vk_delivery")!;
+    assert.equal(check.state, "degraded");
+    assert.match(check.detail, /0 важных, 1 фоновых/u);
+    assert.notEqual(report.state, "failed");
+    assert.equal(s.store.pendingDeliveries().filter(item => item.key.startsWith("health-alert:")).length, 0);
+    s.advance(60_000);
+  }
+  assert.equal((await s.monitor.check(true)).state, "degraded");
+  const alerts = s.store.pendingDeliveries().filter(item => item.key.startsWith("health-alert:"));
+  assert.equal(alerts.length, 1); assert.match(alerts[0]!.view.text, /health check DEGRADED/u);
 });
 
 test("stalled runtime updates and missing Codex streams are visible independently", async t => {

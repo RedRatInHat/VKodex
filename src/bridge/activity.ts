@@ -4,7 +4,7 @@ import { BridgeStore } from "./store.js";
 import type { View } from "./contracts.js";
 
 const FRAMES = ["думаю...", "думаю..", "думаю."] as const;
-const INTERVAL_MS = 6_000;
+const DEFAULT_INTERVAL_MS = 20_000;
 const terminal = (status: TaskDetails["status"]): boolean => ["idle", "failed", "interrupted"].includes(status);
 const labels: Record<Exclude<TaskDetails["status"], "running">, string> = {
   idle: "Готово.", failed: "Ход завершился с ошибкой.", interrupted: "Ход остановлен.",
@@ -25,7 +25,11 @@ export class TaskActivity {
   private readonly running = new Map<string, { state: ActivityState; frame: number; nextAt: number }>();
   private readonly observed = new Set<string>();
 
-  constructor(private readonly store: BridgeStore, private readonly now: () => number = Date.now) {}
+  constructor(
+    private readonly store: BridgeStore,
+    private readonly now: () => number = Date.now,
+    private readonly intervalMs = DEFAULT_INTERVAL_MS,
+  ) {}
 
   private render(state: ActivityState, peerId: number, bindingId: string, frame: string): void {
     if (state.kind === "commentary") {
@@ -87,7 +91,7 @@ export class TaskActivity {
       running.state = current;
       this.render(current, binding.peerId, bindingId, FRAMES[running.frame]!); return;
     }
-    this.running.set(bindingId, { state: current, frame: 0, nextAt: this.now() + INTERVAL_MS });
+    this.running.set(bindingId, { state: current, frame: 0, nextAt: this.now() + this.intervalMs });
     this.render(current, binding.peerId, bindingId, FRAMES[0]);
     if (current.kind !== "commentary") this.store.activateActivity(current.key);
   }
@@ -105,7 +109,7 @@ export class TaskActivity {
       }
       if (this.now() < activity.nextAt) continue;
       activity.frame = (activity.frame + 1) % FRAMES.length;
-      activity.nextAt = this.now() + INTERVAL_MS;
+      activity.nextAt = this.now() + this.intervalMs;
       this.render(activity.state, binding.peerId, bindingId, FRAMES[activity.frame]!);
     }
   }

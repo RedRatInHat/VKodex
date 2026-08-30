@@ -37,6 +37,8 @@ export interface DeliveryFailure {
 }
 export interface DeliveryHealthStats {
   readonly activePending: number;
+  readonly criticalPending: number;
+  readonly streamPending: number;
   readonly inactivePending: number;
   readonly pauseRemainingMs: number;
   readonly lastFailure: DeliveryFailure | null;
@@ -187,11 +189,17 @@ export class BridgeStore {
   deliveryHealth(now = Date.now()): DeliveryHealthStats {
     const row = this.db.prepare(`SELECT
       SUM(CASE WHEN d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id) THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('send', 'panel') THEN 1 ELSE 0 END) AS critical,
+      SUM(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('commentary', 'activity') THEN 1 ELSE 0 END) AS stream,
       SUM(CASE WHEN d.binding_id IS NOT NULL AND (b.id IS NULL OR b.attached <> 1 OR b.peer_id <> d.peer_id) THEN 1 ELSE 0 END) AS inactive
       FROM bridge_delivery d LEFT JOIN bridge_bindings b ON b.id = d.binding_id
-      WHERE d.revision > d.delivered_revision AND d.kind IN ('send', 'commentary', 'panel', 'activity')`).get() as { active: number | null; inactive: number | null };
+      WHERE d.revision > d.delivered_revision AND d.kind IN ('send', 'commentary', 'panel', 'activity')`).get() as {
+        active: number | null; critical: number | null; stream: number | null; inactive: number | null;
+      };
     return {
       activePending: row.active ?? 0,
+      criticalPending: row.critical ?? 0,
+      streamPending: row.stream ?? 0,
       inactivePending: row.inactive ?? 0,
       pauseRemainingMs: Math.max(0, (this.getValue<number>("vk-delivery-paused-until") ?? 0) - now),
       lastFailure: this.getValue<DeliveryFailure>("vk-delivery-last-failure"),

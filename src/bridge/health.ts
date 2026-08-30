@@ -49,7 +49,8 @@ export function formatHealthSummary(snapshot: BridgeHealthSnapshot): string {
 export class BridgeHealthMonitor {
   private checking: Promise<BridgeHealthSnapshot> | null = null;
   private lastCompatibilityAt = 0;
-  private pendingSince: number | null = null;
+  private criticalPendingSince: number | null = null;
+  private streamPendingSince: number | null = null;
 
   constructor(
     private readonly access: OwnerAccess,
@@ -88,20 +89,28 @@ export class BridgeHealthMonitor {
         : { name: "runtime", state: "ok", detail: `Цикл активен; последний tick ${Math.round(tickAge / 1_000)} с назад.` });
 
     const delivery = this.store.deliveryHealth(checkedAt);
-    if (delivery.activePending === 0) this.pendingSince = null;
-    else this.pendingSince ??= checkedAt;
-    const pendingAge = this.pendingSince === null ? 0 : checkedAt - this.pendingSince;
-    const deliveryState: HealthState = delivery.pauseRemainingMs > 0 || pendingAge > 30_000
-      ? pendingAge > 5 * 60_000 ? "failed" : "degraded"
-      : "ok";
+    if (delivery.criticalPending === 0) this.criticalPendingSince = null;
+    else this.criticalPendingSince ??= checkedAt;
+    if (delivery.streamPending === 0) this.streamPendingSince = null;
+    else this.streamPendingSince ??= checkedAt;
+    const criticalAge = this.criticalPendingSince === null ? 0 : checkedAt - this.criticalPendingSince;
+    const streamAge = this.streamPendingSince === null ? 0 : checkedAt - this.streamPendingSince;
+    // A stuck answer or control panel is a hard delivery failure. Commentary and
+    // activity edits are intentionally lossy and must never turn the whole bridge
+    // FAILED, although a VK rate-limit remains visible as DEGRADED.
+    const deliveryState: HealthState = criticalAge > 5 * 60_000
+      ? "failed"
+      : delivery.pauseRemainingMs > 0 || criticalAge > 30_000 || streamAge > 30_000
+        ? "degraded"
+        : "ok";
     const unresolvedFailure = delivery.lastFailure && delivery.lastFailure.at > (delivery.lastSuccessAt ?? 0) ? delivery.lastFailure : null;
     const failureDetail = unresolvedFailure ? ` Последний сбой: ${unresolvedFailure.type}, ${unresolvedFailure.kind}/${unresolvedFailure.operation}.` : "";
     checks.push({
       name: "vk_delivery",
       state: deliveryState,
       detail: delivery.pauseRemainingMs > 0
-        ? `VK ограничил частоту; повтор через ${Math.ceil(delivery.pauseRemainingMs / 1_000)} с. Активная очередь: ${delivery.activePending}.${failureDetail}`
-        : `Активная очередь: ${delivery.activePending}; отменённых записей: ${delivery.inactivePending}${pendingAge ? `; возраст ${Math.round(pendingAge / 1_000)} с` : ""}.${failureDetail}`,
+        ? `VK ограничил частоту; повтор через ${Math.ceil(delivery.pauseRemainingMs / 1_000)} с. Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых.${failureDetail}`
+        : `Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых; отменённых записей: ${delivery.inactivePending}${criticalAge ? `; важные ожидают ${Math.round(criticalAge / 1_000)} с` : ""}${streamAge ? `; фоновые ожидают ${Math.round(streamAge / 1_000)} с` : ""}.${failureDetail}`,
     });
 
     const connectedState: HealthState = runtime.connectedRequiredBindings < runtime.requiredBindings ? "degraded" : "ok";
@@ -159,15 +168,26 @@ export class BridgeHealthMonitor {
   }
 
   private notifyTransition(snapshot: BridgeHealthSnapshot): void {
-    const streak = snapshot.state === "ok" ? 0 : (this.store.getValue<number>("health:unhealthy-runs") ?? 0) + 1;
-    this.store.setValue("health:unhealthy-runs", streak);
     const notified = this.store.getValue<HealthState>("health:last-notified-state");
     if (snapshot.state === "ok") {
-      if (notified && notified !== "ok") this.store.enqueue(`health-recovered:${snapshot.checkedAt}`, this.access.ownerId, { text: "VKodex: health check снова OK. VK, очередь, локальный runtime и Codex проверены." });
-      this.store.setValue("health:last-notified-state", "ok");
+      this.store.setValue("health:unhealthy-runs", 0);
+      this.store.setValue("health:last-observed-state", "ok");
+      const healthyRuns = (this.store.getValue<number>("health:healthy-runs") ?? 0) + 1;
+      this.store.setValue("health:healthy-runs", healthyRuns);
+      if (!notified) this.store.setValue("health:last-notified-state", "ok");
+      else if (notified !== "ok" && healthyRuns >= 3) {
+        this.store.enqueue(`health-recovered:${snapshot.checkedAt}`, this.access.ownerId, { text: "VKodex: health check снова OK. VK, очередь, локальный runtime и Codex проверены." });
+        this.store.setValue("health:last-notified-state", "ok");
+      }
       return;
     }
-    if (streak < 2 || notified === snapshot.state) return;
+    this.store.setValue("health:healthy-runs", 0);
+    const observed = this.store.getValue<HealthState>("health:last-observed-state");
+    const streak = observed === snapshot.state ? (this.store.getValue<number>("health:unhealthy-runs") ?? 0) + 1 : 1;
+    this.store.setValue("health:last-observed-state", snapshot.state);
+    this.store.setValue("health:unhealthy-runs", streak);
+    const threshold = snapshot.state === "failed" ? 2 : 10;
+    if (streak < threshold || notified === snapshot.state || (notified && notified !== "ok" && severity[notified] > severity[snapshot.state])) return;
     const failures = snapshot.checks.filter(check => check.state !== "ok").slice(0, 5).map(check => `${check.name}: ${check.detail}`);
     this.store.enqueue(`health-alert:${snapshot.checkedAt}:${snapshot.state}`, this.access.ownerId, {
       text: `VKodex: health check ${labels[snapshot.state]}.\n${failures.join("\n")}\n\n/menu или /health — актуальное состояние.`,

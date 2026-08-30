@@ -891,7 +891,7 @@ test("technical events and turn statuses never create VK messages", async t => {
 });
 
 test("thinking cycles one silent message and leaves the final answer separate", async t => {
-  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   assert.deepEqual(s.chat.sent.map(message => message.view), [{ text: "думаю...", silent: true }]);
   for (const text of ["думаю..", "думаю.", "думаю..."]) {
@@ -910,16 +910,24 @@ test("thinking cycles one silent message and leaves the final answer separate", 
   const edits = s.chat.edits.length; s.advance(); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, edits);
 });
 
+test("thinking uses a flood-safe twenty-second interval by default", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "running", "turn"); await s.worker.flush();
+  s.advance(19_999); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, 0);
+  s.advance(1); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, 1);
+  assert.equal(s.chat.edits[0]!.view.text, "думаю..");
+});
+
 test("thinking restores the same message after restart and settles an interrupted finish", async t => {
-  const s = setup(t); const binding = s.attach(); let activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); let activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", null); await s.worker.flush();
   activity.observe(binding.id, "running", "turn"); activity.stop(); s.store.recover();
-  activity = new TaskActivity(s.store, s.now); activity.tick(); await s.worker.flush();
+  activity = new TaskActivity(s.store, s.now, 6_000); activity.tick(); await s.worker.flush();
   assert.equal(s.chat.edits.length, 0);
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
   assert.equal(s.chat.sent.length, 1);
   activity.observe(binding.id, "idle"); s.store.recover(); // Process dies before the finishing edit.
-  activity = new TaskActivity(s.store, s.now); activity.observe(binding.id, "idle"); s.advance(); await s.worker.flush();
+  activity = new TaskActivity(s.store, s.now, 6_000); activity.observe(binding.id, "idle"); s.advance(); await s.worker.flush();
   assert.equal(s.chat.edits.at(-1)!.view.text, "Готово."); assert.equal(s.chat.sent.length, 1);
   activity.observe(binding.id, "running", "next-turn"); await s.worker.flush(); assert.equal(s.chat.sent.length, 2);
 });
@@ -962,7 +970,7 @@ test("revisions returning to the last confirmed view do not repeat an identical 
 });
 
 test("thinking moves into the newest commentary and restores older message text", async t => {
-  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   const first = { type: "progress", id: "first", turnId: "turn", text: "First comment" } as const;
   s.mirror.accept(binding.id, first); activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
@@ -985,7 +993,7 @@ test("thinking moves into the newest commentary and restores older message text"
 });
 
 test("user messages and menus move thinking to the bottom while restart reuses its latest handle", async t => {
-  const s = setup(t); const binding = s.attach(); let activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); let activity = new TaskActivity(s.store, s.now, 6_000);
   s.mirror.accept(binding.id, { type: "progress", id: "comment", turnId: "turn", text: "Working" });
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   const incomingId = ++s.chat.messageSequence;
@@ -1001,7 +1009,7 @@ test("user messages and menus move thinking to the bottom while restart reuses i
   s.mirror.accept(binding.id, { type: "progress", id: "new-comment", turnId: "turn", text: "New progress" });
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
   const count = s.chat.sent.length, latest = s.chat.sent.at(-1)!.handle;
-  s.store.recover(); activity = new TaskActivity(s.store, s.now);
+  s.store.recover(); activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
   s.advance(); activity.tick(); await s.worker.flush();
   assert.equal(s.chat.sent.length, count); assert.deepEqual(s.chat.edits.at(-1)!.handle, latest);
@@ -1011,7 +1019,7 @@ test("user messages and menus move thinking to the bottom while restart reuses i
 });
 
 test("thinking stops for approval, disconnection and failure without creating extra status messages", async t => {
-  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "idle"); await s.worker.flush(); assert.equal(s.chat.sent.length, 0);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   for (const [status, label] of [["approval", "Нужен ответ в Codex."], ["unavailable", "Нет связи с Codex."], ["failed", "Ход завершился с ошибкой."]] as const) {
@@ -1023,7 +1031,7 @@ test("thinking stops for approval, disconnection and failure without creating ex
 });
 
 test("thinking cancels unsent indicators and stale frames after completion or detach", async t => {
-  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "fast"); activity.observe(binding.id, "idle"); await s.worker.flush();
   assert.equal(s.chat.sent.length, 0);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
