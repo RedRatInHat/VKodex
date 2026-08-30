@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
-import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskRenameResult } from "../src/desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 
@@ -70,7 +70,7 @@ class Chat implements BridgeChat {
 }
 
 class Desktop implements DesktopTasks {
-  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true };
+  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true, goals: false };
   tasks: DesktopTask[] = [task];
   projects: DesktopProject[] = [{ id: "project-a", title: "Project", workspace: "/project" }];
   projectsError: Error | null = null;
@@ -85,6 +85,10 @@ class Desktop implements DesktopTasks {
   readonly selections: { task: TaskRef; model: string; effort: string }[] = [];
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
+  goal: TaskGoal | null = null;
+  readonly goalUpdates: TaskGoalUpdate[] = [];
+  goalClears = 0;
+  goalContinuations = 0;
   usageReads = 0;
   readonly usageTasks: (TaskRef | undefined)[] = [];
   usage: AccountUsage = { planType: "pro", limits: [
@@ -112,6 +116,24 @@ class Desktop implements DesktopTasks {
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
   async exportMarkdown(): Promise<string> { this.exportHook?.(); return "# Fixture\n\nVisible conversation"; }
   async accountUsage(task?: TaskRef): Promise<readonly AccountUsage[]> { this.usageReads++; this.usageTasks.push(task); return [this.usage]; }
+  async getGoal(): Promise<TaskGoal | null> { return this.goal; }
+  async setGoal(ref: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
+    this.goalUpdates.push(update);
+    const previous = this.goal;
+    this.goal = {
+      threadId: ref.threadId,
+      objective: update.objective ?? previous?.objective ?? "Fixture goal",
+      status: update.status ?? previous?.status ?? "active",
+      tokenBudget: update.tokenBudget !== undefined ? update.tokenBudget : previous?.tokenBudget ?? null,
+      tokensUsed: previous?.tokensUsed ?? 0,
+      timeUsedSeconds: previous?.timeUsedSeconds ?? 0,
+      createdAt: previous?.createdAt ?? 1_788_000_000,
+      updatedAt: 1_788_000_100,
+    };
+    return this.goal;
+  }
+  async clearGoal(): Promise<boolean> { this.goalClears++; const existed = this.goal !== null; this.goal = null; return existed; }
+  async continueGoal(): Promise<void> { this.goalContinuations++; }
   async listTasks() { return this.tasks; }
   async listProjects() { if (this.projectsError) throw this.projectsError; return this.projects; }
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
@@ -277,6 +299,49 @@ test("account limits are available from the manager and task chat without reachi
   assert.equal(s.desktop.usageTasks[2]!.threadId, task.threadId);
   assert.match(panelView(s).text, /Заполнение контекста конкретной задачи/u);
   await clickPanel(s, "Меню"); assert.match(panelView(s).text, /Контекст:/u);
+});
+
+test("task goals can be inspected, budgeted, paused, resumed and cleared without becoming prompts", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  await s.handle("/goal", peerId);
+  assert.match(panelView(s).text, /Цель Codex не задана/u);
+  assert.equal(s.desktop.submissions.length, 0);
+
+  await clickPanel(s, "Задать цель");
+  assert.match(panelView(s).text, /Пришли формулировку цели/u);
+  await s.handle("Довести релиз до проверенного результата", peerId);
+  assert.match(panelView(s).text, /Выбери общий бюджет токенов/u);
+  assert.equal(s.desktop.submissions.length, 0);
+  await clickPanel(s, "250 000");
+  assert.deepEqual(s.desktop.goalUpdates[0], { objective: "Довести релиз до проверенного результата", tokenBudget: 250_000, status: "active" });
+  assert.equal(s.desktop.goalContinuations, 1);
+  assert.match(panelView(s).text, /Статус: Выполняется[\s\S]*Бюджет: 250 000 · осталось 250 000/u);
+
+  await clickPanel(s, "Пауза");
+  assert.deepEqual(s.desktop.goalUpdates[1], { status: "paused" });
+  assert.match(panelView(s).text, /Статус: На паузе/u);
+  await clickPanel(s, "Возобновить");
+  assert.deepEqual(s.desktop.goalUpdates[2], { status: "active" });
+  assert.equal(s.desktop.goalContinuations, 2);
+
+  await clickPanel(s, "Снять цель");
+  assert.match(panelView(s).text, /История задачи, файлы и VK-беседа сохранятся/u);
+  await clickPanel(s, "Снять цель");
+  assert.equal(s.desktop.goalClears, 1);
+  assert.match(panelView(s).text, /Цель Codex не задана[\s\S]*Цель снята/u);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("custom goal budgets are validated and preserve a paused goal while editing", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Old", status: "paused", tokenBudget: 50_000, tokensUsed: 12_500, timeUsedSeconds: 3_700, createdAt: 1_788_000_000, updatedAt: 1_788_000_100 };
+  await s.handle("/goal", peerId);
+  assert.match(panelView(s).text, /Израсходовано: 12 500[\s\S]*осталось 37 500[\s\S]*1 ч\. 1 мин\./u);
+  await clickPanel(s, "Изменить"); await s.handle("Updated objective", peerId); await clickPanel(s, "Другой лимит");
+  await s.handle("0", peerId); assert.match(s.chat.sent.at(-1)!.view.text, /Лимит цели должен быть/u);
+  await s.handle("750_000", peerId);
+  assert.deepEqual(s.desktop.goalUpdates.at(-1), { objective: "Updated objective", tokenBudget: 750_000 });
+  assert.equal(s.desktop.goal!.status, "paused");
 });
 
 test("task card only refreshes on request and never replaces an open model chooser", async t => {

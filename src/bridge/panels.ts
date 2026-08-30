@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type AccountUsage, type DesktopTasks, type TaskDetails } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type AccountUsage, type DesktopTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -11,10 +11,12 @@ interface PanelState {
   id: string;
   messageKey: string;
   bindingId: string | null;
-  view: "home" | "projects" | "moveProject" | "models" | "efforts" | "rename" | "renameConfirm" | "archive" | "share";
+  view: "home" | "projects" | "moveProject" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
   page: number;
   model?: string;
   title?: string;
+  goalObjective?: string;
+  goalTokenBudget?: number | null;
   note?: string;
   expiresAt: number;
   tokens: Record<string, { id: string; expiresAt: number }>;
@@ -33,6 +35,37 @@ const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, mo
 const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ в Codex", unavailable: "Нет связи с задачей" };
 const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ").trim().slice(0, length);
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
+const goalStatuses: Record<TaskGoalStatus, string> = {
+  active: "Выполняется",
+  paused: "На паузе",
+  blocked: "Заблокирована",
+  usageLimited: "Остановлена лимитом аккаунта",
+  budgetLimited: "Исчерпан бюджет цели",
+  complete: "Завершена",
+};
+const elapsed = (seconds: number): string => {
+  if (seconds < 60) return `${seconds} сек.`;
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)} мин.`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)} ч. ${Math.floor(seconds % 3_600 / 60)} мин.`;
+  return `${Math.floor(seconds / 86_400)} дн. ${Math.floor(seconds % 86_400 / 3_600)} ч.`;
+};
+export function taskGoalText(goal: TaskGoal | null): string {
+  if (!goal) return "Цель Codex не задана.\n\nЦель позволяет агенту автономно продолжать работу между ходами до завершения, паузы или исчерпания лимита.";
+  const remaining = goal.tokenBudget === null ? null : Math.max(0, goal.tokenBudget - goal.tokensUsed);
+  const objective = goal.objective.length > 2_500 ? `${goal.objective.slice(0, 2_500)}\n… (формулировка сокращена в VK)` : goal.objective;
+  return [
+    "Цель Codex",
+    `Статус: ${goalStatuses[goal.status]}`,
+    "",
+    objective,
+    "",
+    `Израсходовано: ${number(goal.tokensUsed)} токенов`,
+    goal.tokenBudget === null ? "Бюджет: без ограничения" : `Бюджет: ${number(goal.tokenBudget)} · осталось ${number(remaining!)} токенов`,
+    `Время работы: ${elapsed(goal.timeUsedSeconds)}`,
+    "",
+    "Завершённой цель отмечает сам агент после проверки результата.",
+  ].join("\n");
+}
 const renameRetryDelay = (attempts: number): number => Math.min(30 * 60_000, 30_000 * 2 ** Math.min(Math.max(0, attempts - 1), 6));
 export const taskDeepLink = (threadId: string): string => `codex://threads/${encodeURIComponent(threadId)}`;
 
@@ -130,6 +163,13 @@ export class TaskPanels {
       await this.renderLimits(input.peerId, state);
       return true;
     }
+    if (input.senderId === this.access.ownerId && text === "/goal") {
+      const binding = this.store.byPeer(input.peerId);
+      if (!binding) return false;
+      const state = this.newState(input.peerId, binding.id, "goal", true);
+      await this.renderGoal(binding, state);
+      return true;
+    }
     if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/health"].includes(text))) {
       if (healthRequested) await this.healthCheck?.();
       const binding = this.store.byPeer(input.peerId);
@@ -142,12 +182,29 @@ export class TaskPanels {
     // they must not be consumed as a pending rename value.
     if (text.startsWith("/") && text !== "/cancel") return false;
     const state = this.state(input.peerId);
-    if (!state || !["rename", "renameConfirm"].includes(state.view)) return false;
+    if (!state || !["rename", "renameConfirm", "goalObjective", "goalBudgetInput"].includes(state.view)) return false;
     if (text === "/cancel") { await this.home(input.peerId); return true; }
-    if (state.expiresAt <= Date.now()) { await this.home(input.peerId); throw new ActionRejectedError("Время ввода названия истекло. Текст не отправлен агенту; открой переименование заново."); }
+    if (state.expiresAt <= Date.now()) { await this.home(input.peerId); throw new ActionRejectedError("Время ввода истекло. Текст не отправлен агенту; открой действие заново."); }
+    const binding = this.bound(input.peerId, state.bindingId);
+    if (state.view === "goalObjective") {
+      if (!text || text.length > 8_000 || /\x00/u.test(text)) throw new ActionRejectedError("Цель должна содержать от 1 до 8000 символов. /cancel — отмена.");
+      const current = await this.goal(binding);
+      const next = this.newState(input.peerId, binding.id, "goalBudget");
+      next.goalObjective = text.trim(); next.goalTokenBudget = current?.tokenBudget ?? null;
+      this.showGoalBudget(binding, next);
+      return true;
+    }
+    if (state.view === "goalBudgetInput") {
+      const raw = text.replace(/[\s_]/gu, "");
+      if (!/^\d+$/u.test(raw)) throw new ActionRejectedError("Пришли целое число токенов от 1 до 100 000 000. /cancel — отмена.");
+      const tokenBudget = Number(raw);
+      if (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0 || tokenBudget > 100_000_000) throw new ActionRejectedError("Лимит цели должен быть от 1 до 100 000 000 токенов. /cancel — отмена.");
+      if (!state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+      await this.applyGoal(binding, state.goalObjective, tokenBudget);
+      return true;
+    }
     if (state.view === "renameConfirm") throw new ActionRejectedError("Подтверди название кнопкой или отправь /cancel. Текст не отправлен агенту.");
     if (!text || text.length > 120 || /[\r\n\x00-\x1f]/u.test(text)) throw new ActionRejectedError("Название должно быть одной строкой от 1 до 120 символов. /cancel — отмена.");
-    const binding = this.bound(input.peerId, state.bindingId);
     const next = this.newState(input.peerId, binding.id, "renameConfirm"); next.title = text;
     this.show(input.peerId, next, { text: `Переименовать задачу Codex и связанную VK-беседу?\n\n${short(binding.title)}\n→ ${text}\n\nВ VK сохранится префикс [VKodex]. Открытое окно Codex может продолжить показывать старое имя; его состояние проверяется отдельно.`, buttons: [this.button(input.peerId, next, "Переименовать", "renameApply", { title: text }), this.button(input.peerId, next, "Отмена", "home")] });
     return true;
@@ -213,6 +270,81 @@ export class TaskPanels {
         this.waiting(binding, "Проверяю применение модели в Codex…");
         await this.desktop.selectModel(binding, action.model, action.effort);
         await this.home(input.peerId, `Для следующего хода: ${action.model} · ${action.effort}.`); break;
+      }
+      case "goal": {
+        const next = this.newState(input.peerId, binding.id, "goal");
+        await this.renderGoal(binding, next);
+        break;
+      }
+      case "goalObjective": {
+        if (!this.desktop.capabilities.goals || !this.desktop.getGoal) throw new ActionRejectedError("Цели недоступны в текущем подключении.");
+        const current = await this.goal(binding);
+        const next = this.newState(input.peerId, binding.id, "goalObjective");
+        next.goalTokenBudget = current?.tokenBudget ?? null;
+        this.show(input.peerId, next, {
+          text: `${current ? "Изменение цели" : "Новая цель Codex"}\n\nПришли формулировку цели одним сообщением (до 8000 символов). Она станет явной долгосрочной задачей агента и не будет отправлена как обычный промпт.\n\n/cancel — отмена.`,
+          buttons: [this.button(input.peerId, next, "Отмена", "goal")],
+        });
+        break;
+      }
+      case "goalBudget": {
+        if (!["goalBudget", "goalBudgetInput"].includes(state.view) || !state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+        const next = state.view === "goalBudget" ? state : this.newState(input.peerId, binding.id, "goalBudget");
+        next.goalObjective = state.goalObjective; if (state.goalTokenBudget !== undefined) next.goalTokenBudget = state.goalTokenBudget;
+        this.showGoalBudget(binding, next);
+        break;
+      }
+      case "goalBudgetInput": {
+        if (state.view !== "goalBudget" || !state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+        const next = this.newState(input.peerId, binding.id, "goalBudgetInput");
+        next.goalObjective = state.goalObjective; if (state.goalTokenBudget !== undefined) next.goalTokenBudget = state.goalTokenBudget;
+        this.show(input.peerId, next, { text: "Пришли целое число токенов от 1 до 100 000 000. Этот текст не будет передан агенту.\n\n/cancel — отмена.", buttons: [this.button(input.peerId, next, "Назад", "goalBudget")] });
+        break;
+      }
+      case "goalApply": {
+        if (state.view !== "goalBudget" || !state.goalObjective || action.tokenBudget === undefined) throw new ActionRejectedError("Настройка цели устарела. Открой /goal и повтори.");
+        this.consume(input);
+        await this.applyGoal(binding, state.goalObjective, action.tokenBudget);
+        break;
+      }
+      case "goalPause": {
+        if (state.view !== "goal") throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
+        const current = await this.goal(binding);
+        if (!current || current.status !== "active") throw new ActionRejectedError("Активной цели нет. Обнови /goal.");
+        this.consume(input);
+        const updated = await this.desktop.setGoal!(binding, { status: "paused" });
+        if (updated.status !== "paused") throw new UncertainActionError();
+        const next = this.newState(input.peerId, binding.id, "goal");
+        await this.renderGoal(binding, next, "Автоматическое продолжение приостановлено. Уже начатый ход может закончиться самостоятельно; /stop останавливает и его.");
+        break;
+      }
+      case "goalResume": {
+        if (state.view !== "goal") throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
+        const current = await this.goal(binding);
+        if (!current || !["paused", "blocked", "usageLimited", "budgetLimited"].includes(current.status)) throw new ActionRejectedError("Эту цель сейчас нельзя возобновить. Обнови /goal.");
+        this.consume(input);
+        const updated = await this.desktop.setGoal!(binding, { status: "active" });
+        if (updated.status !== "active") throw new UncertainActionError();
+        await this.desktop.continueGoal?.(binding);
+        const next = this.newState(input.peerId, binding.id, "goal");
+        await this.renderGoal(binding, next, "Цель возобновлена. Codex продолжит её автоматически.");
+        break;
+      }
+      case "goalClear": {
+        if (state.view !== "goal" || !await this.goal(binding)) throw new ActionRejectedError("Цель уже отсутствует. Обнови /goal.");
+        const next = this.newState(input.peerId, binding.id, "goalClear");
+        this.show(input.peerId, next, { text: "Снять цель с этой задачи Codex?\n\nУчёт цели будет удалён. История задачи, файлы и VK-беседа сохранятся. Текущий ход сначала нужно завершить или остановить.", buttons: [this.button(input.peerId, next, "Снять цель", "goalClearApply"), this.button(input.peerId, next, "Отмена", "goal")] });
+        break;
+      }
+      case "goalClearApply": {
+        if (state.view !== "goalClear") throw new ActionRejectedError("Подтверждение снятия цели устарело.");
+        await this.refresh(binding);
+        if (["running", "approval"].includes(this.details(binding.id).status)) throw new ActionRejectedError("Сначала дождись завершения хода или отправь /stop, затем сними цель.");
+        this.consume(input);
+        if (!await this.desktop.clearGoal!(binding)) throw new ActionRejectedError("Цель уже была снята. Обнови /goal.");
+        const next = this.newState(input.peerId, binding.id, "goal");
+        await this.renderGoal(binding, next, "Цель снята. История задачи и VK-беседа сохранены.");
+        break;
       }
       case "rename": {
         if (!this.desktop.capabilities.renameTask) throw new ActionRejectedError("Переименование недоступно в текущем подключении.");
@@ -281,6 +413,53 @@ export class TaskPanels {
       }
       default: throw new ActionRejectedError("Кнопка недоступна в этой беседе.");
     }
+  }
+
+  private async goal(binding: Binding): Promise<TaskGoal | null> {
+    if (!this.desktop.capabilities.goals || !this.desktop.getGoal || !this.desktop.setGoal || !this.desktop.clearGoal) {
+      throw new ActionRejectedError("Цели недоступны в текущем подключении.");
+    }
+    return this.desktop.getGoal(binding);
+  }
+
+  private async renderGoal(binding: Binding, state: PanelState, note?: string): Promise<void> {
+    const goal = await this.goal(binding);
+    const buttons: Button[] = [];
+    if (!goal || goal.status === "complete") buttons.push(this.button(binding.peerId!, state, goal ? "Новая цель" : "Задать цель", "goalObjective"));
+    else {
+      if (goal.status === "active") buttons.push(this.button(binding.peerId!, state, "Пауза", "goalPause"));
+      if (["paused", "blocked", "usageLimited", "budgetLimited"].includes(goal.status)) buttons.push(this.button(binding.peerId!, state, "Возобновить", "goalResume"));
+      buttons.push(this.button(binding.peerId!, state, "Изменить", "goalObjective"), this.button(binding.peerId!, state, "Снять цель", "goalClear"));
+    }
+    buttons.push(this.button(binding.peerId!, state, "Обновить", "goal"), this.button(binding.peerId!, state, "Меню задачи", "home"));
+    this.show(binding.peerId!, state, { text: [taskGoalText(goal), note].filter(Boolean).join("\n\n"), buttons });
+  }
+
+  private showGoalBudget(binding: Binding, state: PanelState): void {
+    if (!state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+    const buttons: Button[] = [];
+    if (state.goalTokenBudget !== undefined) buttons.push(this.button(binding.peerId!, state, state.goalTokenBudget === null ? "Оставить без лимита" : `Оставить ${number(state.goalTokenBudget)}`, "goalApply", { tokenBudget: state.goalTokenBudget }));
+    buttons.push(
+      this.button(binding.peerId!, state, "Без лимита", "goalApply", { tokenBudget: null }),
+      this.button(binding.peerId!, state, "100 000", "goalApply", { tokenBudget: 100_000 }),
+      this.button(binding.peerId!, state, "250 000", "goalApply", { tokenBudget: 250_000 }),
+      this.button(binding.peerId!, state, "500 000", "goalApply", { tokenBudget: 500_000 }),
+      this.button(binding.peerId!, state, "Другой лимит", "goalBudgetInput"),
+      this.button(binding.peerId!, state, "Отмена", "goal"),
+    );
+    const unique = buttons.filter((button, index) => buttons.findIndex(candidate => candidate.label === button.label && candidate.action === button.action) === index);
+    this.show(binding.peerId!, state, { text: `Цель:\n${state.goalObjective.slice(0, 2_500)}${state.goalObjective.length > 2_500 ? "\n…" : ""}\n\nВыбери общий бюджет токенов. Он относится ко всей цели, а не к одному ходу.`, buttons: unique.slice(0, 10) });
+  }
+
+  private async applyGoal(binding: Binding, objective: string, tokenBudget: number | null): Promise<void> {
+    const current = await this.goal(binding);
+    const update = { objective, tokenBudget, ...(!current || current.status === "complete" ? { status: "active" as const } : {}) };
+    const updated = await this.desktop.setGoal!(binding, update);
+    if (updated.objective !== objective.trim() || updated.tokenBudget !== tokenBudget || ((!current || current.status === "complete") && updated.status !== "active")) throw new UncertainActionError();
+    if (!current || current.status === "complete") await this.desktop.continueGoal?.(binding);
+    const next = this.newState(binding.peerId!, binding.id, "goal");
+    const note = !current || current.status === "complete" ? "Цель сохранена и активирована." : current.status === "active" ? "Активная цель обновлена." : "Цель обновлена; её прежний статус сохранён.";
+    await this.renderGoal(binding, next, note);
   }
 
   private async models(binding: Binding, requestedPage: number): Promise<void> {
@@ -381,7 +560,7 @@ export class TaskPanels {
     }
     return { label: short(label, 40), action: token.id };
   }
-  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId">> = {}): Button {
+  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId" | "tokenBudget">> = {}): Button {
     return this.token(peerId, state, label, { type: "panel", screenId: state.id, command, ...(state.bindingId ? { bindingId: state.bindingId } : {}), ...extra });
   }
   private show(peerId: number, state: PanelState, view: View): void {
@@ -393,13 +572,17 @@ export class TaskPanels {
     if (binding.peerId === null) return;
     const button = (label: string, command: PanelAction["command"]) => this.button(binding.peerId!, state, label, command);
     const buttons = [button("Модель / рассуждение", "models"), button("Обновить", "home")];
+    if (this.desktop.capabilities.goals && this.desktop.getGoal && this.desktop.setGoal && this.desktop.clearGoal) buttons.push(button("Цель", "goal"));
     if (this.desktop.capabilities.renameTask) buttons.push(button("Переименовать", "rename"));
     if (this.desktop.capabilities.archiveTask) buttons.push(button("Архивировать", "archive"));
     if (this.desktop.capabilities.moveTask) buttons.push(button("Переместить в проект", "moveProject"));
     buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"), button("Диплинк", "link"));
     if (this.desktop.capabilities.exportMarkdown) buttons.push(button("Markdown-файл", "export"));
     const rename = this.renameState(binding);
-    if (rename && !rename.vkTitleUpdated) buttons.push(this.button(binding.peerId, state, "Повторить для VK", "renameVk", { title: rename.title }));
+    if (rename && !rename.vkTitleUpdated) {
+      if (buttons.length >= 10) buttons.splice(buttons.findIndex(item => item.label === "Диплинк"), 1);
+      buttons.push(this.button(binding.peerId, state, "Повторить для VK", "renameVk", { title: rename.title }));
+    }
     const renameStatus = rename ? [
       rename.liveTitleUpdated ? "Codex: новое имя подтверждено в открытой задаче." : "Codex: новое имя сохранено в каталоге, но открытая задача его ещё не подтвердила. Для немедленного обновления окна используй переименование в самом Codex.",
       rename.vkTitleUpdated ? `VK: ${taskChatTitle(rename.title)}` : "VK: переименование не подтверждено. «Повторить для VK» проверит название и повторит только этот шаг.",

@@ -1,9 +1,10 @@
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type SubmitTaskRequest, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { taskDetails } from "./details.js";
 import { turnsFromState } from "./projector.js";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 export function taskInput(request: SubmitTaskRequest): { text: string; input: IpcObject[]; attachments: IpcObject[] } {
@@ -52,7 +53,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   get capabilities() {
     return { createTask: !!this.executor, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: !!this.catalog.listModels,
       renameTask: !!this.metadata, archiveTask: !!this.metadata, exportMarkdown: !!this.metadata, moveTask: !!this.metadata && !!this.catalog.resolveProject,
-      accountUsage: !!this.usage };
+      accountUsage: !!this.usage, goals: !!this.goals };
   }
 
   constructor(
@@ -64,6 +65,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     private readonly metadata?: DesktopMetadata,
     private readonly executor?: DirectTaskExecutor,
     private readonly usage?: AccountUsageProvider,
+    private readonly goals?: DesktopGoals,
   ) {}
 
   listTasks() { return this.catalog.listTasks(); }
@@ -77,6 +79,44 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   async listModels(task?: TaskRef) {
     if (!this.catalog.listModels) throw new ActionRejectedError("Список моделей недоступен в этом подключении.");
     return this.catalog.listModels(task);
+  }
+
+  async getGoal(task: TaskRef) {
+    if (!this.goals) throw new ActionRejectedError("Цели недоступны в текущем подключении.");
+    return this.goals.get(task);
+  }
+
+  async setGoal(task: TaskRef, update: TaskGoalUpdate) {
+    if (!this.goals) throw new ActionRejectedError("Управление целями недоступно в текущем подключении.");
+    return this.goals.set(task, update);
+  }
+
+  async clearGoal(task: TaskRef) {
+    if (!this.goals) throw new ActionRejectedError("Управление целями недоступно в текущем подключении.");
+    return this.goals.clear(task);
+  }
+
+  async continueGoal(task: TaskRef): Promise<void> {
+    if (this.executor?.isRunning(task) || this.executor?.details(task)) return;
+    try {
+      await this.follow(task, async (subscription, client) => {
+        const state = subscription.current!;
+        if (submissionMode(state) === "steer") return;
+        const reply = await client.request("thread-follower-start-turn", 2, {
+          conversationId: task.threadId,
+          turnStart: {
+            request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
+            context: { inheritThreadSettings: true },
+          },
+        }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
+        const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+        if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+      });
+    } catch (error) {
+      // A goal set through app-server is persistent and can resume an unloaded
+      // task itself. The empty live turn above only wakes an already open owner.
+      if (!(error instanceof TaskNotOpenError)) throw error;
+    }
   }
 
   private async follow<T>(task: TaskRef, work: (subscription: TaskSubscription, client: DesktopIpcClient) => Promise<T>): Promise<T> {

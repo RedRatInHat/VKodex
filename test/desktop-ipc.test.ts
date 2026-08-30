@@ -590,6 +590,28 @@ test("an idle or unloaded task starts the next turn through its owner with inher
   }
 });
 
+test("resuming a goal wakes an idle live owner with an empty inherited turn and never steers an active turn", async () => {
+  for (const status of ["completed", "inProgress"] as const) {
+    const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: status === "inProgress" ? "active" : "idle" } };
+    const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+    await adapter.continueGoal(ref);
+    const starts = server.received.filter(message => message.method === "thread-follower-start-turn");
+    assert.equal(starts.length, status === "completed" ? 1 : 0);
+    if (status === "completed") {
+      const request = starts[0]!;
+      assert.equal(request.version, 2); assert.equal(request.targetClientId, "owner");
+      const params = request.params as IpcObject;
+      assert.equal(params.conversationId, ref.threadId);
+      assert.deepEqual(((params.turnStart as IpcObject).request as IpcObject).input, []);
+      assert.equal(typeof ((params.turnStart as IpcObject).request as IpcObject).clientUserMessageId, "string");
+      assert.deepEqual((params.turnStart as IpcObject).context, { inheritThreadSettings: true });
+    }
+    assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
+    assert.ok(server.destroyed);
+  }
+});
+
 test("starting placeholders without a turn ID are steered rather than mistaken for idle tasks", async () => {
   for (const canonical of [true, false]) {
     const server = new Server();

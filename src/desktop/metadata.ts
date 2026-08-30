@@ -3,11 +3,11 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopMetadata, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
-type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "account/read" | "account/rateLimits/read";
-const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "account/read", "account/rateLimits/read"]);
+type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read";
+const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read"]);
 
 export function nativeCodexPath(): string {
   const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
@@ -26,8 +26,8 @@ export function nativeCodexPath(): string {
   throw new DesktopUnavailableError("Не найден локальный Codex CLI из зависимостей VKodex.");
 }
 
-// This short-lived process only reads or changes metadata. It cannot create,
-// resume, steer or start a task; execution remains with the live desktop owner.
+// This short-lived process exposes a fixed allowlist of metadata, account and
+// goal methods. It cannot submit arbitrary task input or call turn APIs.
 export class MetadataRpc {
   constructor(
     private readonly codexHome: string,
@@ -41,7 +41,7 @@ export class MetadataRpc {
   async call(method: MetadataMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
-    const mutating = !["thread/read", "account/read", "account/rateLimits/read"].includes(method);
+    const mutating = !["thread/read", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
       let buffer = ""; let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
@@ -207,4 +207,76 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   archive(task: TaskRef): Promise<void> { return this.createMetadata(this.sourceHome(task)).archive(task); }
   markdown(task: TaskRef): Promise<string> { return this.createMetadata(this.sourceHome(task)).markdown(task); }
   assignProject(task: TaskRef, projectId: string | null): Promise<void> { return this.createMetadata(this.sourceHome(task)).assignProject(task, projectId); }
+}
+
+const goalStatuses = new Set<TaskGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+
+export function parseTaskGoal(value: unknown, expectedThreadId: string): TaskGoal | null {
+  if (value === null) return null;
+  if (!isObject(value)
+    || value.threadId !== expectedThreadId
+    || typeof value.objective !== "string" || !value.objective.trim() || value.objective.length > 16_000
+    || typeof value.status !== "string" || !goalStatuses.has(value.status as TaskGoalStatus)
+    || !(value.tokenBudget === null || (typeof value.tokenBudget === "number" && Number.isSafeInteger(value.tokenBudget) && value.tokenBudget > 0))
+    || typeof value.tokensUsed !== "number" || !Number.isSafeInteger(value.tokensUsed) || value.tokensUsed < 0
+    || typeof value.timeUsedSeconds !== "number" || !Number.isSafeInteger(value.timeUsedSeconds) || value.timeUsedSeconds < 0
+    || typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt <= 0
+    || typeof value.updatedAt !== "number" || !Number.isSafeInteger(value.updatedAt) || value.updatedAt <= 0) {
+    throw new DesktopUnavailableError("Codex вернул некорректное состояние цели.");
+  }
+  return {
+    threadId: value.threadId,
+    objective: value.objective,
+    status: value.status as TaskGoalStatus,
+    tokenBudget: value.tokenBudget,
+    tokensUsed: value.tokensUsed,
+    timeUsedSeconds: value.timeUsedSeconds,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+export class NativeDesktopGoals implements DesktopGoals {
+  constructor(private readonly rpc: Pick<MetadataRpc, "call">) {}
+  private local(task: TaskRef): void {
+    if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("Цели доступны только для локальных задач.");
+  }
+  async get(task: TaskRef): Promise<TaskGoal | null> {
+    this.local(task);
+    const response = await this.rpc.call("thread/goal/get", { threadId: task.threadId });
+    return parseTaskGoal(response.goal ?? null, task.threadId);
+  }
+  async set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
+    this.local(task);
+    const objective = update.objective?.trim();
+    if (objective !== undefined && (!objective || objective.length > 8_000 || /\x00/u.test(objective))) throw new ActionRejectedError("Цель должна содержать от 1 до 8000 символов.");
+    if (update.status !== undefined && !goalStatuses.has(update.status)) throw new ActionRejectedError("Некорректный статус цели.");
+    if (update.tokenBudget !== undefined && update.tokenBudget !== null && (!Number.isSafeInteger(update.tokenBudget) || update.tokenBudget <= 0 || update.tokenBudget > 100_000_000)) {
+      throw new ActionRejectedError("Лимит цели должен быть от 1 до 100 000 000 токенов.");
+    }
+    if (objective === undefined && update.status === undefined && update.tokenBudget === undefined) throw new ActionRejectedError("Изменения цели не указаны.");
+    const response = await this.rpc.call("thread/goal/set", {
+      threadId: task.threadId,
+      ...(objective !== undefined ? { objective } : {}),
+      ...(update.status !== undefined ? { status: update.status } : {}),
+      ...(update.tokenBudget !== undefined ? { tokenBudget: update.tokenBudget } : {}),
+    });
+    return parseTaskGoal(response.goal, task.threadId)!;
+  }
+  async clear(task: TaskRef): Promise<boolean> {
+    this.local(task);
+    const response = await this.rpc.call("thread/goal/clear", { threadId: task.threadId });
+    if (typeof response.cleared !== "boolean") throw new DesktopUnavailableError("Codex не подтвердил снятие цели.");
+    return response.cleared;
+  }
+}
+
+export class ProfileDesktopGoals implements DesktopGoals {
+  constructor(
+    private readonly sourceHome: (task: TaskRef) => string,
+    private readonly createGoals: (home: string) => DesktopGoals = home => new NativeDesktopGoals(new MetadataRpc(home)),
+  ) {}
+  get(task: TaskRef): Promise<TaskGoal | null> { return this.createGoals(this.sourceHome(task)).get(task); }
+  set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> { return this.createGoals(this.sourceHome(task)).set(task, update); }
+  clear(task: TaskRef): Promise<boolean> { return this.createGoals(this.sourceHome(task)).clear(task); }
 }

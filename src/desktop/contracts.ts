@@ -58,6 +58,31 @@ export interface TaskDetails {
   readonly context: { readonly used: number; readonly window: number; readonly percent: number } | null;
 }
 
+export type TaskGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+
+export interface TaskGoal {
+  readonly threadId: string;
+  readonly objective: string;
+  readonly status: TaskGoalStatus;
+  readonly tokenBudget: number | null;
+  readonly tokensUsed: number;
+  readonly timeUsedSeconds: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface TaskGoalUpdate {
+  readonly objective?: string;
+  readonly status?: TaskGoalStatus;
+  readonly tokenBudget?: number | null;
+}
+
+export interface DesktopGoals {
+  get(task: TaskRef): Promise<TaskGoal | null>;
+  set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
+  clear(task: TaskRef): Promise<boolean>;
+}
+
 export interface AccountRateLimitWindow {
   readonly usedPercent: number;
   readonly windowMinutes: number;
@@ -116,6 +141,7 @@ export interface DesktopCapabilities {
   readonly exportMarkdown?: boolean;
   readonly moveTask?: boolean;
   readonly accountUsage?: boolean;
+  readonly goals?: boolean;
 }
 
 export interface DirectTaskUpdate {
@@ -154,6 +180,10 @@ export interface DesktopTasks {
   archiveTask(task: TaskRef): Promise<void>;
   exportMarkdown(task: TaskRef): Promise<string>;
   accountUsage?(task?: TaskRef): Promise<readonly AccountUsage[]>;
+  getGoal?(task: TaskRef): Promise<TaskGoal | null>;
+  setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
+  clearGoal?(task: TaskRef): Promise<boolean>;
+  continueGoal?(task: TaskRef): Promise<void>;
   isDirectlyManaged?(task: TaskRef): boolean;
   onDirectUpdate?(listener: (update: DirectTaskUpdate) => void): () => void;
   checkCompatibility?(): Promise<DesktopCompatibility>;

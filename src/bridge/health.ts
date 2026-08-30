@@ -117,10 +117,10 @@ export class BridgeHealthMonitor {
     checks.push({ name: "codex_streams", state: connectedState,
       detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}. Остальные беседы подключатся при активности.` });
 
-    const [vkResult, catalogResult, compatibilityResult] = await Promise.all([
-      this.checkVk(), this.checkCatalog(), this.checkCompatibility(force, checkedAt),
+    const [vkResult, catalogResult, goalsResult, compatibilityResult] = await Promise.all([
+      this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt),
     ]);
-    checks.push(...vkResult, catalogResult, compatibilityResult);
+    checks.push(...vkResult, catalogResult, goalsResult, compatibilityResult);
 
     let snapshot: BridgeHealthSnapshot = {
       state: aggregate(checks), checkedAt, pid: process.pid,
@@ -155,6 +155,18 @@ export class BridgeHealthMonitor {
         ? { name: "codex_catalog", state: "degraded", detail: `Найдено задач: ${tasks.length}. ${warnings.join(" ").slice(0, 500)}` }
         : { name: "codex_catalog", state: "ok", detail: `Все настроенные каталоги прочитаны; найдено задач: ${tasks.length}.` };
     } catch { return { name: "codex_catalog", state: "failed", detail: "Каталог задач Codex не прочитан за 15 секунд." }; }
+  }
+
+  private async checkGoals(): Promise<HealthCheckResult> {
+    if (!this.desktop.capabilities.goals) return { name: "codex_goals", state: "ok", detail: "Управление целями не включено в этом адаптере." };
+    if (!this.desktop.getGoal || !this.desktop.setGoal || !this.desktop.clearGoal) return { name: "codex_goals", state: "failed", detail: "Адаптер объявил цели, но не предоставил полный интерфейс управления." };
+    try {
+      const bound = this.store.bindings().find(binding => binding.attached);
+      const task = bound ?? (await withTimeout(this.desktop.listTasks(), 15_000))[0];
+      if (!task) return { name: "codex_goals", state: "ok", detail: "API целей подключён; задач для безопасного чтения пока нет." };
+      const goal = await withTimeout(this.desktop.getGoal(task), 15_000);
+      return { name: "codex_goals", state: "ok", detail: goal ? `API целей отвечает; прочитан статус ${goal.status}.` : "API целей отвечает; у проверенной задачи цели нет." };
+    } catch { return { name: "codex_goals", state: "failed", detail: "Локальный API целей Codex не ответил за 15 секунд." }; }
   }
 
   private async checkCompatibility(force: boolean, checkedAt: number): Promise<HealthCheckResult> {

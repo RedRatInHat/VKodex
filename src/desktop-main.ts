@@ -5,7 +5,7 @@ import { DesktopBridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
-import { ProfileAccountUsage, ProfileDesktopMetadata } from "./desktop/metadata.js";
+import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
 import { SdkTaskExecutor } from "./desktop/sdk-executor.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 
@@ -16,7 +16,8 @@ store.assertPrimaryHome(config.codexHome);
 const gateway = new DesktopVkGateway(config);
 const catalog = new MultiDesktopCatalog(config.codexHomes);
 const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
-const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata), new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task)));
+const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata),
+  new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task)), new ProfileDesktopGoals(task => catalog.sourceHome(task)));
 const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
   path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs);
 let stopping = false;

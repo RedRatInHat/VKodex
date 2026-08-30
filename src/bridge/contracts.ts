@@ -88,12 +88,13 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "health" | "limits" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "health" | "limits" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalApply" | "goalPause" | "goalResume" | "goalClear" | "goalClearApply" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;
   readonly title?: string;
   readonly projectId?: string | null;
+  readonly tokenBudget?: number | null;
 }
 
 export interface NewTaskDraft {

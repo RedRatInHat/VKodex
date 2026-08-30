@@ -3,7 +3,7 @@ import test from "node:test";
 import { BridgeHealthMonitor } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import type { BridgeChat, HealthCheckResult, MessageHandle, View } from "../src/bridge/contracts.js";
-import type { CreateTaskRequest, DesktopCompatibility, DesktopModel, DesktopProject, DesktopTask, DesktopTasks, SubmitTaskRequest, TaskDetails, TaskRef, TaskRenameResult } from "../src/desktop/contracts.js";
+import type { CreateTaskRequest, DesktopCompatibility, DesktopModel, DesktopProject, DesktopTask, DesktopTasks, SubmitTaskRequest, TaskDetails, TaskGoalUpdate, TaskRef, TaskRenameResult } from "../src/desktop/contracts.js";
 
 const access = { ownerId: 101, groupId: 202 };
 
@@ -22,10 +22,11 @@ class HealthChat implements BridgeChat {
 }
 
 class HealthDesktop implements DesktopTasks {
-  readonly capabilities = { createTask: false, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: false };
+  readonly capabilities = { createTask: false, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: false, goals: true };
   compatibilityState: DesktopCompatibility = { state: "ok", message: "protocol v11 confirmed" };
   compatibilityChecks = 0;
-  async listTasks(): Promise<readonly DesktopTask[]> { return []; }
+  goalReads = 0;
+  async listTasks(): Promise<readonly DesktopTask[]> { return [{ hostId: "local", threadId: "fixture", title: "Fixture", workspace: "/fixture", updatedAt: 1 }]; }
   async listProjects(): Promise<readonly DesktopProject[]> { return []; }
   async createTask(_request: CreateTaskRequest): Promise<DesktopTask> { throw new Error("not used"); }
   async submit(_request: SubmitTaskRequest): Promise<void> { throw new Error("not used"); }
@@ -37,6 +38,9 @@ class HealthDesktop implements DesktopTasks {
   async renameTask(_task: TaskRef, _title: string): Promise<TaskRenameResult> { throw new Error("not used"); }
   async archiveTask(_task: TaskRef): Promise<void> { throw new Error("not used"); }
   async exportMarkdown(_task: TaskRef): Promise<string> { throw new Error("not used"); }
+  async getGoal(_task: TaskRef) { this.goalReads++; return null; }
+  async setGoal(_task: TaskRef, _update: TaskGoalUpdate): Promise<never> { throw new Error("not used"); }
+  async clearGoal(_task: TaskRef): Promise<never> { throw new Error("not used"); }
   compatibility() { return this.compatibilityState; }
   async checkCompatibility() { this.compatibilityChecks++; return this.compatibilityState; }
 }
@@ -53,8 +57,9 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "vk_long_poll", "vk_api", "codex_catalog", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.equal(s.desktop.compatibilityChecks, 1);
+  assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
 });

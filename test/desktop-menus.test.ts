@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError } from "../src/desktop/contracts.js";
 import { parseModelsCache, taskDetails } from "../src/desktop/details.js";
-import { conversationMarkdown, MetadataRpc, NativeAccountUsage, NativeDesktopMetadata, parseAccountLabel, parseAccountUsage } from "../src/desktop/metadata.js";
+import { conversationMarkdown, MetadataRpc, NativeAccountUsage, NativeDesktopGoals, NativeDesktopMetadata, parseAccountLabel, parseAccountUsage, parseTaskGoal } from "../src/desktop/metadata.js";
 import type { IpcObject } from "../src/desktop/ipc-client.js";
 
 test("context uses last token usage, clamps at the window and keeps unknown data unknown", () => {
@@ -80,6 +80,32 @@ test("metadata helper initializes once and exposes no task execution methods", a
   assert.equal(child.messages.length, 3); assert.equal(child.stdin.writableEnded, true);
 });
 
+test("native goal API validates identity, state, budgets and exact local methods", async () => {
+  const task = { hostId: "local", threadId: "fixture" };
+  const raw = { threadId: "fixture", objective: "Ship the verified result", status: "active", tokenBudget: 250_000, tokensUsed: 12_500, timeUsedSeconds: 3_700, createdAt: 1_788_000_000, updatedAt: 1_788_000_100 };
+  const calls: { method: string; params: IpcObject }[] = [];
+  const goals = new NativeDesktopGoals({ call: async (method, params) => {
+    calls.push({ method, params });
+    if (method === "thread/goal/get") return { goal: raw };
+    if (method === "thread/goal/set") return { goal: { ...raw, ...params } };
+    if (method === "thread/goal/clear") return { cleared: true };
+    throw new Error("unexpected method");
+  } });
+  assert.deepEqual(await goals.get(task), raw);
+  assert.equal((await goals.set(task, { objective: "Updated", tokenBudget: null, status: "paused" })).status, "paused");
+  assert.equal(await goals.clear(task), true);
+  assert.deepEqual(calls, [
+    { method: "thread/goal/get", params: { threadId: "fixture" } },
+    { method: "thread/goal/set", params: { threadId: "fixture", objective: "Updated", status: "paused", tokenBudget: null } },
+    { method: "thread/goal/clear", params: { threadId: "fixture" } },
+  ]);
+  assert.equal(parseTaskGoal(null, "fixture"), null);
+  assert.throws(() => parseTaskGoal({ ...raw, threadId: "other" }, "fixture"), DesktopUnavailableError);
+  await assert.rejects(goals.set(task, { tokenBudget: 0 }), ActionRejectedError);
+  await assert.rejects(goals.get({ hostId: "remote", threadId: "fixture" }), ActionRejectedError);
+  assert.equal(calls.length, 3);
+});
+
 test("account usage validates Codex rate-limit windows and exposes only displayable fields", async () => {
   const response = { rateLimits: { limitId: "codex", planType: "pro", primary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_788_643_425 },
     credits: { hasCredits: false, unlimited: false, balance: "0" } }, rateLimitsByLimitId: {
@@ -114,6 +140,8 @@ test("account reads are read-only and time out as unavailable rather than uncert
     await assert.rejects(rpc.call(method, method === "account/read" ? { refreshToken: false } : {}), DesktopUnavailableError);
     assert.deepEqual(child.messages.map(message => message.method), ["initialize", "initialized", method]);
   }
+  const child = new MetadataChild(); child.respond = message => message.id === 1 ? { id: 1, result: {} } : null;
+  await assert.rejects(new MetadataRpc("fixture-home", () => child.asChild(), 10).call("thread/goal/get", { threadId: "fixture" }), DesktopUnavailableError);
 });
 
 test("metadata timeouts and raw API failures are sanitized and never retried", async () => {
