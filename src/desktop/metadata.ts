@@ -3,11 +3,11 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopMetadata, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopMetadata, type TaskRef } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
-type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update";
-const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update"]);
+type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "account/rateLimits/read";
+const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "account/rateLimits/read"]);
 
 export function nativeCodexPath(): string {
   const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
@@ -41,7 +41,7 @@ export class MetadataRpc {
   async call(method: MetadataMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
-    const mutating = method !== "thread/read";
+    const mutating = !["thread/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
       let buffer = ""; let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
@@ -80,6 +80,43 @@ export class MetadataRpc {
       send({ id: 1, method: "initialize", params: { clientInfo: { name: "vkodex_metadata", version: "0.1.0" }, capabilities: { experimentalApi: true } } });
     });
   }
+}
+
+function rateLimitWindow(value: unknown): AccountRateLimitWindow | null {
+  if (!isObject(value)) return null;
+  const usedPercent = value.usedPercent; const windowMinutes = value.windowDurationMins; const resetsAt = value.resetsAt;
+  if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100
+    || typeof windowMinutes !== "number" || !Number.isSafeInteger(windowMinutes) || windowMinutes <= 0
+    || typeof resetsAt !== "number" || !Number.isSafeInteger(resetsAt) || resetsAt <= 0 || resetsAt > 8_640_000_000_000) return null;
+  return { usedPercent, windowMinutes, resetsAt };
+}
+
+function rateLimit(value: unknown): AccountRateLimit | null {
+  if (!isObject(value) || typeof value.limitId !== "string" || !/^[\w.-]{1,100}$/u.test(value.limitId)) return null;
+  const name = typeof value.limitName === "string" && value.limitName.trim() && value.limitName.length <= 120 && !/[\r\n\x00-\x1f]/u.test(value.limitName) ? value.limitName.trim() : null;
+  const primary = rateLimitWindow(value.primary); const secondary = rateLimitWindow(value.secondary);
+  if (!primary && !secondary) return null;
+  return { id: value.limitId, name, primary, secondary };
+}
+
+export function parseAccountUsage(response: IpcObject): AccountUsage {
+  const overall = isObject(response.rateLimits) ? response.rateLimits : null;
+  const byId = isObject(response.rateLimitsByLimitId) ? Object.values(response.rateLimitsByLimitId).map(rateLimit).filter((limit): limit is AccountRateLimit => !!limit) : [];
+  const fallback = rateLimit(overall); const candidates = fallback ? [fallback, ...byId] : byId;
+  const limits = candidates.filter((limit, index) => candidates.findIndex(candidate => candidate.id === limit.id) === index);
+  if (!limits.length) throw new DesktopUnavailableError("Codex не вернул данные о лимитах аккаунта.");
+  const planType = typeof overall?.planType === "string" && /^[\w.-]{1,40}$/u.test(overall.planType) ? overall.planType : null;
+  const rawCredits = isObject(overall?.credits) ? overall.credits : null;
+  const credits = rawCredits && typeof rawCredits.hasCredits === "boolean" && typeof rawCredits.unlimited === "boolean"
+    ? { hasCredits: rawCredits.hasCredits, unlimited: rawCredits.unlimited, balance: typeof rawCredits.balance === "string" && /^\d+(?:[.,]\d+)?$/u.test(rawCredits.balance) ? rawCredits.balance : null } : null;
+  const reset = isObject(response.rateLimitResetCredits) ? response.rateLimitResetCredits.availableCount : null;
+  const resetCredits = typeof reset === "number" && Number.isSafeInteger(reset) && reset >= 0 ? reset : null;
+  return { planType, limits, credits, resetCredits };
+}
+
+export class NativeAccountUsage implements AccountUsageProvider {
+  constructor(private readonly rpc: Pick<MetadataRpc, "call">) {}
+  async read(): Promise<AccountUsage> { return parseAccountUsage(await this.rpc.call("account/rateLimits/read", {})); }
 }
 
 export function conversationMarkdown(thread: IpcObject): string {

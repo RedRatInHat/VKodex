@@ -1,4 +1,4 @@
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type CreateTaskRequest, type DesktopCompatibility, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type SubmitTaskRequest, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type SubmitTaskRequest, type TaskRef } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
@@ -51,7 +51,8 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   get capabilities() {
     return { createTask: !!this.executor, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: !!this.catalog.listModels,
-      renameTask: !!this.metadata, archiveTask: !!this.metadata, exportMarkdown: !!this.metadata, moveTask: !!this.metadata && !!this.catalog.resolveProject };
+      renameTask: !!this.metadata, archiveTask: !!this.metadata, exportMarkdown: !!this.metadata, moveTask: !!this.metadata && !!this.catalog.resolveProject,
+      accountUsage: !!this.usage };
   }
 
   constructor(
@@ -62,11 +63,16 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     private readonly createClient: () => DesktopIpcClient = () => new DesktopIpcClient(),
     private readonly metadata?: DesktopMetadata,
     private readonly executor?: DirectTaskExecutor,
+    private readonly usage?: AccountUsageProvider,
   ) {}
 
   listTasks() { return this.catalog.listTasks(); }
   listProjects() { return this.catalog.listProjects(); }
   catalogWarnings() { return this.catalog.catalogWarnings?.() ?? []; }
+  async accountUsage() {
+    if (!this.usage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
+    return this.usage.read();
+  }
 
   async listModels(task?: TaskRef) {
     if (!this.catalog.listModels) throw new ActionRejectedError("Список моделей недоступен в этом подключении.");

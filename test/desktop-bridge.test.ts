@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
-import { ActionRejectedError, UncertainActionError, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskRenameResult } from "../src/desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskRenameResult } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 
@@ -70,7 +70,7 @@ class Chat implements BridgeChat {
 }
 
 class Desktop implements DesktopTasks {
-  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true };
+  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true };
   tasks: DesktopTask[] = [task];
   projects: DesktopProject[] = [{ id: "project-a", title: "Project", workspace: "/project" }];
   projectsError: Error | null = null;
@@ -85,6 +85,8 @@ class Desktop implements DesktopTasks {
   readonly selections: { task: TaskRef; model: string; effort: string }[] = [];
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
+  usageReads = 0;
+  usage: AccountUsage = { planType: "pro", limits: [{ id: "codex", name: null, primary: { usedPercent: 9, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null }], credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
   selectError: Error | null = null;
   renameError: Error | null = null;
   liveTitleUpdated = true;
@@ -105,6 +107,7 @@ class Desktop implements DesktopTasks {
   }
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
   async exportMarkdown(): Promise<string> { this.exportHook?.(); return "# Fixture\n\nVisible conversation"; }
+  async accountUsage(): Promise<AccountUsage> { this.usageReads++; return this.usage; }
   async listTasks() { return this.tasks; }
   async listProjects() { if (this.projectsError) throw this.projectsError; return this.projects; }
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
@@ -195,7 +198,7 @@ test("manager menu separates the project overview from task browsing", async t =
   assert.match(dashboard.text, /VKodex · менеджер/u);
   assert.match(dashboard.text, /Связанных бесед: 1/u);
   assert.equal(dashboard.silent, true);
-  assert.deepEqual(dashboard.buttons!.map(button => button.label), ["Задачи Codex", "Новая задача", "Проекты", "Обновить"]);
+  assert.deepEqual(dashboard.buttons!.map(button => button.label), ["Задачи Codex", "Новая задача", "Проекты", "Лимиты Codex", "Обновить"]);
   await clickPanel(s, "Проекты", access.ownerId);
   const projects = panelView(s, access.ownerId);
   assert.match(projects.text, /^Проекты Codex · 1\n\nProject\n\/project/u);
@@ -218,6 +221,19 @@ test("manager health button runs a fresh check and renders its component report"
   assert.match(panelView(s, access.ownerId).text, /Health: OK[\s\S]*fixture: All components respond/u);
   await s.handle("/health");
   assert.equal(s.healthChecks(), 2);
+});
+
+test("account limits are available from the manager and task chat without reaching the agent", async t => {
+  const s = setup(t); s.attach(); await s.handle("/menu");
+  await clickPanel(s, "Лимиты Codex", access.ownerId);
+  assert.equal(s.desktop.usageReads, 1);
+  assert.match(panelView(s, access.ownerId).text, /Лимиты Codex[\s\S]*Тариф: pro[\s\S]*7 дн\.: использовано 9\.0% · осталось 91\.0%/u);
+  assert.deepEqual(panelView(s, access.ownerId).buttons!.map(button => button.label), ["Обновить лимиты", "Меню"]);
+  await clickPanel(s, "Обновить лимиты", access.ownerId); assert.equal(s.desktop.usageReads, 2);
+  await s.handle("/limits", peerId);
+  assert.equal(s.desktop.usageReads, 3); assert.equal(s.desktop.submissions.length, 0);
+  assert.match(panelView(s).text, /Заполнение контекста конкретной задачи/u);
+  await clickPanel(s, "Меню"); assert.match(panelView(s).text, /Контекст:/u);
 });
 
 test("task card only refreshes on request and never replaces an open model chooser", async t => {

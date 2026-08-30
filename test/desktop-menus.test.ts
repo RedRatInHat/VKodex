@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError } from "../src/desktop/contracts.js";
 import { parseModelsCache, taskDetails } from "../src/desktop/details.js";
-import { conversationMarkdown, MetadataRpc, NativeDesktopMetadata } from "../src/desktop/metadata.js";
+import { conversationMarkdown, MetadataRpc, NativeAccountUsage, NativeDesktopMetadata, parseAccountUsage } from "../src/desktop/metadata.js";
 import type { IpcObject } from "../src/desktop/ipc-client.js";
 
 test("context uses last token usage, clamps at the window and keeps unknown data unknown", () => {
@@ -78,6 +78,29 @@ test("metadata helper initializes once and exposes no task execution methods", a
   assert.deepEqual(child.messages[2]!.params, { threadId: "fixture", name: "New title" });
   await assert.rejects(rpc.call("turn/start" as "thread/read", {}), ActionRejectedError);
   assert.equal(child.messages.length, 3); assert.equal(child.stdin.writableEnded, true);
+});
+
+test("account usage validates Codex rate-limit windows and exposes only displayable fields", async () => {
+  const response = { rateLimits: { limitId: "codex", planType: "pro", primary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_788_643_425 },
+    credits: { hasCredits: false, unlimited: false, balance: "0" } }, rateLimitsByLimitId: {
+      codex: { limitId: "codex", primary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_788_643_425 } },
+      spark: { limitId: "codex_bengalfox", limitName: "GPT-5.3-Codex-Spark", primary: { usedPercent: 12.5, windowDurationMins: 300, resetsAt: 1_788_106_270 }, secondary: { usedPercent: 3, windowDurationMins: 10_080, resetsAt: 1_788_693_070 } },
+      malformed: { limitId: "bad", primary: { usedPercent: 101, windowDurationMins: 0, resetsAt: -1 } },
+    }, rateLimitResetCredits: { availableCount: 2 } };
+  const usage = parseAccountUsage(response);
+  assert.equal(usage.planType, "pro"); assert.equal(usage.limits.length, 2);
+  assert.deepEqual(usage.limits[1], { id: "codex_bengalfox", name: "GPT-5.3-Codex-Spark", primary: { usedPercent: 12.5, windowMinutes: 300, resetsAt: 1_788_106_270 }, secondary: { usedPercent: 3, windowMinutes: 10_080, resetsAt: 1_788_693_070 } });
+  assert.deepEqual(usage.credits, { hasCredits: false, unlimited: false, balance: "0" }); assert.equal(usage.resetCredits, 2);
+  const reader = new NativeAccountUsage({ call: async (method, params) => { assert.equal(method, "account/rateLimits/read"); assert.deepEqual(params, {}); return response; } });
+  assert.deepEqual(await reader.read(), usage);
+  assert.throws(() => parseAccountUsage({ rateLimits: { limitId: "codex", planType: "PRIVATE_SENTINEL" } }), error => error instanceof DesktopUnavailableError && !error.message.includes("PRIVATE_SENTINEL"));
+});
+
+test("account usage RPC is read-only and times out as unavailable rather than uncertain", async () => {
+  const child = new MetadataChild(); child.respond = message => message.id === 1 ? { id: 1, result: {} } : null;
+  const rpc = new MetadataRpc("fixture-home", () => child.asChild(), 10);
+  await assert.rejects(rpc.call("account/rateLimits/read", {}), DesktopUnavailableError);
+  assert.deepEqual(child.messages.map(message => message.method), ["initialize", "initialized", "account/rateLimits/read"]);
 });
 
 test("metadata timeouts and raw API failures are sanitized and never retried", async () => {

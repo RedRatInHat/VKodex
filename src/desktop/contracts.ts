@@ -58,6 +58,30 @@ export interface TaskDetails {
   readonly context: { readonly used: number; readonly window: number; readonly percent: number } | null;
 }
 
+export interface AccountRateLimitWindow {
+  readonly usedPercent: number;
+  readonly windowMinutes: number;
+  readonly resetsAt: number;
+}
+
+export interface AccountRateLimit {
+  readonly id: string;
+  readonly name: string | null;
+  readonly primary: AccountRateLimitWindow | null;
+  readonly secondary: AccountRateLimitWindow | null;
+}
+
+export interface AccountUsage {
+  readonly planType: string | null;
+  readonly limits: readonly AccountRateLimit[];
+  readonly credits: { readonly hasCredits: boolean; readonly unlimited: boolean; readonly balance: string | null } | null;
+  readonly resetCredits: number | null;
+}
+
+export interface AccountUsageProvider {
+  read(): Promise<AccountUsage>;
+}
+
 export interface DesktopMetadata {
   rename(task: TaskRef, title: string): Promise<void>;
   archive(task: TaskRef): Promise<void>;
@@ -87,6 +111,7 @@ export interface DesktopCapabilities {
   readonly archiveTask?: boolean;
   readonly exportMarkdown?: boolean;
   readonly moveTask?: boolean;
+  readonly accountUsage?: boolean;
 }
 
 export interface DirectTaskUpdate {
@@ -124,6 +149,7 @@ export interface DesktopTasks {
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
   archiveTask(task: TaskRef): Promise<void>;
   exportMarkdown(task: TaskRef): Promise<string>;
+  accountUsage?(): Promise<AccountUsage>;
   isDirectlyManaged?(task: TaskRef): boolean;
   onDirectUpdate?(listener: (update: DirectTaskUpdate) => void): () => void;
   checkCompatibility?(): Promise<DesktopCompatibility>;

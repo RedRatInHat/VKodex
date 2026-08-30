@@ -88,7 +88,7 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "health" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "health" | "limits" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;

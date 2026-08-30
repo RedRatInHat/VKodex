@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopTasks, type TaskDetails } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type AccountUsage, type DesktopTasks, type TaskDetails } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -35,6 +35,23 @@ const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ")
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
 const renameRetryDelay = (attempts: number): number => Math.min(30 * 60_000, 30_000 * 2 ** Math.min(Math.max(0, attempts - 1), 6));
 export const taskDeepLink = (threadId: string): string => `codex://threads/${encodeURIComponent(threadId)}`;
+
+const duration = (minutes: number): string => minutes % 1_440 === 0 ? `${minutes / 1_440} дн.` : minutes % 60 === 0 ? `${minutes / 60} ч.` : `${minutes} мин.`;
+const resetTime = (seconds: number): string => new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(seconds * 1_000));
+export function accountUsageText(usage: AccountUsage): string {
+  const lines = ["Лимиты Codex", `Тариф: ${usage.planType ?? "не указан"}`];
+  for (const limit of usage.limits) {
+    const label = limit.id === "codex" ? "Codex" : limit.id === "base_model_inference" ? "Базовые модели" : limit.name ?? limit.id;
+    lines.push("", label);
+    for (const window of [limit.primary, limit.secondary].filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => left.windowMinutes - right.windowMinutes)) {
+      lines.push(`${duration(window.windowMinutes)}: использовано ${window.usedPercent.toFixed(1)}% · осталось ${(100 - window.usedPercent).toFixed(1)}%`, `Сброс: ${resetTime(window.resetsAt)}`);
+    }
+  }
+  if (usage.credits) lines.push("", usage.credits.unlimited ? "Кредиты: без ограничений" : usage.credits.hasCredits ? `Кредиты: ${usage.credits.balance ?? "доступны"}` : "Кредиты: нет");
+  if (usage.resetCredits !== null) lines.push(`Доступных сбросов лимита: ${usage.resetCredits}`);
+  lines.push("", "Это аккаунтные лимиты Codex. Заполнение контекста конкретной задачи показывается в её меню отдельно.");
+  return lines.join("\n");
+}
 
 export function taskCardText(binding: Binding, details: TaskDetails): string {
   const context = details.context ? `${details.context.percent.toFixed(1)}% · ${number(details.context.used)} / ${number(details.context.window)} токенов` : "нет данных";
@@ -101,6 +118,12 @@ export class TaskPanels {
   async text(input: BridgeInput): Promise<boolean> {
     const text = input.text.trim();
     const healthRequested = input.peerId === this.access.ownerId && text === "/health";
+    if (input.senderId === this.access.ownerId && text === "/limits") {
+      const binding = this.store.byPeer(input.peerId);
+      const state = this.newState(input.peerId, binding?.id ?? null, "home", true);
+      await this.renderLimits(input.peerId, state);
+      return true;
+    }
     if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/help", "/health"].includes(text))) {
       if (healthRequested) await this.healthCheck?.();
       const binding = this.store.byPeer(input.peerId);
@@ -132,6 +155,7 @@ export class TaskPanels {
       this.renderManager(state);
       return;
     }
+    if (action.command === "limits" && input.senderId === this.access.ownerId) { await this.renderLimits(input.peerId, state); return; }
     if (action.command === "projects" && input.peerId === this.access.ownerId) {
       const projects = await this.desktop.listProjects();
       const next = this.newState(input.peerId, null, "projects");
@@ -391,11 +415,17 @@ export class TaskPanels {
       "Выбери проект, затем задачу, чтобы открыть связанную VK-беседу. /menu — открыть меню снова.",
     ];
     const buttons = [this.token(this.access.ownerId, state, "Задачи Codex", { type: "browseProjects", page: 0 }), this.token(this.access.ownerId, state, "Новая задача", { type: "new" }), this.button(this.access.ownerId, state, "Проекты", "projects")];
+    if (this.desktop.capabilities.accountUsage && this.desktop.accountUsage) buttons.push(this.button(this.access.ownerId, state, "Лимиты Codex", "limits"));
     if (this.healthCheck) buttons.push(this.button(this.access.ownerId, state, "Проверить здоровье", "health"));
     buttons.push(this.button(this.access.ownerId, state, "Обновить", "home"));
     this.show(this.access.ownerId, state, { text: text.join("\n"), buttons });
   }
   private waiting(binding: Binding, note: string): void { const state = this.newState(binding.peerId!, binding.id, "home"); state.note = note; this.renderTask(binding, state); }
+  private async renderLimits(peerId: number, state: PanelState): Promise<void> {
+    if (!this.desktop.capabilities.accountUsage || !this.desktop.accountUsage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
+    const usage = await this.desktop.accountUsage();
+    this.show(peerId, state, { text: accountUsageText(usage), buttons: [this.button(peerId, state, "Обновить лимиты", "limits"), this.button(peerId, state, "Меню", "home")] });
+  }
   private async home(peerId: number, note?: string): Promise<void> {
     const binding = this.store.byPeer(peerId); const state = this.newState(peerId, binding?.id ?? null, "home");
     if (note) state.note = note;
