@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { TaskEvent } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
+import { comparablePath } from "./paths.js";
 
 export interface ProjectionCheckpoint {
   readonly since: number;
@@ -15,6 +16,8 @@ export interface ProjectionCheckpoint {
    * storing message text.
    */
   readonly semanticByIdentity?: Readonly<Record<string, string>>;
+  /** Exact rollout used for the last snapshot, normalized without exposing it to VK. */
+  readonly rolloutPath?: string;
 }
 
 export interface ProjectionOptions {
@@ -78,6 +81,8 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const semanticByIdentity: Record<string, string> = { ...previousSemantic };
   const previousSemanticCounts = counts(previousSemantic);
   const currentSemanticCounts = new Map<string, number>();
+  const rolloutPath = typeof state.rolloutPath === "string" ? comparablePath(state.rolloutPath) : previous?.rolloutPath;
+  const historyRebuilt = previous?.rolloutPath !== undefined && rolloutPath !== undefined && previous.rolloutPath !== rolloutPath;
   const events: TaskEvent[] = [];
   const eligible = (turn: IpcObject): boolean => activeAtAttach.includes(String(turn.turnId)) || Number(turn.turnStartedAtMs ?? 0) >= since;
   const emitStatus = (event: Extract<TaskEvent, { readonly type: "status" }>, allowInitial = false): void => {
@@ -92,8 +97,9 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
     const occurrence = (currentSemanticCounts.get(semantic) ?? 0) + 1;
     currentSemanticCounts.set(semantic, occurrence);
     const knownSemantic = previousSemantic[key];
+    const previousCount = previousSemanticCounts.get(semantic) ?? 0;
     const semanticallyNew = knownSemantic === undefined
-      ? occurrence > (previousSemanticCounts.get(semantic) ?? 0)
+      ? historyRebuilt ? previousCount === 0 : occurrence > previousCount
       : knownSemantic !== semantic;
     const digest = hash(JSON.stringify(event));
     const changed = seen[key] !== digest;
@@ -138,5 +144,5 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   }
   const activeTurn = turns.filter(turn => turn.status === "inProgress" && eligible(turn)).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
-  return { checkpoint: { since, activeAtAttach, active, seen, semanticByIdentity }, events };
+  return { checkpoint: { since, activeAtAttach, active, seen, semanticByIdentity, ...(rolloutPath ? { rolloutPath } : {}) }, events };
 }
