@@ -50,19 +50,23 @@ export class RevisionedState {
 
   reset(): void { this.revision = null; this.state = null; }
 
-  accept(change: unknown): IpcObject {
+  accept(change: unknown, validate: (state: IpcObject) => void = () => {}): IpcObject {
     if (!isObject(change) || !Number.isSafeInteger(change.revision) || (change.revision as number) < 0) throw new Error("Invalid state revision");
+    let next: IpcObject;
     if (change.type === "snapshot" && isObject(change.conversationState)) {
-      this.state = structuredClone(change.conversationState);
+      next = structuredClone(change.conversationState);
     } else if (change.type === "patches" && this.state && change.baseRevision === this.revision && (change.revision as number) > this.revision! && Array.isArray(change.patches)) {
       // Apply atomically: malformed or missing patches must never corrupt the last good state.
-      let next = structuredClone(this.state);
+      next = structuredClone(this.state);
       for (const patch of change.patches) {
         if (!isObject(patch)) throw new Error("Invalid patch");
         next = mutate(next, patch);
       }
-      this.state = next;
     } else throw new Error("State revision gap or incompatible snapshot");
+    // Identity checks are part of the same transaction. A snapshot from a
+    // different task copy must never replace the last verified state.
+    validate(next);
+    this.state = next;
     this.revision = change.revision as number;
     return this.state;
   }

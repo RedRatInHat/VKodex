@@ -260,6 +260,89 @@ test("source matching accepts equivalent Windows paths and rejects unknown rollo
   try { await assert.rejects(withoutPath.start(100), /путь её истории/u); } finally { withoutPath.close(); otherClient.close(); }
 });
 
+test("source matching accepts a new rollout file for the same thread and CODEX_HOME", async t => {
+  const selected = "C:/Users/test/.codex/sessions/2026/08/29/rollout-thread.jsonl";
+  const live = "C:/Users/test/.codex/sessions/2026/08/29/rollout-thread_continuation.jsonl";
+  const server = new Server(); server.dataState = { ...state(), rolloutPath: live }; let updates = 0;
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, rolloutPath: selected }, () => { updates++; }, () => {});
+  try {
+    await subscription.start(100);
+    assert.equal(updates, 1);
+    assert.equal(subscription.current?.rolloutPath, live);
+  } finally { subscription.close(); }
+});
+
+test("source matching accepts active and archived rollouts from the same CODEX_HOME", async t => {
+  const selected = "C:/Users/test/.codex/archived_sessions/rollout-thread.jsonl";
+  const live = "C:/Users/test/.codex/sessions/2026/08/29/rollout-thread.jsonl";
+  const server = new Server(); server.dataState = { ...state(), rolloutPath: live };
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, rolloutPath: selected }, () => {}, () => {});
+  try { await subscription.start(100); assert.ok(subscription.current); } finally { subscription.close(); }
+});
+
+test("a transient pathless snapshot refreshes once before accepting the selected task copy", async t => {
+  const expected = "C:/profiles/work/sessions/task.jsonl";
+  const server = new Server(); let follows = 0; let updates = 0;
+  server.dataState = { ...state() };
+  server.onFollow = () => {
+    follows++;
+    if (follows === 2) server.dataState = { ...server.dataState, rolloutPath: "\\\\?\\C:\\Profiles\\WORK\\sessions\\task.jsonl" };
+    server.snapshot();
+  };
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: expected }, () => { updates++; }, () => {});
+  try {
+    await subscription.start(100);
+    assert.equal(follows, 2); assert.equal(updates, 1);
+    assert.equal(subscription.current?.rolloutPath, "\\\\?\\C:\\Profiles\\WORK\\sessions\\task.jsonl");
+  } finally { subscription.close(); }
+});
+
+test("a transient mismatched snapshot is never exposed and refreshes to the selected task copy", async t => {
+  const expected = "C:/profiles/work/sessions/task.jsonl";
+  const server = new Server(); let follows = 0; let updates = 0;
+  server.dataState = { ...state(), rolloutPath: "C:/profiles/other/sessions/task.jsonl" };
+  server.onFollow = () => {
+    follows++;
+    if (follows === 2) server.dataState = { ...server.dataState, rolloutPath: expected };
+    server.snapshot();
+  };
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: expected }, () => { updates++; }, () => {});
+  try {
+    await subscription.start(100);
+    assert.equal(follows, 2); assert.equal(updates, 1);
+    assert.equal(subscription.current?.rolloutPath, expected);
+  } finally { subscription.close(); }
+});
+
+test("a verified subscription tolerates a reduced rename snapshot without changing task identity", async t => {
+  const expected = "C:/profiles/work/sessions/task.jsonl";
+  const server = new Server(); server.dataState = { ...state(), rolloutPath: expected }; let updates = 0;
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: expected }, () => { updates++; }, () => {});
+  try {
+    await subscription.start(100);
+    server.dataState = { ...server.dataState }; delete server.dataState.rolloutPath; server.snapshot();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(updates, 2);
+    assert.equal(server.received.filter(message => message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following === true).length, 1);
+  } finally { subscription.close(); }
+});
+
+test("a task copy that never reports its rollout path remains blocked", async t => {
+  const server = new Server(); server.dataState = { ...state() }; let follows = 0;
+  server.onFollow = () => { follows++; server.snapshot(); };
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: "C:/profiles/work/sessions/task.jsonl" }, () => assert.fail("Unverified source leaked"), () => {});
+  try {
+    await assert.rejects(subscription.start(50), /не сообщил путь истории/u);
+    assert.equal(follows, 2);
+  } finally { subscription.close(); }
+});
+
 test("duplicate IDs route by source and never send into the other loaded copy", async () => {
   const primary = { ...ref, title: "Primary", workspace: "/project-a", updatedAt: 1, rolloutPath: "C:/profiles/primary/task.jsonl" };
   const extra = { ...primary, sourceId: "work", title: "Work", workspace: "/project-b", rolloutPath: "C:/profiles/work/task.jsonl" };
