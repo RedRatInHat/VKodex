@@ -49,8 +49,8 @@ export function formatHealthSummary(snapshot: BridgeHealthSnapshot): string {
 export class BridgeHealthMonitor {
   private checking: Promise<BridgeHealthSnapshot> | null = null;
   private lastCompatibilityAt = 0;
+  private criticalPendingId: number | null = null;
   private criticalPendingSince: number | null = null;
-  private streamPendingSince: number | null = null;
 
   constructor(
     private readonly access: OwnerAccess,
@@ -89,28 +89,28 @@ export class BridgeHealthMonitor {
         : { name: "runtime", state: "ok", detail: `Цикл активен; последний tick ${Math.round(tickAge / 1_000)} с назад.` });
 
     const delivery = this.store.deliveryHealth(checkedAt);
-    if (delivery.criticalPending === 0) this.criticalPendingSince = null;
-    else this.criticalPendingSince ??= checkedAt;
-    if (delivery.streamPending === 0) this.streamPendingSince = null;
-    else this.streamPendingSince ??= checkedAt;
+    if (delivery.criticalPending === 0) {
+      this.criticalPendingId = null; this.criticalPendingSince = null;
+    } else if (this.criticalPendingId !== delivery.criticalOldestId) {
+      this.criticalPendingId = delivery.criticalOldestId; this.criticalPendingSince = checkedAt;
+    }
     const criticalAge = this.criticalPendingSince === null ? 0 : checkedAt - this.criticalPendingSince;
-    const streamAge = this.streamPendingSince === null ? 0 : checkedAt - this.streamPendingSince;
+    const unresolvedFailure = delivery.lastFailure && delivery.lastFailure.at > (delivery.lastSuccessAt ?? 0) ? delivery.lastFailure : null;
     // A stuck answer or control panel is a hard delivery failure. Commentary and
     // activity edits are intentionally lossy and must never turn the whole bridge
     // FAILED, although a VK rate-limit remains visible as DEGRADED.
     const deliveryState: HealthState = criticalAge > 5 * 60_000
       ? "failed"
-      : delivery.pauseRemainingMs > 0 || criticalAge > 30_000 || streamAge > 30_000
+      : delivery.pauseRemainingMs > 0 || criticalAge > 30_000 || unresolvedFailure !== null
         ? "degraded"
         : "ok";
-    const unresolvedFailure = delivery.lastFailure && delivery.lastFailure.at > (delivery.lastSuccessAt ?? 0) ? delivery.lastFailure : null;
     const failureDetail = unresolvedFailure ? ` Последний сбой: ${unresolvedFailure.type}, ${unresolvedFailure.kind}/${unresolvedFailure.operation}.` : "";
     checks.push({
       name: "vk_delivery",
       state: deliveryState,
       detail: delivery.pauseRemainingMs > 0
         ? `VK ограничил частоту; повтор через ${Math.ceil(delivery.pauseRemainingMs / 1_000)} с. Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых.${failureDetail}`
-        : `Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых; отменённых записей: ${delivery.inactivePending}${criticalAge ? `; важные ожидают ${Math.round(criticalAge / 1_000)} с` : ""}${streamAge ? `; фоновые ожидают ${Math.round(streamAge / 1_000)} с` : ""}.${failureDetail}`,
+        : `Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых; отменённых записей: ${delivery.inactivePending}${criticalAge ? `; важные ожидают ${Math.round(criticalAge / 1_000)} с` : ""}.${failureDetail}`,
     });
 
     const connectedState: HealthState = runtime.connectedRequiredBindings < runtime.requiredBindings ? "degraded" : "ok";

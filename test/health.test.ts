@@ -89,6 +89,28 @@ test("a delivery backlog becomes degraded and then failed instead of looking hea
   assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_delivery")!.state, "failed");
 });
 
+test("different critical deliveries do not inherit the age of a completed message", async t => {
+  const s = setup(t);
+  s.store.enqueue("first", access.ownerId, { text: "first" });
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_delivery")!.state, "ok");
+  const first = s.store.pendingDeliveries()[0]!;
+  s.store.delivered(first, { peerId: access.ownerId, conversationMessageId: 1 });
+  s.advance(6 * 60_000);
+  s.store.enqueue("second", access.ownerId, { text: "second" });
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_delivery")!.state, "ok");
+});
+
+test("ordinary background revisions never accumulate a false delivery age", async t => {
+  const s = setup(t);
+  s.store.enqueue("thinking", access.ownerId, { text: "думаю...", silent: true }, null, "activity");
+  for (let run = 0; run < 7; run++) {
+    const check = (await s.monitor.check(true)).checks.find(item => item.name === "vk_delivery")!;
+    assert.equal(check.state, "ok");
+    s.advance(60_000);
+    s.store.enqueue("thinking", access.ownerId, { text: `думаю${".".repeat(run % 3 + 1)}`, silent: true }, null, "activity");
+  }
+});
+
 test("a stuck activity edit stays degraded and does not page during a short VK throttle", async t => {
   const s = setup(t);
   s.store.enqueue("thinking", access.ownerId, { text: "думаю...", silent: true }, null, "activity");
