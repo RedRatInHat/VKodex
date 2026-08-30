@@ -41,8 +41,10 @@ const resetTime = (seconds: number): string => new Intl.DateTimeFormat("ru-RU", 
 export function accountUsageText(usage: AccountUsage): string {
   const lines = ["Лимиты Codex", `Тариф: ${usage.planType ?? "не указан"}`];
   for (const limit of usage.limits) {
-    const label = limit.id === "codex" ? "Codex" : limit.id === "base_model_inference" ? "Базовые модели" : limit.name ?? limit.id;
+    const reserve = limit.id === "base_model_inference";
+    const label = limit.id === "codex" ? "Codex" : reserve ? "Luna Reserve" : limit.name ?? limit.id;
     lines.push("", label);
+    if (reserve) lines.push("Резерв GPT-5.6 Luna после исчерпания обычного лимита.");
     for (const window of [limit.primary, limit.secondary].filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => left.windowMinutes - right.windowMinutes)) {
       lines.push(`${duration(window.windowMinutes)}: использовано ${window.usedPercent.toFixed(1)}% · осталось ${(100 - window.usedPercent).toFixed(1)}%`, `Сброс: ${resetTime(window.resetsAt)}`);
     }

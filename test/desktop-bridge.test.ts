@@ -86,7 +86,10 @@ class Desktop implements DesktopTasks {
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
   usageReads = 0;
-  usage: AccountUsage = { planType: "pro", limits: [{ id: "codex", name: null, primary: { usedPercent: 9, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null }], credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
+  usage: AccountUsage = { planType: "pro", limits: [
+    { id: "codex", name: null, primary: { usedPercent: 9, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
+    { id: "base_model_inference", name: "gpt-reserve", primary: { usedPercent: 0, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
+  ], credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
   selectError: Error | null = null;
   renameError: Error | null = null;
   liveTitleUpdated = true;
@@ -228,6 +231,8 @@ test("account limits are available from the manager and task chat without reachi
   await clickPanel(s, "Лимиты Codex", access.ownerId);
   assert.equal(s.desktop.usageReads, 1);
   assert.match(panelView(s, access.ownerId).text, /Лимиты Codex[\s\S]*Тариф: pro[\s\S]*7 дн\.: использовано 9\.0% · осталось 91\.0%/u);
+  assert.match(panelView(s, access.ownerId).text, /Luna Reserve[\s\S]*Резерв GPT-5\.6 Luna после исчерпания обычного лимита/u);
+  assert.doesNotMatch(panelView(s, access.ownerId).text, /Базовые модели/u);
   assert.deepEqual(panelView(s, access.ownerId).buttons!.map(button => button.label), ["Обновить лимиты", "Меню"]);
   await clickPanel(s, "Обновить лимиты", access.ownerId); assert.equal(s.desktop.usageReads, 2);
   await s.handle("/limits", peerId);
