@@ -41,6 +41,35 @@ export function turnsFromState(state: IpcObject): IpcObject[] {
   return [...turns.values()].sort((a, b) => Number(a.turnStartedAtMs ?? 0) - Number(b.turnStartedAtMs ?? 0));
 }
 
+function rawTurnsFromState(state: IpcObject): IpcObject[] {
+  const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
+  const entities = isObject(history) ? history.entitiesByKey : undefined;
+  return [...(Array.isArray(state.turns) ? state.turns : []), ...(isObject(entities) ? Object.values(entities) : [])].filter(isObject);
+}
+
+export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" | "ambiguous" {
+  const rawTurns = rawTurnsFromState(state);
+  const inProgress = rawTurns.filter(turn => turn.status === "inProgress");
+  if (!inProgress.length) return "none";
+  const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
+  if (runtimeStatus !== "idle" && runtimeStatus !== "notLoaded") return "live";
+  const started = inProgress.map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
+  const terminal = rawTurns.filter(turn => ["completed", "failed", "interrupted"].includes(String(turn.status)))
+    .map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
+  return started.length === inProgress.length && terminal.length > 0 && Math.max(...terminal) > Math.max(...started)
+    ? "orphaned" : "ambiguous";
+}
+
+/**
+ * Codex history can retain an orphaned `inProgress` turn after a crash or an
+ * edited branch rebuild. An explicit runtime state is newer and authoritative:
+ * `idle`/`notLoaded` means those historical entries are not live anymore.
+ */
+export function activeTurnsFromState(state: IpcObject): IpcObject[] {
+  if (inProgressState(state) !== "live") return [];
+  return turnsFromState(state).filter(turn => turn.status === "inProgress");
+}
+
 function userText(input: unknown): string {
   if (!Array.isArray(input)) return "";
   return input.filter(isObject).filter(item => item.type === "text" && typeof item.text === "string").map(item => item.text).join("\n");
@@ -71,8 +100,10 @@ function counts(values: Readonly<Record<string, string>>): Map<string, number> {
 
 export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint | null, now = Date.now(), options: ProjectionOptions = {}): { checkpoint: ProjectionCheckpoint; events: TaskEvent[] } {
   const turns = turnsFromState(state);
+  const activeTurns = activeTurnsFromState(state);
+  const activeTurnIds = new Set(activeTurns.map(turn => String(turn.turnId)));
   const since = previous?.since ?? now;
-  const attachedActive = turns.filter(turn => turn.status === "inProgress").at(-1);
+  const attachedActive = activeTurns.at(-1);
   const activeAtAttach = previous?.activeAtAttach ?? (attachedActive ? [String(attachedActive.turnId)] : []);
   const previouslyActive = new Set(previous?.active ?? []);
   const rebaseline = previous !== null && options.rebaseline === true;
@@ -139,10 +170,10 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         }
       }
     }
-    const status = turn.status === "inProgress" ? "running" : turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "interrupted" : turn.status === "failed" ? "failed" : null;
+    const status = turn.status === "inProgress" ? activeTurnIds.has(turnId) ? "running" : null : turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "interrupted" : turn.status === "failed" ? "failed" : null;
     if (status && turnEligible) emitStatus({ type: "status", id: `status:${turnId}`, turnId, status }, turn.status === "inProgress");
   }
-  const activeTurn = turns.filter(turn => turn.status === "inProgress" && eligible(turn)).at(-1);
+  const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
   return { checkpoint: { since, activeAtAttach, active, seen, semanticByIdentity, ...(rolloutPath ? { rolloutPath } : {}) }, events };
 }

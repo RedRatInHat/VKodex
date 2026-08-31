@@ -24,6 +24,16 @@ test("task details separate current/next models and do not mark starting or unkn
   assert.equal(taskDetails({}).status, "unavailable");
   assert.equal(taskDetails({ threadRuntimeStatus: { type: "idle" }, resumeState: "resuming" }).status, "unavailable");
   assert.equal(taskDetails({ threadRuntimeStatus: { type: "idle" } }).status, "idle");
+  const stale = taskDetails({
+    latestThreadSettings: { model: "next", effort: "low" },
+    threadRuntimeStatus: { type: "idle" }, resumeState: "resumed",
+    turns: [
+      { turnId: "orphan", turnStartedAtMs: 100, status: "inProgress", items: [], params: { model: "stale", effort: "high" } },
+      { turnId: "latest", turnStartedAtMs: 200, status: "completed", items: [] },
+    ],
+  });
+  assert.equal(stale.status, "idle"); assert.equal(stale.model, "next"); assert.equal(stale.effort, "low");
+  assert.equal(taskDetails({ threadRuntimeStatus: { type: "idle" }, turns: [{ turnId: "possibly-current", status: "inProgress", items: [] }] }).status, "unavailable");
   assert.equal(taskDetails({ requests: [{}] }).status, "approval");
 });
 

@@ -1,5 +1,5 @@
 import { DesktopIpcClient } from "../desktop/ipc-client.js";
-import { projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
+import { activeTurnsFromState, projectSnapshot, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { TaskSubscription } from "../desktop/subscription.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
@@ -192,7 +192,7 @@ export class DesktopBridgeRuntime {
           const details = taskDetails(state);
           this.manager.panels.observe(binding.id, details);
           this.files?.observe(binding.id, details.status);
-          const activeTurn = turnsFromState(state).filter(turn => turn.status === "inProgress").at(-1);
+          const activeTurn = activeTurnsFromState(state).at(-1);
           this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
         });
       }, error => {

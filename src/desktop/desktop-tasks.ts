@@ -3,7 +3,7 @@ import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { taskDetails } from "./details.js";
-import { turnsFromState } from "./projector.js";
+import { activeTurnsFromState, inProgressState } from "./projector.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -23,10 +23,10 @@ export function taskInput(request: SubmitTaskRequest): { text: string; input: Ip
 }
 
 function submissionMode(state: IpcObject): "start" | "steer" {
-  const turns: unknown[] = Array.isArray(state.turns) ? [...state.turns] : [];
+  const rawTurns: unknown[] = Array.isArray(state.turns) ? [...state.turns] : [];
   const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
   const entities = isObject(history) ? history.entitiesByKey : undefined;
-  if (isObject(entities)) turns.push(...Object.values(entities));
+  if (isObject(entities)) rawTurns.push(...Object.values(entities));
   // A steer message does not resolve the desktop's structured question or
   // approval request. Reject it before writing so VK never reports progress
   // for input that leaves the task blocked.
@@ -35,13 +35,15 @@ function submissionMode(state: IpcObject): "start" | "steer" {
   }
   // A starting turn can still have a null turnId. The owner can wait for its ID
   // when steering; treating that placeholder as idle would start a second turn.
-  if (turns.some(turn => isObject(turn) && turn.status === "inProgress")) return "steer";
+  const progressState = inProgressState(state);
+  if (progressState === "live") return "steer";
+  if (progressState === "ambiguous") throw new ActionRejectedError("Codex сообщает противоречивое состояние хода. Открой задачу в Codex и повтори после обновления состояния; сообщение не отправлено.");
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
   const runtimeReady = runtimeStatus === undefined || runtimeStatus === "idle" || runtimeStatus === "notLoaded";
   if ((state.resumeState !== undefined && state.resumeState !== "resumed") || !runtimeReady) {
     throw new ActionRejectedError("Десктоп ещё не подтвердил готовность задачи к следующему ходу. Сообщение не отправлено; повтори после восстановления состояния.");
   }
-  if (!turns.some(turn => isObject(turn) && ["completed", "failed", "interrupted"].includes(String(turn.status)))) {
+  if (!rawTurns.some(turn => isObject(turn) && ["completed", "failed", "interrupted"].includes(String(turn.status)))) {
     throw new ActionRejectedError("Не удалось определить состояние задачи. Сообщение не отправлено; открой задачу в Codex и повтори.");
   }
   return "start";
@@ -199,7 +201,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     try {
       return await this.follow(task, async subscription => {
         if (expectedTurnId) {
-          return turnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId && turn.status === "inProgress") ? "running" : "stopped";
+          return activeTurnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId) ? "running" : "stopped";
         }
         return taskDetails(subscription.current!).status === "running" ? "running" : "stopped";
       });
@@ -210,7 +212,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   private async interruptLive(task: TaskRef, expectedTurnId: string | undefined): Promise<void> {
     await this.follow(task, async (subscription, client) => {
-      if (expectedTurnId && !turnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId && turn.status === "inProgress")) return;
+      if (expectedTurnId && !activeTurnsFromState(subscription.current!).some(turn => turn.turnId === expectedTurnId)) return;
       const reply = await client.request("thread-follower-interrupt-turn", expectedTurnId ? 4 : 3, {
         conversationId: task.threadId, mode: "user-stop", ...(expectedTurnId ? { expectedTurnId } : {}),
       }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
@@ -225,7 +227,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     let expectedTurnId: string | undefined;
     try {
       await this.follow(task, async (subscription, client) => {
-        const running = turnsFromState(subscription.current!).filter(turn => turn.status === "inProgress").at(-1);
+        const running = activeTurnsFromState(subscription.current!).at(-1);
         expectedTurnId = typeof running?.turnId === "string" && running.turnId ? running.turnId : undefined;
         if (!running && taskDetails(subscription.current!).status !== "running") throw new ActionRejectedError("В задаче нет выполняющегося хода.");
         const reply = await client.request("thread-follower-interrupt-turn", expectedTurnId ? 4 : 3, {

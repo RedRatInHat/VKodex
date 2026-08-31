@@ -1,21 +1,22 @@
 import type { DesktopModel, TaskDetails } from "./contracts.js";
 import { DesktopUnavailableError } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
-import { turnsFromState } from "./projector.js";
+import { activeTurnsFromState, inProgressState, turnsFromState } from "./projector.js";
 
 const string = (value: unknown): string | null => typeof value === "string" && value.trim() ? value : null;
 
 export function taskDetails(state: IpcObject): TaskDetails {
-  const turn = turnsFromState(state).at(-1);
+  const turns = turnsFromState(state);
+  const activeTurns = activeTurnsFromState(state);
+  const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
+  const progressState = inProgressState(state);
+  const running = runtimeStatus === "active" || progressState === "live";
+  const turn = (running ? activeTurns.at(-1) : undefined) ?? turns.at(-1);
   const params = isObject(turn?.params) ? turn.params : {};
   const settings = isObject(state.latestThreadSettings) ? state.latestThreadSettings : {};
   const mode = isObject(params.collaborationMode) && isObject(params.collaborationMode.settings) ? params.collaborationMode.settings : {};
-  const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
-  const entities = isObject(history) ? history.entitiesByKey : undefined;
-  const rawTurns = [...(Array.isArray(state.turns) ? state.turns : []), ...(isObject(entities) ? Object.values(entities) : [])];
-  const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
-  const running = rawTurns.some(turn => isObject(turn) && turn.status === "inProgress") || runtimeStatus === "active";
-  const idleKnown = (state.resumeState === undefined || state.resumeState === "resumed") && (runtimeStatus === "idle" || !!turn && ["completed", "failed", "interrupted"].includes(String(turn.status)));
+  const idleKnown = progressState !== "ambiguous" && (state.resumeState === undefined || state.resumeState === "resumed")
+    && (runtimeStatus === "idle" || !!turn && ["completed", "failed", "interrupted"].includes(String(turn.status)));
   const usage = isObject(state.latestTokenUsageInfo) ? state.latestTokenUsageInfo : {};
   const last = isObject(usage.last) ? usage.last : {};
   const window = usage.modelContextWindow;

@@ -609,6 +609,37 @@ test("an idle or unloaded task starts the next turn through its owner with inher
   }
 });
 
+test("an explicit idle runtime ignores an orphaned in-progress history turn", async () => {
+  const server = new Server();
+  server.dataState = {
+    id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "idle" },
+    turns: [
+      { turnId: "orphan", turnStartedAtMs: 100, status: "inProgress", items: [] },
+      { turnId: "latest", turnStartedAtMs: 200, status: "completed", items: [] },
+    ],
+  };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  await adapter.submit({ operationId: "message", task: ref, text: "Continue" });
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
+  const projected = projectSnapshot(server.dataState, null, 300);
+  assert.deepEqual(projected.checkpoint.active, []);
+  assert.equal(projected.events.some(event => event.type === "status" && event.status === "running"), false);
+});
+
+test("an idle runtime with a possibly current in-progress turn fails closed", async () => {
+  const server = new Server();
+  server.dataState = {
+    id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "idle" },
+    turns: [{ turnId: "possibly-current", turnStartedAtMs: 200, status: "inProgress", items: [] }],
+  };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.submit({ operationId: "message", task: ref, text: "Continue" }), error => error instanceof ActionRejectedError && /противоречивое состояние/u.test(error.message));
+  assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" || message.method === "thread-follower-steer-turn"), false);
+});
+
 test("resuming a goal wakes an idle live owner with an empty inherited turn and never steers an active turn", async () => {
   for (const status of ["completed", "inProgress"] as const) {
     const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: status === "inProgress" ? "active" : "idle" } };
