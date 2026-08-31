@@ -1,5 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { inspect } from "node:util";
 import { loadDesktopBridgeConfig } from "./bridge/config.js";
 import { DesktopBridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
@@ -39,23 +40,27 @@ process.once("SIGINT", () => { exitReason = "SIGINT"; void shutdown(); });
 process.once("SIGTERM", () => { exitReason = "SIGTERM"; void shutdown(); });
 
 let fatal = false;
-const fatalShutdown = (reason: "uncaught_exception" | "unhandled_rejection"): void => {
+const formatFatalDetail = (value: unknown): string => {
+  const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
+  return detail.slice(0, 32_768);
+};
+const fatalShutdown = (reason: "uncaught_exception" | "unhandled_rejection", detail: unknown): void => {
   if (fatal) return;
   fatal = true; exitReason = reason;
-  process.stderr.write(`VKodex desktop bridge stopped after ${reason.replace("_", " ")}.\n`);
+  process.stderr.write(`VKodex desktop bridge stopped after ${reason.replaceAll("_", " ")}.\n${formatFatalDetail(detail)}\n`);
   const hardStop = setTimeout(() => process.exit(1), 5_000);
   void shutdown().finally(() => { clearTimeout(hardStop); process.exit(1); });
 };
-process.once("uncaughtException", () => fatalShutdown("uncaught_exception"));
-process.once("unhandledRejection", () => fatalShutdown("unhandled_rejection"));
+process.once("uncaughtException", error => fatalShutdown("uncaught_exception", error));
+process.once("unhandledRejection", reason => fatalShutdown("unhandled_rejection", reason));
 try {
   process.stdout.write("VKodex desktop bridge: starting (experimental).\n");
   await gateway.start(input => runtime.handle(input));
   runtime.start();
   process.stdout.write("VKodex desktop bridge: VK Long Poll started.\n");
-} catch {
+} catch (error) {
   exitReason = "startup_error";
-  process.stderr.write("VKodex desktop bridge could not start. Check the local configuration and connections.\n");
+  process.stderr.write(`VKodex desktop bridge could not start. Check the local configuration and connections.\n${formatFatalDetail(error)}\n`);
   await shutdown();
   process.exitCode = 1;
 }

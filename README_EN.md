@@ -475,6 +475,8 @@ npm run service:install
 
 The installer registers a `VKodex` Windows Scheduled Task and starts it immediately. A local supervisor relaunches the bridge five seconds after any exit; Task Scheduler additionally restarts the supervisor if it fails and never starts a second instance over a running one. The task runs only in the interactive session of the same user as Codex, while the bridge itself still runs as the stable `%LOCALAPPDATA%\VKodex\runtime\VKodex.exe`. Running as `SYSTEM` is not supported.
 
+The supervisor stores output from every run locally under `BOT_DATA_DIR/logs`: normal output goes to `vkodex-<run>.stdout.log`, errors and crash stacks to `vkodex-<run>.stderr.log`, and start/exit history to `supervisor.log`. Per-run files are not overwritten by the next launch. This directory lives inside private, Git-ignored `data/`. Review logs before sharing them because third-party messages can include local paths and technical data.
+
 Inspect it with `Get-ScheduledTask -TaskName VKodex` and `Get-ScheduledTaskInfo -TaskName VKodex`. Run `npm run service:uninstall` to remove it. Reinstall the task after moving the clone so its absolute paths are refreshed.
 
 Do not run the scheduled task and `desktop:start` in a terminal at the same time. Codex must also be running and authenticated after login.
