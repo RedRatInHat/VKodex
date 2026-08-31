@@ -12,6 +12,7 @@ $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $runtimePath = Join-Path $env:LOCALAPPDATA "VKodex\runtime\VKodex.exe"
 $environmentFile = Join-Path $projectRoot ".env"
 $entryPoint = Join-Path $projectRoot "dist\src\desktop-main.js"
+$iconPath = Join-Path $projectRoot "docs\logo.ico"
 $logDirectory = Join-Path $projectRoot "data\desktop\logs"
 $supervisorLog = Join-Path $logDirectory "supervisor.log"
 
@@ -25,13 +26,33 @@ function Write-SupervisorLog([string]$Message) {
 }
 
 try {
-  foreach ($required in @($runtimePath, $environmentFile, $entryPoint)) {
+  foreach ($required in @($runtimePath, $environmentFile, $entryPoint, $iconPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
       throw "Required VKodex file is missing: $required"
     }
   }
 
   try { $Host.UI.RawUI.WindowTitle = "VKodex Bridge - DO NOT CLOSE" } catch { }
+  try {
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class VKodexWindowIconNative {
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+}
+"@
+    $script:windowIcon = New-Object System.Drawing.Icon($iconPath)
+    $windowHandle = [VKodexWindowIconNative]::GetConsoleWindow()
+    if ($windowHandle -eq [IntPtr]::Zero) { throw "Console window handle is unavailable." }
+    [VKodexWindowIconNative]::SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge") | Out-Null
+    [VKodexWindowIconNative]::SendMessage($windowHandle, 0x80, [IntPtr]0, $script:windowIcon.Handle) | Out-Null
+    [VKodexWindowIconNative]::SendMessage($windowHandle, 0x80, [IntPtr]1, $script:windowIcon.Handle) | Out-Null
+  } catch {
+    Write-SupervisorLog "The VKodex window icon could not be applied; the bridge will continue without it."
+  }
   Write-Host "VKodex Bridge - DO NOT CLOSE THIS WINDOW" -ForegroundColor Yellow
   Write-Host "Closing it stops remote access until the scheduled task is started again." -ForegroundColor Yellow
   Write-Host "Runtime logs: $logDirectory"

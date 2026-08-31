@@ -477,7 +477,7 @@ The installer registers a `VKodex` Windows Scheduled Task and starts it immediat
 
 VKodex writes the same structured stream to both the console and local `BOT_DATA_DIR/logs/vkodex-<run>.log`; errors and crash stacks use the appropriate level in that same file. Start and exit history is stored separately in `supervisor.log`. Per-run files are not overwritten. This directory lives inside private, Git-ignored `data/`. Review logs before sharing them because third-party messages can include local paths and technical data.
 
-The supervisor window intentionally remains visible under the title `VKodex Bridge - DO NOT CLOSE`. It shows a warning, supervisor events, and the live structured VKodex log; the same lines are simultaneously saved to the current run's file. Do not close the window: closing it manually stops both the supervisor and the bridge. If that happens, start the `VKodex` task in Task Scheduler or run `npm run service:install` again.
+The supervisor window intentionally remains visible with the VKodex logo and the title `VKodex Bridge - DO NOT CLOSE`. It shows a warning, supervisor events, and the live structured VKodex log; the same lines are simultaneously saved to the current run's file. Do not close the window: closing it manually stops both the supervisor and the bridge. If that happens, start the `VKodex` task in Task Scheduler or run `npm run service:install` again.
 
 Inspect it with `Get-ScheduledTask -TaskName VKodex` and `Get-ScheduledTaskInfo -TaskName VKodex`. Run `npm run service:uninstall` to remove it. Reinstall the task after moving the clone so its absolute paths are refreshed.
 
