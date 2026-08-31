@@ -19,6 +19,8 @@
     "desktop:start": "node dist/src/desktop/launch.js start",
     "vk:check": "node --import tsx src/desktop/launch.ts check",
     "health:check": "node --env-file=.env --import tsx src/desktop/health-check.ts",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-task.ps1",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-windows-task.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build"

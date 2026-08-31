@@ -467,20 +467,17 @@ VK may be unstable or unreachable when VKodex is sent through a foreign VPN. Cod
 
 A TUN client with per-application or per-process routing works, for example [v2RayTun](https://github.com/LXST-CODE/v2RayTun). This is only an example of a third-party client; VKodex neither installs nor configures it. Rule names and formats depend on the client version.
 
-There is no built-in service installer or automatic startup configuration yet. A dedicated terminal running `npm run desktop:start` is enough for an initial deployment.
+First verify a manual launch with `npm run desktop:start`. Then install automatic startup for the current Windows user:
 
-If you use Windows Task Scheduler, configure it manually:
+```powershell
+npm run service:install
+```
 
-| Field | Value |
-| --- | --- |
-| User | The same Windows user that runs Codex. |
-| Mode | Run only while that user is logged on; do not run as SYSTEM. |
-| Program | The full path to `VKodex.exe` printed by `npm run runtime:prepare`. |
-| Arguments | `--env-file=.env dist/src/desktop-main.js` |
-| Working directory / Start in | Full path to the cloned VKodex repository. |
-| Concurrent runs | Do not start a new instance while the previous one is running. |
+The installer registers a `VKodex` Windows Scheduled Task and starts it immediately. A local supervisor relaunches the bridge five seconds after any exit; Task Scheduler additionally restarts the supervisor if it fails and never starts a second instance over a running one. The task runs only in the interactive session of the same user as Codex, while the bridge itself still runs as the stable `%LOCALAPPDATA%\VKodex\runtime\VKodex.exe`. Running as `SYSTEM` is not supported.
 
-Validate a manual launch before configuring automatic startup. Do not run a scheduled instance and a terminal instance at the same time. Codex must also be running and authenticated after a reboot.
+Inspect it with `Get-ScheduledTask -TaskName VKodex` and `Get-ScheduledTaskInfo -TaskName VKodex`. Run `npm run service:uninstall` to remove it. Reinstall the task after moving the clone so its absolute paths are refreshed.
+
+Do not run the scheduled task and `desktop:start` in a terminal at the same time. Codex must also be running and authenticated after login.
 
 ### Dedicated process for TUN rules
 
@@ -524,17 +521,18 @@ At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete
 - size and age of the important VK queue (answers and panels), separately from background progress (comments and indicator), plus any rate-limit pause;
 - local Bots Long Poll, token permissions, event configuration, and Long Poll server availability;
 - readability of every configured `CODEX_HOME`;
+- availability of attached task workspaces, so a renamed or removed directory cannot look like a healthy Codex connection;
 - safe goal-state reads through the local Codex API without exposing the objective in the health report;
 - the number of connected active streams;
 - the Codex named pipe and stream protocol v11 compatibility. A full protocol canary runs at startup, manually through `/health`, and at least once every ten minutes.
 
-The latest report is stored without tokens or message content in `BOT_DATA_DIR/health.json`. The following command checks freshness and exits nonzero if the bridge stopped, the report is stale, or its state is not `OK`:
+The latest report is stored without tokens or message content in `BOT_DATA_DIR/health.json`. Current process state and the reason for a handled exit are stored without configuration or error text in `BOT_DATA_DIR/runtime-process.json`. The following command checks health report freshness and exits nonzero if the bridge stopped, the report is stale, or its state is not `OK`:
 
 ```powershell
 npm run health:check
 ```
 
-This is suitable for Task Scheduler, NSSM, systemd, or another external monitor. `FAILED` is sent to the manager after two consecutive checks; `DEGRADED` is sent only after ten consecutive checks. `health check is OK again` is sent after three successful checks, so a brief VK pause does not create a cascade of alerts. If VK itself is unavailable, the warning remains in the durable queue and is delivered after recovery.
+An in-process check cannot send a warning after its own process has died, so a persistent installation needs `service:install` or another external supervisor. `FAILED` is sent to the manager after two consecutive checks; `DEGRADED` is sent only after ten consecutive checks. `health check is OK again` is sent after three successful checks, so a brief VK pause does not create a cascade of alerts. If VK itself is unavailable, the warning remains in the durable queue and is delivered after recovery.
 
 `DEGRADED` means core work may continue but part of the chain is unconfirmed: for example, no open task is available for the protocol canary, an active task lost its live connection, VK imposed a temporary pause, the last delivery failed, or an important queue item has not cleared for more than 30 seconds. A pending background comment edit or `thinking` update without a delivery error does not degrade health or raise it to `FAILED`. Closed and idle tasks do not need a live subscription and do not degrade health by themselves; they reconnect through the available desktop or SDK path when a new request arrives. `FAILED` means a mandatory check failed or the same important answer or panel has been delayed for more than five minutes. After a Codex update, also run `desktop:probe`, `/health`, and a test turn in a separate task. Never edit the IPC version manually to bypass adapter rejection.
 
