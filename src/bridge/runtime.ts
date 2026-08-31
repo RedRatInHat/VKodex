@@ -36,7 +36,8 @@ export class DesktopBridgeRuntime {
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
     private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string,
-    healthFile?: string, private readonly healthIntervalMs = 60_000) {
+    healthFile?: string, private readonly healthIntervalMs = 60_000,
+    private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.gate = new AccessGate(access, store);
@@ -99,7 +100,7 @@ export class DesktopBridgeRuntime {
 
   private checkHealth(force = false): Promise<BridgeHealthSnapshot> {
     this.lastHealthAt = this.now();
-    return this.health.check(force);
+    return this.healthCheckOverride?.(force) ?? this.health.check(force);
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -136,7 +137,10 @@ export class DesktopBridgeRuntime {
     if (this.stopped) return;
     this.closeInactiveSubscriptions();
     this.activity.tick();
-    if (this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth();
+    // Health reporting is advisory to the delivery loop. A transient failure in
+    // the report writer must not become an unhandled rejection and terminate the
+    // entire bridge process.
+    if (this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth().catch(() => {});
     await this.manager.panels.tick();
     for (const listed of this.store.bindings()) {
       let binding = listed;

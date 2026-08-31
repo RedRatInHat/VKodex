@@ -2,36 +2,36 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { loadDesktopBridgeConfig } from "../bridge/config.js";
 import { formatHealthSummary } from "../bridge/health.js";
-import type { BridgeHealthSnapshot, HealthState } from "../bridge/contracts.js";
-import { isObject } from "./ipc-client.js";
+import { healthFailure, parseHealthSnapshot, parseRuntimeProcessState } from "./health-status.js";
 
-function snapshot(value: unknown): BridgeHealthSnapshot | null {
-  if (!isObject(value) || !["ok", "degraded", "failed"].includes(String(value.state)) || typeof value.checkedAt !== "number"
-    || typeof value.pid !== "number" || typeof value.uptimeSeconds !== "number" || !Array.isArray(value.checks)) return null;
-  const checks = value.checks.filter(isObject);
-  if (checks.length !== value.checks.length || checks.some(check => typeof check.name !== "string" || typeof check.detail !== "string"
-    || !["ok", "degraded", "failed"].includes(String(check.state)))) return null;
-  return value as unknown as BridgeHealthSnapshot;
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
 }
 
 async function main(): Promise<void> {
   const config = loadDesktopBridgeConfig();
-  let parsed: unknown;
-  try { parsed = JSON.parse(await readFile(path.join(config.dataDir, "health.json"), "utf8")); }
+  let parsedHealth: unknown; let parsedRuntime: unknown;
+  try {
+    [parsedHealth, parsedRuntime] = await Promise.all([
+      readFile(path.join(config.dataDir, "health.json"), "utf8").then(JSON.parse),
+      readFile(path.join(config.dataDir, "runtime-process.json"), "utf8").then(JSON.parse),
+    ]);
+  }
   catch {
-    process.stderr.write("FAIL: health.json отсутствует или повреждён. Мост ещё не прошёл health check.\n");
+    process.stderr.write("FAIL: health.json или runtime-process.json отсутствует либо повреждён.\n");
     process.exitCode = 1; return;
   }
-  const report = snapshot(parsed);
-  if (!report) {
-    process.stderr.write("FAIL: health.json имеет неподдерживаемый формат.\n");
+  const report = parseHealthSnapshot(parsedHealth); const runtime = parseRuntimeProcessState(parsedRuntime);
+  if (!report || !runtime) {
+    process.stderr.write("FAIL: локальные health-файлы имеют неподдерживаемый формат.\n");
     process.exitCode = 1; return;
   }
   const age = Date.now() - report.checkedAt;
   const staleAfter = Math.max(2 * config.healthIntervalMs + 15_000, 75_000);
   process.stdout.write(`${formatHealthSummary(report)}\nВозраст отчёта: ${Math.max(0, Math.round(age / 1_000))} с; предел: ${Math.round(staleAfter / 1_000)} с.\n`);
-  const state = report.state as HealthState;
-  if (age < 0 || age > staleAfter || state !== "ok") process.exitCode = 1;
+  const failure = healthFailure(report, runtime, Date.now(), staleAfter, processAlive);
+  if (failure) { process.stderr.write(`FAIL: ${failure}\n`); process.exitCode = 1; }
 }
 
 await main().catch(() => {

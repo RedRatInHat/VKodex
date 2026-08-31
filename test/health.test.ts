@@ -49,7 +49,7 @@ function setup(t: { after(fn: () => void): void }) {
   const store = new BridgeStore(); t.after(() => store.close());
   const chat = new HealthChat(); const desktop = new HealthDesktop(); let now = 100_000;
   const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
-  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now);
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
   return { store, chat, desktop, monitor, advance: (ms: number) => { now += ms; } };
 }
 
@@ -62,6 +62,20 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("health monitor degrades when an attached task points to a missing workspace", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const chat = new HealthChat(); const desktop = new HealthDesktop(); const now = 100_000;
+  const task = (await desktop.listTasks())[0]!;
+  const binding = store.ensureBinding(task); store.setChat(binding.id, 2_000_000_001, 1);
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 1, requiredBindings: 0, connectedRequiredBindings: 0,
+  }), undefined, () => now, undefined, () => false);
+  const report = await monitor.check(true);
+  const catalog = report.checks.find(check => check.name === "codex_catalog")!;
+  assert.equal(catalog.state, "degraded");
+  assert.match(catalog.detail, /рабочая папка недоступна/u);
 });
 
 test("failed checks alert after two runs and recovery waits for three healthy runs", async t => {

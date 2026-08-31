@@ -6,6 +6,7 @@ import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
 import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
+import { writeRuntimeProcessState } from "./desktop/process-state.js";
 import { SdkTaskExecutor } from "./desktop/sdk-executor.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 
@@ -20,22 +21,40 @@ const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkT
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task)), new ProfileDesktopGoals(task => catalog.sourceHome(task)));
 const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
   path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs);
+const startedAt = Date.now();
+let exitReason = "process_exit";
 let stopping = false;
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
   await gateway.stop().catch(() => {});
-  await runtime.stop();
-  store.close();
+  await runtime.stop().catch(() => {});
+  try { store.close(); } catch { /* Process is already stopping. */ }
 };
-process.once("SIGINT", () => { void shutdown(); });
-process.once("SIGTERM", () => { void shutdown(); });
+writeRuntimeProcessState(config.dataDir, { status: "running", pid: process.pid, at: startedAt, startedAt });
+process.once("exit", code => {
+  writeRuntimeProcessState(config.dataDir, { status: "stopped", pid: process.pid, at: Date.now(), startedAt, exitCode: code, reason: exitReason });
+});
+process.once("SIGINT", () => { exitReason = "SIGINT"; void shutdown(); });
+process.once("SIGTERM", () => { exitReason = "SIGTERM"; void shutdown(); });
+
+let fatal = false;
+const fatalShutdown = (reason: "uncaught_exception" | "unhandled_rejection"): void => {
+  if (fatal) return;
+  fatal = true; exitReason = reason;
+  process.stderr.write(`VKodex desktop bridge stopped after ${reason.replace("_", " ")}.\n`);
+  const hardStop = setTimeout(() => process.exit(1), 5_000);
+  void shutdown().finally(() => { clearTimeout(hardStop); process.exit(1); });
+};
+process.once("uncaughtException", () => fatalShutdown("uncaught_exception"));
+process.once("unhandledRejection", () => fatalShutdown("unhandled_rejection"));
 try {
   process.stdout.write("VKodex desktop bridge: starting (experimental).\n");
   await gateway.start(input => runtime.handle(input));
   runtime.start();
   process.stdout.write("VKodex desktop bridge: VK Long Poll started.\n");
 } catch {
+  exitReason = "startup_error";
   process.stderr.write("VKodex desktop bridge could not start. Check the local configuration and connections.\n");
   await shutdown();
   process.exitCode = 1;

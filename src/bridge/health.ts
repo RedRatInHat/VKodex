@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
-import type { DesktopCompatibility, DesktopTasks } from "../desktop/contracts.js";
+import { existsSync } from "node:fs";
+import { sameTask, type DesktopCompatibility, type DesktopTasks } from "../desktop/contracts.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 
@@ -61,6 +62,7 @@ export class BridgeHealthMonitor {
     private readonly healthFile?: string,
     private readonly now: () => number = Date.now,
     private readonly compatibilityIntervalMs = 10 * 60_000,
+    private readonly workspaceExists: (workspace: string) => boolean = existsSync,
   ) {}
 
   check(force = false): Promise<BridgeHealthSnapshot> {
@@ -151,8 +153,16 @@ export class BridgeHealthMonitor {
     try {
       const tasks = await withTimeout(this.desktop.listTasks(), 15_000);
       const warnings = this.desktop.catalogWarnings?.() ?? [];
-      return warnings.length
-        ? { name: "codex_catalog", state: "degraded", detail: `Найдено задач: ${tasks.length}. ${warnings.join(" ").slice(0, 500)}` }
+      const missingWorkspaces = this.store.bindings().filter(binding => binding.attached).filter(binding => {
+        const task = tasks.find(candidate => sameTask(candidate, binding));
+        return !!task && !this.workspaceExists(task.workspace);
+      }).length;
+      const problems = [
+        ...(missingWorkspaces ? [`У ${missingWorkspaces} подключённых задач рабочая папка недоступна.`] : []),
+        ...warnings,
+      ];
+      return problems.length
+        ? { name: "codex_catalog", state: "degraded", detail: `Найдено задач: ${tasks.length}. ${problems.join(" ").slice(0, 500)}` }
         : { name: "codex_catalog", state: "ok", detail: `Все настроенные каталоги прочитаны; найдено задач: ${tasks.length}.` };
     } catch { return { name: "codex_catalog", state: "failed", detail: "Каталог задач Codex не прочитан за 15 секунд." }; }
   }

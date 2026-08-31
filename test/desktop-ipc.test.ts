@@ -87,7 +87,7 @@ class Server extends Duplex {
   }
 }
 
-function runtimeSetup(t: TestContext) {
+function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => Promise<import("../src/bridge/contracts.js").BridgeHealthSnapshot>) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -105,11 +105,28 @@ function runtimeSetup(t: TestContext) {
   };
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client);
   let now = 100_000;
-  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, client, () => now);
+  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, client, () => now, undefined, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
+
+test("a rejected scheduled health report cannot terminate the runtime", async t => {
+  let checks = 0;
+  const s = runtimeSetup(t, async () => {
+    checks++;
+    throw new Error("fixture health writer failure");
+  });
+  s.runtime.start();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const initialChecks = checks;
+  assert.ok(initialChecks >= 1);
+
+  s.advance(60_001);
+  await s.runtime.tick();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(checks > initialChecks);
+});
 
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
   const decoder = new FrameDecoder(); const one = encodeFrame({ type: "one" }); const two = encodeFrame({ type: "two" });
