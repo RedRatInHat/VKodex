@@ -1,4 +1,5 @@
 import { APIError, VK, type MessageContext, type MessageEventContext } from "vk-io";
+import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
 import { ChatRateLimitError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
@@ -115,11 +116,14 @@ export class DesktopVkGateway implements BridgeChat {
       release();
     }
   }
-  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000) {
+  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000, private readonly logger?: Logger) {
     // vk-io's default middleware error handler prints the full exception.
     this.vk.updates.use(async (_context, next) => {
       try { await next(); }
-      catch { process.stderr.write("VKodex could not handle an incoming VK event.\n"); }
+      catch {
+        if (this.logger) this.logger.error("VKodex could not handle an incoming VK event");
+        else process.stderr.write("VKodex could not handle an incoming VK event.\n");
+      }
     });
   }
 

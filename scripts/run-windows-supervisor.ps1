@@ -19,7 +19,9 @@ New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
 function Write-SupervisorLog([string]$Message) {
   $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffK")
-  Add-Content -LiteralPath $supervisorLog -Value "[$timestamp] $Message" -Encoding UTF8
+  $line = "[$timestamp] $Message"
+  Add-Content -LiteralPath $supervisorLog -Value $line -Encoding UTF8
+  Write-Host $line -ForegroundColor Cyan
 }
 
 try {
@@ -29,16 +31,26 @@ try {
     }
   }
 
+  try { $Host.UI.RawUI.WindowTitle = "VKodex Bridge - DO NOT CLOSE" } catch { }
+  Write-Host "VKodex Bridge - DO NOT CLOSE THIS WINDOW" -ForegroundColor Yellow
+  Write-Host "Closing it stops remote access until the scheduled task is started again." -ForegroundColor Yellow
+  Write-Host "Runtime logs: $logDirectory"
+  Write-Host ""
   Write-SupervisorLog "Supervisor started (PID $PID)."
   while ($true) {
     $runId = "{0}-{1}" -f (Get-Date).ToString("yyyyMMdd-HHmmssfff"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
-    $stdoutLog = Join-Path $logDirectory "vkodex-$runId.stdout.log"
-    $stderrLog = Join-Path $logDirectory "vkodex-$runId.stderr.log"
-    $arguments = @("--env-file=`"$environmentFile`"", "`"$entryPoint`"")
-    Write-SupervisorLog "Starting VKodex run $runId."
-    $child = Start-Process -FilePath $runtimePath -ArgumentList $arguments -NoNewWindow -PassThru -Wait `
-      -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
-    Write-SupervisorLog "VKodex run $runId exited with code $($child.ExitCode); restarting in $RestartDelaySeconds seconds."
+    $runLog = Join-Path $logDirectory "vkodex-$runId.log"
+    Write-SupervisorLog "Starting VKodex run $runId (log: $runLog)."
+    $previousRunId = $env:VKODEX_RUN_ID
+    $env:VKODEX_RUN_ID = $runId
+    try {
+      & $runtimePath "--env-file=$environmentFile" $entryPoint
+      $exitCode = $LASTEXITCODE
+    } finally {
+      if ($null -eq $previousRunId) { Remove-Item Env:VKODEX_RUN_ID -ErrorAction SilentlyContinue }
+      else { $env:VKODEX_RUN_ID = $previousRunId }
+    }
+    Write-SupervisorLog "VKodex run $runId exited with code $exitCode; restarting in $RestartDelaySeconds seconds."
     Start-Sleep -Seconds $RestartDelaySeconds
   }
 } catch {

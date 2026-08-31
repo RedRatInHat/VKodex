@@ -20,7 +20,7 @@ foreach ($required in @($runtimePath, $environmentFile, $entryPoint, $supervisor
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$supervisor`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Normal -ExecutionPolicy Bypass -File `"$supervisor`""
 $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited

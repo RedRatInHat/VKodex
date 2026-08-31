@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { healthFailure, parseRuntimeProcessState } from "../src/desktop/health-status.js";
+import { createDesktopLogger, desktopLogPath } from "../src/desktop/logging.js";
 import { writeRuntimeProcessState } from "../src/desktop/process-state.js";
 
 test("runtime process state contains no configuration or exception payload", async () => {
@@ -43,4 +45,21 @@ test("runtime process parser rejects malformed and impossible process identities
     { status: "running", pid: 42, at: 200, startedAt: 100 });
   assert.equal(parseRuntimeProcessState({ status: "running", pid: 0, at: 200, startedAt: 100 }), null);
   assert.equal(parseRuntimeProcessState({ status: "unknown", pid: 42, at: 200, startedAt: 100 }), null);
+});
+
+test("desktop runtime logger duplicates structured output to the console and its private run file", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-runtime-log-"));
+  const env = { VKODEX_RUN_ID: "20260831-193556183-ebdca976", LOG_LEVEL: "info" };
+  const consoleStream = new PassThrough();
+  let consoleOutput = "";
+  consoleStream.setEncoding("utf8");
+  consoleStream.on("data", chunk => { consoleOutput += String(chunk); });
+  const logger = createDesktopLogger(root, env, consoleStream);
+  logger.info({ check: "dual-output" }, "bridge ready");
+  const fileOutput = await readFile(desktopLogPath(root, env), "utf8");
+  assert.equal(fileOutput, consoleOutput);
+  assert.deepEqual(JSON.parse(fileOutput), {
+    level: 30, time: JSON.parse(fileOutput).time, pid: process.pid, check: "dual-output", msg: "bridge ready",
+  });
+  assert.equal(path.basename(desktopLogPath(root, { VKODEX_RUN_ID: "../escape" })), "vkodex.log");
 });

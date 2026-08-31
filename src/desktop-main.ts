@@ -1,21 +1,33 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { inspect } from "node:util";
-import { loadDesktopBridgeConfig } from "./bridge/config.js";
+import { loadDesktopBridgeConfig, type DesktopBridgeConfig } from "./bridge/config.js";
 import { DesktopBridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
 import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
+import { createDesktopLogger } from "./desktop/logging.js";
 import { writeRuntimeProcessState } from "./desktop/process-state.js";
 import { SdkTaskExecutor } from "./desktop/sdk-executor.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 
-const config = loadDesktopBridgeConfig();
-await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+const formatFatalDetail = (value: unknown): string => {
+  const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
+  return detail.slice(0, 32_768);
+};
+const bootstrapDataDir = path.resolve(process.env.BOT_DATA_DIR || "./data/desktop");
+await mkdir(bootstrapDataDir, { recursive: true, mode: 0o700 });
+const logger = createDesktopLogger(bootstrapDataDir);
+let config: DesktopBridgeConfig;
+try { config = loadDesktopBridgeConfig(); }
+catch (error) {
+  logger.fatal({ error: formatFatalDetail(error) }, "VKodex desktop bridge configuration is invalid");
+  process.exit(1);
+}
 const store = new BridgeStore(path.join(config.dataDir, "vkodex.sqlite"));
 store.assertPrimaryHome(config.codexHome);
-const gateway = new DesktopVkGateway(config);
+const gateway = new DesktopVkGateway(config, undefined, undefined, logger);
 const catalog = new MultiDesktopCatalog(config.codexHomes);
 const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
 const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata),
@@ -28,6 +40,7 @@ let stopping = false;
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
+  logger.info({ reason: exitReason }, "VKodex desktop bridge is stopping");
   await gateway.stop().catch(() => {});
   await runtime.stop().catch(() => {});
   try { store.close(); } catch { /* Process is already stopping. */ }
@@ -40,27 +53,23 @@ process.once("SIGINT", () => { exitReason = "SIGINT"; void shutdown(); });
 process.once("SIGTERM", () => { exitReason = "SIGTERM"; void shutdown(); });
 
 let fatal = false;
-const formatFatalDetail = (value: unknown): string => {
-  const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
-  return detail.slice(0, 32_768);
-};
 const fatalShutdown = (reason: "uncaught_exception" | "unhandled_rejection", detail: unknown): void => {
   if (fatal) return;
   fatal = true; exitReason = reason;
-  process.stderr.write(`VKodex desktop bridge stopped after ${reason.replaceAll("_", " ")}.\n${formatFatalDetail(detail)}\n`);
+  logger.fatal({ reason, error: formatFatalDetail(detail) }, "VKodex desktop bridge stopped unexpectedly");
   const hardStop = setTimeout(() => process.exit(1), 5_000);
   void shutdown().finally(() => { clearTimeout(hardStop); process.exit(1); });
 };
 process.once("uncaughtException", error => fatalShutdown("uncaught_exception", error));
 process.once("unhandledRejection", reason => fatalShutdown("unhandled_rejection", reason));
 try {
-  process.stdout.write("VKodex desktop bridge: starting (experimental).\n");
+  logger.info("VKodex desktop bridge is starting");
   await gateway.start(input => runtime.handle(input));
   runtime.start();
-  process.stdout.write("VKodex desktop bridge: VK Long Poll started.\n");
+  logger.info("VKodex desktop bridge and VK Long Poll are ready");
 } catch (error) {
   exitReason = "startup_error";
-  process.stderr.write(`VKodex desktop bridge could not start. Check the local configuration and connections.\n${formatFatalDetail(error)}\n`);
+  logger.fatal({ error: formatFatalDetail(error) }, "VKodex desktop bridge could not start");
   await shutdown();
   process.exitCode = 1;
 }
