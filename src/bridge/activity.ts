@@ -49,7 +49,10 @@ export class TaskActivity {
     if (state.kind === "commentary") {
       const base = this.store.getValue<View>(`commentary-base:${state.key}`);
       if (base) this.store.enqueue(state.key, peerId, status === "running" || status === "idle" ? base : { ...base, text: `${base.text}\n\n${labels[status]}` }, bindingId, true);
-    } else this.store.settleActivity(state.key, status === "running" ? "Работа продолжается в сообщениях ниже." : labels[status], refresh);
+    } else if (status === "running") {
+      this.store.deleteActivity(state.key);
+      return;
+    } else this.store.settleActivity(state.key, labels[status], refresh);
     this.store.prioritizeDelivery(state.key);
   }
 

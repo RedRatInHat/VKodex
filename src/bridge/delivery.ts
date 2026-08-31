@@ -67,6 +67,21 @@ export class DeliveryWorker {
       try {
         if (delivery.id > 2_147_483_647) throw new Error("VK random_id range exhausted");
         const firstView = delivery.firstView ?? delivery.view;
+        if (delivery.kind === "delete") {
+          let handle = delivery.handle;
+          if (!handle) {
+            if (!delivery.firstView) { this.store.completed(delivery); continue; }
+            handle = await this.chat.send(delivery.peerId, delivery.firstView, delivery.id);
+            if (handle.peerId !== delivery.peerId || !Number.isSafeInteger(handle.conversationMessageId) || handle.conversationMessageId <= 0) throw new Error("Invalid message handle");
+            this.store.saveHandle(delivery.id, handle);
+            if (!this.active(delivery)) continue;
+          }
+          await this.chat.delete(handle);
+          this.store.delivered(delivery, handle);
+          this.store.recordDeliverySuccess(this.now());
+          this.retries.delete(delivery.id);
+          continue;
+        }
         if (!delivery.handle) this.store.sending(delivery);
         const handle = delivery.handle ?? await this.chat.send(delivery.peerId, firstView, delivery.id);
         if (handle.peerId !== delivery.peerId || !Number.isSafeInteger(handle.conversationMessageId) || handle.conversationMessageId <= 0) throw new Error("Invalid message handle");
@@ -89,6 +104,11 @@ export class DeliveryWorker {
         this.store.recordDeliveryFailure(delivery, "transient", undefined, this.now());
         // Keep the same random_id/handle after a timeout. Never turn a failed edit into a new message.
         const attempts = (this.retries.get(delivery.id)?.attempts ?? 0) + 1;
+        // Cleanup is best-effort. A community that cannot delete for everyone
+        // must not accumulate an immortal queue or block normal VK delivery.
+        if (delivery.kind === "delete" && attempts >= 3) {
+          this.store.completed(delivery); this.retries.delete(delivery.id); continue;
+        }
         this.retries.set(delivery.id, { attempts, after: this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6)) });
       }
     }

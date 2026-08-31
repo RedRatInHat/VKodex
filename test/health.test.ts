@@ -18,6 +18,7 @@ class HealthChat implements BridgeChat {
   async inviteLink() { return "https://vk.me/join/fixture"; }
   async send(peerId: number, _view: View, randomId: number): Promise<MessageHandle> { return { peerId, conversationMessageId: randomId }; }
   async edit() {}
+  async delete() {}
   async uploadDocument() { return "doc-202_1_fixture"; }
 }
 

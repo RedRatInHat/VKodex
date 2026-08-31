@@ -236,6 +236,10 @@ export class DesktopVkGateway implements BridgeChat {
     await this.write(() => this.vk.api.messages.edit({ peer_id: handle.peerId, cmid: handle.conversationMessageId, message: view.text, ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}), ...(view.attachments?.length ? { attachment: view.attachments.join(",") } : {}), dont_parse_links: 1, disable_mentions: 1 }));
   }
 
+  async delete(handle: MessageHandle): Promise<void> {
+    await this.write(() => this.vk.api.messages.delete({ peer_id: handle.peerId, cmids: handle.conversationMessageId, delete_for_all: 1, group_id: this.config.access.groupId }));
+  }
+
   async uploadDocument(peerId: number, name: string, contents: string): Promise<string> {
     const attachment = await this.vk.upload.messageDocument({ peer_id: peerId, title: name, source: { value: Buffer.from(contents, "utf8"), filename: name } });
     return attachment.toString();

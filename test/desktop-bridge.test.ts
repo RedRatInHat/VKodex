@@ -28,6 +28,7 @@ class Chat implements BridgeChat {
   readonly sent: { peerId: number; view: View; randomId: number; handle: MessageHandle }[] = [];
   readonly sendAttempts: { peerId: number; view: View; randomId: number }[] = [];
   readonly edits: { handle: MessageHandle; view: View }[] = [];
+  readonly deletes: MessageHandle[] = [];
   creates = 0;
   invites = 0;
   readonly renames: { peerId: number; title: string }[] = [];
@@ -38,6 +39,7 @@ class Chat implements BridgeChat {
   inviteError: Error | null = null;
   lostSendResponse = false;
   failEdits = false;
+  failDeletes = false;
   messageSequence = 0;
   memberError = false;
   memberReads = 0;
@@ -67,6 +69,7 @@ class Chat implements BridgeChat {
     return handle;
   }
   async edit(handle: MessageHandle, view: View): Promise<void> { if (this.failEdits) throw new Error("edit expired"); this.edits.push({ handle, view }); }
+  async delete(handle: MessageHandle): Promise<void> { if (this.failDeletes) throw new Error("delete failed"); this.deletes.push(handle); }
 }
 
 class Desktop implements DesktopTasks {
@@ -1234,10 +1237,12 @@ test("revisions returning to the last confirmed view do not repeat an identical 
 test("thinking stays separate and follows the newest commentary", async t => {
   const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
+  const initialIndicator = s.chat.sent.at(-1)!.handle;
   const first = { type: "progress", id: "first", turnId: "turn", text: "First comment" } as const;
   s.mirror.accept(binding.id, first); activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
   assert.equal(s.chat.sent.at(-2)!.view.text, "First comment");
   assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
+  assert.deepEqual(s.chat.deletes, [initialIndicator]);
   const firstHandle = s.chat.sent.at(-2)!.handle;
   const firstIndicatorHandle = s.chat.sent.at(-1)!.handle;
   s.advance(); activity.tick(); await s.worker.flush();
@@ -1256,6 +1261,33 @@ test("thinking stays separate and follows the newest commentary", async t => {
   activity.observe(binding.id, "idle"); s.advance(); await s.worker.flush();
   assert.equal(s.chat.edits.at(-1)!.view.text, "Готово.");
   assert.ok(s.chat.sent.filter(item => item.view.text === "Second comment").length === 1);
+  assert.ok(s.chat.sent.every(item => !item.view.text.includes("Работа продолжается")));
+  assert.ok(s.chat.edits.every(item => !item.view.text.includes("Работа продолжается")));
+});
+
+test("old thinking deletion retries safely without duplicating an ambiguous indicator send", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
+  s.chat.lostSendResponse = true;
+  activity.observe(binding.id, "running", "turn"); await s.worker.flush();
+  const oldIndicator = s.chat.sent[0]!.handle;
+  s.mirror.accept(binding.id, { type: "progress", id: "comment", turnId: "turn", text: "Progress" });
+  activity.observe(binding.id, "running", "turn"); s.chat.failDeletes = true; s.advance(); await s.worker.flush();
+  assert.equal(s.chat.sent.filter(item => item.handle.conversationMessageId === oldIndicator.conversationMessageId).length, 1);
+  assert.equal(s.store.pendingDeliveries().filter(item => item.kind === "delete").length, 1);
+  s.chat.failDeletes = false; s.advance(); await s.worker.flush();
+  assert.deepEqual(s.chat.deletes, [oldIndicator]);
+  assert.equal(s.store.pendingDeliveries().filter(item => item.kind === "delete").length, 0);
+});
+
+test("unsupported indicator deletion is abandoned without blocking the delivery queue", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
+  activity.observe(binding.id, "running", "turn"); await s.worker.flush();
+  s.mirror.accept(binding.id, { type: "progress", id: "comment", turnId: "turn", text: "Progress" });
+  activity.observe(binding.id, "running", "turn"); s.chat.failDeletes = true;
+  for (let attempt = 0; attempt < 3; attempt++) { s.advance(70_000); await s.worker.flush(); }
+  assert.equal(s.store.pendingDeliveries().filter(item => item.kind === "delete").length, 0);
+  s.store.enqueue("after-delete", peerId, { text: "Still delivering" }, binding.id);
+  await s.worker.flush(); assert.equal(s.chat.sent.at(-1)!.view.text, "Still delivering");
 });
 
 test("user messages and menus move thinking to the bottom while restart reuses its latest handle", async t => {
@@ -1450,6 +1482,17 @@ test("VK serialization enables silent only for messages explicitly marked quiet"
   assert.equal(quiet.dont_parse_links, 1); assert.equal(quiet.disable_mentions, 1);
   assert.equal(Object.hasOwn(vkSendParams(peerId, { text: "Final" }, 43), "silent"), false);
   assert.equal(Object.hasOwn(vkSendParams(peerId, { text: "Final", silent: false }, 44), "silent"), false);
+});
+
+test("VK deletes a retired indicator for everyone using its conversation message id", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  let params: unknown;
+  t.mock.method(vk.api, "callWithRequest", async ({ method, params: value }: { method: string; params: unknown }) => {
+    assert.equal(method, "messages.delete"); params = value; return [];
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 0);
+  await gateway.delete({ peerId, conversationMessageId: 42 });
+  assert.deepEqual(params, { peer_id: peerId, cmids: 42, delete_for_all: 1, group_id: access.groupId });
 });
 
 test("outbox retries an ambiguous send with the same random_id and retains edit handles", async t => {

@@ -98,6 +98,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const chat: BridgeChat = {
     send: async (peerId, view) => { sent.push({ peerId, view }); return { peerId, conversationMessageId: sent.length }; },
     edit: async (handle, view) => { edits.push({ handle, view }); },
+    delete: async () => {},
     createConversation: async () => { throw new Error("Unexpected chat creation"); },
     renameConversation: async () => { throw new Error("Unexpected chat rename"); },
     inviteLink: async () => { throw new Error("Unexpected invitation"); },

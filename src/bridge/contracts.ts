@@ -33,6 +33,7 @@ export interface BridgeChat {
   inviteLink(peerId: number): Promise<string>;
   send(peerId: number, view: View, randomId: number): Promise<MessageHandle>;
   edit(handle: MessageHandle, view: View): Promise<void>;
+  delete(handle: MessageHandle): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
   uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string>;
   /** Read-only operational checks. Implementations must never expose credentials in details. */
@@ -115,7 +116,7 @@ export interface Delivery {
   readonly key: string;
   readonly bindingId: string | null;
   readonly peerId: number;
-  readonly kind: "send" | "commentary" | "panel" | "activity";
+  readonly kind: "send" | "commentary" | "panel" | "activity" | "delete";
   readonly view: View;
   readonly firstView: View | null;
   readonly handle: MessageHandle | null;

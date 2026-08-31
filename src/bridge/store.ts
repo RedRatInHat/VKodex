@@ -32,7 +32,7 @@ export interface DeliveryFailure {
   readonly at: number;
   readonly type: "rate_limit" | "transient";
   readonly kind: Delivery["kind"];
-  readonly operation: "send" | "edit";
+  readonly operation: "send" | "edit" | "delete";
   readonly retryAfterMs?: number;
 }
 export interface DeliveryHealthStats {
@@ -195,10 +195,10 @@ export class BridgeStore {
       SUM(CASE WHEN d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id) THEN 1 ELSE 0 END) AS active,
       SUM(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('send', 'panel') THEN 1 ELSE 0 END) AS critical,
       MIN(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('send', 'panel') THEN d.id END) AS critical_oldest_id,
-      SUM(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('commentary', 'activity') THEN 1 ELSE 0 END) AS stream,
+      SUM(CASE WHEN (d.binding_id IS NULL OR (b.attached = 1 AND b.peer_id = d.peer_id)) AND d.kind IN ('commentary', 'activity', 'delete') THEN 1 ELSE 0 END) AS stream,
       SUM(CASE WHEN d.binding_id IS NOT NULL AND (b.id IS NULL OR b.attached <> 1 OR b.peer_id <> d.peer_id) THEN 1 ELSE 0 END) AS inactive
       FROM bridge_delivery d LEFT JOIN bridge_bindings b ON b.id = d.binding_id
-      WHERE d.revision > d.delivered_revision AND d.kind IN ('send', 'commentary', 'panel', 'activity')`).get() as {
+      WHERE d.revision > d.delivered_revision AND d.kind IN ('send', 'commentary', 'panel', 'activity', 'delete')`).get() as {
         active: number | null; critical: number | null; critical_oldest_id: number | null; stream: number | null; inactive: number | null;
       };
     return {
@@ -213,7 +213,7 @@ export class BridgeStore {
     };
   }
   recordDeliveryFailure(delivery: Delivery, type: DeliveryFailure["type"], retryAfterMs?: number, now = Date.now()): void {
-    this.setValue("vk-delivery-last-failure", { at: now, type, kind: delivery.kind, operation: delivery.handle ? "edit" : "send", ...(retryAfterMs ? { retryAfterMs } : {}) } satisfies DeliveryFailure);
+    this.setValue("vk-delivery-last-failure", { at: now, type, kind: delivery.kind, operation: delivery.kind === "delete" ? "delete" : delivery.handle ? "edit" : "send", ...(retryAfterMs ? { retryAfterMs } : {}) } satisfies DeliveryFailure);
   }
   recordDeliverySuccess(now = Date.now()): void { this.setValue("vk-delivery-last-success-at", now); }
   getDraft(): NewTaskDraft | null { return this.getValue<NewTaskDraft>("draft"); }
@@ -288,6 +288,12 @@ export class BridgeStore {
       WHERE key = ? AND kind = 'activity' AND (view <> ? OR ? = 1)`).run(view, key, view, Number(refresh));
   }
 
+  deleteActivity(key: string): void {
+    this.db.prepare(`UPDATE bridge_delivery SET kind = 'delete', revision = revision + 1,
+      delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END
+      WHERE key = ? AND kind = 'activity'`).run(key);
+  }
+
   activateActivity(key: string): void {
     this.db.prepare("UPDATE bridge_delivery SET revision = revision + 1 WHERE key = ? AND kind = 'activity' AND delivered_revision = revision").run(key);
   }
@@ -306,8 +312,8 @@ export class BridgeStore {
 
   pendingDeliveries(): Delivery[] {
     const rows = this.db.prepare(`SELECT * FROM bridge_delivery WHERE revision > delivered_revision
-      AND kind IN ('send', 'commentary', 'panel', 'activity')
-      ORDER BY CASE kind WHEN 'send' THEN 0 WHEN 'panel' THEN 1 WHEN 'commentary' THEN 2 ELSE 3 END, id`).all() as {
+      AND kind IN ('send', 'commentary', 'panel', 'activity', 'delete')
+      ORDER BY CASE kind WHEN 'send' THEN 0 WHEN 'panel' THEN 1 WHEN 'commentary' THEN 2 WHEN 'activity' THEN 3 ELSE 4 END, id`).all() as {
       id: number; key: string; binding_id: string | null; peer_id: number; kind: Delivery["kind"]; view: string; first_view: string | null; handle: string | null; revision: number; delivered_revision: number;
     }[];
     return rows.map(row => ({ id: row.id, key: row.key, bindingId: row.binding_id, peerId: row.peer_id, kind: row.kind, view: JSON.parse(row.view) as View, firstView: row.first_view ? JSON.parse(row.first_view) as View : null, handle: row.handle ? JSON.parse(row.handle) as MessageHandle : null, revision: row.revision, deliveredRevision: row.delivered_revision }));
@@ -317,7 +323,7 @@ export class BridgeStore {
     this.db.prepare("UPDATE bridge_delivery SET first_view = COALESCE(first_view, ?) WHERE id = ?").run(JSON.stringify(delivery.view), delivery.id);
   }
   isPending(delivery: Delivery): boolean {
-    if (delivery.kind === "activity") return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND revision = ? AND delivered_revision < ?").get(delivery.id, delivery.revision, delivery.revision));
+    if (delivery.kind === "activity" || delivery.kind === "delete") return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND revision = ? AND delivered_revision < ?").get(delivery.id, delivery.revision, delivery.revision));
     return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND delivered_revision < ?").get(delivery.id, delivery.revision));
   }
   saveHandle(id: number, handle: MessageHandle): void {
@@ -326,5 +332,8 @@ export class BridgeStore {
 
   delivered(delivery: Delivery, handle: MessageHandle): void {
     this.db.prepare("UPDATE bridge_delivery SET handle = ?, delivered_revision = MAX(delivered_revision, ?) WHERE id = ?").run(JSON.stringify(handle), delivery.revision, delivery.id);
+  }
+  completed(delivery: Delivery): void {
+    this.db.prepare("UPDATE bridge_delivery SET delivered_revision = MAX(delivered_revision, ?) WHERE id = ?").run(delivery.revision, delivery.id);
   }
 }
