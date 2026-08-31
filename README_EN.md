@@ -329,6 +329,7 @@ The manager is the **private chat with the community**, not another group conver
 | `/menu`, `/start`, `/status` | Open the bridge menu and technical summary. |
 | `/help` | Show the manager's supported commands. |
 | `/health`, **Check health** | Immediately recheck VK, queues, SQLite, Codex catalogs, goals API, named pipe, stream protocol, and active streams. |
+| `/load`, `/pc` | Sample current CPU, memory and disk usage, OS uptime, and the VKodex process CPU, memory and PID. Manager-only; the command is never forwarded to an agent. |
 | `/limits`, **Codex limits** | Show the data directory, account, used limit percentage, reset time, plan, and credits. The manager shows every configured profile; a task conversation shows only that task's account. The command is not forwarded to the agent. |
 | `/list`, **Codex tasks** | Select a project, then select a task. |
 | `/new`, **New task** | Create a user task: project → local folder or separate Git worktree → title → initial prompt → model → reasoning effort. |

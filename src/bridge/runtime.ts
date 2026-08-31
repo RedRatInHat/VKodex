@@ -12,6 +12,7 @@ import { TaskActivity } from "./activity.js";
 import { TaskFiles } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
 import type { BridgeHealthSnapshot } from "./contracts.js";
+import { systemLoadText } from "./system-load.js";
 
 export class DesktopBridgeRuntime {
   private readonly gate: AccessGate;
@@ -44,7 +45,7 @@ export class DesktopBridgeRuntime {
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
-    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true));
+    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot));
     this.mirror = new TaskMirror(store);
     this.activity = new TaskActivity(store, now);
     this.unsubscribeDirect = desktop.onDirectUpdate?.(update => this.acceptDirect(update)) ?? null;

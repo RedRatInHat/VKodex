@@ -156,13 +156,15 @@ function setup(t: { after(fn: () => void): void }, enableHealth = false) {
   let time = 100_000;
   const gate = new AccessGate(access, store);
   let healthChecks = 0;
+  let loadChecks = 0;
   const healthCheck = enableHealth ? async () => {
     healthChecks++;
     const report = { state: "ok" as const, checkedAt: time, pid: 42, uptimeSeconds: 60,
       checks: [{ name: "fixture", state: "ok" as const, detail: "All components respond." }] };
     store.setValue("health:latest", report); return report;
   } : undefined;
-  const manager = new TaskManager(access, desktop, chat, store, gate, undefined, healthCheck);
+  const loadReport = async () => { loadChecks++; return "Нагрузка ПК\nCPU: 12.5%\nRAM: 8.0 ГБ из 32.0 ГБ"; };
+  const manager = new TaskManager(access, desktop, chat, store, gate, undefined, healthCheck, loadReport);
   // Most unit tests assert a completely drained fixture queue. Production uses
   // the default bounded batch, covered by a dedicated backlog test below.
   const worker = new DeliveryWorker(chat, store, gate, 3_000, () => time, 100);
@@ -172,7 +174,7 @@ function setup(t: { after(fn: () => void): void }, enableHealth = false) {
   const handle = async (text: string, peer = access.ownerId, action?: string) => { await manager.handle(input(text, peer, action)); await worker.flush(); };
   const attach = () => { const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17); return store.getBinding(binding.id)!; };
   return { store, chat, desktop, gate, manager, worker, mirror, input, handle, attach, now: () => time,
-    healthChecks: () => healthChecks, advance: (ms = 6_000) => { time += ms; } };
+    healthChecks: () => healthChecks, loadChecks: () => loadChecks, advance: (ms = 6_000) => { time += ms; } };
 }
 
 function panelView(s: ReturnType<typeof setup>, peer = peerId): View {
@@ -286,6 +288,19 @@ test("manager health button runs a fresh check and renders its component report"
   assert.match(panelView(s, access.ownerId).text, /Health: OK[\s\S]*fixture: All components respond/u);
   await s.handle("/health");
   assert.equal(s.healthChecks(), 2);
+});
+
+test("manager load command reports the PC snapshot without reaching a Codex task", async t => {
+  const s = setup(t); s.attach();
+  await s.handle("/load");
+  assert.equal(s.loadChecks(), 1);
+  assert.match(s.chat.sent.at(-1)!.view.text, /^Нагрузка ПК\nCPU: 12\.5%\nRAM:/u);
+  assert.deepEqual(s.chat.sent.at(-1)!.view.buttons, [MENU_BUTTON]);
+  await s.handle("/pc"); assert.equal(s.loadChecks(), 2);
+  await s.handle("/load", peerId);
+  assert.equal(s.loadChecks(), 2);
+  assert.match(s.chat.sent.at(-1)!.view.text, /VKodex · команды задачи/u);
+  assert.equal(s.desktop.submissions.length, 0);
 });
 
 test("account limits are available from the manager and task chat without reaching the agent", async t => {

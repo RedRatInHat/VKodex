@@ -6,6 +6,7 @@ import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { TaskPanels } from "./panels.js";
 import { TaskFiles } from "./files.js";
+import { systemLoadText } from "./system-load.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -16,6 +17,7 @@ const managerHelp = [
   "/menu, /start, /status — меню и состояние моста",
   "/help — эта справка",
   "/health — полная проверка моста",
+  "/load, /pc — текущая нагрузка компьютера",
   "/limits — лимиты аккаунта Codex",
   "/list — задачи по проектам",
   "/new — создать новую задачу",
@@ -57,6 +59,7 @@ export class TaskManager {
     private readonly gate: AccessGate,
     private readonly files?: TaskFiles,
     healthCheck?: () => Promise<BridgeHealthSnapshot>,
+    private readonly loadReport: () => Promise<string> = systemLoadText,
   ) { this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck); }
 
   handle(input: BridgeInput): Promise<void> {
@@ -164,6 +167,7 @@ export class TaskManager {
   private async handleManager(input: BridgeInput): Promise<void> {
     const text = input.text.trim();
     if (text === "/help") { this.reply(input, { text: managerHelp }); return; }
+    if (["/load", "/pc"].includes(text)) { this.reply(input, { text: await this.loadReport() }); return; }
     if (["/start", "/list"].includes(text)) { await this.chooseProject(input, 0); return; }
     if (text === "/new") { await this.newTask(input); return; }
     if (text === "/cancel") { this.cancel(input); return; }
@@ -181,7 +185,7 @@ export class TaskManager {
       await this.newModels(input, 0);
       return;
     }
-    this.reply(input, { text: "Это менеджер задач. /menu — меню и состояние моста, /health — полная проверка, /list — задачи по проектам, /new — новая задача, /cancel — отмена ввода.", buttons: [MENU_BUTTON] });
+    this.reply(input, { text: "Это менеджер задач. /menu — меню и состояние моста, /health — полная проверка, /load — нагрузка ПК, /list — задачи по проектам, /new — новая задача, /cancel — отмена ввода.", buttons: [MENU_BUTTON] });
   }
 
   private button(label: string, action: ManagerAction): Button { return { label: label.slice(0, 40), action: this.store.action(action, Date.now(), this.access.ownerId) }; }
