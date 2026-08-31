@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/logo.png" width="112" alt="VKodex logo">
+  <img src="docs/logo-transparent.png" width="112" alt="VKodex logo">
 </p>
 
 # VKodex
