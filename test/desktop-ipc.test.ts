@@ -160,7 +160,7 @@ test("runtime connects a large task and mirrors progress without forwarding tool
   await s.runtime.tick();
   assert.deepEqual(s.follows(), [true]);
   assert.equal(s.server.destroyed, false);
-  assert.deepEqual(s.sent.map(item => item.view.text), ["думаю..."]);
+  assert.match(s.sent[0]!.view.text, /^думаю\.\.\. · обновлено \d{2}:\d{2}:\d{2}$/u);
   s.server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11, sourceClientId: "owner", targetClientIds: ["bridge-client"], params: {
     hostId: ref.hostId, conversationId: ref.threadId, change: { type: "patches", baseRevision: 1, revision: 2, patches: [
       { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 2], value: { id: "progress", type: "agentMessage", phase: "commentary", text: "Progress after connecting" } },
@@ -168,7 +168,8 @@ test("runtime connects a large task and mirrors progress without forwarding tool
   } });
   await new Promise(resolve => setImmediate(resolve));
   await s.runtime.tick();
-  assert.deepEqual(s.sent.map(item => item.view.text), ["думаю...", "Progress after connecting\n\nдумаю..."]);
+  assert.equal(s.sent.at(-2)!.view.text, "Progress after connecting");
+  assert.match(s.sent.at(-1)!.view.text, /^думаю\.\.\. · обновлено \d{2}:\d{2}:\d{2}$/u);
 });
 
 test("runtime reports the actual connection failure without leaking malformed IPC contents", async t => {
@@ -190,7 +191,7 @@ test("runtime reports the actual connection failure without leaking malformed IP
 test("runtime animates an active task between desktop events and stops when its turn completes", async t => {
   const s = runtimeSetup(t); await s.runtime.tick();
   s.advance(20_000); await s.runtime.tick();
-  assert.equal(s.edits.at(-1)!.view.text, "думаю..");
+  assert.match(s.edits.at(-1)!.view.text, /^думаю\.\. · обновлено \d{2}:\d{2}:\d{2}$/u);
   s.server.dataState = state([], "completed"); s.server.snapshot();
   await new Promise(resolve => setImmediate(resolve)); s.advance(3_000); await s.runtime.tick();
   assert.equal(s.edits.at(-1)!.view.text, "Готово.");

@@ -16,10 +16,10 @@ interface ActivityState {
   generation: number;
   turnId: string | null;
   status: TaskDetails["status"];
-  kind?: "activity" | "commentary";
+  // Kept only to cleanly migrate indicators embedded into commentary by
+  // older bridge versions. New indicators are always standalone messages.
+  kind?: "commentary";
 }
-
-export interface CommentaryTarget { itemKey: string; key: string; turnId: string; generation: number; order: number }
 
 export class TaskActivity {
   private readonly running = new Map<string, { state: ActivityState; frame: number; nextAt: number }>();
@@ -31,11 +31,18 @@ export class TaskActivity {
     private readonly intervalMs = DEFAULT_INTERVAL_MS,
   ) {}
 
+  private frame(text: string): string {
+    const updated = new Intl.DateTimeFormat("ru-RU", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).format(new Date(this.now()));
+    return `${text} · обновлено ${updated}`;
+  }
+
   private render(state: ActivityState, peerId: number, bindingId: string, frame: string): void {
-    if (state.kind === "commentary") {
-      const base = this.store.getValue<View>(`commentary-base:${state.key}`);
-      if (base) this.store.enqueue(state.key, peerId, { ...base, text: `${base.text}\n\n${frame}`, silent: true }, bindingId, true);
-    } else this.store.enqueue(state.key, peerId, { text: frame, silent: true }, bindingId, "activity");
+    this.store.enqueue(state.key, peerId, { text: this.frame(frame), silent: true }, bindingId, "activity");
   }
 
   private settle(state: ActivityState, peerId: number, bindingId: string, status: TaskDetails["status"], refresh = false): void {
@@ -55,11 +62,16 @@ export class TaskActivity {
     const valueKey = `activity:${bindingId}`;
     const saved = this.store.getValue<ActivityState>(valueKey);
     const generation = this.store.streamGeneration(bindingId);
-    const previous = saved?.generation === generation ? saved : null;
+    let previous = saved?.generation === generation ? saved : null;
     if (!binding?.attached || binding.peerId === null) {
       this.running.delete(bindingId); this.observed.delete(bindingId);
       if (saved) this.retire(saved);
       return;
+    }
+    if (previous?.kind === "commentary") {
+      const base = this.store.getValue<View>(`commentary-base:${previous.key}`);
+      if (base) this.store.enqueue(previous.key, binding.peerId, base, binding.id, true);
+      previous = null;
     }
     const first = !this.observed.has(bindingId);
     this.observed.add(bindingId);
@@ -71,20 +83,17 @@ export class TaskActivity {
       }
       return;
     }
-    const sameTurn = previous && !terminal(previous.status) && (!turnId || !previous.turnId || turnId === previous.turnId);
+    const sameTurn = previous !== null && !terminal(previous.status) && (!turnId || !previous.turnId || turnId === previous.turnId);
     let current: ActivityState = sameTurn
-      ? { ...previous, status, turnId: turnId ?? previous.turnId }
+      ? { ...previous!, status, turnId: turnId ?? previous!.turnId }
       : { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
-    const commentary = this.store.getValue<CommentaryTarget>(`latest-commentary:${bindingId}`);
     const latestMessageId = this.store.latestPeerMessage(binding.peerId);
-    const commentaryMessageId = commentary ? this.store.deliveryMessageId(commentary.key) : null;
-    if (commentary?.generation === generation && commentary.turnId === turnId && (commentaryMessageId === null || commentaryMessageId >= latestMessageId) && this.store.getValue<View>(`commentary-base:${commentary.key}`)) {
-      current = { ...current, key: commentary.key, kind: "commentary" };
-    } else if (current.kind === "commentary") {
+    const currentMessageId = this.store.deliveryMessageId(current.key);
+    const currentOrder = this.store.deliveryOrder(current.key);
+    if ((currentMessageId !== null && currentMessageId < latestMessageId)
+      || (currentOrder > 0 && currentOrder < this.store.latestPeerDeliveryOrder(binding.peerId))) {
       current = { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
     }
-    const currentMessageId = this.store.deliveryMessageId(current.key);
-    if (currentMessageId !== null && currentMessageId < latestMessageId) current = { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
     if (previous && previous.key !== current.key && !terminal(previous.status)) this.settle(previous, binding.peerId, bindingId, sameTurn ? "running" : "idle");
     if (JSON.stringify(current) !== JSON.stringify(saved)) this.store.setValue(valueKey, current);
     const running = this.running.get(bindingId);
@@ -94,7 +103,7 @@ export class TaskActivity {
     }
     this.running.set(bindingId, { state: current, frame: 0, nextAt: this.now() + this.intervalMs });
     this.render(current, binding.peerId, bindingId, FRAMES[0]);
-    if (current.kind !== "commentary") this.store.activateActivity(current.key);
+    this.store.activateActivity(current.key);
   }
 
   tick(): void {
@@ -105,7 +114,9 @@ export class TaskActivity {
         continue;
       }
       const messageId = this.store.deliveryMessageId(activity.state.key);
-      if (messageId !== null && messageId < this.store.latestPeerMessage(binding.peerId)) {
+      const deliveryOrder = this.store.deliveryOrder(activity.state.key);
+      if ((messageId !== null && messageId < this.store.latestPeerMessage(binding.peerId))
+        || (deliveryOrder > 0 && deliveryOrder < this.store.latestPeerDeliveryOrder(binding.peerId))) {
         this.observe(bindingId, "running", activity.state.turnId); continue;
       }
       if (this.now() < activity.nextAt) continue;
@@ -118,10 +129,8 @@ export class TaskActivity {
   disconnected(bindingId: string): void { this.observe(bindingId, "unavailable"); this.observed.delete(bindingId); }
 
   stop(): void {
-    for (const [bindingId, activity] of this.running) {
-      const binding = this.store.getBinding(bindingId);
-      if (activity.state.kind === "commentary" && binding?.attached && binding.peerId !== null) this.settle(activity.state, binding.peerId, bindingId, "idle");
-      else this.retire(activity.state);
+    for (const activity of this.running.values()) {
+      this.retire(activity.state);
     }
     this.running.clear();
     this.observed.clear();

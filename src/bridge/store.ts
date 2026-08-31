@@ -240,6 +240,9 @@ export class BridgeStore {
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
   rememberEvent(bindingId: string, eventId: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_events(binding_id, event_id) VALUES (?, ?)").run(bindingId, eventId).changes === 1; }
   deliveryOrder(key: string): number { return (this.db.prepare("SELECT id FROM bridge_delivery WHERE key = ?").get(key) as { id: number } | undefined)?.id ?? 0; }
+  latestPeerDeliveryOrder(peerId: number): number {
+    return (this.db.prepare("SELECT MAX(id) AS id FROM bridge_delivery WHERE peer_id = ? AND kind IN ('send', 'commentary', 'panel', 'activity')").get(peerId) as { id: number | null }).id ?? 0;
+  }
   deliveryMessageId(key: string): number | null {
     return (this.db.prepare("SELECT json_extract(handle, '$.conversationMessageId') AS id FROM bridge_delivery WHERE key = ?").get(key) as { id: number | null } | undefined)?.id ?? null;
   }

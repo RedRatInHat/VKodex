@@ -2,7 +2,6 @@ import type { TaskEvent } from "../desktop/contracts.js";
 import { chunkText } from "../lib/text.js";
 import { BridgeStore } from "./store.js";
 import { MENU_BUTTON } from "./contracts.js";
-import type { CommentaryTarget } from "./activity.js";
 
 const USER_REQUEST_PREFIX = "## user request\n\n";
 const MENU_FOOTER = "\n\nМеню задачи:";
@@ -36,13 +35,6 @@ export class TaskMirror {
           this.store.setValue(`commentary-base:${key}:${index}`, null);
           this.store.withdrawCommentary(`${key}:${index}`);
         }
-        const targetKey = `latest-commentary:${binding.id}`;
-        const target = this.store.getValue<CommentaryTarget>(targetKey);
-        const generation = this.store.streamGeneration(binding.id);
-        const order = this.store.deliveryOrder(`${key}:0`);
-        if (chunks.length && (!target || target.generation !== generation || order >= target.order)) {
-          this.store.setValue(targetKey, { itemKey: key, key: `${key}:${chunks.length - 1}`, turnId: event.turnId, generation, order } satisfies CommentaryTarget);
-        } else if (!chunks.length && target?.itemKey === key) this.store.setValue(targetKey, null);
         this.store.setValue(key, chunks.length);
         return;
       }

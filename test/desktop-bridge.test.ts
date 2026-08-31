@@ -180,6 +180,10 @@ function panelView(s: ReturnType<typeof setup>, peer = peerId): View {
   return s.chat.edits.filter(edit => edit.handle.peerId === peer && edit.handle.conversationMessageId === sent.handle.conversationMessageId).at(-1)?.view ?? sent.view;
 }
 
+function assertThinking(text: string, frame: "думаю..." | "думаю.." | "думаю."): void {
+  assert.match(text, new RegExp(`^${frame.replaceAll(".", "\\.")} · обновлено \\d{2}:\\d{2}:\\d{2}$`, "u"));
+}
+
 async function clickPanel(s: ReturnType<typeof setup>, label: string, peer = peerId): Promise<void> {
   const button = panelView(s, peer).buttons!.find(button => button.label === label);
   assert.ok(button, `Missing button ${label}`);
@@ -1103,14 +1107,16 @@ test("technical events and turn statuses never create VK messages", async t => {
 test("thinking cycles one silent message and leaves the final answer separate", async t => {
   const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
-  assert.deepEqual(s.chat.sent.map(message => message.view), [{ text: "думаю...", silent: true }]);
-  for (const text of ["думаю..", "думаю.", "думаю..."]) {
+  assert.equal(s.chat.sent[0]!.view.silent, true); assertThinking(s.chat.sent[0]!.view.text, "думаю...");
+  const firstUpdatedAt = s.chat.sent[0]!.view.text.split("обновлено ")[1];
+  for (const text of ["думаю..", "думаю.", "думаю..."] as const) {
     activity.observe(binding.id, "running", "turn");
     activity.tick(); await s.worker.flush();
     s.advance(); activity.tick(); await s.worker.flush();
-    assert.equal(s.chat.edits.at(-1)!.view.text, text);
+    assertThinking(s.chat.edits.at(-1)!.view.text, text);
     assert.deepEqual(s.chat.edits.at(-1)!.handle, s.chat.sent[0]!.handle);
   }
+  assert.notEqual(s.chat.edits[0]!.view.text.split("обновлено ")[1], firstUpdatedAt);
   assert.equal(s.chat.sent.length, 1); assert.equal(s.chat.edits.length, 3);
   assert.ok(s.chat.edits.every(edit => edit.view.silent));
   s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "Final answer" });
@@ -1125,7 +1131,7 @@ test("thinking uses a flood-safe twenty-second interval by default", async t => 
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   s.advance(19_999); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, 0);
   s.advance(1); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, 1);
-  assert.equal(s.chat.edits[0]!.view.text, "думаю..");
+  assertThinking(s.chat.edits[0]!.view.text, "думаю..");
 });
 
 test("thinking restores the same message after restart and settles an interrupted finish", async t => {
@@ -1140,6 +1146,21 @@ test("thinking restores the same message after restart and settles an interrupte
   activity = new TaskActivity(s.store, s.now, 6_000); activity.observe(binding.id, "idle"); s.advance(); await s.worker.flush();
   assert.equal(s.chat.edits.at(-1)!.view.text, "Готово."); assert.equal(s.chat.sent.length, 1);
   activity.observe(binding.id, "running", "next-turn"); await s.worker.flush(); assert.equal(s.chat.sent.length, 2);
+});
+
+test("upgrade removes a legacy embedded indicator and creates a standalone one", async t => {
+  const s = setup(t); const binding = s.attach();
+  const key = `commentary:${binding.id}:turn:legacy:0`;
+  const base = { text: "Legacy progress", silent: true };
+  s.store.setValue(`commentary-base:${key}`, base);
+  s.store.enqueue(key, peerId, { ...base, text: `${base.text}\n\nдумаю...` }, binding.id, true);
+  s.store.setValue(`activity:${binding.id}`, { key, generation: s.store.streamGeneration(binding.id), turnId: "turn", status: "running", kind: "commentary" });
+  await s.worker.flush(); s.store.recover();
+  const activity = new TaskActivity(s.store, s.now, 6_000);
+  activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
+  assert.equal(s.chat.edits.at(-1)!.view.text, "Legacy progress");
+  assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
+  assert.notEqual(s.chat.sent.at(-1)!.handle.conversationMessageId, s.chat.sent[0]!.handle.conversationMessageId);
 });
 
 test("VK flood control pauses the whole delivery queue across worker restart", async t => {
@@ -1195,27 +1216,31 @@ test("revisions returning to the last confirmed view do not repeat an identical 
   assert.equal(s.chat.edits.length, 0); assert.equal(s.store.pendingDeliveries().length, 0);
 });
 
-test("thinking moves into the newest commentary and restores older message text", async t => {
+test("thinking stays separate and follows the newest commentary", async t => {
   const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now, 6_000);
   activity.observe(binding.id, "running", "turn"); await s.worker.flush();
   const first = { type: "progress", id: "first", turnId: "turn", text: "First comment" } as const;
   s.mirror.accept(binding.id, first); activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.sent.at(-1)!.view.text, "First comment\n\nдумаю...");
-  const firstHandle = s.chat.sent.at(-1)!.handle;
+  assert.equal(s.chat.sent.at(-2)!.view.text, "First comment");
+  assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
+  const firstHandle = s.chat.sent.at(-2)!.handle;
+  const firstIndicatorHandle = s.chat.sent.at(-1)!.handle;
   s.advance(); activity.tick(); await s.worker.flush();
-  assert.equal(s.chat.edits.at(-1)!.view.text, "First comment\n\nдумаю..");
+  assertThinking(s.chat.edits.at(-1)!.view.text, "думаю..");
   s.mirror.accept(binding.id, { ...first, text: "First comment expanded" });
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.edits.at(-1)!.view.text, "First comment expanded\n\nдумаю..");
+  assert.ok(s.chat.edits.some(item => item.handle.conversationMessageId === firstHandle.conversationMessageId && item.view.text === "First comment expanded"));
+  assertThinking(s.chat.edits.filter(item => item.handle.conversationMessageId === firstIndicatorHandle.conversationMessageId).at(-1)!.view.text, "думаю..");
   s.mirror.accept(binding.id, { ...first, id: "second", text: "Second comment" });
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.sent.length, 3); assert.equal(s.chat.sent.at(-1)!.view.text, "Second comment\n\nдумаю...");
+  assert.equal(s.chat.sent.at(-2)!.view.text, "Second comment"); assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
   assert.equal(s.chat.edits.filter(item => item.handle.conversationMessageId === firstHandle.conversationMessageId).at(-1)!.view.text, "First comment expanded");
   s.mirror.accept(binding.id, { ...first, text: "Older comment corrected" });
   activity.observe(binding.id, "running", "turn"); s.advance(); activity.tick(); await s.worker.flush();
-  assert.equal(s.chat.edits.at(-1)!.view.text, "Second comment\n\nдумаю..");
+  assertThinking(s.chat.edits.at(-1)!.view.text, "думаю..");
   activity.observe(binding.id, "idle"); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.edits.at(-1)!.view.text, "Second comment");
+  assert.equal(s.chat.edits.at(-1)!.view.text, "Готово.");
+  assert.ok(s.chat.sent.filter(item => item.view.text === "Second comment").length === 1);
 });
 
 test("user messages and menus move thinking to the bottom while restart reuses its latest handle", async t => {
@@ -1225,12 +1250,12 @@ test("user messages and menus move thinking to the bottom while restart reuses i
   const incomingId = ++s.chat.messageSequence;
   await s.manager.handle({ ...s.input("Follow up", peerId), eventId: `message:${incomingId}` });
   activity.tick(); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.sent.at(-1)!.view.text, "думаю...");
+  assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
   assert.ok(s.chat.sent.at(-1)!.handle.conversationMessageId > incomingId);
   await s.handle("/menu", peerId);
   const menuId = s.chat.sent.at(-1)!.handle.conversationMessageId;
   activity.tick(); s.advance(); await s.worker.flush();
-  assert.equal(s.chat.sent.at(-1)!.view.text, "думаю...");
+  assertThinking(s.chat.sent.at(-1)!.view.text, "думаю...");
   assert.ok(s.chat.sent.at(-1)!.handle.conversationMessageId > menuId);
   s.mirror.accept(binding.id, { type: "progress", id: "new-comment", turnId: "turn", text: "New progress" });
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
@@ -1239,7 +1264,7 @@ test("user messages and menus move thinking to the bottom while restart reuses i
   activity.observe(binding.id, "running", "turn"); s.advance(); await s.worker.flush();
   s.advance(); activity.tick(); await s.worker.flush();
   assert.equal(s.chat.sent.length, count); assert.deepEqual(s.chat.edits.at(-1)!.handle, latest);
-  assert.equal(s.chat.edits.at(-1)!.view.text, "New progress\n\nдумаю..");
+  assertThinking(s.chat.edits.at(-1)!.view.text, "думаю..");
   s.store.stopStreaming(binding.id); const edits = s.chat.edits.length;
   s.advance(); activity.tick(); await s.worker.flush(); assert.equal(s.chat.edits.length, edits);
 });
