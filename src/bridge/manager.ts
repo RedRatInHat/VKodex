@@ -9,6 +9,7 @@ import { TaskFiles } from "./files.js";
 import { systemLoadText } from "./system-load.js";
 import { taskInput } from "../desktop/desktop-tasks.js";
 import path from "node:path";
+import os from "node:os";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -76,6 +77,7 @@ export class TaskManager {
     private readonly files?: TaskFiles,
     healthCheck?: () => Promise<BridgeHealthSnapshot>,
     private readonly loadReport: () => Promise<string> = systemLoadText,
+    private readonly projectlessRoot: string = path.join(os.tmpdir(), "VKodex", "workspaces"),
   ) { this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck); }
 
   handle(input: BridgeInput): Promise<void> {
@@ -190,6 +192,15 @@ export class TaskManager {
     if (text.startsWith("/")) { this.reply(input, { text: unknownCommand(managerHelp) }); return; }
     const draft = this.store.getDraft();
     if (draft?.stage === "workspace") {
+      // Drafts created by the previous mobile-hostile wizard did not carry an
+      // explicit manual marker. Treat their next non-path message as the title
+      // of a new isolated projectless task so an upgrade can continue in place.
+      if (draft.projectId === null && draft.automaticWorkspace !== false && text && !path.isAbsolute(text) && !path.win32.isAbsolute(text)) {
+        if (text.length > 120) throw new ActionRejectedError("Введи название задачи длиной от 1 до 120 символов.");
+        this.store.saveDraft({ ...draft, stage: "prompt", title: text, workspace: this.automaticWorkspace(text, draft.id), automaticWorkspace: true, environment: "local" });
+        this.reply(input, { text: "Теперь отправь стартовый промпт.", buttons: [this.button("Отмена", { type: "cancel" })] });
+        return;
+      }
       const workspace = enteredPath(text);
       const next = { ...draft, stage: "environment" as const, workspace };
       this.store.saveDraft(next);
@@ -198,7 +209,8 @@ export class TaskManager {
     }
     if (draft?.stage === "title") {
       if (!text || text.length > 120) throw new ActionRejectedError("Введи название задачи длиной от 1 до 120 символов.");
-      this.store.saveDraft({ ...draft, stage: "prompt", title: text });
+      const workspace = draft.automaticWorkspace ? this.automaticWorkspace(text, draft.id) : draft.workspace;
+      this.store.saveDraft({ ...draft, stage: "prompt", title: text, ...(workspace ? { workspace } : {}) });
       this.reply(input, { text: "Теперь отправь стартовый промпт.", buttons: [this.button("Отмена", { type: "cancel" })] });
       return;
     }
@@ -252,8 +264,17 @@ export class TaskManager {
       case "newProjectless": {
         const draft = this.store.getDraft();
         if (draft?.stage !== "project") throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
-        this.store.saveDraft({ ...draft, stage: "workspace", projectId: null, projectTitle: "Без проекта" });
-        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\n\nОтправь абсолютный путь к рабочей папке. Папка должна существовать на компьютере с VKodex.`, buttons: [this.button("Отмена", { type: "cancel" })] });
+        this.store.saveDraft({ ...draft, stage: "title", projectId: null, projectTitle: "Без проекта", automaticWorkspace: true, environment: "local" });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\nРабочая папка: VKodex создаст новую пустую папку на компьютере.\nСреда: локальная\n\nКак назвать задачу?`, buttons: [this.button("Другая папка", { type: "newWorkspaceManual" }), this.button("Отмена", { type: "cancel" })] });
+        break;
+      }
+      case "newWorkspaceManual": {
+        const draft = this.store.getDraft();
+        if (draft?.stage !== "title" || draft.projectId !== null || !draft.automaticWorkspace) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+        const { automaticWorkspace, environment, workspace, ...rest } = draft;
+        void automaticWorkspace; void environment; void workspace;
+        this.store.saveDraft({ ...rest, stage: "workspace", automaticWorkspace: false });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\n\nДополнительный режим: отправь абсолютный путь к существующей папке на компьютере с VKodex.`, buttons: [this.button("Отмена", { type: "cancel" })] });
         break;
       }
       case "newEnvironment": {
@@ -376,6 +397,12 @@ export class TaskManager {
     return { id: input.senderId, name: resolved?.slice(0, 120) || (input.senderId > 0 ? "Пользователь VK" : "Сообщество VK") };
   }
 
+  private automaticWorkspace(title: string, draftId: string): string {
+    const safeTitle = title.normalize("NFKC").replace(/[<>:"/\\|?*\x00-\x1f]/gu, "-")
+      .replace(/^[.\s]+|[.\s]+$/gu, "").replace(/\s+/gu, " ").slice(0, 48) || "task";
+    return path.join(this.projectlessRoot, `${safeTitle}-${draftId.slice(0, 8)}`);
+  }
+
   private sharedAuthor(binding: Binding, input: BridgeInput): { readonly id: number; readonly name: string } | undefined {
     // The configured owner is the implicit first author. This avoids a participant-list API
     // dependency while still enabling attribution on the first message from somebody else.
@@ -460,7 +487,8 @@ export class TaskManager {
     let task: DesktopTask;
     try {
       task = await this.desktop.createTask({ operationId: draft.id, projectId: draft.projectId, title: draft.title, prompt: draft.prompt, model: draft.model, effort: draft.effort, environment: draft.environment,
-        ...(draft.sourceId ? { sourceId: draft.sourceId } : {}), ...(draft.workspace ? { workspace: draft.workspace } : {}) });
+        ...(draft.sourceId ? { sourceId: draft.sourceId } : {}), ...(draft.workspace ? { workspace: draft.workspace } : {}),
+        ...(draft.automaticWorkspace ? { automaticWorkspace: true } : {}) });
     } catch (error) {
       this.store.saveDraft({ ...draft, stage: error instanceof ActionRejectedError ? "confirm" : "uncertain" });
       throw error instanceof ActionRejectedError ? error : new UncertainActionError();

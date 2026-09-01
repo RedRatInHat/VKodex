@@ -1652,6 +1652,7 @@ test("new-task wizard selects a Codex catalog and creates a projectless chat in 
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex-work")!.action);
   assert.match(s.chat.sent.at(-1)!.view.text, /нет проектов/u);
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Другая папка")!.action);
   await s.handle(workspace);
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Локально")!.action);
   await s.handle("Loose task"); await s.handle("Initial prompt");
@@ -1665,6 +1666,33 @@ test("new-task wizard selects a Codex catalog and creates a projectless chat in 
   assert.equal(s.desktop.modelSources.at(-1)!.sourceId, "extra-source");
   assert.equal(s.desktop.tasks.at(-1)!.projectId, null);
   assert.equal(s.desktop.tasks.at(-1)!.sourceId, "extra-source");
+});
+
+test("projectless task creation from a phone uses an automatic isolated workspace", async t => {
+  const s = setup(t);
+  await s.handle("/new");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
+  assert.match(s.chat.sent.at(-1)!.view.text, /создаст новую пустую папку/u);
+  assert.doesNotMatch(s.chat.sent.at(-1)!.view.text, /Отправь абсолютный путь/u);
+  await s.handle("Phone task"); await s.handle("Initial prompt");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Model A")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "medium")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Создать")!.action);
+  const request = s.desktop.creations[0]!;
+  assert.equal(request.projectId, null); assert.equal(request.environment, "local"); assert.equal(request.automaticWorkspace, true);
+  assert.equal(path.dirname(request.workspace!), path.join(os.tmpdir(), "VKodex", "workspaces"));
+  assert.match(path.basename(request.workspace!), /^Phone task-[0-9a-f]{8}$/u);
+});
+
+test("an old projectless path prompt upgrades to the mobile title flow", async t => {
+  const s = setup(t);
+  s.store.saveDraft({ id: "12345678-legacy", stage: "workspace", sourceLabel: ".codex", projectId: null, projectTitle: "Без проекта" });
+  await s.handle("Recovered phone task");
+  const draft = s.store.getDraft()!;
+  assert.equal(draft.stage, "prompt"); assert.equal(draft.title, "Recovered phone task"); assert.equal(draft.environment, "local");
+  assert.equal(draft.automaticWorkspace, true); assert.match(path.basename(draft.workspace!), /^Recovered phone task-12345678$/u);
+  assert.match(s.chat.sent.at(-1)!.view.text, /стартовый промпт/u);
 });
 
 test("unknown desktop creation result stays blocked after restart and repeated clicks", async t => {
@@ -1812,7 +1840,9 @@ test("config accepts one owner and never includes private values in validation e
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101,102" }));
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101" }).access.ownerId, 101);
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "30000" }).healthIntervalMs, 30_000);
+  assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_PROJECTLESS_ROOT: "fixture-workspaces" }).projectlessRoot, path.resolve("fixture-workspaces"));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "29999" }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_PROJECTLESS_ROOT: "private\u0000path" }), error => error instanceof Error && !error.message.includes("private"));
 });
 
 test("callback payloads contain opaque tokens, not identity, thread IDs, or paths", () => {

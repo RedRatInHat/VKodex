@@ -34,6 +34,8 @@ export interface CreateTaskRequest {
   readonly sourceId?: string;
   /** Required when projectId is null. */
   readonly workspace?: string;
+  /** Create the bridge-selected isolated workspace instead of requiring it to exist. */
+  readonly automaticWorkspace?: boolean;
   readonly title: string;
   readonly prompt: string;
   readonly model?: string;

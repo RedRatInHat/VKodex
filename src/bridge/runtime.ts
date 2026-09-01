@@ -38,14 +38,14 @@ export class DesktopBridgeRuntime {
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
     private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
-    private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>) {
+    private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
-    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot));
+    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot);
     this.mirror = new TaskMirror(store);
     this.activity = new TaskActivity(store, now);
     this.unsubscribeDirect = desktop.onDirectUpdate?.(update => this.acceptDirect(update)) ?? null;

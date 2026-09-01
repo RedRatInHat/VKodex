@@ -33,7 +33,7 @@ const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
 const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata),
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task)), new ProfileDesktopGoals(task => catalog.sourceHome(task)));
 const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
-  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs);
+  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot);
 const startedAt = Date.now();
 let exitReason = "process_exit";
 let stopping = false;

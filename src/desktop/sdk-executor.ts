@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -101,8 +101,13 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
       const selected = request.workspace?.trim();
       if (!selected || !path.isAbsolute(selected)) throw new ActionRejectedError("Для задачи без проекта укажи абсолютный путь к рабочей папке.");
       workspace = path.normalize(selected);
-      try { if (!(await stat(workspace)).isDirectory()) throw new Error("not a directory"); }
-      catch { throw new ActionRejectedError("Рабочая папка не существует или недоступна."); }
+      if (request.automaticWorkspace) {
+        try { await mkdir(workspace, { recursive: true, mode: 0o700 }); }
+        catch { throw new ActionRejectedError("Не удалось создать служебную рабочую папку VKodex."); }
+      } else {
+        try { if (!(await stat(workspace)).isDirectory()) throw new Error("not a directory"); }
+        catch { throw new ActionRejectedError("Рабочая папка не существует или недоступна."); }
+      }
       sourceId = request.sourceId || undefined;
       sourceHome = this.catalog.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
       project = { project: { id: "", title: "Без проекта", workspace }, rawProjectId: "", sourceHome, sourceLabel: "",

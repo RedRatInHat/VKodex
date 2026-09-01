@@ -8,6 +8,7 @@ export interface DesktopBridgeConfig {
   readonly access: OwnerAccess;
   readonly token: string;
   readonly dataDir: string;
+  readonly projectlessRoot: string;
   readonly codexHome: string;
   readonly codexHomes: readonly string[];
   readonly healthIntervalMs: number;
@@ -44,10 +45,14 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
   const healthIntervalMs = Number(env.HEALTH_CHECK_INTERVAL_MS?.trim() || "60000");
   if (!Number.isSafeInteger(healthIntervalMs) || healthIntervalMs < 30_000 || healthIntervalMs > 60 * 60_000) throw new Error("HEALTH_CHECK_INTERVAL_MS must be between 30000 and 3600000");
   const codexHomes = configuredCodexHomes(env);
+  const automaticRoot = env.VKODEX_PROJECTLESS_ROOT?.trim();
+  if (automaticRoot && /[\x00-\x1f]/u.test(automaticRoot)) throw new Error("VKODEX_PROJECTLESS_ROOT must be a valid directory path");
+  const localData = env.LOCALAPPDATA?.trim() || env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), ".local", "share");
   return {
     token,
     access: { ownerId: id("VK_OWNER_ID"), groupId: id("VK_GROUP_ID") },
     dataDir: path.resolve(env.BOT_DATA_DIR || "./data/desktop"),
+    projectlessRoot: path.resolve(automaticRoot || path.join(localData, "VKodex", "workspaces")),
     codexHome: codexHomes[0]!, codexHomes, healthIntervalMs,
   };
 }

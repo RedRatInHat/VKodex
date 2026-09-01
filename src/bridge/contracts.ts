@@ -84,6 +84,7 @@ export type ManagerAction =
   | { readonly type: "newProjects"; readonly page: number }
   | { readonly type: "project"; readonly id: string; readonly title: string }
   | { readonly type: "newProjectless" }
+  | { readonly type: "newWorkspaceManual" }
   | { readonly type: "newEnvironment"; readonly environment: "local" | "worktree" }
   | { readonly type: "newModels"; readonly page: number }
   | { readonly type: "newModel"; readonly model: string }
@@ -114,6 +115,7 @@ export interface NewTaskDraft {
   readonly projectId?: string | null;
   readonly projectTitle?: string;
   readonly workspace?: string;
+  readonly automaticWorkspace?: boolean;
   readonly title?: string;
   readonly prompt?: string;
   readonly model?: string;

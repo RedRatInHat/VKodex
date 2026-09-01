@@ -210,6 +210,7 @@ VK_OWNER_ID=
 BOT_DATA_DIR=./data/desktop
 CODEX_HOME=
 CODEX_EXTRA_HOMES=[]
+VKODEX_PROJECTLESS_ROOT=
 HEALTH_CHECK_INTERVAL_MS=60000
 ```
 
@@ -223,6 +224,7 @@ HEALTH_CHECK_INTERVAL_MS=60000
 | `BOT_DATA_DIR` | No | Private database, queue, files, and bindings. The desktop adapter uses `./data/desktop` by default. |
 | `CODEX_HOME` | No | Primary Codex data directory. An empty value means `~/.codex`. This is not a source-code project directory. |
 | `CODEX_EXTRA_HOMES` | No | JSON array of additional Codex data directories, up to 16. Default: `[]`. |
+| `VKODEX_PROJECTLESS_ROOT` | No | Root for automatically created empty workspaces used by **No project** tasks. The default is the user's local application-data directory; on Windows, `%LOCALAPPDATA%/VKodex/workspaces`. |
 | `HEALTH_CHECK_INTERVAL_MS` | No | Full operational-check interval. Default: 60 seconds; allowed range: 30 seconds to one hour. |
 
 The shared `.env.example` retains settings for the legacy SDK bot, including `BOT_DATA_DIR=./data`. For the current desktop bridge, set **`BOT_DATA_DIR=./data/desktop`** so it does not reuse the old mode's database. Preserve your current path if you already have a working desktop installation elsewhere.
@@ -349,7 +351,7 @@ Manager service responses contain a **Menu** button. The menu shows the bridge p
 
 Inbound events are serialized independently per VK conversation. A stalled task connection cannot block the manager or other tasks. After 45 seconds, a watchdog releases that conversation's queue and reports that the operation result is unknown; state-changing operations are not retried automatically.
 
-New tasks are created by the official Codex SDK in the selected `CODEX_HOME`, so they appear in that Codex catalog and use that profile's model list. For a project task, **Local** mode uses the project's saved working directory. For **No project**, the wizard requests an absolute path to an existing working directory and stores the task without a project assignment. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; the source directory must be a Git repository, and worktrees are not deleted automatically. If task startup succeeds but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
+New tasks are created by the official Codex SDK in the selected `CODEX_HOME`, so they appear in that Codex catalog and use that profile's model list. For a project task, **Local** mode uses the project's saved working directory. **No project** does not require typing a computer path from a phone: VKodex creates a separate empty directory under `VKODEX_PROJECTLESS_ROOT`, selects local mode, and stores the task without a project assignment. The optional **Other folder** button still accepts an existing absolute path and allows a worktree when needed. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; the source directory must be a Git repository, and worktrees are not deleted automatically. If task startup succeeds but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
 
 ### Task conversation
 
