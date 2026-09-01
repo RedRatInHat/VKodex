@@ -174,7 +174,7 @@ export class DesktopBridgeRuntime {
       if (this.stopped || !current?.attached) { this.closeSubscription(binding.id); continue; }
       if (!task) {
         this.retryAfter.set(binding.id, this.now() + 30_000);
-        this.manager.panels.disconnected(binding.id);
+        this.manager.panels.disconnected(binding.id, true);
         this.activity.disconnected(binding.id);
         this.files?.observe(binding.id, "unavailable");
         continue;
@@ -196,7 +196,7 @@ export class DesktopBridgeRuntime {
           this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
         });
       }, error => {
-        this.manager.panels.disconnected(binding.id);
+        this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
         this.subscriptions.delete(binding.id);
         this.readySubscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
@@ -210,7 +210,7 @@ export class DesktopBridgeRuntime {
       this.subscriptions.set(binding.id, subscription);
       try { await subscription.start(); this.readySubscriptions.add(binding.id); }
       catch (error) {
-        this.manager.panels.disconnected(binding.id);
+        this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
         subscription.close(); this.subscriptions.delete(binding.id); this.readySubscriptions.delete(binding.id);
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !current?.attached) continue;

@@ -123,7 +123,13 @@ export class TaskPanels {
     }
   }
 
-  disconnected(bindingId: string): void { this.live.delete(bindingId); }
+  disconnected(bindingId: string, taskNotOpen = false): void {
+    this.live.delete(bindingId);
+    if (!taskNotOpen) return;
+    const key = `task-details:${bindingId}`;
+    const previous = this.store.getValue<TaskDetails>(key) ?? unknownDetails;
+    if (previous.status !== "unavailable") this.store.setValue(key, { ...previous, status: "unavailable" });
+  }
 
   async tick(): Promise<void> {
     if (Date.now() - this.lastCatalogAt > 30_000) {

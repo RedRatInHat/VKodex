@@ -208,9 +208,11 @@ test("runtime reports the actual connection failure without leaking malformed IP
 
 test("runtime silently retries desktop discovery while an SDK-backed task is unloaded", async t => {
   const s = runtimeSetup(t); s.server.rejectDiscovery = true;
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
   await s.runtime.tick();
   assert.equal(s.sent.length, 0);
   assert.equal(s.store.getBinding(s.binding.id)!.attached, true);
+  assert.equal(s.store.getValue<{ status: string }>(`task-details:${s.binding.id}`)!.status, "unavailable");
   assert.equal(s.server.received.filter(message => message.method === "thread-owner-discovery").length, 1);
 
   s.advance(5_001); await s.runtime.tick();
