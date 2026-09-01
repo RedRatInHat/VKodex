@@ -150,7 +150,14 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
     const prepared = taskInput(request);
     const input: UserInput[] = [{ type: "text", text: prepared.text }, ...(request.inputFiles ?? []).filter(file => file.kind === "image").map(file => ({ type: "local_image" as const, path: file.path }))];
     const controller = new AbortController();
-    const thread = this.codex(this.catalog.sourceHome(task)).resumeThread(task.threadId, { workingDirectory: task.workspace, threadSource: "user" });
+    const thread = this.codex(this.catalog.sourceHome(task)).resumeThread(task.threadId, {
+      workingDirectory: task.workspace,
+      threadSource: "user",
+      // Projectless tasks are intentionally hosted in isolated non-Git
+      // workspaces. Codex requires this flag on every resumed invocation too,
+      // not only when the thread is first created.
+      skipGitRepoCheck: task.projectId === null,
+    });
     await request.beforeSend?.();
     const stream = await thread.runStreamed(input, { signal: controller.signal });
     const started = deferred<DesktopTask>(); started.resolve(task);

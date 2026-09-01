@@ -628,14 +628,17 @@ test("SDK executor creates an isolated workspace for a projectless task in the s
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-projectless-"));
   const workspace = path.join(root, "automatic-workspace");
   const codexHome = path.resolve("fixture-extra-codex-home");
-  const threadOptions: Record<string, unknown>[] = []; const metadata: (string | null)[] = [];
+  const threadOptions: Record<string, unknown>[] = []; const resumeOptions: Record<string, unknown>[] = []; const metadata: (string | null)[] = [];
+  let catalogTask: DesktopTask | null = null;
   const codex = { startThread: (options: Record<string, unknown>) => {
     threadOptions.push(options); return { runStreamed: async () => ({ events: events() }) };
+  }, resumeThread: (_id: string, options: Record<string, unknown>) => {
+    resumeOptions.push(options); return { runStreamed: async () => ({ events: events() }) };
   } } as unknown as Codex;
   const executor = new SdkTaskExecutor({
     resolveProject: async () => { throw new Error("project lookup must not run"); },
     sourceHome: source => { assert.equal(source.sourceId, "extra-source"); return codexHome; },
-    listTasks: async () => [],
+    listTasks: async () => catalogTask ? [catalogTask] : [],
   }, {
     rename: async () => {}, assignProject: async (_task, projectId) => { metadata.push(projectId); },
     archive: async () => {}, markdown: async () => "",
@@ -647,6 +650,10 @@ test("SDK executor creates an isolated workspace for a projectless task in the s
   assert.deepEqual(metadata, [null]);
   assert.equal(threadOptions[0]!.workingDirectory, workspace); assert.equal(threadOptions[0]!.skipGitRepoCheck, true);
   assert.equal((await stat(workspace)).isDirectory(), true);
+  catalogTask = created;
+  await executor.submit({ operationId: "projectless-followup", task: created, text: "Continue" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(resumeOptions[0]!.workingDirectory, workspace); assert.equal(resumeOptions[0]!.skipGitRepoCheck, true);
 });
 
 test("a desktop discovery rejection for an unloaded task safely uses the SDK fallback", async () => {
