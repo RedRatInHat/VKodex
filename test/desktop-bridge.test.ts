@@ -75,7 +75,9 @@ class Chat implements BridgeChat {
 class Desktop implements DesktopTasks {
   capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true, goals: false, editLastUserTurn: true };
   tasks: DesktopTask[] = [task];
+  sources = [{ id: "", label: ".codex" }];
   projects: DesktopProject[] = [{ id: "project-a", title: "Project", workspace: "/project" }];
+  sourceProjects: Record<string, DesktopProject[]> | null = null;
   projectsError: Error | null = null;
   readonly creations: CreateTaskRequest[] = [];
   readonly submissions: SubmitTaskRequest[] = [];
@@ -87,6 +89,7 @@ class Desktop implements DesktopTasks {
   submitHook: (() => Promise<void>) | null = null;
   details: TaskDetails = { status: "idle", workspace: "/project", model: "model-a", effort: "medium", nextModel: "model-a", nextEffort: "medium", context: { used: 25_000, window: 100_000, percent: 25 } };
   models: DesktopModel[] = [{ id: "model-a", title: "Model A", efforts: ["low", "medium", "high"], defaultEffort: "medium" }, { id: "model-b", title: "Model B", efforts: ["high"], defaultEffort: "high" }];
+  readonly modelSources: (TaskRef | undefined)[] = [];
   readonly selections: { task: TaskRef; model: string; effort: string }[] = [];
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
@@ -106,7 +109,7 @@ class Desktop implements DesktopTasks {
   renameHook: (() => void) | null = null;
   exportHook: (() => void) | null = null;
   async inspectTask() { return this.details; }
-  async listModels() { return this.models; }
+  async listModels(source?: TaskRef) { this.modelSources.push(source); return this.models; }
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
     if (!this.models.find(item => item.id === model)?.efforts.includes(effort)) throw new ActionRejectedError("Invalid model");
     this.selections.push({ task, model, effort }); if (this.selectError) throw this.selectError;
@@ -140,11 +143,14 @@ class Desktop implements DesktopTasks {
   async clearGoal(): Promise<boolean> { this.goalClears++; const existed = this.goal !== null; this.goal = null; return existed; }
   async continueGoal(): Promise<void> { this.goalContinuations++; }
   async listTasks() { return this.tasks; }
-  async listProjects() { if (this.projectsError) throw this.projectsError; return this.projects; }
+  listSources() { return this.sources; }
+  async listProjects(sourceId?: string) { if (this.projectsError) throw this.projectsError; return sourceId !== undefined && this.sourceProjects ? (this.sourceProjects[sourceId] ?? []) : this.projects; }
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
     this.creations.push(request);
     if (this.createError) throw this.createError;
-    const created = { ...task, threadId: "new-task", title: request.title };
+    const created = { ...task, threadId: "new-task", title: request.title, projectId: request.projectId,
+      workspace: request.workspace ?? this.projects.find(project => project.id === request.projectId)?.workspace ?? task.workspace,
+      ...(request.sourceId ? { sourceId: request.sourceId } : {}) };
     this.tasks.push(created);
     return created;
   }
@@ -1599,6 +1605,7 @@ test("a known rejection allows an explicit retry, without an automatic fallback 
 async function draft(s: ReturnType<typeof setup>): Promise<string> {
   await s.handle("/new");
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons![0]!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons![0]!.action);
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Локально")!.action);
   await s.handle("New title"); await s.handle("Initial prompt");
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Model A")!.action);
@@ -1616,6 +1623,29 @@ test("new-task wizard creates a desktop task once even when VK chat creation fai
   assert.equal(s.desktop.creations[0]!.model, "model-a");
   assert.equal(s.desktop.creations[0]!.effort, "medium");
   assert.equal(s.store.getDraft()!.stage, "created");
+});
+
+test("new-task wizard selects a Codex catalog and creates a projectless chat in an explicit folder", async t => {
+  const s = setup(t); const workspace = path.resolve("fixture-projectless-workspace");
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "extra-source", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, "extra-source": [] };
+  await s.handle("/new");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex-work")!.action);
+  assert.match(s.chat.sent.at(-1)!.view.text, /нет проектов/u);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
+  await s.handle(workspace);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Локально")!.action);
+  await s.handle("Loose task"); await s.handle("Initial prompt");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Model A")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "medium")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Создать")!.action);
+  assert.deepEqual(s.desktop.creations, [{
+    operationId: s.desktop.creations[0]!.operationId, projectId: null, sourceId: "extra-source", workspace,
+    title: "Loose task", prompt: "Initial prompt", model: "model-a", effort: "medium", environment: "local",
+  }]);
+  assert.equal(s.desktop.modelSources.at(-1)!.sourceId, "extra-source");
+  assert.equal(s.desktop.tasks.at(-1)!.projectId, null);
+  assert.equal(s.desktop.tasks.at(-1)!.sourceId, "extra-source");
 });
 
 test("unknown desktop creation result stays blocked after restart and repeated clicks", async t => {

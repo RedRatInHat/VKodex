@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -88,15 +89,35 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
   isRunning(task: TaskRef): boolean { return this.runs.has(taskKey(task)); }
 
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
-    const project = await this.catalog.resolveProject(request.projectId);
     const model = request.model?.trim();
     const effort = request.effort?.trim();
     if (effort && !efforts.has(effort)) throw new ActionRejectedError("Выбранный уровень рассуждения не поддерживается Codex SDK.");
-    const workspace = request.environment === "worktree" ? await this.makeWorktree(project, request.operationId) : project.project.workspace;
+    let project: ResolvedDesktopProject | null = null;
+    let sourceHome: string;
+    let sourceId: string | undefined;
+    let workspace: string;
+    let rawProjectId: string | null;
+    if (request.projectId === null) {
+      const selected = request.workspace?.trim();
+      if (!selected || !path.isAbsolute(selected)) throw new ActionRejectedError("Для задачи без проекта укажи абсолютный путь к рабочей папке.");
+      workspace = path.normalize(selected);
+      try { if (!(await stat(workspace)).isDirectory()) throw new Error("not a directory"); }
+      catch { throw new ActionRejectedError("Рабочая папка не существует или недоступна."); }
+      sourceId = request.sourceId || undefined;
+      sourceHome = this.catalog.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
+      project = { project: { id: "", title: "Без проекта", workspace }, rawProjectId: "", sourceHome, sourceLabel: "",
+        ...(sourceId ? { sourceId } : {}) };
+      rawProjectId = null;
+    } else {
+      project = await this.catalog.resolveProject(request.projectId);
+      if ((project.sourceId ?? "") !== (request.sourceId ?? "")) throw new ActionRejectedError("Проект относится к другому каталогу Codex.");
+      sourceHome = project.sourceHome; sourceId = project.sourceId; workspace = project.project.workspace; rawProjectId = project.rawProjectId;
+    }
+    if (request.environment === "worktree") workspace = await this.makeWorktree(project, request.operationId);
     if (!path.isAbsolute(workspace)) throw new ActionRejectedError("У проекта нет локальной рабочей папки.");
-    const codex = this.codex(project.sourceHome);
+    const codex = this.codex(sourceHome);
     const controller = new AbortController();
-    const thread = codex.startThread({ workingDirectory: workspace, threadSource: "user", skipGitRepoCheck: false,
+    const thread = codex.startThread({ workingDirectory: workspace, threadSource: "user", skipGitRepoCheck: request.projectId === null,
       ...(model ? { model } : {}), ...(effort ? { modelReasoningEffort: effort as ModelReasoningEffort } : {}) });
     const stream = await thread.runStreamed(request.prompt, { signal: controller.signal });
     const started = deferred<DesktopTask>();
@@ -104,12 +125,12 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
     const consume = this.consume(stream.events, {
       operationId: request.operationId, controller, started, turnStarted,
       initialTask: null, title: request.title, workspace, projectId: request.projectId,
-      ...(project.sourceId ? { sourceId: project.sourceId } : {}),
+      ...(sourceId ? { sourceId } : {}),
     });
     void consume.catch(() => {});
     const task = await accepted(started.promise);
     try {
-      await this.metadata.assignProject(task, project.rawProjectId);
+      await this.metadata.assignProject(task, rawProjectId);
       await this.metadata.rename(task, request.title);
     } catch (error) {
       throw error instanceof ActionRejectedError ? new UncertainActionError() : error;

@@ -40,6 +40,9 @@ test("Windows source comparisons normalize case, separators and extended-length 
 
 test("catalog preserves separate copies of an ID and gives extra sources stable identities", async () => {
   const combined = new MultiDesktopCatalog([primary, extra], catalog);
+  const sources = combined.listSources();
+  assert.equal(sources[0]!.id, ""); assert.equal(sources[0]!.label, path.basename(primary));
+  assert.equal(sources[1]!.label, path.basename(extra)); assert.ok(sources[1]!.id);
   const tasks = await combined.listTasks();
   assert.equal(tasks.length, 2); assert.equal(tasks[0]!.sourceId, undefined); assert.ok(tasks[1]!.sourceId);
   assert.notEqual(taskKey(tasks[0]!), taskKey(tasks[1]!));
@@ -71,6 +74,10 @@ test("an empty configured source adds no task or project prefixes", async () => 
   assert.equal(tasks.length, 1); assert.equal(tasks[0]!.sourceLabel, undefined);
   const projects = await combined.listProjects();
   assert.equal(projects.length, 1); assert.equal(projects[0]!.title, "Fixture project");
+  const extraSource = combined.listSources()[1]!;
+  const extraProjects = await combined.listProjects(extraSource.id);
+  assert.equal(extraProjects.length, 1); assert.equal(extraProjects[0]!.title, "Fixture project");
+  assert.notEqual(extraProjects[0]!.id, projects[0]!.id);
 });
 
 test("tasks from active sources are merged by recency instead of source order", async () => {

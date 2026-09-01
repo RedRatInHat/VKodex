@@ -21,9 +21,19 @@ export interface DesktopProject {
   readonly workspaceRoots?: readonly string[];
 }
 
+export interface DesktopSource {
+  /** Empty string identifies the primary CODEX_HOME without changing legacy task keys. */
+  readonly id: string;
+  readonly label: string;
+}
+
 export interface CreateTaskRequest {
   readonly operationId: string;
-  readonly projectId: string;
+  readonly projectId: string | null;
+  /** Selected CODEX_HOME. Omitted for the primary catalog. */
+  readonly sourceId?: string;
+  /** Required when projectId is null. */
+  readonly workspace?: string;
   readonly title: string;
   readonly prompt: string;
   readonly model?: string;
@@ -184,7 +194,8 @@ export interface DesktopCompatibility {
 export interface DesktopTasks {
   readonly capabilities: DesktopCapabilities;
   listTasks(): Promise<readonly DesktopTask[]>;
-  listProjects(): Promise<readonly DesktopProject[]>;
+  listSources?(): readonly DesktopSource[];
+  listProjects(sourceId?: string): Promise<readonly DesktopProject[]>;
   catalogWarnings?(): readonly string[];
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;

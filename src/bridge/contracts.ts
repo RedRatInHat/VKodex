@@ -77,7 +77,11 @@ export type ManagerAction =
   | { readonly type: "list"; readonly page: number; readonly filter?: TaskListFilter }
   | { readonly type: "open"; readonly task: DesktopTask }
   | { readonly type: "new" }
+  | { readonly type: "newSources"; readonly page: number }
+  | { readonly type: "newSource"; readonly sourceId: string }
+  | { readonly type: "newProjects"; readonly page: number }
   | { readonly type: "project"; readonly id: string; readonly title: string }
+  | { readonly type: "newProjectless" }
   | { readonly type: "newEnvironment"; readonly environment: "local" | "worktree" }
   | { readonly type: "newModels"; readonly page: number }
   | { readonly type: "newModel"; readonly model: string }
@@ -102,9 +106,12 @@ export interface PanelAction {
 
 export interface NewTaskDraft {
   readonly id: string;
-  readonly stage: "project" | "environment" | "title" | "prompt" | "model" | "effort" | "confirm" | "creating" | "uncertain" | "created";
-  readonly projectId?: string;
+  readonly stage: "source" | "project" | "workspace" | "environment" | "title" | "prompt" | "model" | "effort" | "confirm" | "creating" | "uncertain" | "created";
+  readonly sourceId?: string;
+  readonly sourceLabel?: string;
+  readonly projectId?: string | null;
   readonly projectTitle?: string;
+  readonly workspace?: string;
   readonly title?: string;
   readonly prompt?: string;
   readonly model?: string;

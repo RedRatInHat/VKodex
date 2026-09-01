@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type DesktopTask, type TaskRef } from "./contracts.js";
+import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type TaskRef } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { comparablePath } from "./paths.js";
 
@@ -61,6 +61,10 @@ export class MultiDesktopCatalog {
     return source.home;
   }
 
+  listSources(): readonly DesktopSource[] {
+    return this.sources.map(source => ({ id: source.id, label: source.label }));
+  }
+
   catalogWarnings(): readonly string[] { return this.warnings; }
 
   private async snapshot(): Promise<readonly SourceSnapshot[]> {
@@ -115,12 +119,17 @@ export class MultiDesktopCatalog {
     return this.sources.find(source => source.home === home)!.catalog.listModels(task);
   }
 
-  async listProjects(): Promise<readonly DesktopProject[]> {
+  async listProjects(sourceId?: string): Promise<readonly DesktopProject[]> {
     const snapshot = await this.snapshot();
     const readable = this.updateWarnings(snapshot);
     if (!readable) throw new DesktopUnavailableError("Не удалось прочитать ни один настроенный каталог Codex.");
-    const active = snapshot.filter(entry => entry.tasks.status === "fulfilled" && entry.tasks.value.length > 0 && entry.projects.status === "fulfilled" && entry.projects.value.length > 0);
-    const showSource = active.length > 1;
+    const selected = sourceId === undefined ? snapshot : snapshot.filter(entry => entry.source.id === sourceId);
+    if (!selected.length) throw new DesktopUnavailableError("Выбранный каталог Codex больше не подключён в конфигурации VKodex.");
+    // The general project browser ignores empty task sources to avoid noisy
+    // prefixes. The creation wizard can explicitly select such a source.
+    const active = selected.filter(entry => entry.projects.status === "fulfilled" && entry.projects.value.length > 0
+      && (sourceId !== undefined || (entry.tasks.status === "fulfilled" && entry.tasks.value.length > 0)));
+    const showSource = sourceId === undefined && active.length > 1;
     return active.flatMap(entry => entry.projects.status === "fulfilled" ? entry.projects.value.map(project => sourceProject(entry.source, project, showSource)) : []);
   }
 
@@ -128,7 +137,7 @@ export class MultiDesktopCatalog {
     const snapshot = await this.snapshot();
     const readable = this.updateWarnings(snapshot);
     if (!readable) throw new DesktopUnavailableError("Не удалось прочитать ни один настроенный каталог Codex.");
-    const active = snapshot.filter(entry => entry.tasks.status === "fulfilled" && entry.tasks.value.length > 0 && entry.projects.status === "fulfilled" && entry.projects.value.length > 0);
+    const active = snapshot.filter(entry => entry.projects.status === "fulfilled" && entry.projects.value.length > 0);
     const showSource = active.length > 1;
     for (const entry of active) {
       if (entry.projects.status !== "fulfilled") continue;

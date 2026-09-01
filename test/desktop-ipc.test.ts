@@ -3,6 +3,8 @@ import { Duplex } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 import path from "node:path";
+import os from "node:os";
+import { mkdtemp } from "node:fs/promises";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopTask } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
@@ -592,6 +594,35 @@ test("SDK executor creates a user task with the selected worktree and streams it
   assert.deepEqual(homes, [codexHome]); assert.deepEqual(worktrees, ["operation"]);
   assert.deepEqual(metadata, ["project:raw-project", "rename:New SDK task"]);
   assert.ok(updates.includes("final")); assert.equal(executor.details(task)?.status, "idle");
+});
+
+test("SDK executor creates a projectless task in the selected Codex catalog", async () => {
+  async function* events(): AsyncGenerator<unknown> {
+    yield { type: "thread.started", thread_id: "projectless-thread" };
+    yield { type: "turn.started" };
+    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "Done" } };
+    yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "vkodex-projectless-"));
+  const codexHome = path.resolve("fixture-extra-codex-home");
+  const threadOptions: Record<string, unknown>[] = []; const metadata: (string | null)[] = [];
+  const codex = { startThread: (options: Record<string, unknown>) => {
+    threadOptions.push(options); return { runStreamed: async () => ({ events: events() }) };
+  } } as unknown as Codex;
+  const executor = new SdkTaskExecutor({
+    resolveProject: async () => { throw new Error("project lookup must not run"); },
+    sourceHome: source => { assert.equal(source.sourceId, "extra-source"); return codexHome; },
+    listTasks: async () => [],
+  }, {
+    rename: async () => {}, assignProject: async (_task, projectId) => { metadata.push(projectId); },
+    archive: async () => {}, markdown: async () => "",
+  }, () => codex);
+  const created = await executor.createTask({ operationId: "projectless-operation", projectId: null, sourceId: "extra-source",
+    workspace, title: "Projectless", prompt: "Start", model: "model", effort: "high", environment: "local" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(created.projectId, null); assert.equal(created.sourceId, "extra-source"); assert.equal(created.workspace, workspace);
+  assert.deepEqual(metadata, [null]);
+  assert.equal(threadOptions[0]!.workingDirectory, workspace); assert.equal(threadOptions[0]!.skipGitRepoCheck, true);
 });
 
 test("an idle or unloaded task starts the next turn through its owner with inherited settings", async () => {

@@ -59,8 +59,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
 
   constructor(
-    private readonly catalog: Pick<LocalDesktopCatalog, "listTasks" | "listProjects"> & Partial<Pick<LocalDesktopCatalog, "listModels">> & {
+    private readonly catalog: Pick<LocalDesktopCatalog, "listTasks"> & Partial<Pick<LocalDesktopCatalog, "listModels">> & {
+      listProjects: (sourceId?: string) => Promise<readonly import("./contracts.js").DesktopProject[]>;
       catalogWarnings?: () => readonly string[];
+      listSources?: () => readonly { readonly id: string; readonly label: string }[];
       resolveProject?: (id: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>;
     },
     private readonly createClient: () => DesktopIpcClient = () => new DesktopIpcClient(),
@@ -71,7 +73,8 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   ) {}
 
   listTasks() { return this.catalog.listTasks(); }
-  listProjects() { return this.catalog.listProjects(); }
+  listSources() { return this.catalog.listSources?.() ?? [{ id: "", label: "Основной" }]; }
+  listProjects(sourceId?: string) { return this.catalog.listProjects(sourceId); }
   catalogWarnings() { return this.catalog.catalogWarnings?.() ?? []; }
   async accountUsage(task?: TaskRef) {
     if (!this.usage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");

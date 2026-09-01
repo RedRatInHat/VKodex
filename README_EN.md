@@ -334,7 +334,7 @@ The manager is the **private chat with the community**, not another group conver
 | `/load`, `/pc` | Sample current CPU, memory and disk usage, OS uptime, and the VKodex process CPU, memory and PID. Manager-only; the command is never forwarded to an agent. |
 | `/limits`, **Codex limits** | Show the data directory, account, used limit percentage, reset time, plan, and credits. The manager shows every configured profile; a task conversation shows only that task's account. The command is not forwarded to the agent. |
 | `/list`, **Codex tasks** | Select a project, then select a task. |
-| `/new`, **New task** | Create a user task: project → local folder or separate Git worktree → title → initial prompt → model → reasoning effort. |
+| `/new`, **New task** | Create a user task: Codex catalog → project or **No project** → local folder or separate Git worktree → title → initial prompt → model → reasoning effort. |
 | `/cancel` | Cancel an unfinished new-task wizard. |
 | **Projects** | Show project names and working directories. |
 | **No project** | Show tasks confirmed to have no project. |
@@ -349,7 +349,7 @@ Manager service responses contain a **Menu** button. The menu shows the bridge p
 
 Inbound events are serialized independently per VK conversation. A stalled task connection cannot block the manager or other tasks. After 45 seconds, a watchdog releases that conversation's queue and reports that the operation result is unknown; state-changing operations are not retried automatically.
 
-New tasks are created by the official Codex SDK in the selected `CODEX_HOME`, so they appear in the normal Codex catalog. **Local** mode uses the project's saved working directory. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; worktrees are not deleted automatically. If task startup succeeds but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
+New tasks are created by the official Codex SDK in the selected `CODEX_HOME`, so they appear in that Codex catalog and use that profile's model list. For a project task, **Local** mode uses the project's saved working directory. For **No project**, the wizard requests an absolute path to an existing working directory and stores the task without a project assignment. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; the source directory must be a Git repository, and worktrees are not deleted automatically. If task startup succeeds but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
 
 ### Task conversation
 

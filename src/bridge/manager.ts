@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopProject, type DesktopTask, type DesktopTasks } from "../desktop/contracts.js";
-import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, TaskListFilter, View } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type DesktopTasks, type TaskRef } from "../desktop/contracts.js";
+import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
@@ -8,9 +8,12 @@ import { TaskPanels } from "./panels.js";
 import { TaskFiles } from "./files.js";
 import { systemLoadText } from "./system-load.js";
 import { taskInput } from "../desktop/desktop-tasks.js";
+import path from "node:path";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
+const NEW_SOURCE_PAGE_SIZE = 7;
+const NEW_PROJECT_PAGE_SIZE = 6;
 
 const managerHelp = [
   "VKodex · команды менеджера",
@@ -47,6 +50,17 @@ const unknownCommand = (help: string): string => `Команда не найде
 function shortTitle(title: string, maxLength: number): string {
   const text = title.replace(/\s+/gu, " ").trim() || "Без названия";
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function enteredPath(text: string): string {
+  const trimmed = text.trim();
+  const unquoted = trimmed.length >= 2 && ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))
+    ? trimmed.slice(1, -1).trim() : trimmed;
+  if (!unquoted || unquoted.length > 1_000 || /[\x00-\x1f]/u.test(unquoted)
+    || (!path.isAbsolute(unquoted) && !path.win32.isAbsolute(unquoted))) {
+    throw new ActionRejectedError("Укажи абсолютный путь к рабочей папке, например D:\\Projects\\MyApp.");
+  }
+  return path.normalize(unquoted);
 }
 
 export class TaskManager {
@@ -175,6 +189,13 @@ export class TaskManager {
     if (text === "/cancel") { this.cancel(input); return; }
     if (text.startsWith("/")) { this.reply(input, { text: unknownCommand(managerHelp) }); return; }
     const draft = this.store.getDraft();
+    if (draft?.stage === "workspace") {
+      const workspace = enteredPath(text);
+      const next = { ...draft, stage: "environment" as const, workspace };
+      this.store.saveDraft(next);
+      this.reply(input, this.environmentView(next));
+      return;
+    }
     if (draft?.stage === "title") {
       if (!text || text.length > 120) throw new ActionRejectedError("Введи название задачи длиной от 1 до 120 символов.");
       this.store.saveDraft({ ...draft, stage: "prompt", title: text });
@@ -208,31 +229,45 @@ export class TaskManager {
         break;
       }
       case "new": await this.newTask(input); break;
+      case "newSources": await this.newSources(input, action.page); break;
+      case "newSource": {
+        const draft = this.store.getDraft();
+        if (draft?.stage !== "source") throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+        const source = this.sources().find(source => source.id === action.sourceId);
+        if (!source) throw new ActionRejectedError("Каталог больше не подключён в конфигурации VKodex.");
+        this.store.saveDraft({ ...draft, stage: "project", sourceId: source.id, sourceLabel: source.label });
+        await this.newProjects(input, 0);
+        break;
+      }
+      case "newProjects": await this.newProjects(input, action.page); break;
       case "project": {
         const draft = this.store.getDraft();
         if (draft?.stage !== "project") throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
-        const project = (await this.desktop.listProjects()).find(project => project.id === action.id);
+        const project = (await this.desktop.listProjects(draft.sourceId)).find(project => project.id === action.id);
         if (!project) throw new ActionRejectedError("Проект больше не доступен.");
         this.store.saveDraft({ ...draft, stage: "environment", projectId: project.id, projectTitle: project.title });
-        this.reply(input, { text: `Проект: ${project.title}\nГде создать задачу?\n\nЛокально — в сохранённой папке проекта. Worktree — в отдельной Git-копии рядом с репозиторием.`, buttons: [
-          this.button("Локально", { type: "newEnvironment", environment: "local" }),
-          this.button("Отдельный worktree", { type: "newEnvironment", environment: "worktree" }),
-          this.button("Отмена", { type: "cancel" }),
-        ] });
+        this.reply(input, this.environmentView({ ...draft, stage: "environment", projectId: project.id, projectTitle: project.title }));
+        break;
+      }
+      case "newProjectless": {
+        const draft = this.store.getDraft();
+        if (draft?.stage !== "project") throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+        this.store.saveDraft({ ...draft, stage: "workspace", projectId: null, projectTitle: "Без проекта" });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\n\nОтправь абсолютный путь к рабочей папке. Папка должна существовать на компьютере с VKodex.`, buttons: [this.button("Отмена", { type: "cancel" })] });
         break;
       }
       case "newEnvironment": {
         const draft = this.store.getDraft();
-        if (draft?.stage !== "environment" || !draft.projectId) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+        if (draft?.stage !== "environment" || draft.projectId === undefined || (draft.projectId === null && !draft.workspace)) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
         this.store.saveDraft({ ...draft, stage: "title", environment: action.environment });
-        this.reply(input, { text: `Проект: ${draft.projectTitle}\nСреда: ${action.environment === "worktree" ? "отдельный worktree" : "локальная папка"}\n\nКак назвать задачу?`, buttons: [this.button("Отмена", { type: "cancel" })] });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: ${draft.projectTitle}${draft.workspace ? `\nРабочая папка: ${draft.workspace}` : ""}\nСреда: ${action.environment === "worktree" ? "отдельный worktree" : "локальная папка"}\n\nКак назвать задачу?`, buttons: [this.button("Отмена", { type: "cancel" })] });
         break;
       }
       case "newModels": await this.newModels(input, action.page); break;
       case "newModel": {
         const draft = this.store.getDraft();
         if (draft?.stage !== "model" || !draft.prompt) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
-        const model = (await this.desktop.listModels()).find(item => item.id === action.model);
+        const model = (await this.desktop.listModels(this.draftSource(draft))).find(item => item.id === action.model);
         if (!model) throw new ActionRejectedError("Модель больше не доступна. Обнови список.");
         this.store.saveDraft({ ...draft, stage: "effort", model: model.id });
         const buttons = model.efforts.slice(0, 8).map(effort => this.button(effort, { type: "newEffort", model: model.id, effort }));
@@ -243,11 +278,11 @@ export class TaskManager {
       case "newEffort": {
         const draft = this.store.getDraft();
         if (draft?.stage !== "effort" || draft.model !== action.model || !draft.prompt) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
-        const model = (await this.desktop.listModels()).find(item => item.id === action.model);
+        const model = (await this.desktop.listModels(this.draftSource(draft))).find(item => item.id === action.model);
         if (!model?.efforts.includes(action.effort)) throw new ActionRejectedError("Модель или уровень рассуждения больше не доступны.");
         const confirmed = { ...draft, stage: "confirm" as const, effort: action.effort };
         this.store.saveDraft(confirmed);
-        this.reply(input, { text: `Проект: ${draft.projectTitle}\nСреда: ${draft.environment === "worktree" ? "отдельный worktree" : "локальная папка"}\nНазвание: ${draft.title}\nМодель: ${draft.model}\nРассуждение: ${action.effort}\n\n${draft.prompt.slice(0, 2_000)}${draft.prompt.length > 2_000 ? "\n… (промпт сохранён полностью)" : ""}`,
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: ${draft.projectTitle}${draft.workspace ? `\nРабочая папка: ${draft.workspace}` : ""}\nСреда: ${draft.environment === "worktree" ? "отдельный worktree" : "локальная папка"}\nНазвание: ${draft.title}\nМодель: ${draft.model}\nРассуждение: ${action.effort}\n\n${draft.prompt.slice(0, 2_000)}${draft.prompt.length > 2_000 ? "\n… (промпт сохранён полностью)" : ""}`,
           buttons: [this.button("Создать", { type: "create", draftId: draft.id }), this.button("Отмена", { type: "cancel" })] });
         break;
       }
@@ -328,20 +363,65 @@ export class TaskManager {
     this.reply(input, { text: "Ввод новой задачи отменён." });
   }
 
+  private sources(): readonly DesktopSource[] {
+    return this.desktop.listSources?.() ?? [{ id: "", label: "Основной" }];
+  }
+
+  private draftSource(draft: NewTaskDraft): TaskRef {
+    return { hostId: "local", threadId: "", ...(draft.sourceId ? { sourceId: draft.sourceId } : {}) };
+  }
+
+  private environmentView(draft: NewTaskDraft): View {
+    return {
+      text: `Каталог: ${draft.sourceLabel}\nПроект: ${draft.projectTitle}${draft.workspace ? `\nРабочая папка: ${draft.workspace}` : ""}\n\nГде создать задачу?\n\nЛокально — в выбранной папке. Worktree — в отдельной Git-копии рядом с репозиторием.`,
+      buttons: [
+        this.button("Локально", { type: "newEnvironment", environment: "local" }),
+        this.button("Отдельный worktree", { type: "newEnvironment", environment: "worktree" }),
+        this.button("Отмена", { type: "cancel" }),
+      ],
+    };
+  }
+
   private async newTask(input: BridgeInput): Promise<void> {
     if (!this.desktop.capabilities.createTask) throw new ActionRejectedError("Создание задач через этот адаптер десктопа ещё не подтверждено. Существующие задачи доступны через /list.");
     const draft = this.store.getDraft();
-    if (draft && !["created", "project"].includes(draft.stage)) throw new ActionRejectedError("Сначала заверши текущий ввод или отправь /cancel.");
-    const projects = await this.desktop.listProjects();
-    if (projects.length === 0) throw new ActionRejectedError("В Codex нет доступных проектов.");
-    this.store.saveDraft({ id: randomUUID(), stage: "project" });
-    this.reply(input, { text: "В каком проекте создать задачу?", buttons: projects.slice(0, 8).map(project => this.button(project.title, { type: "project", id: project.id, title: project.title })).concat(this.button("Отмена", { type: "cancel" })) });
+    if (draft && !["created", "source"].includes(draft.stage)) throw new ActionRejectedError("Сначала заверши текущий ввод или отправь /cancel.");
+    this.store.saveDraft({ id: randomUUID(), stage: "source" });
+    await this.newSources(input, 0);
+  }
+
+  private async newSources(input: BridgeInput, requestedPage: number): Promise<void> {
+    const draft = this.store.getDraft();
+    if (draft?.stage !== "source") throw new ActionRejectedError("Сначала начни создание через /new.");
+    const sources = this.sources();
+    if (!sources.length) throw new ActionRejectedError("В конфигурации VKodex нет каталогов Codex.");
+    const page = Math.max(0, Math.min(Math.floor(requestedPage), Math.ceil(sources.length / NEW_SOURCE_PAGE_SIZE) - 1));
+    const visible = sources.slice(page * NEW_SOURCE_PAGE_SIZE, page * NEW_SOURCE_PAGE_SIZE + NEW_SOURCE_PAGE_SIZE);
+    const buttons = visible.map(source => this.button(source.label, { type: "newSource", sourceId: source.id }));
+    if (page > 0) buttons.push(this.button("Предыдущие", { type: "newSources", page: page - 1 }));
+    if ((page + 1) * NEW_SOURCE_PAGE_SIZE < sources.length) buttons.push(this.button("Следующие", { type: "newSources", page: page + 1 }));
+    buttons.push(this.button("Отмена", { type: "cancel" }));
+    this.reply(input, { text: `В каком каталоге Codex создать задачу?${sources.length > 1 ? ` · ${page + 1}/${Math.ceil(sources.length / NEW_SOURCE_PAGE_SIZE)}` : ""}\n\n${visible.map(source => source.label).join("\n")}`, buttons });
+  }
+
+  private async newProjects(input: BridgeInput, requestedPage: number): Promise<void> {
+    const draft = this.store.getDraft();
+    if (draft?.stage !== "project") throw new ActionRejectedError("Сначала выбери каталог через /new.");
+    const projects = await this.desktop.listProjects(draft.sourceId);
+    const page = Math.max(0, Math.min(Math.floor(requestedPage), Math.max(0, Math.ceil(projects.length / NEW_PROJECT_PAGE_SIZE) - 1)));
+    const visible = projects.slice(page * NEW_PROJECT_PAGE_SIZE, page * NEW_PROJECT_PAGE_SIZE + NEW_PROJECT_PAGE_SIZE);
+    const buttons = visible.map(project => this.button(project.title, { type: "project", id: project.id, title: project.title }));
+    buttons.push(this.button("Без проекта", { type: "newProjectless" }));
+    if (page > 0) buttons.push(this.button("Предыдущие", { type: "newProjects", page: page - 1 }));
+    if ((page + 1) * NEW_PROJECT_PAGE_SIZE < projects.length) buttons.push(this.button("Следующие", { type: "newProjects", page: page + 1 }));
+    buttons.push(this.button("Отмена", { type: "cancel" }));
+    this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nВ каком проекте создать задачу?${projects.length > NEW_PROJECT_PAGE_SIZE ? ` · ${page + 1}/${Math.ceil(projects.length / NEW_PROJECT_PAGE_SIZE)}` : ""}\n\n${visible.map(project => project.title).join("\n") || "В этом каталоге нет проектов. Выбери «Без проекта»."}`, buttons });
   }
 
   private async newModels(input: BridgeInput, requestedPage: number): Promise<void> {
     const draft = this.store.getDraft();
     if (!draft || !["model", "effort"].includes(draft.stage) || !draft.prompt) throw new ActionRejectedError("Сначала начни создание через /new.");
-    const models = await this.desktop.listModels();
+    const models = await this.desktop.listModels(this.draftSource(draft));
     if (!models.length) throw new ActionRejectedError("Codex не сообщил доступные модели.");
     const page = Math.max(0, Math.min(Math.floor(requestedPage), Math.ceil(models.length / 6) - 1));
     const { model, effort, ...rest } = draft;
@@ -359,14 +439,16 @@ export class TaskManager {
     const existing = this.store.getDraft();
     if (existing?.id === draftId && existing.stage === "created" && existing.task) { await this.open(input, existing.task); return; }
     const draft = this.store.claimDraft(draftId);
-    if (!draft || !draft.projectId || !draft.title || !draft.prompt || !draft.model || !draft.effort || !draft.environment) throw new ActionRejectedError("Создание уже выполнено, ожидает проверки или эта кнопка устарела.");
+    if (!draft || draft.projectId === undefined || !draft.title || !draft.prompt || !draft.model || !draft.effort || !draft.environment
+      || (draft.projectId === null && !draft.workspace)) throw new ActionRejectedError("Создание уже выполнено, ожидает проверки или эта кнопка устарела.");
     if (!this.desktop.capabilities.createTask) {
       this.store.saveDraft({ ...draft, stage: "confirm" });
       throw new ActionRejectedError("Создание задач недоступно в текущем подключении.");
     }
     let task: DesktopTask;
     try {
-      task = await this.desktop.createTask({ operationId: draft.id, projectId: draft.projectId, title: draft.title, prompt: draft.prompt, model: draft.model, effort: draft.effort, environment: draft.environment });
+      task = await this.desktop.createTask({ operationId: draft.id, projectId: draft.projectId, title: draft.title, prompt: draft.prompt, model: draft.model, effort: draft.effort, environment: draft.environment,
+        ...(draft.sourceId ? { sourceId: draft.sourceId } : {}), ...(draft.workspace ? { workspace: draft.workspace } : {}) });
     } catch (error) {
       this.store.saveDraft({ ...draft, stage: error instanceof ActionRejectedError ? "confirm" : "uncertain" });
       throw error instanceof ActionRejectedError ? error : new UncertainActionError();
