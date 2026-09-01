@@ -892,6 +892,20 @@ test("duplicate VK delivery cannot submit twice; a busy task receives a follow-u
   assert.equal(s.desktop.submissions[0]!.task.threadId, task.threadId);
 });
 
+test("a solo task chat omits attribution until a second author writes", async t => {
+  const s = setup(t); s.attach();
+  await s.manager.handle({ ...s.input("owner only", peerId), senderName: "Owner User" });
+  assert.equal(s.desktop.submissions[0]!.author, undefined);
+  assert.equal(desktopTaskInput(s.desktop.submissions[0]!).text, "owner only");
+
+  await s.manager.handle({ ...s.input("shared request", peerId), senderId: 999, senderName: "Second User" });
+  assert.deepEqual(s.desktop.submissions[1]!.author, { id: 999, name: "Second User" });
+
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  await restarted.handle({ ...s.input("owner after restart", peerId), senderName: "Owner User" });
+  assert.deepEqual(s.desktop.submissions[2]!.author, { id: access.ownerId, name: "Owner User" });
+});
+
 test("linked non-owner messages are attributed prompts while the manager stays private", async t => {
   const s = setup(t); s.attach();
   await s.manager.handle({ ...s.input("/list"), senderId: 999 });

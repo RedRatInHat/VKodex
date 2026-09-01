@@ -78,6 +78,10 @@ export class BridgeStore {
       CREATE TABLE IF NOT EXISTS bridge_values (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_events (binding_id TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(binding_id, event_id));
+      CREATE TABLE IF NOT EXISTS bridge_task_senders (
+        binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), sender_id INTEGER NOT NULL,
+        PRIMARY KEY(binding_id, sender_id)
+      );
       CREATE TABLE IF NOT EXISTS bridge_delivery (
         id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, binding_id TEXT REFERENCES bridge_bindings(id),
         peer_id INTEGER NOT NULL, kind TEXT NOT NULL, view TEXT NOT NULL, first_view TEXT, handle TEXT,
@@ -167,6 +171,15 @@ export class BridgeStore {
   }
   setAttached(id: string, attached: boolean): void { this.db.prepare("UPDATE bridge_bindings SET attached = ? WHERE id = ?").run(Number(attached), id); }
   setPaused(id: string, paused: boolean): void { this.db.prepare("UPDATE bridge_bindings SET paused = ? WHERE id = ?").run(Number(paused), id); }
+
+  observeTaskSender(bindingId: string, senderId: number): number {
+    if (!Number.isSafeInteger(senderId) || senderId === 0) throw new Error("Invalid VK sender ID");
+    return this.atomic(() => {
+      this.db.prepare("INSERT OR IGNORE INTO bridge_task_senders(binding_id, sender_id) VALUES (?, ?)").run(bindingId, senderId);
+      const row = this.db.prepare("SELECT COUNT(*) AS count FROM bridge_task_senders WHERE binding_id = ?").get(bindingId) as { count: number };
+      return row.count;
+    });
+  }
 
   streamGeneration(id: string): number { return this.getValue<number>(`stream-generation:${id}`) ?? 0; }
 
