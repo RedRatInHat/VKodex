@@ -1677,6 +1677,27 @@ test("files enter the same task and completed output is uploaded once across ret
   assert.equal(s.desktop.submissions.length, 1);
 });
 
+test("an invalid old outbox does not block files from newer turns", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", false);
+  for (let index = 0; index <= 10; index++) await writeFile(path.join(invalid.outboxDir, `${index}.txt`), "fixture");
+  const valid = await files.prepare(binding, "valid-output", []); files.finish(binding.id, "valid-output", false);
+  await writeFile(path.join(valid.outboxDir, "result.txt"), "new result");
+
+  files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
+
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "new result");
+  assert.ok(s.chat.sent.some(item => /не больше 10 файлов/u.test(item.view.text)));
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.length === 1));
+  const jobs = s.store.getValue<{ operationId: string; done: boolean }[]>(`file-jobs:${binding.id}`)!;
+  assert.deepEqual(jobs.map(job => [job.operationId, job.done]), [["invalid-output", true], ["valid-output", true]]);
+
+  await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
 test("attachment transfer stops on explicit detach during download or upload and never replays old jobs", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);

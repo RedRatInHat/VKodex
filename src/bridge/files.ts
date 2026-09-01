@@ -10,8 +10,12 @@ import { BridgeStore } from "./store.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 20 * 1024 * 1024, maxTotalBytes: 50 * 1024 * 1024, timeoutMs: 30_000 };
 interface FileJob { operationId: string; generation: number; directory: string; state: "prepared" | "accepted" | "uncertain"; done: boolean }
+class OutputFilesError extends ActionRejectedError {
+  constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
+}
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
+const mebibytes = (bytes: number): number => Math.ceil(bytes / (1024 * 1024));
 
 export function validateVkFileUrl(raw: string): URL {
   let url: URL;
@@ -69,39 +73,42 @@ async function directory(root: string, ...segments: string[]): Promise<string> {
 }
 
 export async function readOutputFiles(root: string, limits = FILE_LIMITS): Promise<{ name: string; contents: Buffer; kind: "image" | "file" }[]> {
-  if ((await lstat(root)).isSymbolicLink()) throw new ActionRejectedError("Папка выходных файлов не должна быть ссылкой.");
+  if ((await lstat(root)).isSymbolicLink()) throw new OutputFilesError("Папка выходных файлов не должна быть ссылкой.");
   const canonicalRoot = await realpath(root);
   const checkPath = async (file: string): Promise<void> => {
     const relative = path.relative(canonicalRoot, await realpath(file));
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new ActionRejectedError("Выходной файл находится вне папки отправки.");
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new OutputFilesError("Выходной файл находится вне папки отправки.");
   };
   const files: { name: string; contents: Buffer; kind: "image" | "file" }[] = []; let total = 0; let entries = 0;
   const walk = async (folder: string, depth: number): Promise<void> => {
     const stat = await lstat(folder);
-    if (depth > 8 || stat.isSymbolicLink() || !stat.isDirectory()) throw new ActionRejectedError("Небезопасная структура папки выходных файлов.");
+    if (depth > 8 || stat.isSymbolicLink() || !stat.isDirectory()) throw new OutputFilesError("Небезопасная структура папки выходных файлов.");
     await checkPath(folder);
     for (const entry of await readdir(folder)) {
-      if (++entries > 256) throw new ActionRejectedError("Слишком много выходных файлов.");
+      if (++entries > 256) throw new OutputFilesError("В папке выдачи больше 256 элементов.");
       if (entry.startsWith(".")) continue;
       const file = path.join(folder, entry); const before = await lstat(file);
-      if (before.isSymbolicLink() || (before.isFile() && before.nlink !== 1)) throw new ActionRejectedError("Ссылки в папке выходных файлов не отправляются.");
+      if (before.isSymbolicLink() || (before.isFile() && before.nlink !== 1)) throw new OutputFilesError("Ссылки в папке выходных файлов не отправляются.");
       if (before.isDirectory()) { await walk(file, depth + 1); continue; }
       if (!before.isFile()) continue;
       await checkPath(file);
-      if (files.length >= limits.maxFiles || before.size > limits.maxFileBytes || total + before.size > limits.maxTotalBytes) throw new ActionRejectedError("Выходные файлы превышают лимит количества или размера.");
+      if (files.length >= limits.maxFiles) throw new OutputFilesError(`В одной выдаче можно отправить не больше ${limits.maxFiles} файлов.`);
+      if (before.size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» занимает ${mebibytes(before.size)} МиБ при лимите ${mebibytes(limits.maxFileBytes)} МиБ.`);
+      if (total + before.size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
       const handle = await open(file, "r"); const chunks: Buffer[] = []; let size = 0;
       try {
         const opened = await handle.stat();
-        if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new ActionRejectedError("Выходной файл изменился во время чтения.");
+        if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new OutputFilesError("Выходной файл изменился во время чтения.", true);
         while (true) {
           const buffer = Buffer.alloc(Math.min(64 * 1024, limits.maxFileBytes - size + 1));
           const read = await handle.read(buffer, 0, buffer.length, null); if (!read.bytesRead) break;
           size += read.bytesRead;
-          if (size > limits.maxFileBytes || total + size > limits.maxTotalBytes) throw new ActionRejectedError("Выходной файл превышает лимит размера.");
+          if (size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» превышает лимит ${mebibytes(limits.maxFileBytes)} МиБ.`);
+          if (total + size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
           chunks.push(buffer.subarray(0, read.bytesRead));
         }
         const after = await handle.stat();
-        if (after.size !== size || after.mtimeMs !== before.mtimeMs) throw new ActionRejectedError("Выходной файл ещё записывается; повтори отправку позже.");
+        if (after.size !== size || after.mtimeMs !== before.mtimeMs) throw new OutputFilesError("Выходной файл ещё записывается; отправка будет повторена позже.", true);
         await checkPath(file);
       } finally { await handle.close(); }
       total += size;
@@ -156,10 +163,21 @@ export class TaskFiles {
   private async collectNow(binding: Binding, manual: boolean): Promise<number> {
     const generation = this.store.streamGeneration(binding.id); await this.check(binding, generation);
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
-    let count = 0;
+    let count = 0; let retryableFailure: OutputFilesError | null = null;
     for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted" && (manual || !job.done))) {
       const outbox = await directory(this.root, job.directory, "outbox");
-      for (const file of await readOutputFiles(outbox)) {
+      let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
+      try { outputFiles = await readOutputFiles(outbox); }
+      catch (error) {
+        if (!(error instanceof OutputFilesError)) throw error;
+        this.store.enqueue(`files-error:${binding.id}:${job.operationId}`, binding.peerId!, {
+          text: `Не удалось забрать файлы одного запроса: ${error.message} Более новые выдачи продолжат отправляться. Исправь эту выдачу и отправь /files.`, silent: true,
+        }, binding.id);
+        if (error.retryable) retryableFailure ??= error;
+        else this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
+        continue;
+      }
+      for (const file of outputFiles) {
         const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
         if (this.store.getValue<boolean>(`${key}:queued`)) continue;
         await this.check(binding, generation);
@@ -176,6 +194,7 @@ export class TaskFiles {
       }
       this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
     }
+    if (retryableFailure && !manual) throw retryableFailure;
     return count;
   }
   tick(): Promise<void> {
@@ -191,7 +210,7 @@ export class TaskFiles {
       catch (error) {
         this.retries.set(id, Date.now() + 60_000);
         const current = this.store.getBinding(id);
-        if (current?.attached && this.store.streamGeneration(id) === generation) this.store.enqueue(`files-error:${id}:${this.jobs(id).at(-1)?.operationId}`, binding.peerId, { text: error instanceof ActionRejectedError ? error.message : "Не удалось отправить выходные файлы. Можно повторить командой /files.", silent: true }, id);
+        if (current?.attached && this.store.streamGeneration(id) === generation && !(error instanceof OutputFilesError)) this.store.enqueue(`files-error:${id}:${this.jobs(id).at(-1)?.operationId}`, binding.peerId, { text: error instanceof ActionRejectedError ? error.message : "Не удалось отправить выходные файлы. Можно повторить командой /files.", silent: true }, id);
       }
     }
   }
