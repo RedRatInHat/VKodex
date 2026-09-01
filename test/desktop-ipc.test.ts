@@ -594,11 +594,13 @@ test("SDK executor creates a user task with the selected worktree and streams it
   async function* events(): AsyncGenerator<unknown> {
     yield { type: "thread.started", thread_id: "sdk-thread" };
     yield { type: "turn.started" };
+    yield { type: "item.completed", item: { id: "comment", type: "agent_message", text: "SDK progress" } };
+    yield { type: "item.completed", item: { id: "command", type: "command_execution", command: "test", aggregated_output: "", exit_code: 0, status: "completed" } };
     yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "SDK answer" } };
     yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
   }
   const projectWorkspace = path.resolve("fixture-repo"); const codexHome = path.resolve("fixture-codex-home"); const worktreeWorkspace = path.resolve("fixture-worktree");
-  const homes: string[] = []; const worktrees: string[] = []; const metadata: string[] = []; const updates: string[] = [];
+  const homes: string[] = []; const worktrees: string[] = []; const metadata: string[] = []; const updates: string[] = []; const progress: string[] = []; const finals: string[] = [];
   const codex = { startThread: () => ({ runStreamed: async () => ({ events: events() }) }) } as unknown as Codex;
   const catalog = {
     resolveProject: async () => ({ project: { id: "project", title: "Project", workspace: projectWorkspace }, rawProjectId: "raw-project", sourceHome: codexHome, sourceLabel: ".codex" }),
@@ -609,12 +611,17 @@ test("SDK executor creates a user task with the selected worktree and streams it
     assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
     archive: async () => {}, markdown: async () => "",
   }, home => { homes.push(home); return codex; }, async (_project, operationId) => { worktrees.push(operationId); return worktreeWorkspace; });
-  executor.onUpdate(update => updates.push(update.event.type));
+  executor.onUpdate(update => {
+    updates.push(update.event.type);
+    if (update.event.type === "progress") progress.push(update.event.text);
+    if (update.event.type === "final") finals.push(update.event.text);
+  });
   const task = await executor.createTask({ operationId: "operation", projectId: "project", title: "New SDK task", prompt: "Start", model: "model", effort: "high", environment: "worktree" });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(task.threadId, "sdk-thread"); assert.equal(task.workspace, worktreeWorkspace);
   assert.deepEqual(homes, [codexHome]); assert.deepEqual(worktrees, ["operation"]);
   assert.deepEqual(metadata, ["project:raw-project", "rename:New SDK task"]);
+  assert.deepEqual(progress, ["SDK progress"]); assert.deepEqual(finals, ["SDK answer"]);
   assert.ok(updates.includes("final")); assert.equal(executor.details(task)?.status, "idle");
 });
 
@@ -651,9 +658,11 @@ test("SDK executor creates an isolated workspace for a projectless task in the s
   assert.equal(threadOptions[0]!.workingDirectory, workspace); assert.equal(threadOptions[0]!.skipGitRepoCheck, true);
   assert.equal((await stat(workspace)).isDirectory(), true);
   catalogTask = created;
-  await executor.submit({ operationId: "projectless-followup", task: created, text: "Continue" });
+  const outboxDir = path.join(root, "delivery", "outbox");
+  await executor.submit({ operationId: "projectless-followup", task: created, text: "Continue", outboxDir });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(resumeOptions[0]!.workingDirectory, workspace); assert.equal(resumeOptions[0]!.skipGitRepoCheck, true);
+  assert.deepEqual(resumeOptions[0]!.additionalDirectories, [outboxDir]);
 });
 
 test("a desktop discovery rejection for an unloaded task safely uses the SDK fallback", async () => {

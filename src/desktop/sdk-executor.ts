@@ -23,6 +23,7 @@ interface RunState {
   readonly finish: () => void;
   details: TaskDetails;
   latestAgentText: string;
+  pendingAgent: { readonly id: string; readonly text: string } | null;
 }
 
 interface Deferred<T> {
@@ -157,6 +158,10 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
       // workspaces. Codex requires this flag on every resumed invocation too,
       // not only when the thread is first created.
       skipGitRepoCheck: task.projectId === null,
+      // The per-request delivery directory lives outside a projectless
+      // workspace. Grant only that exact directory so the agent can return
+      // requested files without broadening access to the bridge data tree.
+      ...(request.outboxDir ? { additionalDirectories: [request.outboxDir] } : {}),
     });
     await request.beforeSend?.();
     const stream = await thread.runStreamed(input, { signal: controller.signal });
@@ -209,16 +214,18 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
             projectId: options.projectId, updatedAt: Date.now(), ...(options.sourceId ? { sourceId: options.sourceId } : {}) };
           const details = this.makeDetails(task, "running");
           const done = deferred<void>();
-          state = { task, operationId: options.operationId, controller: options.controller, done: done.promise, finish: () => done.resolve(), details, latestAgentText: "" };
+          state = { task, operationId: options.operationId, controller: options.controller, done: done.promise, finish: () => done.resolve(), details, latestAgentText: "", pendingAgent: null };
           this.runs.set(taskKey(task), state); this.latest.set(taskKey(task), details);
           options.started.resolve(task);
         }
         if (!task) continue;
         if (!state) {
           const details = this.makeDetails(task, "running"); const done = deferred<void>();
-          state = { task, operationId: options.operationId, controller: options.controller, done: done.promise, finish: () => done.resolve(), details, latestAgentText: "" };
+          state = { task, operationId: options.operationId, controller: options.controller, done: done.promise, finish: () => done.resolve(), details, latestAgentText: "", pendingAgent: null };
           this.runs.set(taskKey(task), state); this.latest.set(taskKey(task), details);
         }
+        const itemEvent = event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed" ? event.item : null;
+        if (state.pendingAgent && itemEvent && itemEvent.id !== state.pendingAgent.id) this.flushPendingAgent(state);
         if (event.type === "turn.started") {
           acceptedTurn = true; options.turnStarted.resolve();
           this.emit(state, { type: "status", id: `status:${options.operationId}`, turnId: options.operationId, status: "running" });
@@ -226,12 +233,16 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
           this.emit(state, { type: "progress", id: event.item.id, turnId: options.operationId, text: event.item.text });
         } else if ((event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") && event.item.type === "agent_message") {
           state.latestAgentText = event.item.text;
-          if (event.type !== "item.completed" && event.item.text.trim()) this.emit(state, { type: "progress", id: event.item.id, turnId: options.operationId, text: event.item.text });
+          if (event.type === "item.completed") state.pendingAgent = event.item.text.trim() ? { id: event.item.id, text: event.item.text } : null;
+          else if (event.item.text.trim()) this.emit(state, { type: "progress", id: event.item.id, turnId: options.operationId, text: event.item.text });
         } else if (event.type === "turn.completed") {
-          if (state.latestAgentText.trim()) this.emit(state, { type: "final", id: `final:${options.operationId}`, turnId: options.operationId, text: state.latestAgentText });
+          const finalText = state.pendingAgent?.text ?? state.latestAgentText;
+          state.pendingAgent = null;
+          if (finalText.trim()) this.emit(state, { type: "final", id: `final:${options.operationId}`, turnId: options.operationId, text: finalText });
           state.details = this.makeDetails(task, "idle"); this.latest.set(taskKey(task), state.details);
           this.emit(state, { type: "status", id: `status:${options.operationId}`, turnId: options.operationId, status: "completed" });
         } else if (event.type === "turn.failed" || event.type === "error") {
+          this.flushPendingAgent(state);
           const message = event.type === "turn.failed" ? event.error.message : event.message;
           state.details = this.makeDetails(task, "failed"); this.latest.set(taskKey(task), state.details);
           this.emit(state, { type: "final", id: `failure:${options.operationId}`, turnId: options.operationId, text: `Codex не завершил ход: ${message.slice(0, 1_000)}` });
@@ -243,6 +254,7 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
       const safe = error instanceof ActionRejectedError || error instanceof DesktopUnavailableError ? error : new UncertainActionError();
       failBeforeStart(safe);
       if (task && state) {
+        this.flushPendingAgent(state);
         const status = options.controller.signal.aborted ? "interrupted" : "failed";
         state.details = this.makeDetails(task, status); this.latest.set(taskKey(task), state.details);
         this.emit(state, { type: "status", id: `status:${options.operationId}`, turnId: options.operationId, status });
@@ -250,6 +262,7 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
     } finally {
       if (task && state) {
         if (state.details.status === "running") {
+          this.flushPendingAgent(state);
           const status = options.controller.signal.aborted ? "interrupted" : "failed";
           state.details = this.makeDetails(task, status); this.latest.set(taskKey(task), state.details);
           this.emit(state, { type: "status", id: `status:${options.operationId}`, turnId: options.operationId, status });
@@ -262,6 +275,13 @@ export class SdkTaskExecutor implements DirectTaskExecutor {
 
   private makeDetails(task: DesktopTask, status: TaskDetails["status"]): TaskDetails {
     return { title: task.title, status, workspace: task.workspace, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
+  }
+
+  private flushPendingAgent(state: RunState): void {
+    const pending = state.pendingAgent;
+    if (!pending) return;
+    state.pendingAgent = null;
+    this.emit(state, { type: "progress", id: pending.id, turnId: state.operationId, text: pending.text });
   }
 
   private emit(state: RunState, event: TaskEvent): void {
