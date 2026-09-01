@@ -1652,7 +1652,8 @@ test("new-task wizard selects a Codex catalog and creates a projectless chat in 
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex-work")!.action);
   assert.match(s.chat.sent.at(-1)!.view.text, /нет проектов/u);
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
-  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Другая папка")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Выбрать папку")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Ввести путь")!.action);
   await s.handle(workspace);
   await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Локально")!.action);
   await s.handle("Loose task"); await s.handle("Initial prompt");
@@ -1683,6 +1684,36 @@ test("projectless task creation from a phone uses an automatic isolated workspac
   assert.equal(request.projectId, null); assert.equal(request.environment, "local"); assert.equal(request.automaticWorkspace, true);
   assert.equal(path.dirname(request.workspace!), path.join(os.tmpdir(), "VKodex", "workspaces"));
   assert.match(path.basename(request.workspace!), /^Phone task-[0-9a-f]{8}$/u);
+});
+
+test("projectless task creation offers known workspaces as phone buttons", async t => {
+  const s = setup(t);
+  await s.handle("/new");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Выбрать папку")!.action);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Выбери рабочую папку/u);
+  assert.ok(s.chat.sent.at(-1)!.view.buttons!.some(button => button.label === "Project"));
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Project")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Локально")!.action);
+  await s.handle("Folder task"); await s.handle("Initial prompt");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Model A")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "medium")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Создать")!.action);
+  const request = s.desktop.creations[0]!;
+  assert.equal(request.projectId, null); assert.equal(request.workspace, path.normalize("/project"));
+  assert.equal(request.automaticWorkspace, undefined);
+});
+
+test("a legacy other-folder button opens the new phone workspace picker", async t => {
+  const s = setup(t);
+  await s.handle("/new");
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === ".codex")!.action);
+  await s.handle("", access.ownerId, s.chat.sent.at(-1)!.view.buttons!.find(button => button.label === "Без проекта")!.action);
+  const legacyAction = s.store.action({ type: "newWorkspaceManual" }, Date.now(), access.ownerId);
+  await s.handle("", access.ownerId, legacyAction);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Выбери рабочую папку/u);
+  assert.ok(s.chat.sent.at(-1)!.view.buttons!.some(button => button.label === "Ввести путь"));
 });
 
 test("an old projectless path prompt upgrades to the mobile title flow", async t => {

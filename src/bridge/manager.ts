@@ -10,11 +10,15 @@ import { systemLoadText } from "./system-load.js";
 import { taskInput } from "../desktop/desktop-tasks.js";
 import path from "node:path";
 import os from "node:os";
+import { comparablePath } from "../desktop/paths.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
 const NEW_SOURCE_PAGE_SIZE = 7;
 const NEW_PROJECT_PAGE_SIZE = 6;
+const NEW_WORKSPACE_PAGE_SIZE = 5;
+
+interface WorkspaceChoice { readonly workspace: string; readonly label: string; readonly updatedAt: number }
 
 const managerHelp = [
   "VKodex · команды менеджера",
@@ -265,12 +269,30 @@ export class TaskManager {
         const draft = this.store.getDraft();
         if (draft?.stage !== "project") throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
         this.store.saveDraft({ ...draft, stage: "title", projectId: null, projectTitle: "Без проекта", automaticWorkspace: true, environment: "local" });
-        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\nРабочая папка: VKodex создаст новую пустую папку на компьютере.\nСреда: локальная\n\nКак назвать задачу?`, buttons: [this.button("Другая папка", { type: "newWorkspaceManual" }), this.button("Отмена", { type: "cancel" })] });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\nРабочая папка: VKodex создаст новую пустую папку на компьютере.\nСреда: локальная\n\nКак назвать задачу?`, buttons: [this.button("Выбрать папку", { type: "newWorkspaces", page: 0 }), this.button("Отмена", { type: "cancel" })] });
         break;
       }
-      case "newWorkspaceManual": {
-        const draft = this.store.getDraft();
-        if (draft?.stage !== "title" || draft.projectId !== null || !draft.automaticWorkspace) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+      case "newWorkspaces": await this.newWorkspaces(input, action.page); break;
+      case "newWorkspaceAuto": {
+        const draft = this.projectlessTitleDraft();
+        const { workspace, ...rest } = draft;
+        void workspace;
+        this.store.saveDraft({ ...rest, automaticWorkspace: true, environment: "local" });
+        this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\nРабочая папка: VKodex создаст новую пустую папку на компьютере.\nСреда: локальная\n\nКак назвать задачу?`, buttons: [this.button("Выбрать папку", { type: "newWorkspaces", page: 0 }), this.button("Отмена", { type: "cancel" })] });
+        break;
+      }
+      case "newWorkspace": {
+        const draft = this.projectlessTitleDraft();
+        const selected = (await this.workspaceChoices(draft.sourceId)).find(choice => comparablePath(choice.workspace) === comparablePath(action.workspace));
+        if (!selected) throw new ActionRejectedError("Папка больше не доступна в списке. Обнови выбор папок.");
+        const next = { ...draft, stage: "environment" as const, workspace: selected.workspace, automaticWorkspace: false };
+        this.store.saveDraft(next);
+        this.reply(input, this.environmentView(next));
+        break;
+      }
+      case "newWorkspaceManual": await this.newWorkspaces(input, 0); break;
+      case "newWorkspacePath": {
+        const draft = this.projectlessTitleDraft();
         const { automaticWorkspace, environment, workspace, ...rest } = draft;
         void automaticWorkspace; void environment; void workspace;
         this.store.saveDraft({ ...rest, stage: "workspace", automaticWorkspace: false });
@@ -455,6 +477,49 @@ export class TaskManager {
     if ((page + 1) * NEW_PROJECT_PAGE_SIZE < projects.length) buttons.push(this.button("Следующие", { type: "newProjects", page: page + 1 }));
     buttons.push(this.button("Отмена", { type: "cancel" }));
     this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nВ каком проекте создать задачу?${projects.length > NEW_PROJECT_PAGE_SIZE ? ` · ${page + 1}/${Math.ceil(projects.length / NEW_PROJECT_PAGE_SIZE)}` : ""}\n\n${visible.map(project => project.title).join("\n") || "В этом каталоге нет проектов. Выбери «Без проекта»."}`, buttons });
+  }
+
+  private projectlessTitleDraft(): NewTaskDraft & { readonly stage: "title"; readonly projectId: null } {
+    const draft = this.store.getDraft();
+    if (draft?.stage !== "title" || draft.projectId !== null) throw new ActionRejectedError("Этот шаг уже пройден. Используй /new или /cancel.");
+    return draft as NewTaskDraft & { readonly stage: "title"; readonly projectId: null };
+  }
+
+  private async workspaceChoices(sourceId?: string): Promise<WorkspaceChoice[]> {
+    const key = sourceId ?? "";
+    const choices = new Map<string, WorkspaceChoice>();
+    const add = (workspace: string, label: string, updatedAt: number): void => {
+      if (!workspace || (!path.isAbsolute(workspace) && !path.win32.isAbsolute(workspace))) return;
+      const comparable = comparablePath(workspace);
+      const previous = choices.get(comparable);
+      if (!previous || updatedAt > previous.updatedAt || (updatedAt === previous.updatedAt && label.length < previous.label.length)) {
+        choices.set(comparable, { workspace: path.normalize(workspace), label: shortTitle(label, 120), updatedAt });
+      }
+    };
+    let projects: readonly DesktopProject[] = [];
+    try { projects = await this.desktop.listProjects(sourceId); }
+    catch { /* Existing task workspaces still provide a useful mobile picker. */ }
+    for (const project of projects) add(project.workspace, project.title || path.basename(project.workspace), Number.MAX_SAFE_INTEGER);
+    for (const task of await this.desktop.listTasks()) {
+      if ((task.sourceId ?? "") !== key) continue;
+      add(task.workspace, path.basename(task.workspace) || task.title, task.updatedAt);
+    }
+    return [...choices.values()].sort((left, right) => right.updatedAt - left.updatedAt || left.label.localeCompare(right.label, "ru"));
+  }
+
+  private async newWorkspaces(input: BridgeInput, requestedPage: number): Promise<void> {
+    const draft = this.projectlessTitleDraft();
+    const choices = await this.workspaceChoices(draft.sourceId);
+    const pageCount = Math.max(1, Math.ceil(choices.length / NEW_WORKSPACE_PAGE_SIZE));
+    const page = Math.max(0, Math.min(Math.floor(requestedPage), pageCount - 1));
+    const start = page * NEW_WORKSPACE_PAGE_SIZE;
+    const visible = choices.slice(start, start + NEW_WORKSPACE_PAGE_SIZE);
+    const buttons = visible.map(choice => this.button(choice.label, { type: "newWorkspace", workspace: choice.workspace }));
+    if (page > 0) buttons.push(this.button("Назад", { type: "newWorkspaces", page: page - 1 }));
+    if (page + 1 < pageCount) buttons.push(this.button("Далее", { type: "newWorkspaces", page: page + 1 }));
+    buttons.push(this.button("Новая пустая папка", { type: "newWorkspaceAuto" }), this.button("Ввести путь", { type: "newWorkspacePath" }), this.button("Отмена", { type: "cancel" }));
+    const body = visible.length ? visible.map((choice, index) => `${start + index + 1}. ${choice.label}\n${choice.workspace}`).join("\n\n") : "Известных рабочих папок в этом каталоге пока нет.";
+    this.reply(input, { text: `Каталог: ${draft.sourceLabel}\nПроект: без проекта\n\nВыбери рабочую папку${pageCount > 1 ? ` · ${page + 1}/${pageCount}` : ""}.\n\n${body}`, buttons });
   }
 
   private async newModels(input: BridgeInput, requestedPage: number): Promise<void> {

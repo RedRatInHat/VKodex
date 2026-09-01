@@ -84,7 +84,12 @@ export type ManagerAction =
   | { readonly type: "newProjects"; readonly page: number }
   | { readonly type: "project"; readonly id: string; readonly title: string }
   | { readonly type: "newProjectless" }
+  | { readonly type: "newWorkspaces"; readonly page: number }
+  | { readonly type: "newWorkspace"; readonly workspace: string }
+  | { readonly type: "newWorkspaceAuto" }
+  /** Legacy buttons from the path-only wizard now open the workspace picker. */
   | { readonly type: "newWorkspaceManual" }
+  | { readonly type: "newWorkspacePath" }
   | { readonly type: "newEnvironment"; readonly environment: "local" | "worktree" }
   | { readonly type: "newModels"; readonly page: number }
   | { readonly type: "newModel"; readonly model: string }
