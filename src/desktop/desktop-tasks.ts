@@ -1,9 +1,9 @@
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type EditLastUserTurnRequest, type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { taskDetails } from "./details.js";
-import { activeTurnsFromState, inProgressState } from "./projector.js";
+import { activeTurnsFromState, inProgressState, turnsFromState } from "./projector.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -55,7 +55,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   get capabilities() {
     return { createTask: !!this.executor, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: !!this.catalog.listModels,
       renameTask: !!this.metadata, archiveTask: !!this.metadata, exportMarkdown: !!this.metadata, moveTask: !!this.metadata && !!this.catalog.resolveProject,
-      accountUsage: !!this.usage, goals: !!this.goals };
+      accountUsage: !!this.usage, goals: !!this.goals, editLastUserTurn: true };
   }
 
   constructor(
@@ -272,6 +272,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
 
   async submit(request: SubmitTaskRequest): Promise<void> {
+    await this.submitWithReceipt(request);
+  }
+
+  async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
     const text = request.text.trim();
     if ((!text && !request.inputFiles?.length) || text.length > 16_000) throw new ActionRejectedError("Пришли текст до 16000 символов или вложение.");
     const prepared = taskInput(request);
@@ -280,15 +284,16 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     // Subscription ownership is per IPC client. Closing a temporary follower on the
     // shared event client would also unsubscribe the long-lived mirror.
     try {
-      await this.submitLive(request, task, prepared);
+      return await this.submitLive(request, task, prepared);
     } catch (error) {
       if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
       if (!(error instanceof TaskNotOpenError) || !this.executor) throw error;
       await this.executor.submit(request);
+      return { mode: "fallback", turnId: null };
     }
   }
 
-  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: ReturnType<typeof taskInput>): Promise<void> {
+  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: ReturnType<typeof taskInput>): Promise<SubmitTaskReceipt> {
     const client = this.createClient(); const subscription = new TaskSubscription(client, task, () => {}, () => {});
     try {
       await subscription.start();
@@ -305,7 +310,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
         }, { targetClientId: subscription.owner, timeoutMs: 30_000, mutating: true });
         const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
         if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
-        return;
+        return { mode: "start", turnId: result.turn.id };
       }
       const reply = await client.request("thread-follower-steer-turn", 1, {
         conversationId: task.threadId,
@@ -318,7 +323,50 @@ export class ConnectedDesktopTasks implements DesktopTasks {
         },
       }, { targetClientId: subscription.owner, timeoutMs: 30_000, mutating: true });
       if (!isObject(reply.result) || !isObject(reply.result.result) || typeof reply.result.result.turnId !== "string" || !reply.result.result.turnId) throw new UncertainActionError();
+      return { mode: "steer", turnId: reply.result.result.turnId };
     } finally { subscription.close(); client.close(); }
+  }
+
+  async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
+    const prepared = taskInput(request);
+    const task = (await this.listTasks()).find(candidate => sameTask(candidate, request.task));
+    if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
+    return this.follow(task, async (subscription, client) => {
+      const state = subscription.current!;
+      const latest = turnsFromState(state).at(-1);
+      const params = latest && isObject(latest.params) ? latest.params : null;
+      if (!latest || latest.turnId !== request.expectedTurnId || params?.clientUserMessageId !== request.expectedOperationId) {
+        throw new ActionRejectedError("Это уже не последний запрос задачи. Изменение осталось только в VK; контекст Codex не затронут.");
+      }
+      const items = Array.isArray(latest.items) ? latest.items.filter(isObject) : [];
+      if (items.some(item => item.type === "steeringUserMessage")) {
+        throw new ActionRejectedError("После этого запроса в текущий ход уже пришло уточнение. Codex не умеет безопасно отредактировать только раннюю часть хода; изменение осталось только в VK.");
+      }
+      if (latest.status === "inProgress") await this.interruptLive(task, request.expectedTurnId);
+      else if (!["completed", "failed", "interrupted"].includes(String(latest.status))) {
+        throw new ActionRejectedError("Последний ход находится в состоянии, которое нельзя безопасно перезапустить редактированием.");
+      }
+      const reply = await client.request("thread-follower-edit-last-user-turn", 1, {
+        conversationId: task.threadId,
+        turnId: request.expectedTurnId,
+        message: prepared.text,
+      }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
+      if (!isObject(reply.result) || reply.result.ok !== true) throw new UncertainActionError();
+
+      // The owner starts a replacement turn before acknowledging the edit. Keep
+      // the receipt when its snapshot arrives promptly so repeated VK edits can
+      // still target exactly the replacement turn.
+      const deadline = Date.now() + 3_000;
+      do {
+        const replacement = turnsFromState(subscription.current!).at(-1);
+        const replacementParams = replacement && isObject(replacement.params) ? replacement.params : null;
+        if (replacement && replacement.turnId !== request.expectedTurnId && typeof replacement.turnId === "string") {
+          return { turnId: replacement.turnId, operationId: typeof replacementParams?.clientUserMessageId === "string" ? replacementParams.clientUserMessageId : null };
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      } while (Date.now() < deadline);
+      return { turnId: null, operationId: null };
+    });
   }
 
   isDirectlyManaged(task: TaskRef): boolean { return (this.executor?.details(task) ?? null) !== null; }

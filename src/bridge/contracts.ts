@@ -51,6 +51,8 @@ export interface BridgeInput {
   readonly hasAttachments?: boolean;
   readonly attachments?: readonly RemoteAttachment[];
   readonly attachmentError?: string;
+  /** Present only for an incoming VK message_edit event. */
+  readonly editOfMessageId?: number;
 }
 
 export interface Binding extends TaskRef {

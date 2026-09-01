@@ -29,7 +29,7 @@ export class TaskMirror {
         chunks.forEach((text, index) => {
           const view = { text, silent: true };
           this.store.setValue(`commentary-base:${key}:${index}`, view);
-          this.store.enqueue(`${key}:${index}`, peerId, view, binding.id, true);
+          this.store.enqueue(`${key}:${index}`, peerId, view, binding.id, true, event.turnId);
         });
         for (let index = chunks.length; index < previousCount; index++) {
           this.store.setValue(`commentary-base:${key}:${index}`, null);
@@ -43,6 +43,7 @@ export class TaskMirror {
       if (event.type === "final") this.store.retireTurnCommentary(binding.id, event.turnId);
       if (!this.store.rememberEvent(binding.id, event.id)) return;
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
+      if (event.type === "user" && this.store.consumeExpectedEditedUser(binding.id, event.text)) return;
       const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";
       const footer = event.type === "final" ? MENU_FOOTER : "";
       // Reserve room for the footer so it cannot become a separate VK message.
@@ -52,7 +53,7 @@ export class TaskMirror {
           text: `${prefix}${chunk}${index === chunks.length - 1 ? footer : ""}`,
           ...(event.type === "user" ? { silent: true } : {}),
           ...(event.type === "final" && index === chunks.length - 1 ? { buttons: [MENU_BUTTON] } : {}),
-        }, binding.id);
+        }, binding.id, false, event.turnId);
       });
     });
   }

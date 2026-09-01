@@ -7,7 +7,7 @@ export interface VkReadinessApi {
 }
 
 export interface ReadinessCheck {
-  readonly name: "messages_permission" | "long_poll" | "message_new" | "message_event" | "event_version" | "long_poll_server";
+  readonly name: "messages_permission" | "long_poll" | "message_new" | "message_edit" | "message_event" | "event_version" | "long_poll_server";
   readonly ok: boolean;
   readonly detail: string;
 }
@@ -35,7 +35,7 @@ export async function checkVkReadiness(api: VkReadinessApi): Promise<readonly Re
     const settings = isObject(response) ? response : {};
     const events = isObject(settings.events) ? settings.events : {};
     result.push({ name: "long_poll", ok: enabled(settings.is_enabled), detail: enabled(settings.is_enabled) ? "Bots Long Poll включён." : "Включи Bots Long Poll в настройках сообщества." });
-    for (const name of ["message_new", "message_event"] as const) {
+    for (const name of ["message_new", "message_edit", "message_event"] as const) {
       result.push({ name, ok: enabled(events[name]), detail: enabled(events[name]) ? `Событие ${name} включено.` : `Включи событие ${name} в типах событий Long Poll.` });
     }
     const compatible = settings.api_version === "5.199";

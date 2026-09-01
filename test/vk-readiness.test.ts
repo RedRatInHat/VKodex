@@ -5,21 +5,22 @@ import { checkVkReadiness, type VkReadinessApi } from "../src/platforms/vk/readi
 function fixture(): VkReadinessApi {
   return {
     tokenPermissions: async () => ({ permissions: [{ name: "messages", setting: 1 }] }),
-    longPollSettings: async () => ({ is_enabled: true, api_version: "5.199", events: { message_new: true, message_event: true } }),
+    longPollSettings: async () => ({ is_enabled: true, api_version: "5.199", events: { message_new: true, message_edit: true, message_event: true } }),
     longPollServer: async () => ({ key: "secret-poll-key-fixture", server: "https://example.invalid/private-endpoint", ts: "1" }),
   };
 }
 
-test("VK readiness verifies messages and both Long Poll event types without exposing server credentials", async () => {
+test("VK readiness verifies messages and all Long Poll event types without exposing server credentials", async () => {
   const checks = await checkVkReadiness(fixture());
-  assert.equal(checks.length, 6); assert.ok(checks.every(check => check.ok));
+  assert.equal(checks.length, 7); assert.ok(checks.every(check => check.ok));
   assert.doesNotMatch(JSON.stringify(checks), /secret-poll-key-fixture|private-endpoint/u);
 });
 
 test("disabled callback events and mismatched event versions are reported", async () => {
-  const checks = await checkVkReadiness({ ...fixture(), longPollSettings: async () => ({ is_enabled: 1, api_version: "different", events: { message_new: 1, message_event: 0 } }) });
+  const checks = await checkVkReadiness({ ...fixture(), longPollSettings: async () => ({ is_enabled: 1, api_version: "different", events: { message_new: 1, message_edit: 0, message_event: 0 } }) });
   assert.equal(checks.find(check => check.name === "message_new")!.ok, true);
   assert.equal(checks.find(check => check.name === "message_event")!.ok, false);
+  assert.equal(checks.find(check => check.name === "message_edit")!.ok, false);
   assert.equal(checks.find(check => check.name === "event_version")!.ok, false);
 });
 

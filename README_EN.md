@@ -128,9 +128,10 @@ Open **Management → API usage → Long Poll API**:
 | Long Poll API | Enabled |
 | API version | **5.199** |
 | Incoming-message event | `message_new` enabled |
+| Message-edit event | `message_edit` enabled |
 | Button-action event | `message_event` enabled |
 
-`message_new` is required for text and conversation service events. `message_event` is required for menu buttons. VKodex does not need Callback API configuration, a server URL, or a confirmation string.
+`message_new` is required for new messages, `message_edit` for synchronizing a corrected last request, and `message_event` for menu buttons. VKodex does not need Callback API configuration, a server URL, or a confirmation string.
 
 Do not select a different version merely because it is newer: the adapter and validation command target **5.199**. Save the changes. Long Poll settings are described by the [official VK schema](https://github.com/VKCOM/vk-api-schema/blob/master/groups/methods.json).
 
@@ -246,6 +247,7 @@ A healthy configuration reports `OK` for every check:
 messages_permission
 long_poll
 message_new
+message_edit
 message_event
 event_version
 long_poll_server
@@ -352,6 +354,8 @@ New tasks are created by the official Codex SDK in the selected `CODEX_HOME`, so
 ### Task conversation
 
 A regular message continues the linked task. During an active turn it becomes a steer; after completion it starts the next turn in the same context. Any participant in the linked conversation may author a prompt: the bridge ignores only its own community messages and already processed outbound messages. It does not inspect the participant list. A request is not retried automatically when Codex state is uncertain or a response was lost.
+
+An edit made in VK is synchronized to Codex only for the same author's latest message when that message started a standalone turn through the live desktop owner. VKodex interrupts an unfinished turn, invokes Codex's native last-request edit, deletes VKodex output from the discarded branch, and starts the corrected turn. Commands and workspace file changes already performed by the discarded turn are not reverted. A steer sent during an active turn, an older message, an SDK fallback request, or a turn followed by another steer is not rewritten; the edit remains in VK and the bot explains why.
 
 If a binding was explicitly disabled through `/detach` or archiving, a new message does not silently enable it. The private manager receives an explanation and a reconnect button. Reconnect, then repeat the original message. For a conversation that has never been linked, the manager offers the task list. Leaving the conversation or changing its participants does not disable the binding.
 
@@ -572,6 +576,7 @@ Startup is blocked if native modules have a mismatched architecture or ABI. Do n
 | --- | --- |
 | The bot never replies | Look for `VK Long Poll started`; check the token, community ID, exactly **one** `VK_OWNER_ID`, and permission to receive community messages. Run `npm run vk:check`. |
 | Text works but buttons do not | Enable the `message_event` event and set Long Poll API version to `5.199`. |
+| A VK edit does not reach Codex | Enable `message_edit`, and verify that this is the same author's latest message and that it started a standalone live turn. A steer sent while the agent was already working cannot be rewritten safely. |
 | The catalog contains no tasks | Make sure Codex runs under the same user, check `CODEX_HOME` and extra directories, and inspect `desktop:probe`. Archived and internal tasks are excluded. |
 | A task is listed but cannot be linked | Codex desktop and VKodex must run as the same Windows user. `notLoaded` means the task was unloaded from memory, not deleted. When no live owner is available, a new text turn uses the Codex SDK in the same profile; for duplicate IDs, still check the selected source and history path. |
 | No conversation invite arrived | Open the manager. After creating a conversation, the bot sends a link whether or not VK added the owner automatically. Join through it; there is no confirmation button. Check that the bot may participate in conversations. |

@@ -80,6 +80,14 @@ class Server extends Duplex {
           this.dataState = state([], "interrupted"); this.snapshot(); result = { result: { ok: true } };
         } else result = { result: { ok: true, interruptedTurnId: "fixture-turn" } };
       }
+      if (message.method === "thread-follower-edit-last-user-turn") {
+        result = { ok: true };
+        this.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "active" }, turns: [{
+          turnId: "replacement-turn", turnStartedAtMs: 200, status: "inProgress",
+          params: { clientUserMessageId: "replacement-operation", input: [{ type: "text", text: (message.params as IpcObject).message }] }, items: [],
+        }] };
+        this.snapshot();
+      }
       this.send({ type: "response", requestId: message.requestId, resultType: "success", result, handledByClientId: "owner" });
     } else if (message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following) {
       if (this.onFollow) this.onFollow(); else this.snapshot();
@@ -606,6 +614,38 @@ test("an idle or unloaded task starts the next turn through its owner with inher
     });
     assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn" || message.method === "thread/start" || message.method === "thread/resume"), false);
     assert.ok(server.destroyed);
+  }
+});
+
+test("editing the last standalone VK turn uses the desktop owner and returns the replacement identity", async () => {
+  const server = new Server();
+  server.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "idle" }, turns: [{
+    turnId: "fixture-turn", turnStartedAtMs: 100, status: "completed",
+    params: { clientUserMessageId: "vk-operation", input: [{ type: "text", text: "Old request" }] },
+    items: [{ type: "userMessage", id: "user", clientId: "vk-operation", content: [{ type: "text", text: "Old request" }] }],
+  }] };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+  const result = await adapter.editLastUserTurn({ task: ref, operationId: "vk-operation", expectedOperationId: "vk-operation", expectedTurnId: "fixture-turn", text: "Corrected request" });
+  const request = server.received.find(message => message.method === "thread-follower-edit-last-user-turn")!;
+  assert.equal(request.version, 1); assert.equal(request.targetClientId, "owner");
+  assert.deepEqual(request.params, { conversationId: ref.threadId, turnId: "fixture-turn", message: "Corrected request" });
+  assert.deepEqual(result, { turnId: "replacement-turn", operationId: "replacement-operation" });
+});
+
+test("editing never rewrites an older or already-steered turn", async () => {
+  for (const stateOverride of [
+    { turnId: "another-turn", params: { clientUserMessageId: "vk-operation" }, items: [] },
+    { turnId: "fixture-turn", params: { clientUserMessageId: "vk-operation" }, items: [{ type: "steeringUserMessage" }] },
+  ]) {
+    const server = new Server();
+    server.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "idle" }, turns: [{
+      turnStartedAtMs: 100, status: "completed", ...stateOverride,
+    }] };
+    const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+    await assert.rejects(adapter.editLastUserTurn({ task: ref, operationId: "vk-operation", expectedOperationId: "vk-operation", expectedTurnId: "fixture-turn", text: "Corrected" }), ActionRejectedError);
+    assert.equal(server.received.some(message => message.method === "thread-follower-edit-last-user-turn"), false);
   }
 });
 

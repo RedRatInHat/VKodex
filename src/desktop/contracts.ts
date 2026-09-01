@@ -40,6 +40,22 @@ export interface SubmitTaskRequest {
   readonly beforeSend?: () => Promise<void>;
 }
 
+export interface SubmitTaskReceipt {
+  readonly mode: "start" | "steer" | "fallback";
+  readonly turnId: string | null;
+}
+
+export interface EditLastUserTurnRequest extends SubmitTaskRequest {
+  readonly expectedTurnId: string;
+  readonly expectedOperationId: string;
+}
+
+export interface EditLastUserTurnResult {
+  /** The replacement turn is normally visible in the owner snapshot before the IPC reply. */
+  readonly turnId: string | null;
+  readonly operationId: string | null;
+}
+
 export interface DesktopModel {
   readonly id: string;
   readonly title: string;
@@ -142,6 +158,7 @@ export interface DesktopCapabilities {
   readonly moveTask?: boolean;
   readonly accountUsage?: boolean;
   readonly goals?: boolean;
+  readonly editLastUserTurn?: boolean;
 }
 
 export interface DirectTaskUpdate {
@@ -171,6 +188,8 @@ export interface DesktopTasks {
   catalogWarnings?(): readonly string[];
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;
+  submitWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
+  editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
   interrupt(task: TaskRef): Promise<void>;
   moveTask(task: TaskRef, projectId: string | null): Promise<void>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;

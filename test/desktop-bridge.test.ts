@@ -14,7 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
-import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult } from "../src/desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 
@@ -73,12 +73,14 @@ class Chat implements BridgeChat {
 }
 
 class Desktop implements DesktopTasks {
-  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true, goals: false };
+  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true, goals: false, editLastUserTurn: true };
   tasks: DesktopTask[] = [task];
   projects: DesktopProject[] = [{ id: "project-a", title: "Project", workspace: "/project" }];
   projectsError: Error | null = null;
   readonly creations: CreateTaskRequest[] = [];
   readonly submissions: SubmitTaskRequest[] = [];
+  readonly messageEdits: EditLastUserTurnRequest[] = [];
+  submitReceipt: SubmitTaskReceipt = { mode: "start", turnId: "submitted-turn" };
   readonly stops: TaskRef[] = [];
   createError: Error | null = null;
   submitError: Error | null = null;
@@ -146,7 +148,9 @@ class Desktop implements DesktopTasks {
     this.tasks.push(created);
     return created;
   }
-  async submit(request: SubmitTaskRequest): Promise<void> { this.submissions.push(request); if (this.submitHook) await this.submitHook(); if (this.submitError) throw this.submitError; }
+  async submit(request: SubmitTaskRequest): Promise<void> { await this.submitWithReceipt(request); }
+  async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> { this.submissions.push(request); if (this.submitHook) await this.submitHook(); if (this.submitError) throw this.submitError; return this.submitReceipt; }
+  async editLastUserTurn(request: EditLastUserTurnRequest) { this.messageEdits.push(request); return { turnId: "replacement-turn", operationId: "replacement-operation" }; }
   async interrupt(ref: TaskRef): Promise<void> { this.stops.push(ref); }
   async moveTask(ref: TaskRef, projectId: string | null): Promise<void> {
     this.tasks = this.tasks.map(item => item.threadId === ref.threadId ? { ...item, projectId } : item);
@@ -238,6 +242,39 @@ test("help and unknown commands cannot become a pending rename value", async t =
   assert.match(s.chat.sent.at(-1)!.view.text, /^Команда не найдена\./u);
   assert.equal(s.desktop.renames.length, 0);
   assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("editing the latest standalone VK request replaces its Codex turn and deletes the discarded bot branch", async t => {
+  const s = setup(t); const binding = s.attach();
+  await s.manager.handle({ eventId: "message:41", peerId, senderId: access.ownerId, text: "Old request" });
+  assert.equal(s.store.editableRequest(binding.id)?.mode, "start");
+  s.mirror.accept(binding.id, { type: "progress", id: "old-progress", turnId: "submitted-turn", text: "Old progress" });
+  await s.worker.flush();
+  s.mirror.accept(binding.id, { type: "final", id: "old-final", turnId: "submitted-turn", text: "Old answer" });
+  await s.worker.flush();
+  const oldHandles = s.chat.sent.filter(item => /Old progress|Old answer/u.test(item.view.text)).map(item => item.handle.conversationMessageId);
+
+  await s.manager.handle({ eventId: "message-edit:41:fixture", peerId, senderId: access.ownerId, text: "Corrected request", editOfMessageId: 41 });
+  await s.worker.flush();
+  assert.equal(s.desktop.messageEdits.length, 1);
+  assert.equal(s.desktop.messageEdits[0]!.expectedTurnId, "submitted-turn");
+  assert.deepEqual(s.chat.deletes.map(handle => handle.conversationMessageId).sort((a, b) => a - b), oldHandles.sort((a, b) => a - b));
+  assert.match(s.chat.sent.at(-1)!.view.text, /Запрос обновлён в Codex/u);
+
+  s.mirror.accept(binding.id, { type: "user", id: "replacement-user", turnId: "replacement-turn", text: "Corrected request", operationId: "replacement-operation" });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.some(item => item.view.text.includes("## user request")), false);
+  assert.equal(s.store.editableRequest(binding.id)?.turnId, "replacement-turn");
+});
+
+test("editing a VK steering message never rewrites the containing Codex turn", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.submitReceipt = { mode: "steer", turnId: "active-turn" };
+  await s.manager.handle({ eventId: "message:42", peerId, senderId: 999, text: "Steering request" });
+  await s.manager.handle({ eventId: "message-edit:42:fixture", peerId, senderId: 999, text: "Changed steering", editOfMessageId: 42 });
+  await s.worker.flush();
+  assert.equal(s.desktop.messageEdits.length, 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /уточнение внутри уже идущего хода/u);
+  assert.equal(s.store.editableRequest(binding.id)?.text, "Steering request");
 });
 
 test("final menu shortcut is on the last chunk and opens fresh peer-scoped panels", async t => {
@@ -988,24 +1025,27 @@ test("VK rename refuses mismatched readback and rechecks access immediately befo
   }
 });
 
-test("VK service events do not detach a task and every inbound non-bot user can prompt it", async t => {
+test("VK service events do not detach a task and message edits keep their original conversation id", async t => {
   const s = setup(t); const binding = s.attach(); const inputs: BridgeInput[] = [];
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
   const config = loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" });
   const gateway = new DesktopVkGateway(config, vk);
   await gateway.start(async input => { inputs.push(input); await s.manager.handle(input); });
-  const update = (id: number, senderId: number, action?: { type: string; member_id?: number }, out = 0) => ({
-    type: "message_new", group_id: access.groupId, event_id: `fixture-${id}`, v: "5.199",
+  const update = (id: number, senderId: number, action?: { type: string; member_id?: number }, out = 0, type: "message_new" | "message_edit" = "message_new", text = "Fixture text") => ({
+    type, group_id: access.groupId, event_id: `fixture-${type}-${id}`, v: "5.199",
     object: { message: { id: 0, conversation_message_id: id, peer_id: peerId, from_id: senderId,
-      date: 100, out, text: "Fixture text", attachments: [], ...(action ? { action } : {}) }, client_info: {} },
+      date: 100, update_time: type === "message_edit" ? 101 : undefined, out, text, attachments: [], ...(action ? { action } : {}) }, client_info: {} },
   });
   await vk.updates.handleWebhookUpdate(update(1, access.ownerId, { type: "chat_kick_user", member_id: access.ownerId }, 1));
   assert.equal(s.store.getBinding(binding.id)!.attached, true);
   await vk.updates.handleWebhookUpdate(update(2, 999));
   await vk.updates.handleWebhookUpdate(update(3, -access.groupId));
   await vk.updates.handleWebhookUpdate(update(4, access.ownerId, undefined, 1));
-  assert.equal(inputs.length, 1); assert.equal(inputs[0]!.senderId, 999);
+  await vk.updates.handleWebhookUpdate(update(2, 999, undefined, 0, "message_edit", "Corrected text"));
+  assert.equal(inputs.length, 2); assert.equal(inputs[0]!.senderId, 999);
+  assert.equal(inputs[1]!.editOfMessageId, 2); assert.match(inputs[1]!.eventId, /^message-edit:2:/u);
   assert.equal(s.desktop.submissions.length, 1); assert.equal(s.desktop.submissions[0]!.text, "Fixture text");
+  assert.equal(s.desktop.messageEdits.length, 1); assert.equal(s.desktop.messageEdits[0]!.text, "Corrected text");
   assert.equal(s.chat.memberReads, 0); assert.equal(s.store.getBinding(binding.id)!.paused, false);
 });
 

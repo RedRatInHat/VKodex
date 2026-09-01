@@ -4,6 +4,7 @@ import { taskKey, type DesktopTask, type TaskRef } from "../desktop/contracts.js
 import type { Binding, Delivery, ManagerAction, MessageHandle, NewTaskDraft, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../desktop/paths.js";
+import type { LocalInputFile } from "../domain/models.js";
 
 const bindingColumns = `id TEXT PRIMARY KEY, host_id TEXT NOT NULL, thread_id TEXT NOT NULL, title TEXT NOT NULL,
   peer_id INTEGER UNIQUE, chat_id INTEGER, chat_state TEXT NOT NULL DEFAULT 'planned',
@@ -45,6 +46,17 @@ export interface DeliveryHealthStats {
   readonly lastFailure: DeliveryFailure | null;
   readonly lastSuccessAt: number | null;
 }
+
+export interface EditableVkRequest {
+  readonly messageId: number;
+  readonly senderId: number;
+  readonly operationId: string;
+  readonly turnId: string | null;
+  readonly mode: "start" | "steer" | "fallback" | "unconfirmed";
+  readonly text: string;
+  readonly inputFiles?: readonly LocalInputFile[];
+  readonly outboxDir?: string;
+}
 function binding(row: BindingRow): Binding {
   return { id: row.id, hostId: row.host_id, threadId: row.thread_id, title: row.title, peerId: row.peer_id, chatId: row.chat_id, chatState: row.chat_state, attached: row.attached === 1, paused: row.paused === 1,
     ...(row.source_id ? { sourceId: row.source_id } : {}), ...(row.source_label ? { sourceLabel: row.source_label } : {}), ...(row.rollout_path ? { rolloutPath: row.rollout_path } : {}) };
@@ -69,7 +81,7 @@ export class BridgeStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, binding_id TEXT REFERENCES bridge_bindings(id),
         peer_id INTEGER NOT NULL, kind TEXT NOT NULL, view TEXT NOT NULL, first_view TEXT, handle TEXT,
         revision INTEGER NOT NULL DEFAULT 1, delivered_revision INTEGER NOT NULL DEFAULT 0,
-        priority_revision INTEGER NOT NULL DEFAULT 0
+        priority_revision INTEGER NOT NULL DEFAULT 0, turn_id TEXT
       );
     `);
     migrateBindingSources(this.db);
@@ -78,6 +90,7 @@ export class BridgeStore {
     if (!actionColumns.has("consumed")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
     const deliveryColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_delivery)").all() as { name: string }[]).map(column => column.name));
     if (!deliveryColumns.has("priority_revision")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN priority_revision INTEGER NOT NULL DEFAULT 0");
+    if (!deliveryColumns.has("turn_id")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN turn_id TEXT");
   }
 
   close(): void { this.db.close(); }
@@ -238,6 +251,17 @@ export class BridgeStore {
   recordOperation(id: string, task: TaskRef): void { this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task)); }
   finishOperation(id: string, uncertain: boolean): void { this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "accepted", id); }
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
+  saveEditableRequest(bindingId: string, request: EditableVkRequest): void { this.setValue(`editable-request:${bindingId}`, request); }
+  editableRequest(bindingId: string): EditableVkRequest | null { return this.getValue<EditableVkRequest>(`editable-request:${bindingId}`); }
+  expectEditedUser(bindingId: string, text: string, now = Date.now()): void {
+    this.setValue(`expected-edited-user:${bindingId}`, { digest: createHash("sha256").update(text).digest("hex"), expiresAt: now + 60_000 });
+  }
+  clearExpectedEditedUser(bindingId: string): void { this.setValue(`expected-edited-user:${bindingId}`, null); }
+  consumeExpectedEditedUser(bindingId: string, text: string, now = Date.now()): boolean {
+    const expected = this.getValue<{ digest: string; expiresAt: number }>(`expected-edited-user:${bindingId}`);
+    if (!expected || expected.expiresAt < now || expected.digest !== createHash("sha256").update(text).digest("hex")) return false;
+    this.clearExpectedEditedUser(bindingId); return true;
+  }
   rememberEvent(bindingId: string, eventId: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_events(binding_id, event_id) VALUES (?, ?)").run(bindingId, eventId).changes === 1; }
   deliveryOrder(key: string): number { return (this.db.prepare("SELECT id FROM bridge_delivery WHERE key = ?").get(key) as { id: number } | undefined)?.id ?? 0; }
   latestPeerDeliveryOrder(peerId: number): number {
@@ -256,13 +280,19 @@ export class BridgeStore {
     return Math.max(sent, this.getValue<number>(`peer-message:${peerId}`) ?? 0);
   }
 
-  enqueue(key: string, peerId: number, view: View, bindingId: string | null = null, commentary: boolean | "panel" | "activity" = false): void {
+  enqueue(key: string, peerId: number, view: View, bindingId: string | null = null, commentary: boolean | "panel" | "activity" = false, turnId: string | null = null): void {
     const serialized = JSON.stringify(view);
     if (commentary) {
-      this.db.prepare(`INSERT INTO bridge_delivery(key, binding_id, peer_id, kind, view) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET view = excluded.view, revision = bridge_delivery.revision + 1
-        WHERE bridge_delivery.view <> excluded.view`).run(key, bindingId, peerId, commentary === true ? "commentary" : commentary, serialized);
-    } else this.db.prepare("INSERT OR IGNORE INTO bridge_delivery(key, binding_id, peer_id, kind, view) VALUES (?, ?, ?, 'send', ?)").run(key, bindingId, peerId, serialized);
+      this.db.prepare(`INSERT INTO bridge_delivery(key, binding_id, peer_id, kind, view, turn_id) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET view = excluded.view, turn_id = COALESCE(bridge_delivery.turn_id, excluded.turn_id), revision = bridge_delivery.revision + 1
+        WHERE bridge_delivery.view <> excluded.view`).run(key, bindingId, peerId, commentary === true ? "commentary" : commentary, serialized, turnId);
+    } else this.db.prepare("INSERT OR IGNORE INTO bridge_delivery(key, binding_id, peer_id, kind, view, turn_id) VALUES (?, ?, ?, 'send', ?, ?)").run(key, bindingId, peerId, serialized, turnId);
+  }
+
+  deleteTurnDeliveries(bindingId: string, turnId: string): void {
+    this.db.prepare(`UPDATE bridge_delivery SET kind = 'delete', revision = revision + 1,
+      delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END
+      WHERE binding_id = ? AND turn_id = ? AND kind IN ('send', 'commentary', 'activity')`).run(bindingId, turnId);
   }
 
   withdrawCommentary(key: string): void {

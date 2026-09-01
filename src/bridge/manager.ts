@@ -7,6 +7,7 @@ import { BridgeStore } from "./store.js";
 import { TaskPanels } from "./panels.js";
 import { TaskFiles } from "./files.js";
 import { systemLoadText } from "./system-load.js";
+import { taskInput } from "../desktop/desktop-tasks.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -38,6 +39,7 @@ const taskHelp = [
   "/detach — отключить трансляцию, не останавливая задачу",
   "",
   "Обычный текст, фотографии и документы продолжают эту задачу.",
+  "Правка последнего сообщения VK заменяет отдельный live-ход; уточнения внутри идущего хода не переписываются.",
 ].join("\n");
 
 const unknownCommand = (help: string): string => `Команда не найдена.\n\n${help}`;
@@ -130,7 +132,7 @@ export class TaskManager {
       }
       const incomingId = /^message:(\d+)$/u.exec(input.eventId);
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
-      if (input.hasAttachments) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
+      if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
       if (input.attachments?.length && (!this.files || managerPeer || input.action || input.text.trim().startsWith("/"))) throw new ActionRejectedError("Вложения отправляй отдельным сообщением в связанную беседу задачи.");
       if (input.action) {
         // This read-only shortcut always opens the current peer's menu, even
@@ -399,6 +401,10 @@ export class TaskManager {
     if (!binding || input.action) return;
     const text = input.text.trim();
     const ownerCommand = input.senderId === this.access.ownerId;
+    if (input.editOfMessageId !== undefined) {
+      await this.handleTaskEdit(input, binding, text);
+      return;
+    }
     if (ownerCommand && text === "/help") {
       this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: taskHelp, buttons: [MENU_BUTTON] }, binding.id);
       return;
@@ -431,15 +437,62 @@ export class TaskManager {
     const prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []);
     this.store.recordOperation(operationId, binding);
     try {
-      await this.desktop.submit({ task: binding, operationId, text, ...prepared, beforeSend: async () => {
+      const request = { task: binding, operationId, text, ...prepared, beforeSend: async () => {
         if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена во время подготовки запроса. Сообщение не отправлено.");
-      } });
+      } };
+      const receipt = this.desktop.submitWithReceipt
+        ? await this.desktop.submitWithReceipt(request)
+        : (await this.desktop.submit(request), null);
       this.store.finishOperation(operationId, false);
       this.files?.finish(binding.id, operationId, false);
+      const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
+      if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
+        messageId: Number(messageId), senderId: input.senderId, operationId,
+        turnId: receipt.turnId, mode: receipt.mode, text, ...prepared,
+      });
     } catch (error) {
       this.store.finishOperation(operationId, true);
       this.files?.finish(binding.id, operationId, true);
       throw error;
     }
+  }
+
+  private async handleTaskEdit(input: BridgeInput, binding: Binding, text: string): Promise<void> {
+    if (!text) throw new ActionRejectedError("Пустой запрос нельзя передать в Codex. Изменение осталось только в VK.");
+    if (text.length > 16_000) throw new ActionRejectedError("Допустим текст до 16000 символов. Изменение осталось только в VK.");
+    if (input.hasAttachments || input.attachments?.length) throw new ActionRejectedError("VKodex пока синхронизирует только правку текста. Вложения и контекст Codex не изменены.");
+    const previous = this.store.editableRequest(binding.id);
+    if (!previous || previous.messageId !== input.editOfMessageId || previous.senderId !== input.senderId) {
+      throw new ActionRejectedError("Отредактировано не последнее отправленное через VK сообщение. Изменение осталось только в VK; контекст Codex не затронут.");
+    }
+    if (previous.text === text) return;
+    if (previous.mode === "steer") {
+      throw new ActionRejectedError("Это сообщение было добавлено как уточнение внутри уже идущего хода. Codex не умеет безопасно заменить только такое уточнение; изменение осталось только в VK.");
+    }
+    if (previous.mode !== "start" || !previous.turnId || !this.desktop.capabilities.editLastUserTurn || !this.desktop.editLastUserTurn) {
+      throw new ActionRejectedError("Для этого сообщения нет подтверждённого отдельного хода Codex. Изменение осталось только в VK.");
+    }
+    const request = {
+      task: binding, operationId: previous.operationId, expectedOperationId: previous.operationId,
+      expectedTurnId: previous.turnId, text,
+      ...(previous.inputFiles ? { inputFiles: previous.inputFiles } : {}),
+      ...(previous.outboxDir ? { outboxDir: previous.outboxDir } : {}),
+    };
+    this.store.expectEditedUser(binding.id, taskInput(request).text);
+    let result;
+    try { result = await this.desktop.editLastUserTurn(request); }
+    catch (error) { this.store.clearExpectedEditedUser(binding.id); throw error; }
+    this.store.deleteTurnDeliveries(binding.id, previous.turnId);
+    this.store.saveEditableRequest(binding.id, {
+      ...previous, text,
+      operationId: result.operationId ?? previous.operationId,
+      turnId: result.turnId,
+      mode: result.turnId && result.operationId ? "start" : "unconfirmed",
+    });
+    this.store.enqueue(`edit-confirmed:${binding.id}:${input.eventId}`, input.peerId, {
+      text: result.turnId ? "Запрос обновлён в Codex. Предыдущая ветка отброшена; исправленный ход запущен заново. Изменения файлов, уже сделанные старым ходом, автоматически не отменяются."
+        : "Запрос обновлён в Codex и запущен заново. Состояние нового хода ещё не пришло в мост, поэтому повторное редактирование пока недоступно.",
+      silent: true,
+    }, binding.id);
   }
 }

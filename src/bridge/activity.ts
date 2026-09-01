@@ -42,7 +42,7 @@ export class TaskActivity {
   }
 
   private render(state: ActivityState, peerId: number, bindingId: string, frame: string): void {
-    this.store.enqueue(state.key, peerId, { text: this.frame(frame), silent: true }, bindingId, "activity");
+    this.store.enqueue(state.key, peerId, { text: this.frame(frame), silent: true }, bindingId, "activity", state.turnId);
   }
 
   private settle(state: ActivityState, peerId: number, bindingId: string, status: TaskDetails["status"], refresh = false): void {

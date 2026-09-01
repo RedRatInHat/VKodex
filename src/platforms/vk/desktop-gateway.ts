@@ -8,6 +8,7 @@ import { isObject } from "../../desktop/ipc-client.js";
 import type { RemoteAttachment } from "../../domain/models.js";
 import { safeFileName } from "../../lib/files.js";
 import { checkVkReadiness } from "./readiness.js";
+import { createHash } from "node:crypto";
 
 export function vkKeyboard(view: View): string {
   const buttons = (view.buttons ?? []).map(button => ({
@@ -132,10 +133,18 @@ export class DesktopVkGateway implements BridgeChat {
     // prompts from every sender except the community itself.
     this.vk.updates.on("message", async (context: MessageContext) => {
       if (context.eventType) return;
-      if (!context.is(["message_new"]) || context.isOutbox) return;
+      if (!context.is(["message_new", "message_edit"]) || context.isOutbox) return;
       if ([this.config.access.groupId, -this.config.access.groupId].includes(context.senderId)) return;
       const id = context.conversationMessageId;
       if (!Number.isSafeInteger(id) || !id || id <= 0) return;
+      const edited = context.is(["message_edit"]);
+      if (edited) {
+        const text = context.text ?? "";
+        const digest = createHash("sha256").update(JSON.stringify([id, context.updatedAt ?? 0, text])).digest("hex").slice(0, 16);
+        await onInput({ eventId: `message-edit:${id}:${digest}`, peerId: context.peerId, senderId: context.senderId, text,
+          editOfMessageId: id, ...(hasVkAttachments(context) ? { hasAttachments: true } : {}) });
+        return;
+      }
       let attachments: RemoteAttachment[] = []; let attachmentError: string | undefined;
       try { attachments = await collectVkFiles(context); }
       catch (error) { attachmentError = error instanceof ActionRejectedError ? error.message : "Не удалось получить вложения из VK. Сообщение не отправлено."; }
