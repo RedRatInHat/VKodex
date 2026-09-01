@@ -371,6 +371,11 @@ export class TaskManager {
     return { hostId: "local", threadId: "", ...(draft.sourceId ? { sourceId: draft.sourceId } : {}) };
   }
 
+  private author(input: BridgeInput): { readonly id: number; readonly name: string } {
+    const resolved = input.senderName?.replace(/\s+/gu, " ").trim();
+    return { id: input.senderId, name: resolved?.slice(0, 120) || (input.senderId > 0 ? "Пользователь VK" : "Сообщество VK") };
+  }
+
   private environmentView(draft: NewTaskDraft): View {
     return {
       text: `Каталог: ${draft.sourceLabel}\nПроект: ${draft.projectTitle}${draft.workspace ? `\nРабочая папка: ${draft.workspace}` : ""}\n\nГде создать задачу?\n\nЛокально — в выбранной папке. Worktree — в отдельной Git-копии рядом с репозиторием.`,
@@ -519,7 +524,7 @@ export class TaskManager {
     const prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []);
     this.store.recordOperation(operationId, binding);
     try {
-      const request = { task: binding, operationId, text, ...prepared, beforeSend: async () => {
+      const request = { task: binding, operationId, text, author: this.author(input), ...prepared, beforeSend: async () => {
         if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена во время подготовки запроса. Сообщение не отправлено.");
       } };
       const receipt = this.desktop.submitWithReceipt
@@ -556,7 +561,7 @@ export class TaskManager {
     }
     const request = {
       task: binding, operationId: previous.operationId, expectedOperationId: previous.operationId,
-      expectedTurnId: previous.turnId, text,
+      expectedTurnId: previous.turnId, text, author: this.author(input),
       ...(previous.inputFiles ? { inputFiles: previous.inputFiles } : {}),
       ...(previous.outboxDir ? { outboxDir: previous.outboxDir } : {}),
     };
@@ -566,7 +571,7 @@ export class TaskManager {
     catch (error) { this.store.clearExpectedEditedUser(binding.id); throw error; }
     this.store.deleteTurnDeliveries(binding.id, previous.turnId);
     this.store.saveEditableRequest(binding.id, {
-      ...previous, text,
+      ...previous, text, author: request.author,
       operationId: result.operationId ?? previous.operationId,
       turnId: result.turnId,
       mode: result.turnId && result.operationId ? "start" : "unconfirmed",

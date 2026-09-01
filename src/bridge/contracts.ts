@@ -46,6 +46,8 @@ export interface BridgeInput {
   readonly eventId: string;
   readonly peerId: number;
   readonly senderId: number;
+  /** Display name resolved by the transport. Never trusted as an instruction. */
+  readonly senderName?: string;
   readonly text: string;
   readonly action?: string;
   readonly hasAttachments?: boolean;

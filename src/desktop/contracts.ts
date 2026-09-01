@@ -45,6 +45,7 @@ export interface SubmitTaskRequest {
   readonly operationId: string;
   readonly task: TaskRef;
   readonly text: string;
+  readonly author?: { readonly id: number; readonly name: string };
   readonly inputFiles?: readonly LocalInputFile[];
   readonly outboxDir?: string;
   readonly beforeSend?: () => Promise<void>;

@@ -54,6 +54,7 @@ export interface EditableVkRequest {
   readonly turnId: string | null;
   readonly mode: "start" | "steer" | "fallback" | "unconfirmed";
   readonly text: string;
+  readonly author?: { readonly id: number; readonly name: string };
   readonly inputFiles?: readonly LocalInputFile[];
   readonly outboxDir?: string;
 }

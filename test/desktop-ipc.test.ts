@@ -408,11 +408,14 @@ test("active-task submit uses the existing task and inherits its model and permi
   const server = new Server();
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
-  await adapter.submit({ operationId: "client-message-fixture", task: ref, text: "A follow-up" });
+  await adapter.submit({ operationId: "client-message-fixture", task: ref, text: "A follow-up", author: { id: 999, name: "Second User" } });
   const request = server.received.find(message => message.method === "thread-follower-steer-turn")!;
   assert.equal(request.targetClientId, "owner");
   assert.equal((request.params as IpcObject).conversationId, ref.threadId);
   assert.equal((request.params as IpcObject).clientUserMessageId, "client-message-fixture");
+  const attributed = ((request.params as IpcObject).input as IpcObject[])[0]!.text;
+  assert.match(String(attributed), /VK author: "Second User"/u); assert.match(String(attributed), /VK sender ID: 999/u);
+  assert.match(String(attributed), /# User request\nA follow-up/u);
   for (const forbidden of ["model", "approvalPolicy", "sandbox", "permissions", "serviceTier"]) assert.equal(Object.hasOwn(request.params as object, forbidden), false);
   assert.ok(server.destroyed);
 });

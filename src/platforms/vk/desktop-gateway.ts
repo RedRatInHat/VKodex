@@ -89,6 +89,7 @@ export class DesktopVkGateway implements BridgeChat {
   private lastWriteSuccessAt = 0;
   private lastWriteFailureAt = 0;
   private pollingStarted = false;
+  private readonly senderNames = new Map<number, string>();
 
   private async write<T>(operation: () => Promise<T>): Promise<T> {
     let release!: () => void;
@@ -117,7 +118,8 @@ export class DesktopVkGateway implements BridgeChat {
       release();
     }
   }
-  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000, private readonly logger?: Logger) {
+  constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000, private readonly logger?: Logger,
+    private readonly senderNameLookup?: (senderId: number) => Promise<string>) {
     // vk-io's default middleware error handler prints the full exception.
     this.vk.updates.use(async (_context, next) => {
       try { await next(); }
@@ -126,6 +128,33 @@ export class DesktopVkGateway implements BridgeChat {
         else process.stderr.write("VKodex could not handle an incoming VK event.\n");
       }
     });
+  }
+
+  private async senderName(senderId: number): Promise<string> {
+    const cached = this.senderNames.get(senderId);
+    if (cached) return cached;
+    const fallback = senderId > 0 ? "Пользователь VK" : "Сообщество VK";
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const lookup = this.senderNameLookup ? this.senderNameLookup(senderId) : this.fetchSenderName(senderId);
+      const value = await Promise.race([lookup, new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), 5_000); timer.unref();
+      })]);
+      const safe = value.replace(/[\x00-\x1f]+/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 120) || fallback;
+      this.senderNames.set(senderId, safe); return safe;
+    } catch {
+      this.senderNames.set(senderId, fallback); return fallback;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  private async fetchSenderName(senderId: number): Promise<string> {
+    if (senderId > 0) {
+      const users = await this.vk.api.users.get({ user_ids: [senderId] });
+      const user = users[0];
+      return user ? `${user.first_name ?? ""} ${user.last_name ?? ""}`.trim() : "";
+    }
+    const response = await this.vk.api.groups.getById({ group_ids: [-senderId] });
+    return response.groups[0]?.name ?? "";
   }
 
   async start(onInput: (input: BridgeInput) => Promise<void>): Promise<void> {
@@ -137,18 +166,19 @@ export class DesktopVkGateway implements BridgeChat {
       if ([this.config.access.groupId, -this.config.access.groupId].includes(context.senderId)) return;
       const id = context.conversationMessageId;
       if (!Number.isSafeInteger(id) || !id || id <= 0) return;
+      const senderName = await this.senderName(context.senderId);
       const edited = context.is(["message_edit"]);
       if (edited) {
         const text = context.text ?? "";
         const digest = createHash("sha256").update(JSON.stringify([id, context.updatedAt ?? 0, text])).digest("hex").slice(0, 16);
-        await onInput({ eventId: `message-edit:${id}:${digest}`, peerId: context.peerId, senderId: context.senderId, text,
+        await onInput({ eventId: `message-edit:${id}:${digest}`, peerId: context.peerId, senderId: context.senderId, senderName, text,
           editOfMessageId: id, ...(hasVkAttachments(context) ? { hasAttachments: true } : {}) });
         return;
       }
       let attachments: RemoteAttachment[] = []; let attachmentError: string | undefined;
       try { attachments = await collectVkFiles(context); }
       catch (error) { attachmentError = error instanceof ActionRejectedError ? error.message : "Не удалось получить вложения из VK. Сообщение не отправлено."; }
-      await onInput({ eventId: `message:${id}`, peerId: context.peerId, senderId: context.senderId, text: context.text ?? "", attachments,
+      await onInput({ eventId: `message:${id}`, peerId: context.peerId, senderId: context.senderId, senderName, text: context.text ?? "", attachments,
         ...(attachmentError ? { hasAttachments: true, attachmentError } : {}) });
     });
     this.vk.updates.on("message_event", async (context: MessageEventContext) => {

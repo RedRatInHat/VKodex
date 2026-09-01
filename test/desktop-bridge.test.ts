@@ -17,6 +17,7 @@ import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
 import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
+import { taskInput as desktopTaskInput } from "../src/desktop/desktop-tasks.js";
 
 // Deliberately fictional fixture IDs; production identity is supplied only through local configuration.
 const access = { ownerId: 101, groupId: 202 };
@@ -267,7 +268,7 @@ test("editing the latest standalone VK request replaces its Codex turn and delet
   assert.deepEqual(s.chat.deletes.map(handle => handle.conversationMessageId).sort((a, b) => a - b), oldHandles.sort((a, b) => a - b));
   assert.match(s.chat.sent.at(-1)!.view.text, /Запрос обновлён в Codex/u);
 
-  s.mirror.accept(binding.id, { type: "user", id: "replacement-user", turnId: "replacement-turn", text: "Corrected request", operationId: "replacement-operation" });
+  s.mirror.accept(binding.id, { type: "user", id: "replacement-user", turnId: "replacement-turn", text: desktopTaskInput(s.desktop.messageEdits[0]!).text, operationId: "replacement-operation" });
   await s.worker.flush();
   assert.equal(s.chat.sent.some(item => item.view.text.includes("## user request")), false);
   assert.equal(s.store.editableRequest(binding.id)?.turnId, "replacement-turn");
@@ -891,14 +892,15 @@ test("duplicate VK delivery cannot submit twice; a busy task receives a follow-u
   assert.equal(s.desktop.submissions[0]!.task.threadId, task.threadId);
 });
 
-test("linked non-owner messages are prompts while the manager stays private", async t => {
+test("linked non-owner messages are attributed prompts while the manager stays private", async t => {
   const s = setup(t); s.attach();
   await s.manager.handle({ ...s.input("/list"), senderId: 999 });
-  await s.manager.handle({ ...s.input("do shared work", peerId), senderId: 999 });
+  await s.manager.handle({ ...s.input("do shared work", peerId), senderId: 999, senderName: "Second User" });
   await s.manager.handle({ ...s.input("do not route", peerId + 1), senderId: 999 });
   await s.worker.flush();
   assert.equal(s.desktop.submissions.length, 1);
   assert.equal(s.desktop.submissions[0]!.text, "do shared work");
+  assert.deepEqual(s.desktop.submissions[0]!.author, { id: 999, name: "Second User" });
   assert.equal(s.chat.sent.length, 1);
   assert.equal(s.chat.sent[0]!.peerId, access.ownerId);
   assert.match(s.chat.sent[0]!.view.text, /не связана/u);
@@ -1035,7 +1037,7 @@ test("VK service events do not detach a task and message edits keep their origin
   const s = setup(t); const binding = s.attach(); const inputs: BridgeInput[] = [];
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
   const config = loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" });
-  const gateway = new DesktopVkGateway(config, vk);
+  const gateway = new DesktopVkGateway(config, vk, undefined, undefined, async id => id === 999 ? "Second User" : "Owner User");
   await gateway.start(async input => { inputs.push(input); await s.manager.handle(input); });
   const update = (id: number, senderId: number, action?: { type: string; member_id?: number }, out = 0, type: "message_new" | "message_edit" = "message_new", text = "Fixture text") => ({
     type, group_id: access.groupId, event_id: `fixture-${type}-${id}`, v: "5.199",
@@ -1049,9 +1051,12 @@ test("VK service events do not detach a task and message edits keep their origin
   await vk.updates.handleWebhookUpdate(update(4, access.ownerId, undefined, 1));
   await vk.updates.handleWebhookUpdate(update(2, 999, undefined, 0, "message_edit", "Corrected text"));
   assert.equal(inputs.length, 2); assert.equal(inputs[0]!.senderId, 999);
+  assert.equal(inputs[0]!.senderName, "Second User"); assert.equal(inputs[1]!.senderName, "Second User");
   assert.equal(inputs[1]!.editOfMessageId, 2); assert.match(inputs[1]!.eventId, /^message-edit:2:/u);
   assert.equal(s.desktop.submissions.length, 1); assert.equal(s.desktop.submissions[0]!.text, "Fixture text");
+  assert.deepEqual(s.desktop.submissions[0]!.author, { id: 999, name: "Second User" });
   assert.equal(s.desktop.messageEdits.length, 1); assert.equal(s.desktop.messageEdits[0]!.text, "Corrected text");
+  assert.deepEqual(s.desktop.messageEdits[0]!.author, { id: 999, name: "Second User" });
   assert.equal(s.chat.memberReads, 0); assert.equal(s.store.getBinding(binding.id)!.paused, false);
 });
 
@@ -1265,7 +1270,7 @@ test("stream edits are coalesced for twenty seconds while requested panels stay 
 
 test("gateway translates VK flood errors to a safe retry interval", async t => {
   const vk = new VK({ token: "fixture-token" });
-  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
   t.mock.method(vk.api, "callWithRequest", async () => { throw new APIError({ error_code: 9, error_msg: "private response", request_params: [{ key: "access_token", value: "private fixture" }] }); });
   await assert.rejects(gateway.edit({ peerId, conversationMessageId: 1 }, { text: "Working" }), error => error instanceof ChatRateLimitError && error.retryAfterMs === 120_000 && !error.message.includes("private"));
 });
@@ -1680,7 +1685,7 @@ test("attachments are explicitly rejected rather than silently dropped", async t
 test("VK link previews keep the original URL prompt and errors stay in the originating chat", async t => {
   const s = setup(t); s.attach();
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
-  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
   await gateway.start(input => s.manager.handle(input));
   const text = "Review https://example.com/guide";
   await vk.updates.handleWebhookUpdate({ type: "message_new", group_id: access.groupId, event_id: "fixture-preview", v: "5.199", object: {
@@ -1713,7 +1718,7 @@ test("VK Long Poll photo and reply-document payloads reach the linked task throu
   const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate, files);
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
   t.mock.method(globalThis, "fetch", async () => new Response("fixture bytes"));
-  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
   await gateway.start(input => manager.handle(input));
   await vk.updates.handleWebhookUpdate({ type: "message_new", group_id: access.groupId, event_id: "fixture-files", v: "5.199", object: {
     message: { id: 0, conversation_message_id: 22, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0, text: "Read these files",
