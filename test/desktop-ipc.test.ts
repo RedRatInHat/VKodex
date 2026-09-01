@@ -206,6 +206,18 @@ test("runtime reports the actual connection failure without leaking malformed IP
   await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /прочитать/u.test(error.message) && !error.message.includes("private-data"));
 });
 
+test("runtime silently retries desktop discovery while an SDK-backed task is unloaded", async t => {
+  const s = runtimeSetup(t); s.server.rejectDiscovery = true;
+  await s.runtime.tick();
+  assert.equal(s.sent.length, 0);
+  assert.equal(s.store.getBinding(s.binding.id)!.attached, true);
+  assert.equal(s.server.received.filter(message => message.method === "thread-owner-discovery").length, 1);
+
+  s.advance(5_001); await s.runtime.tick();
+  assert.equal(s.sent.length, 0);
+  assert.equal(s.server.received.filter(message => message.method === "thread-owner-discovery").length, 2);
+});
+
 test("runtime animates an active task between desktop events and stops when its turn completes", async t => {
   const s = runtimeSetup(t); await s.runtime.tick();
   s.advance(20_000); await s.runtime.tick();

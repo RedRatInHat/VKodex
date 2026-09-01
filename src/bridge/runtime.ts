@@ -6,7 +6,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, sameTask, taskKey, type DesktopTasks, type DirectTaskUpdate, type TaskDetails } from "../desktop/contracts.js";
+import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type DirectTaskUpdate, type TaskDetails } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles } from "./files.js";
@@ -217,6 +217,10 @@ export class DesktopBridgeRuntime {
         this.activity.disconnected(binding.id);
         this.files?.observe(binding.id, "unavailable");
         this.retryAfter.set(binding.id, this.now() + 5_000);
+        // An unloaded task is still available through the local SDK. Keep
+        // probing for a desktop owner in the background without alarming the
+        // user or filling the manager conversation with expected retries.
+        if (error instanceof TaskNotOpenError) continue;
         const reason = error instanceof DesktopUnavailableError ? error.message : "Не удалось получить состояние Codex.";
         this.store.enqueue(`unavailable:${binding.id}`, this.access.ownerId, {
           text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
