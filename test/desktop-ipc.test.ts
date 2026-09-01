@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import { mkdtemp, stat } from "node:fs/promises";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopTask } from "../src/desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopTask, type DirectTaskExecutor } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
 import { SdkTaskExecutor } from "../src/desktop/sdk-executor.js";
 import type { Codex } from "@openai/codex-sdk";
@@ -30,6 +30,7 @@ class Server extends Duplex {
   answerWrites = true;
   disconnectOnStart = false;
   rejectStart = false;
+  rejectDiscovery = false;
   startResult: IpcObject = { turn: { id: "next-turn", status: "inProgress", items: [] } };
   onFollow: (() => void) | null = null;
   onDiscovery: (() => void) | null = null;
@@ -53,7 +54,13 @@ class Server extends Duplex {
     if (message.type === "request") {
       let result: IpcObject = {};
       if (message.method === "initialize") result = { clientId: "bridge-client" };
-      if (message.method === "thread-owner-discovery") this.onDiscovery?.();
+      if (message.method === "thread-owner-discovery") {
+        this.onDiscovery?.();
+        if (this.rejectDiscovery) {
+          this.send({ type: "response", requestId: message.requestId, resultType: "error", error: "private backend error" });
+          return;
+        }
+      }
       if (message.method === "thread-follower-steer-turn") {
         if (!this.answerWrites) return;
         result = { result: { turnId: "fixture-turn" } };
@@ -628,6 +635,26 @@ test("SDK executor creates an isolated workspace for a projectless task in the s
   assert.deepEqual(metadata, [null]);
   assert.equal(threadOptions[0]!.workingDirectory, workspace); assert.equal(threadOptions[0]!.skipGitRepoCheck, true);
   assert.equal((await stat(workspace)).isDirectory(), true);
+});
+
+test("a desktop discovery rejection for an unloaded task safely uses the SDK fallback", async () => {
+  const server = new Server(); server.rejectDiscovery = true;
+  const task = { ...ref, title: "New projectless task", workspace: "/fixture", updatedAt: 1 };
+  const submissions: string[] = [];
+  const executor: DirectTaskExecutor = {
+    createTask: async () => { throw new Error("not used"); },
+    submit: async request => { await request.beforeSend?.(); submissions.push(request.text); },
+    interrupt: async () => false,
+    details: () => null,
+    isRunning: () => false,
+    onUpdate: () => () => {},
+  };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, executor);
+  const receipt = await adapter.submitWithReceipt({ operationId: "fallback-operation", task, text: "Continue safely" });
+  assert.deepEqual(receipt, { mode: "fallback", turnId: null });
+  assert.deepEqual(submissions, ["Continue safely"]);
+  assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" || message.method === "thread-follower-steer-turn"), false);
 });
 
 test("an idle or unloaded task starts the next turn through its owner with inherited settings", async () => {

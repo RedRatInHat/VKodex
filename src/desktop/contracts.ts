@@ -236,6 +236,14 @@ export class DesktopUnavailableError extends Error {
   }
 }
 
+/** The desktop explicitly rejected a read-only IPC request before any mutation. */
+export class DesktopRequestRejectedError extends DesktopUnavailableError {
+  constructor() {
+    super("Десктоп отклонил запрос.");
+    this.name = "DesktopRequestRejectedError";
+  }
+}
+
 /** Discovery confirmed that no desktop client currently owns this task. */
 export class TaskNotOpenError extends DesktopUnavailableError {
   constructor() {

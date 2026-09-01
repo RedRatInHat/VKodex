@@ -1,4 +1,4 @@
-import { DesktopUnavailableError, TaskNotOpenError, type TaskRef } from "./contracts.js";
+import { DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, type TaskRef } from "./contracts.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { RevisionedState } from "./state.js";
 import { sameRolloutSource } from "./paths.js";
@@ -42,9 +42,18 @@ export class TaskSubscription {
     try {
       await this.client.connect();
       checkActive();
-      const reply = await this.client.request("thread-owner-discovery", 1, {
-        hostId: this.task.hostId, conversationId: this.task.threadId,
-      }, { timeoutMs });
+      let reply: IpcObject;
+      try {
+        reply = await this.client.request("thread-owner-discovery", 1, {
+          hostId: this.task.hostId, conversationId: this.task.threadId,
+        }, { timeoutMs });
+      } catch (error) {
+        // Current Codex builds may reject discovery for a known but unloaded
+        // task instead of returning an unhandled response. Discovery is read-only,
+        // so classifying this as not open safely enables the SDK fallback.
+        if (error instanceof DesktopRequestRejectedError) throw new TaskNotOpenError();
+        throw error;
+      }
       checkActive();
       if (typeof reply.handledByClientId !== "string") throw new TaskNotOpenError();
       this.ownerId = reply.handledByClientId;

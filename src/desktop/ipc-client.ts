@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import type { Duplex } from "node:stream";
-import { DesktopUnavailableError, UncertainActionError } from "./contracts.js";
+import { DesktopRequestRejectedError, DesktopUnavailableError, UncertainActionError } from "./contracts.js";
 
 export type IpcObject = Record<string, unknown>;
 // Match the desktop IPC limit: a task snapshot includes its full loaded history.
@@ -178,7 +178,7 @@ export class DesktopIpcClient {
       this.pending.delete(message.requestId);
       if (message.resultType === "success") pending.resolve(message);
       // Internal protocol errors are not a reliable proof that a write did not happen.
-      else pending.reject(pending.mutating ? new UncertainActionError() : new DesktopUnavailableError("Десктоп отклонил запрос."));
+      else pending.reject(pending.mutating ? new UncertainActionError() : new DesktopRequestRejectedError());
       return;
     }
     if (message.type === "broadcast" && Array.isArray(message.targetClientIds) && message.targetClientIds.includes(this.clientId)) {
