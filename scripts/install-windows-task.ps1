@@ -45,6 +45,39 @@ if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
   }
 }
 
+function Stop-OrphanedBridgeProcesses {
+  $snapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $roots = @($snapshot | Where-Object {
+    $_.Name -ieq "powershell.exe" -and
+    $_.CommandLine -and
+    $_.CommandLine.IndexOf($supervisor, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+  })
+  if ($roots.Count -eq 0) { return }
+  $rootIds = @($roots | ForEach-Object { [int]$_.ProcessId })
+
+  # Stop the restart loop first. Never kill its whole descendant tree: a Codex
+  # client opened by the launcher may contain unrelated tasks and browser tabs.
+  foreach ($root in $roots) {
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($root.ProcessId)" -ErrorAction SilentlyContinue
+    if ($current -and $current.CreationDate -eq $root.CreationDate -and $current.ExecutablePath -ieq $root.ExecutablePath) {
+      Stop-Process -Id $root.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+  }
+  $runtimes = @($snapshot | Where-Object {
+    $rootIds -contains [int]$_.ParentProcessId -and
+    $_.ExecutablePath -ieq $runtimePath -and
+    $_.CommandLine -and
+    $_.CommandLine.IndexOf($entryPoint, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+  })
+  foreach ($runtime in $runtimes) {
+    # Recheck identity in case a PID was reused after taking the snapshot.
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($runtime.ProcessId)" -ErrorAction SilentlyContinue
+    if ($current -and $current.CreationDate -eq $runtime.CreationDate -and $current.ExecutablePath -ieq $runtimePath) {
+      Stop-Process -Id $runtime.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $existingTask) {
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -55,6 +88,7 @@ if ($null -ne $existingTask) {
   } while ($oldLauncher -and (Get-Date) -lt $deadline)
   if ($oldLauncher) { throw "The previous VKodex supervisor did not stop." }
 }
+Stop-OrphanedBridgeProcesses
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = "`"$projectRoot`""

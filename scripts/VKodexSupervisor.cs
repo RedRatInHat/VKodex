@@ -1,9 +1,13 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 
 internal static class Program
 {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
     private static int Main(string[] args)
     {
         if (args.Length != 1 || string.IsNullOrWhiteSpace(args[0]))
@@ -29,6 +33,7 @@ internal static class Program
             return 2;
         }
 
+        SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge");
         Console.Title = "VKodex Bridge - DO NOT CLOSE";
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("VKodex Bridge - DO NOT CLOSE THIS WINDOW");
@@ -42,6 +47,7 @@ internal static class Program
             UseShellExecute = false,
             CreateNoWindow = false,
         };
+        // Do not put native clients launched by the bridge in a kill-on-close job.
         try
         {
             using (var child = Process.Start(startInfo))
