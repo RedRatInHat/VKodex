@@ -324,6 +324,28 @@ Use a non-critical task first. The internal application protocol is not a stable
 
 <a id="usage"></a>
 
+### Experimental task-owner adapter
+
+When a native client holds a transfer source, a separate App Server may be unable to archive it. `VKodexOwnerLauncher.exe` sends archival through the client's own App Server connection. It does not run extra turns: normal requests, notifications and approvals remain on the original connection.
+
+Prepare on Windows after `npm run build`:
+
+```powershell
+./scripts/prepare-owner-launcher.ps1 `
+  -CodexHome 'C:\CodexProfiles\work' `
+  -NativeExecutable 'C:\Path\To\Native\codex.exe' `
+  -Destination 'C:\VKodexAdapters\work-v1'
+```
+
+Select the client's actual native CLI, not another adapter executable. The installer creates a separate package and private local channel; it does not change client settings or running processes. For standard VS Code extension installations, the package follows `extensions.json` across extension updates. Ambiguous entries or a mismatching manifest prevent startup.
+
+- **VS Code:** set `chatgpt.cliExecutable` in the selected profile to the generated `VKodexOwnerLauncher.exe`. This is an experimental extension setting.
+- **Codex Desktop:** launch the application with `CODEX_CLI_PATH` pointing to that executable. `CODEX_SOURCES` supports this through `launcher.type: "command"` and `launcher.environment`. Opening a system URI does not guarantee environment propagation.
+- **An existing client:** new environment variables cannot attach the adapter to an existing App Server. Initial activation requires a safe client restart; do not restart during tasks or while a browser session must be preserved.
+- **Rollback:** restore the previous CLI setting or remove `CODEX_CLI_PATH`, then restart the client when safe. The adapter does not rewrite task history.
+
+Status: owner-side archival has been verified in a separate VS Code instance. Integration into both working clients and a fully autonomous round trip remain unverified. The source and all unarchived descendants must have confirmed idle status and inactive goals. Unknown, unloaded or running descendants block archival; the adapter does not automatically load or stop them. Uncertain archival is never retried automatically. The `owner-transports` directory contains local access tokens: never publish it or send it to VK.
+
 ## 6. Manager and linked conversations
 
 ### Manager
