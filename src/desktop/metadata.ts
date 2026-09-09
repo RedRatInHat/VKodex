@@ -10,6 +10,8 @@ import { isObject, type IpcObject } from "./ipc-client.js";
 import { mirrorLegacyProjectAssignment } from "./projects.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
+import { archiveThroughOwner } from "./owner-channel.js";
+import { OwnerTransportError } from "./owner-transport.js";
 
 export type LocalAppServerMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
 const methods = new Set<LocalAppServerMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
@@ -297,9 +299,21 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   constructor(
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
+    private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
   ) {}
   rename(task: TaskRef, title: string): Promise<void> { return this.createMetadata(this.sourceHome(task)).rename(task, title); }
-  archive(task: TaskRef): Promise<void> { return this.createMetadata(this.sourceHome(task)).archive(task); }
+  async archive(task: TaskRef): Promise<void> {
+    if (task.hostId !== "local") throw new ActionRejectedError("Архивация доступна только локальным задачам.");
+    const home = this.sourceHome(task);
+    try { if (await this.ownerArchive(home, task.threadId)) return; }
+    catch (error) {
+      // Once dispatched to an owner, do not retry through a different connection.
+      if (error instanceof OwnerTransportError && error.outcome === "unknown") throw new UncertainActionError();
+      if (error instanceof OwnerTransportError && error.outcome === "rejected") throw new ActionRejectedError("Владелец задачи не разрешил безопасную архивацию. Проверь завершение ходов, состояние цели и дочерних задач.");
+      throw new DesktopUnavailableError("Канал владельца задачи недоступен; архивация не подтверждена.");
+    }
+    await this.createMetadata(home).archive(task);
+  }
   markdown(task: TaskRef): Promise<string> { return this.createMetadata(this.sourceHome(task)).markdown(task); }
   async read(task: TaskRef): Promise<{ title: string | null; projectId: string | null }> {
     const metadata = this.createMetadata(this.sourceHome(task));

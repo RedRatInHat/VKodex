@@ -26,9 +26,10 @@ test("custom launcher expands only documented placeholders and keeps the source 
   const home = path.resolve("fixture-custom-home"); const executable = process.execPath; const child = new Spawned();
   let args: readonly string[] = []; let env: NodeJS.ProcessEnv = {};
   const launcher = new SourceTaskLauncher([{ home, launcher: { type: "command", executable,
-    arguments: ["--thread", "{threadId}", "--home", "{codexHome}"], environment: { VKODEX_TARGET_HOME: "{codexHome}" } } }], () => home,
+    arguments: ["--thread", "{threadId}", "--home", "{codexHome}"], environment: { VKODEX_TARGET_HOME: "{codexHome}", CODEX_CLI_PATH: path.resolve("fixture-owner-launcher.exe") } } }], () => home,
     (_file, actualArgs, options) => { args = actualArgs; env = options.env; queueMicrotask(() => child.emit("spawn")); return child; });
   await launcher.open({ hostId: "local", threadId: "fixture-thread" });
   assert.deepEqual(args, ["--thread", "fixture-thread", "--home", home]);
   assert.equal(env.CODEX_HOME, home); assert.equal(env.VKODEX_TARGET_HOME, home);
+  assert.equal(env.CODEX_CLI_PATH, path.resolve("fixture-owner-launcher.exe"));
 });
