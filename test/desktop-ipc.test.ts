@@ -3,17 +3,16 @@ import { Duplex } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 import path from "node:path";
-import os from "node:os";
-import { mkdtemp, stat } from "node:fs/promises";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type DesktopTask, type DirectTaskExecutor } from "../src/desktop/contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
-import { SdkTaskExecutor } from "../src/desktop/sdk-executor.js";
-import type { Codex } from "@openai/codex-sdk";
+import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
+import { AppServerTaskTransfer, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
+import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import type { BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
@@ -27,10 +26,12 @@ class Server extends Duplex {
   readonly received: IpcObject[] = [];
   private readonly decoder = new FrameDecoder();
   dataState = state();
+  ownerId = "owner";
   answerWrites = true;
   disconnectOnStart = false;
   rejectStart = false;
   rejectDiscovery = false;
+  discoveryError = "no-client-found";
   startResult: IpcObject = { turn: { id: "next-turn", status: "inProgress", items: [] } };
   onFollow: (() => void) | null = null;
   onDiscovery: (() => void) | null = null;
@@ -46,7 +47,7 @@ class Server extends Duplex {
     callback();
   }
   send(message: IpcObject): void { if (!this.destroyed) this.push(encodeFrame(message)); }
-  snapshot(version = 11, source = "owner", threadId = ref.threadId): void {
+  snapshot(version = 11, source = this.ownerId, threadId = ref.threadId): void {
     this.send({ type: "broadcast", method: "thread-stream-state-changed", version, sourceClientId: source, targetClientIds: ["bridge-client"],
       params: { hostId: "local", conversationId: threadId, change: { type: "snapshot", revision: 1, conversationState: this.dataState } } });
   }
@@ -57,7 +58,7 @@ class Server extends Duplex {
       if (message.method === "thread-owner-discovery") {
         this.onDiscovery?.();
         if (this.rejectDiscovery) {
-          this.send({ type: "response", requestId: message.requestId, resultType: "error", error: "private backend error" });
+          this.send({ type: "response", requestId: message.requestId, resultType: "error", error: this.discoveryError });
           return;
         }
       }
@@ -97,7 +98,7 @@ class Server extends Duplex {
         }] };
         this.snapshot();
       }
-      this.send({ type: "response", requestId: message.requestId, resultType: "success", result, handledByClientId: "owner" });
+      this.send({ type: "response", requestId: message.requestId, resultType: "success", result, handledByClientId: this.ownerId });
     } else if (message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following) {
       if (this.onFollow) this.onFollow(); else this.snapshot();
     }
@@ -144,6 +145,25 @@ test("a rejected scheduled health report cannot terminate the runtime", async t 
   await s.runtime.tick();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.ok(checks > initialChecks);
+});
+
+test("health keeps checking while the initial task subscription is still pending", async t => {
+  let checks = 0;
+  const s = runtimeSetup(t, async () => {
+    checks++;
+    throw new Error("fixture health writer failure");
+  });
+  s.server.onFollow = () => {}; // The owner does not deliver its initial snapshot.
+  s.runtime.start();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(s.follows().includes(true));
+  assert.equal(checks, 0);
+  let settled = false;
+  s.advance(60_001);
+  void s.runtime.tick().then(() => { settled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(checks, 1);
 });
 
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
@@ -206,7 +226,7 @@ test("runtime reports the actual connection failure without leaking malformed IP
   await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /прочитать/u.test(error.message) && !error.message.includes("private-data"));
 });
 
-test("runtime silently retries desktop discovery while an SDK-backed task is unloaded", async t => {
+test("runtime silently retries desktop discovery while a task owner is loading", async t => {
   const s = runtimeSetup(t); s.server.rejectDiscovery = true;
   s.store.setValue(`task-details:${s.binding.id}`, { status: "running", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
   await s.runtime.tick();
@@ -250,6 +270,127 @@ test("subscription uses honest client registration and filters other tasks and o
   assert.deepEqual(server.received[0]!.params, { clientType: "vkodex" });
   subscription.close();
   assert.ok(server.received.some(message => message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following === false));
+});
+
+test("runtime rediscovers a replaced owner on a surviving IPC broker and recovers only its final", async t => {
+  const s = runtimeSetup(t);
+  s.server.dataState = state([{ id: "old-progress", type: "agentMessage", phase: "commentary", text: "Old progress" }]);
+  await s.runtime.tick();
+  s.server.ownerId = "replacement-owner";
+  s.server.dataState = state([
+    { id: "old-progress", type: "agentMessage", phase: "commentary", text: "Old progress" },
+    { id: "final", type: "agentMessage", phase: "final_answer", text: "Recovered final" },
+  ], "completed");
+  s.advance(); await s.runtime.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(s.server.destroyed, false);
+  s.advance(5_001); await s.runtime.tick();
+  assert.equal(s.store.getValue<{ status: string }>(`task-details:${s.binding.id}`)?.status, "idle");
+  assert.equal(s.sent.filter(message => message.view.text.startsWith("Recovered final")).length, 1);
+  assert.equal(s.sent.some(message => message.view.text === "Old progress"), false);
+  // A delayed snapshot from the former owner cannot revive its running turn.
+  s.server.dataState = state(); s.server.snapshot(11, "owner");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(s.store.getValue<{ status: string }>(`task-details:${s.binding.id}`)?.status, "idle");
+  assert.equal(s.server.received.some(message => String(message.method).startsWith("thread-follower-")), false);
+});
+
+test("a missing owner stops the thinking indicator although the broker socket is still open", async t => {
+  const s = runtimeSetup(t); await s.runtime.tick();
+  s.server.rejectDiscovery = true;
+  s.advance(); await s.runtime.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  s.advance(1_000); await s.runtime.tick();
+  assert.equal(s.server.destroyed, false);
+  assert.equal(s.store.getValue<{ status: string }>(`activity:${s.binding.id}`)?.status, "unavailable");
+  assert.equal(s.store.getValue<{ status: string }>(`task-details:${s.binding.id}`)?.status, "unavailable");
+});
+
+test("events from a closed IPC socket cannot close or corrupt the replacement connection", async t => {
+  const old = new Server(); const next = new Server(); let connects = 0;
+  const client = new DesktopIpcClient(() => connects++ === 0 ? old : next, 100); t.after(() => client.close());
+  await client.connect(); client.close(); await client.connect();
+  old.emit("data", Buffer.from([0, 0, 0, 0]));
+  old.emit("error", new Error("late socket error"));
+  const reply = await client.request("thread-owner-discovery", 1, { hostId: ref.hostId, conversationId: ref.threadId });
+  assert.equal(reply.handledByClientId, "owner"); assert.equal(next.destroyed, false);
+});
+
+test("systemError overrides orphaned history, reports usage limits once and permits a new turn", async t => {
+  const s = runtimeSetup(t); await s.runtime.tick();
+  s.server.dataState = {
+    id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "systemError" },
+    turns: [
+      { turnId: "orphan", turnStartedAtMs: 10, status: "inProgress", items: [] },
+      { turnId: "fixture-turn", turnStartedAtMs: 100, status: "failed", items: [{ type: "error", errorInfo: "usageLimitExceeded", message: "PRIVATE ERROR SENTINEL" }] },
+    ],
+  };
+  s.server.snapshot(); await new Promise(resolve => setImmediate(resolve)); await s.runtime.tick();
+  const details = taskDetails(s.server.dataState);
+  assert.equal(details.status, "failed"); assert.equal(details.failure, "usageLimit");
+  assert.equal(s.store.getValue<{ status: string }>(`activity:${s.binding.id}`)?.status, "failed");
+  s.server.snapshot(); await new Promise(resolve => setImmediate(resolve)); s.advance(); await s.runtime.tick();
+  assert.equal(s.sent.filter(message => message.view.text.includes("исчерпан лимит")).length, 1);
+  assert.equal(JSON.stringify(s.sent).includes("PRIVATE ERROR SENTINEL"), false);
+  const server = new Server(); server.dataState = s.server.dataState;
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+  await adapter.submit({ operationId: "retry", task, text: "Continue" });
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
+});
+
+test("first-turn creation output survives a runtime restart before its VK binding exists", async () => {
+  const access = { ownerId: 101, groupId: 202 };
+  const peerId = 2_000_000_017;
+  const task: DesktopTask = { ...ref, title: "Created through VK", workspace: "/fixture", projectId: null, updatedAt: 1 };
+  const listeners = new Set<(update: import("../src/desktop/contracts.js").TaskCreationUpdate) => void>();
+  const creator: DesktopTaskCreator = {
+    createTask: async () => task,
+    interrupt: async () => false,
+    details: () => null,
+    isActive: () => false,
+    onUpdate: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => new Server(), 100), undefined, undefined, undefined, { creator });
+  const store = new BridgeStore();
+  const sent: View[] = [];
+  const chat: BridgeChat = {
+    send: async (sentPeerId, view) => { assert.equal(sentPeerId, peerId); sent.push(view); return { peerId, conversationMessageId: sent.length }; },
+    edit: async () => {}, delete: async () => {},
+    createConversation: async () => { throw new Error("Unexpected chat creation"); },
+    renameConversation: async () => { throw new Error("Unexpected chat rename"); },
+    inviteLink: async () => { throw new Error("Unexpected invitation"); },
+    uploadDocument: async () => { throw new Error("Unexpected upload"); },
+  };
+  const runtime1 = new DesktopBridgeRuntime(access, desktop, chat, store, new DesktopIpcClient(() => new Server(), 100));
+  const update = { task, event: { type: "final" as const, id: "creation-final", turnId: "creation-turn", text: "Durable first answer" },
+    details: { status: "idle" as const, workspace: "/fixture", model: "model-a", effort: "high", nextModel: null, nextEffort: null, context: null } };
+  for (const listener of listeners) listener(update);
+  assert.equal(store.pendingCreation(task).length, 1);
+  await runtime1.stop();
+
+  const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17);
+  const server = new Server(); server.dataState = { ...state([], "completed"), threadRuntimeStatus: { type: "idle" } };
+  const runtime2 = new DesktopBridgeRuntime(access, desktop, chat, store, new DesktopIpcClient(() => server, 100));
+  try {
+    await runtime2.tick();
+    assert.ok(sent.some(view => view.text.includes("Durable first answer")));
+    assert.equal(store.pendingCreation(task).length, 0);
+  } finally {
+    await runtime2.stop(); store.close();
+  }
+});
+
+test("a transient command subscription cannot disable the durable task stream when it closes", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const subscription = new TaskSubscription(client, ref, () => {}, () => {}, false);
+  server.onFollow = () => server.snapshot();
+  await subscription.start(100); subscription.close();
+  const follows = server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following);
+  assert.deepEqual(follows, [true]);
 });
 
 test("closing a subscription during connection, discovery or its first snapshot cannot reopen it", async t => {
@@ -534,6 +675,32 @@ test("interrupt targets the active desktop turn and requires a confirmed turn id
   assert.deepEqual(request.params, { conversationId: ref.threadId, mode: "user-stop", expectedTurnId: "fixture-turn" });
 });
 
+test("interrupt reaches a unique task when owner discovery works but snapshots are silent", async () => {
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const servers: Server[] = [];
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server(); server.onFollow = () => {}; servers.push(server);
+    return new DesktopIpcClient(() => server, 30);
+  });
+  await adapter.interrupt(ref);
+  const requests = servers.flatMap(server => server.received).filter(message => message.method === "thread-follower-interrupt-turn");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.version, 3);
+  assert.deepEqual(requests[0]!.params, { conversationId: ref.threadId, mode: "user-stop" });
+});
+
+test("snapshot-free interrupt refuses an ambiguous thread copied across catalogs", async () => {
+  const primary = { ...ref, title: "Primary", workspace: "/fixture", updatedAt: 1 };
+  const copy = { ...primary, sourceId: "work", title: "Work copy" };
+  const servers: Server[] = [];
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [primary, copy], listProjects: async () => [] }, () => {
+    const server = new Server(); server.onFollow = () => {}; servers.push(server);
+    return new DesktopIpcClient(() => server, 30);
+  });
+  await assert.rejects(adapter.interrupt(primary), error => error instanceof ActionRejectedError && /копии/u.test(error.message));
+  assert.equal(servers.flatMap(server => server.received).some(message => message.method === "thread-follower-interrupt-turn"), false);
+});
+
 function interruptSetup(replies: ("success" | "error" | "malformed-stopped")[]) {
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const servers: Server[] = []; const plan = [...replies];
@@ -573,14 +740,27 @@ test("project move writes Codex metadata and confirms the catalog without starti
   const writes: (string | null)[] = [];
   const adapter = new ConnectedDesktopTasks({
     listTasks: async () => [task], listProjects: async () => [],
-    resolveProject: async id => ({ rawProjectId: id, sourceId: "" }),
+    resolveProject: async id => ({ rawProjectId: id === "legacy-b" ? "project-b" : id, sourceId: "", project: { id: id === "legacy-b" ? "project-b" : id } }),
   }, () => new DesktopIpcClient(() => server, 50), {
     rename: async () => {}, archive: async () => {}, markdown: async () => "",
     assignProject: async (_ref, projectId) => { writes.push(projectId); task = { ...task, projectId }; },
   });
   await adapter.moveTask(ref, "project-b");
   assert.deepEqual(writes, ["project-b"]); assert.equal(task.projectId, "project-b");
+  await adapter.moveTask(ref, "legacy-b");
+  assert.deepEqual(writes, ["project-b", "project-b"]);
   assert.equal(server.received.some(message => /turn/u.test(String(message.method))), false);
+  let databaseWrites = 0;
+  const databaseOnly = new ConnectedDesktopTasks({
+    listTasks: async () => [{ ...task, projectId: null }], listProjects: async () => [],
+    resolveProject: async id => ({ rawProjectId: id, sourceId: "" }),
+  }, () => assert.fail("Project assignment must not start or focus a task"), {
+    rename: async () => {}, archive: async () => {}, markdown: async () => "",
+    assignProject: async () => { databaseWrites++; },
+  });
+  await assert.rejects(databaseOnly.moveTask(ref, "project-b"),
+    error => error instanceof UncertainActionError && /назначение в приложении не подтверждено/u.test(error.message));
+  assert.equal(databaseWrites, 1);
 });
 
 test("compatibility canary confirms stream protocol v11 through an open task", async () => {
@@ -592,99 +772,325 @@ test("compatibility canary confirms stream protocol v11 through an open task", a
   assert.equal(status.state, "ok"); assert.match(status.message, /v11/u); assert.equal(servers.length, 2);
 });
 
-test("SDK executor creates a user task with the selected worktree and streams its answer", async () => {
-  async function* events(): AsyncGenerator<unknown> {
-    yield { type: "thread.started", thread_id: "sdk-thread" };
-    yield { type: "turn.started" };
-    yield { type: "item.completed", item: { id: "comment", type: "agent_message", text: "SDK progress" } };
-    yield { type: "item.completed", item: { id: "command", type: "command_execution", command: "test", aggregated_output: "", exit_code: 0, status: "completed" } };
-    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "SDK answer" } };
-    yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
-  }
-  const projectWorkspace = path.resolve("fixture-repo"); const codexHome = path.resolve("fixture-codex-home"); const worktreeWorkspace = path.resolve("fixture-worktree");
-  const homes: string[] = []; const worktrees: string[] = []; const metadata: string[] = []; const updates: string[] = []; const progress: string[] = []; const finals: string[] = [];
-  const codex = { startThread: () => ({ runStreamed: async () => ({ events: events() }) }) } as unknown as Codex;
-  const catalog = {
-    resolveProject: async () => ({ project: { id: "project", title: "Project", workspace: projectWorkspace }, rawProjectId: "raw-project", sourceHome: codexHome, sourceLabel: ".codex" }),
-    sourceHome: () => codexHome, listTasks: async () => [],
-  };
-  const executor = new SdkTaskExecutor(catalog, {
-    rename: async (_task, title) => { metadata.push(`rename:${title}`); },
-    assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
-    archive: async () => {}, markdown: async () => "",
-  }, home => { homes.push(home); return codex; }, async (_project, operationId) => { worktrees.push(operationId); return worktreeWorkspace; });
-  executor.onUpdate(update => {
-    updates.push(update.event.type);
-    if (update.event.type === "progress") progress.push(update.event.text);
-    if (update.event.type === "final") finals.push(update.event.text);
-  });
-  const task = await executor.createTask({ operationId: "operation", projectId: "project", title: "New SDK task", prompt: "Start", model: "model", effort: "high", environment: "worktree" });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(task.threadId, "sdk-thread"); assert.equal(task.workspace, worktreeWorkspace);
-  assert.deepEqual(homes, [codexHome]); assert.deepEqual(worktrees, ["operation"]);
-  assert.deepEqual(metadata, ["project:raw-project", "rename:New SDK task"]);
-  assert.deepEqual(progress, ["SDK progress"]); assert.deepEqual(finals, ["SDK answer"]);
-  assert.ok(updates.includes("final")); assert.equal(executor.details(task)?.status, "idle");
-});
-
-test("SDK executor creates an isolated workspace for a projectless task in the selected Codex catalog", async () => {
-  async function* events(): AsyncGenerator<unknown> {
-    yield { type: "thread.started", thread_id: "projectless-thread" };
-    yield { type: "turn.started" };
-    yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "Done" } };
-    yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } };
-  }
-  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-projectless-"));
-  const workspace = path.join(root, "automatic-workspace");
-  const codexHome = path.resolve("fixture-extra-codex-home");
-  const threadOptions: Record<string, unknown>[] = []; const resumeOptions: Record<string, unknown>[] = []; const metadata: (string | null)[] = [];
-  let catalogTask: DesktopTask | null = null;
-  const codex = { startThread: (options: Record<string, unknown>) => {
-    threadOptions.push(options); return { runStreamed: async () => ({ events: events() }) };
-  }, resumeThread: (_id: string, options: Record<string, unknown>) => {
-    resumeOptions.push(options); return { runStreamed: async () => ({ events: events() }) };
-  } } as unknown as Codex;
-  const executor = new SdkTaskExecutor({
-    resolveProject: async () => { throw new Error("project lookup must not run"); },
-    sourceHome: source => { assert.equal(source.sourceId, "extra-source"); return codexHome; },
-    listTasks: async () => catalogTask ? [catalogTask] : [],
+test("App Server creator materializes a new task with its atomic first turn", async () => {
+  const profileRoot = path.resolve("fixture-app-server-home"); const workspace = path.resolve("fixture-project"); const worktree = path.resolve("fixture-project_worktree");
+  const metadata: string[] = []; const calls: { readonly options: unknown; readonly prompt: string }[] = [];
+  const catalogTask: DesktopTask = { hostId: "local", threadId: "created-thread", title: "Initial", workspace: worktree,
+    projectId: "visible", rolloutPath: path.join(profileRoot, "sessions", "created.jsonl"), sourceId: "work", updatedAt: 1 };
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => ({ project: { id: "visible", title: "Project", workspace }, rawProjectId: "raw", sourceHome: profileRoot, sourceId: "work", sourceLabel: ".codex-work" }),
+    sourceHome: () => profileRoot, listTasks: async () => [catalogTask],
   }, {
-    rename: async () => {}, assignProject: async (_task, projectId) => { metadata.push(projectId); },
-    archive: async () => {}, markdown: async () => "",
-  }, () => codex);
-  const created = await executor.createTask({ operationId: "projectless-operation", projectId: null, sourceId: "extra-source",
-    workspace, automaticWorkspace: true, title: "Projectless", prompt: "Start", model: "model", effort: "high", environment: "local" });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(created.projectId, null); assert.equal(created.sourceId, "extra-source"); assert.equal(created.workspace, workspace);
-  assert.deepEqual(metadata, [null]);
-  assert.equal(threadOptions[0]!.workingDirectory, workspace); assert.equal(threadOptions[0]!.skipGitRepoCheck, true);
-  assert.equal((await stat(workspace)).isDirectory(), true);
-  catalogTask = created;
-  const outboxDir = path.join(root, "delivery", "outbox");
-  await executor.submit({ operationId: "projectless-followup", task: created, text: "Continue", outboxDir });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(resumeOptions[0]!.workingDirectory, workspace); assert.equal(resumeOptions[0]!.skipGitRepoCheck, true);
-  assert.deepEqual(resumeOptions[0]!.additionalDirectories, [outboxDir]);
+    rename: async (_task, title) => { metadata.push(`name:${title}`); }, archive: async () => {}, markdown: async () => "",
+    assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
+  }, () => ({ startThread: (options: unknown) => ({ runStreamed: async (prompt: string) => {
+    calls.push({ options, prompt });
+    async function* events() {
+      yield { type: "thread.started", thread_id: "created-thread" } as const;
+      yield { type: "turn.started" } as const;
+      yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } } as const;
+    }
+    return { events: events() };
+  } }) }) as never, async () => worktree);
+  const task = await creator.createTask({ operationId: "create-op", projectId: "visible", sourceId: "work", title: "Created", prompt: "Initial prompt", model: "model-a", effort: "high", environment: "worktree" });
+  assert.equal(calls.length, 1); assert.equal(calls[0]?.prompt, "Initial prompt");
+  assert.equal(task.threadId, "created-thread"); assert.equal(task.sourceId, "work"); assert.equal(task.workspace, worktree);
+  assert.deepEqual(metadata, ["project:raw", "name:Created"]);
 });
 
-test("a desktop discovery rejection for an unloaded task safely uses the SDK fallback", async () => {
-  const server = new Server(); server.rejectDiscovery = true;
-  const task = { ...ref, title: "New projectless task", workspace: "/fixture", updatedAt: 1 };
-  const submissions: string[] = [];
-  const executor: DirectTaskExecutor = {
-    createTask: async () => { throw new Error("not used"); },
-    submit: async request => { await request.beforeSend?.(); submissions.push(request.text); },
-    interrupt: async () => false,
-    details: () => null,
-    isRunning: () => false,
-    onUpdate: () => () => {},
+test("desktop transfer delegates from the catalog without opening an idle source task", async () => {
+  const server = new Server(); server.dataState = { ...state([], "completed"), rolloutPath: path.resolve("source.jsonl") };
+  const source: DesktopTask = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: path.resolve("source.jsonl") };
+  const target: DesktopTask = { ...source, threadId: "target", sourceId: "work", rolloutPath: path.resolve("target.jsonl") };
+  const forkRequests: TransferTaskRequest[] = [];
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [source], listProjects: async () => [], listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }] },
+    () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { transfer: { fork: async request => { forkRequests.push(request); return target; } } });
+  const result = await adapter.transferTask!({ operationId: "move", startedAt: 1, task: source, targetSourceId: "work", projectId: null });
+  assert.equal(result.threadId, "target"); assert.equal(forkRequests.length, 1);
+  assert.equal(server.received.length, 0);
+});
+
+test("transfer source archival verifies exact persisted state without launching the source", async () => {
+  const source: DesktopTask = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: path.resolve("source.jsonl") };
+  let tasks: DesktopTask[] = [source]; let archives = 0;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => tasks, listProjects: async () => [] },
+    () => assert.fail("transfer finalization must not connect to or launch the source task"), {
+      rename: async () => {}, archive: async task => { assert.equal(task.threadId, source.threadId); archives++; tasks = []; },
+      markdown: async () => "", assignProject: async () => {},
+      isArchived: async () => archives > 0,
+    });
+  await adapter.archiveTransferredSource(source);
+  assert.equal(archives, 1);
+});
+
+test("App Server transfer forks a fixed completed boundary into the target profile", async () => {
+  const targetHome = path.resolve("fixture-target-home"); const rollout = path.join(targetHome, "sessions", "target.jsonl");
+  let target: DesktopTask = { hostId: "local", threadId: "target-thread", sourceId: "work", sourceLabel: ".codex-work",
+    title: "Initial prompt", workspace: path.resolve("fixture-project"), projectId: "target-project", rolloutPath: rollout, updatedAt: 2 };
+  const calls: { method: string; params: IpcObject }[] = []; const metadata: string[] = [];
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => targetHome,
+    listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }],
+    listTasks: async () => [target],
+    listProjects: async (sourceId?: string) => { assert.equal(sourceId, "work"); return [{ id: "target-project", title: "Target", workspace: target.workspace }]; },
+  } as never, {
+    rename: async (_task, title) => { metadata.push(`name:${title}`); target = { ...target, title }; }, archive: async () => {}, markdown: async () => "",
+    assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
+  }, () => ({ call: async (method: "thread/fork" | "thread/list" | "thread/turns/list", params: IpcObject) => {
+    calls.push({ method, params });
+    if (method === "thread/turns/list") return { data: [{ id: "completed-turn", status: "completed" }] };
+    if (method === "thread/list") return { data: [] };
+    return { thread: { id: target.threadId, cwd: target.workspace, path: rollout, updatedAt: 2, name: null } };
+  } }), async () => ({ path: path.join(targetHome, ".vkodex-transfer-staging", "transfer-op", "source.jsonl"),
+    model: "model-a", effort: "high", cwd: path.resolve("fixture-project"), cleanup: async () => {} }));
+  const result = await transfer.fork({ operationId: "transfer-op", startedAt: 1_000, task: {
+    hostId: "local", threadId: "source-thread", title: "Moved task", rolloutPath: path.resolve("source.jsonl"),
+  }, targetSourceId: "work", projectId: "target-project" });
+  assert.equal(result.threadId, target.threadId); assert.equal(result.sourceId, "work");
+  assert.deepEqual(calls.map(call => call.method), ["thread/turns/list", "thread/fork"]);
+  assert.deepEqual(calls[1]!.params, { threadId: "source-thread", path: path.join(targetHome, ".vkodex-transfer-staging", "transfer-op", "source.jsonl"),
+    lastTurnId: "completed-turn", model: "model-a", cwd: path.resolve("fixture-project"), config: { model_reasoning_effort: "high" },
+    threadSource: "user", excludeTurns: true, deferGoalContinuation: true });
+  assert.deepEqual(metadata, ["name:Moved task", "project:target-project"]);
+});
+
+test("transfer compatibility keeps Responses history and exposes paginated user and agent items to the target app", () => {
+  const session = transferCompatibleRecord({ type: "session_meta", payload: { id: "source", history_mode: "paginated" } }) as IpcObject;
+  assert.equal((session.payload as IpcObject).history_mode, "legacy");
+  const user = transferCompatibleRecord({ type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", client_id: "client",
+    content: [{ type: "text", text: "hello", text_elements: [] }, { type: "localImage", path: "C:\\image.png" }] } } }) as IpcObject;
+  assert.deepEqual(user.payload, { type: "user_message", client_id: "client", message: "hello", images: [], local_images: ["C:\\image.png"], audio: [], local_audio: [], text_elements: [] });
+  const agent = transferCompatibleRecord({ type: "event_msg", payload: { type: "item_completed", item: { type: "AgentMessage", phase: "final_answer",
+    content: [{ type: "Text", text: "done" }] } } }) as IpcObject;
+  assert.deepEqual(agent.payload, { type: "agent_message", message: "done", phase: "final_answer", memory_citation: null });
+  const response = { type: "response_item", payload: { type: "message", role: "user" } };
+  assert.equal(transferCompatibleRecord(response), response);
+});
+
+test("App Server transfer reconciles a lost fork response without creating a duplicate", async () => {
+  const targetHome = path.resolve("fixture-target-home"); const rollout = path.join(targetHome, "sessions", "recovered.jsonl");
+  let forks = 0;
+  const target: DesktopTask = { hostId: "local", threadId: "recovered-thread", sourceId: "work", title: "Moved task",
+    workspace: path.resolve("fixture-project"), projectId: null, rolloutPath: rollout, updatedAt: 100_001 };
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => targetHome, listSources: () => [{ id: "work", label: ".codex-work" }], listTasks: async () => [target],
+    resolveProject: async () => assert.fail("No project expected"),
+  } as never, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} }, () => ({
+    call: async (method: "thread/fork" | "thread/list") => {
+      if (method === "thread/fork") { forks++; throw new Error("must not fork"); }
+      return { data: [{ id: target.threadId, cwd: target.workspace, path: rollout, name: target.title,
+        createdAt: 100, updatedAt: 101, forkedFromId: "source-thread" }] };
+    },
+  }), undefined, async () => true);
+  const result = await transfer.fork({ operationId: "same-op", startedAt: 100_000, task: {
+    hostId: "local", threadId: "source-thread", title: "Moved task", rolloutPath: path.resolve("source.jsonl"),
+  }, targetSourceId: "work", projectId: null });
+  assert.equal(result.threadId, target.threadId); assert.equal(forks, 0);
+});
+
+test("a v2 transfer with an unacknowledged fork never adopts an unrelated descendant or submits another fork", async () => {
+  const home = path.resolve("fixture-target");
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: "work" }], listTasks: async () => assert.fail("No heuristic descendant adoption"),
+    listProjects: async () => [] },
+  { rename: async () => assert.fail("No metadata write"), archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  () => ({ call: async () => assert.fail("No repeated fork") }));
+  await assert.rejects(transfer.fork({ operationId: "unacknowledged", startedAt: 1, task: { ...ref, title: "Fixture", rolloutPath: path.join(home, "source.jsonl") },
+    targetSourceId: "work", projectId: null, forkSubmitted: true,
+    checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }), TransferConflictError);
+});
+
+test("transfer verification rejects inferred project success when native metadata disagrees", async () => {
+  const home = path.resolve("fixture-target");
+  const target: DesktopTask = { ...ref, threadId: "new-thread", sourceId: "work", title: "Fixture", workspace: home, rolloutPath: path.join(home, "sessions", "target.jsonl"), projectId: null, updatedAt: 1 };
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => assert.fail("Verification is read-only"), archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    read: async () => ({ title: "Fixture", projectId: "unexpected-native-project" }) },
+  () => ({ call: async () => ({ data: [{ id: "boundary", status: "completed" }] }) }));
+  await assert.rejects(transfer.verifyTarget({ operationId: "verify", startedAt: 1, task: { ...ref, title: "Fixture" }, targetSourceId: "work", projectId: null,
+    checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }, target), DesktopUnavailableError);
+});
+
+test("a projectless transfer accepts catalog project inference from its workspace", async () => {
+  const targetHome = path.resolve("fixture-target-home"); const rollout = path.join(targetHome, "sessions", "inferred.jsonl");
+  const target: DesktopTask = { hostId: "local", threadId: "inferred-thread", sourceId: "work", sourceLabel: ".codex-work",
+    title: "Moved task", workspace: path.resolve("fixture-project"), projectId: "inferred-project", rolloutPath: rollout, updatedAt: 100_001 };
+  let projectWrites = 0;
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => targetHome, listSources: () => [{ id: "work", label: ".codex-work" }], listTasks: async () => [target],
+    resolveProject: async () => assert.fail("No explicit project expected"),
+  } as never, {
+    rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => { projectWrites++; },
+  }, () => ({ call: async () => assert.fail("Existing copy must not be forked again") }), undefined, async () => true);
+  const result = await transfer.fork({ operationId: "projectless-inferred", startedAt: 100_000, existingTarget: target,
+    task: { hostId: "local", threadId: "source-thread", title: target.title, rolloutPath: path.resolve("source.jsonl") },
+    targetSourceId: "work", projectId: null });
+  assert.equal(result.projectId, "inferred-project");
+  assert.equal(projectWrites, 0);
+});
+
+test("a fork identity survives rejected project metadata and retry prepares that same target", async () => {
+  const home = path.resolve("fixture-target-home"); const visibleProject = JSON.stringify(["work", "native-project"]);
+  let target: DesktopTask | undefined; let saved: DesktopTask | undefined; let forks = 0; let rejectProject = true;
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => home, listSources: () => [{ id: "work", label: ".codex-work" }],
+    listTasks: async () => target ? [target] : [], listProjects: async () => [],
+    resolveProject: async id => {
+      assert.equal(id, "legacy-project");
+      return { project: { id: visibleProject, title: "Project", workspace: home }, rawProjectId: "native-project", sourceHome: home, sourceId: "work", sourceLabel: ".codex-work" };
+    },
+  }, {
+    rename: async (_task, title) => { target = { ...target!, title }; }, archive: async () => {}, markdown: async () => "",
+    assignProject: async (_task, projectId) => {
+      assert.equal(saved?.threadId, "one-fork"); assert.equal(projectId, "native-project");
+      if (rejectProject) throw new ActionRejectedError("fixture metadata rejection");
+      target = { ...target!, projectId: visibleProject };
+    },
+  }, () => ({ call: async method => {
+    if (method === "thread/turns/list") return { data: [{ id: "terminal", status: "failed" }] };
+    assert.equal(method, "thread/fork"); forks++;
+    target = { hostId: "local", threadId: "one-fork", sourceId: "work", title: "Initial", workspace: home, rolloutPath: path.join(home, "sessions", "target.jsonl"), projectId: null, updatedAt: 100_000 };
+    return { thread: { id: target.threadId, cwd: home, path: target.rolloutPath } };
+  } }), async () => ({ path: path.join(home, "staged.jsonl"), cleanup: async () => {} }), async () => true);
+  const request: TransferTaskRequest = { operationId: "same-operation", startedAt: 100_000, task: { ...ref, title: "Preserved title", rolloutPath: path.resolve("source.jsonl") },
+    targetSourceId: "work", projectId: "legacy-project", onForkCreated: task => { saved = task; } };
+  await assert.rejects(transfer.fork(request), /metadata rejection/u);
+  assert.equal(forks, 1); assert.equal(saved!.threadId, "one-fork");
+  assert.equal(target!.title, request.task.title, "A rejected project assignment must not leave the fork with its initial prompt as title");
+  rejectProject = false;
+  const result = await transfer.fork({ ...request, existingTarget: saved! });
+  assert.equal(forks, 1); assert.equal(result.threadId, "one-fork");
+  assert.equal(result.title, request.task.title); assert.equal(result.projectId, visibleProject);
+});
+
+test("transfer does not confirm a project from an acknowledged database write alone", async () => {
+  const home = path.resolve("fixture-target-home");
+  const target: DesktopTask = { ...ref, threadId: "saved-copy", sourceId: "work", sourceLabel: ".codex-work", title: "Preserved title",
+    workspace: home, rolloutPath: path.join(home, "sessions", "target.jsonl"), projectId: null, updatedAt: 1 };
+  let writes = 0; let saved: DesktopTask | undefined;
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => home, listSources: () => [{ id: "work", label: ".codex-work" }], listTasks: async () => [target],
+    listProjects: async () => [{ id: "target-project", title: "Project", workspace: home }],
+  }, {
+    rename: async () => {}, archive: async () => assert.fail("Unconfirmed project must not archive the source"), markdown: async () => "",
+    assignProject: async () => { writes++; },
+  }, () => ({ call: async () => assert.fail("Existing copy must not be forked again") }),
+  async () => assert.fail("Existing copy must not be staged again"), async () => true);
+  await assert.rejects(transfer.fork({ operationId: "same-operation", startedAt: 1, existingTarget: target,
+    task: { ...ref, title: target.title, rolloutPath: path.resolve("source.jsonl") }, targetSourceId: "work", projectId: "target-project",
+    onForkCreated: task => { saved = task; } }),
+  error => error instanceof UncertainActionError && /назначение в приложении не подтверждено/u.test(error.message));
+  assert.equal(writes, 1); assert.equal(saved?.threadId, target.threadId);
+});
+
+function fixedCreator(created: DesktopTask, create: () => void = () => {}): DesktopTaskCreator {
+  return {
+    createTask: async () => { create(); return created; }, interrupt: async () => false,
+    details: () => null, isActive: () => false, onUpdate: () => () => {},
   };
+}
+
+test("new task creation is delegated once to the atomic creator", async () => {
+  const created: DesktopTask = { ...ref, title: "Created", workspace: "/fixture", projectId: null, rolloutPath: "/codex/sessions/created.jsonl", updatedAt: 1 };
+  const server = new Server(); let creations = 0;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [created], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined, { creator: fixedCreator(created, () => { creations++; }) });
+  const task = await adapter.createTask({ operationId: "initial-op", projectId: null, workspace: "/fixture", title: "Created", prompt: "Initial prompt", model: "model-a", effort: "high", environment: "local" });
+  assert.equal(task.threadId, ref.threadId); assert.equal(creations, 1);
+  assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
+});
+
+test("an active first turn opens its configured client without waiting for impossible follower ownership", async () => {
+  const created: DesktopTask = { ...ref, title: "Created", workspace: "/fixture", projectId: null, rolloutPath: "/codex/sessions/created.jsonl", updatedAt: 1 };
+  const server = new Server(); let opens = 0;
+  const creator = fixedCreator(created); creator.isActive = () => true;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [created], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, {
+      creator, launcher: { open: async task => { assert.equal(task.threadId, created.threadId); opens++; } },
+    });
+  await adapter.ensureOpen(created);
+  assert.equal(opens, 1); assert.equal(server.received.length, 0);
+});
+
+test("a rejected creation is not retried or replaced with a follower turn", async () => {
+  const server = new Server(); const created: DesktopTask = { ...ref, title: "Created", workspace: "/fixture", projectId: null, updatedAt: 1 };
+  let creations = 0;
+  const creator = fixedCreator(created, () => { creations++; });
+  creator.createTask = async () => { creations++; throw new ActionRejectedError("bad workspace"); };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [created], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { creator });
+  await assert.rejects(adapter.createTask({ operationId: "initial-op", projectId: null, workspace: "/fixture", title: "Created", prompt: "Initial", environment: "local" }), ActionRejectedError);
+  assert.equal(creations, 1); assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
+});
+
+test("a generic desktop discovery rejection never launches a client or starts a substitute turn", async () => {
+  const server = new Server(); server.rejectDiscovery = true;
+  server.discoveryError = "private backend error";
+  const task = { ...ref, title: "New projectless task", workspace: "/fixture", updatedAt: 1 };
+  let opens = 0;
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
-    () => new DesktopIpcClient(() => server, 100), undefined, executor);
-  const receipt = await adapter.submitWithReceipt({ operationId: "fallback-operation", task, text: "Continue safely" });
-  assert.deepEqual(receipt, { mode: "fallback", turnId: null });
-  assert.deepEqual(submissions, ["Continue safely"]);
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
+    { launcher: { open: async () => { opens++; } } });
+  await assert.rejects(adapter.submitWithReceipt({ operationId: "unloaded-operation", task, text: "Continue safely" }), DesktopRequestRejectedError);
   assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" || message.method === "thread-follower-steer-turn"), false);
+  assert.equal(opens, 0);
+});
+
+test("fresh input reopens a task after desktop restart, then reuses its live owner", async () => {
+  const task = { ...ref, title: "Existing task", workspace: "/fixture", updatedAt: 1, rolloutPath: "/fixture/sessions/task.jsonl" };
+  const servers: Server[] = [];
+  let loaded = true;
+  let opens = 0;
+  let accessChecks = 0;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server(); servers.push(server);
+    server.rejectDiscovery = !loaded;
+    server.dataState = { ...state([], "completed"), rolloutPath: task.rolloutPath, resumeState: "resumed" };
+    return new DesktopIpcClient(() => server, 100);
+  }, undefined, undefined, undefined, { launcher: { open: async opened => {
+    assert.deepEqual(opened, task); assert.ok(accessChecks > 0); loaded = true; opens++;
+  } } });
+  const submit = (operationId: string) => adapter.submitWithReceipt({ operationId, task, text: "Continue", beforeSend: async () => { accessChecks++; } });
+  await submit("before-restart");
+  assert.equal(opens, 0);
+  loaded = false; accessChecks = 0;
+  assert.deepEqual(await submit("after-restart"), { mode: "start", turnId: "next-turn" });
+  assert.equal(opens, 1);
+  await submit("already-connected");
+  assert.equal(opens, 1);
+  const writes = servers.flatMap(server => server.received).filter(message => message.method === "thread-follower-start-turn");
+  assert.equal(writes.length, 3);
+  assert.deepEqual(writes.map(message => ((message.params as IpcObject).turnStart as IpcObject).request).map(request => (request as IpcObject).clientUserMessageId), ["before-restart", "after-restart", "already-connected"]);
+});
+
+test("reopening cannot send input to a different rollout or bypass a cancelled binding", async () => {
+  const task = { ...ref, title: "Existing task", workspace: "/fixture", updatedAt: 1, rolloutPath: "/selected/sessions/task.jsonl" };
+  for (const cancelled of [false, true]) {
+    const servers: Server[] = [];
+    let opened = false;
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+      const server = new Server(); servers.push(server); server.rejectDiscovery = !opened;
+      server.dataState = { ...state([], "completed"), rolloutPath: "/other/sessions/task.jsonl" };
+      return new DesktopIpcClient(() => server, 100);
+    }, undefined, undefined, undefined, { launcher: { open: async () => { opened = true; } } });
+    await assert.rejects(adapter.submitWithReceipt({ operationId: "blocked", task, text: "Continue", beforeSend: async () => {
+      if (cancelled) throw new ActionRejectedError("binding cancelled");
+    } }), cancelled ? /binding cancelled/ : /другой копии/);
+    assert.equal(opened, !cancelled);
+    assert.equal(servers.flatMap(server => server.received).some(message => message.method === "thread-follower-start-turn"), false);
+  }
+});
+
+test("read-only task operations never invoke the configured launcher", async () => {
+  const server = new Server(); server.rejectDiscovery = true;
+  const task = { ...ref, title: "Unloaded", workspace: "/fixture", updatedAt: 1 };
+  let opens = 0;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
+    { launcher: { open: async () => { opens++; } } });
+  await assert.rejects(adapter.inspectTask(task), TaskNotOpenError);
+  assert.equal(opens, 0);
 });
 
 test("an idle or unloaded task starts the next turn through its owner with inherited settings", async () => {
@@ -707,6 +1113,95 @@ test("an idle or unloaded task starts the next turn through its owner with inher
     });
     assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn" || message.method === "thread/start" || message.method === "thread/resume"), false);
     assert.ok(server.destroyed);
+  }
+});
+
+test("submission waits for a large task's delayed initial desktop snapshot", async () => {
+  const server = new Server();
+  server.dataState = { ...state([], "completed"), resumeState: "resumed", threadRuntimeStatus: { type: "systemError" } };
+  server.onFollow = () => setTimeout(() => server.snapshot(), 2_100);
+  const task = { ...ref, title: "Large task", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100));
+  await adapter.submit({ operationId: "after-large-snapshot", task, text: "Continue" });
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});
+
+test("submission waits for a transient active snapshot to settle before starting the next turn", async () => {
+  const server = new Server();
+  server.dataState = { ...state([], "completed"), resumeState: "resumed", threadRuntimeStatus: { type: "active" } };
+  server.onFollow = () => {
+    server.snapshot();
+    setTimeout(() => {
+      server.dataState = { ...state([], "completed"), resumeState: "resumed", threadRuntimeStatus: { type: "idle" } };
+      server.snapshot();
+    }, 20);
+  };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined, { stateSettleMs: 200 });
+  await adapter.submit({ operationId: "message", task: ref, text: "Continue" });
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
+});
+
+test("submission waits for resynchronization between access checks and sends only from the fresh state", async () => {
+  const server = new Server(); server.dataState = state([], "completed");
+  let follows = 0; let checks = 0;
+  server.onFollow = () => {
+    if (++follows === 1) server.snapshot();
+    else setTimeout(() => { server.dataState = state([], "inProgress"); server.snapshot(); }, 25);
+  };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100));
+  const receipt = await adapter.submitWithReceipt({ operationId: "resync-message", task, text: "Continue", beforeSend: async () => {
+    if (++checks !== 2) return;
+    for (const revision of [901, 902]) server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11, sourceClientId: "owner", targetClientIds: ["bridge-client"],
+      params: { hostId: ref.hostId, conversationId: ref.threadId, change: { type: "patches", baseRevision: revision - 1, revision, patches: [] } } });
+    await new Promise(resolve => setTimeout(resolve, 1));
+  } });
+  assert.deepEqual(receipt, { mode: "steer", turnId: "fixture-turn" });
+  assert.equal(follows, 2);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 0);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-steer-turn").length, 1);
+});
+
+test("a connection lost before writing is reattached once without reopening the application", async () => {
+  const servers: Server[] = []; let checks = 0; let opens = 0;
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server(); server.dataState = state([], "completed"); servers.push(server);
+    return new DesktopIpcClient(() => server, 100);
+  }, undefined, undefined, undefined, { launcher: { open: async () => { opens++; } } });
+  const receipt = await adapter.submitWithReceipt({ operationId: "connection-loss", task, text: "Continue", beforeSend: async () => {
+    if (++checks !== 2) return;
+    servers[0]!.destroy();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  } });
+  assert.deepEqual(receipt, { mode: "start", turnId: "next-turn" });
+  assert.equal(servers.length, 2); assert.equal(opens, 0);
+  assert.equal(servers[0]!.received.some(message => message.method === "thread-follower-start-turn"), false);
+  assert.equal(servers[1]!.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});
+
+test("pre-send retries are bounded and protocol failures retain their cause", async () => {
+  for (const protocolFailure of [false, true]) {
+    const servers: Server[] = []; let checks = 0; let opens = 0;
+    const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+      const server = new Server(); server.dataState = state([], "completed"); servers.push(server);
+      return new DesktopIpcClient(() => server, 100);
+    }, undefined, undefined, undefined, { launcher: { open: async () => { opens++; } } });
+    await assert.rejects(adapter.submitWithReceipt({ operationId: "failure", task, text: "Continue", beforeSend: async () => {
+      if (++checks % 2 !== 0) return;
+      if (protocolFailure) servers.at(-1)!.snapshot(10);
+      else servers.at(-1)!.destroy();
+      await new Promise<void>(resolve => setImmediate(resolve));
+    } }), protocolFailure ? /Версия событий/ : DesktopUnavailableError);
+    assert.equal(servers.length, protocolFailure ? 1 : 2);
+    assert.equal(opens, 0);
+    assert.equal(servers.flatMap(server => server.received).some(message => message.method === "thread-follower-start-turn"), false);
   }
 });
 
@@ -752,7 +1247,8 @@ test("an explicit idle runtime ignores an orphaned in-progress history turn", as
     ],
   };
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
-  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { stateSettleMs: 5 });
   await adapter.submit({ operationId: "message", task: ref, text: "Continue" });
   assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
   assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
@@ -768,7 +1264,8 @@ test("an idle runtime with a possibly current in-progress turn fails closed", as
     turns: [{ turnId: "possibly-current", turnStartedAtMs: 200, status: "inProgress", items: [] }],
   };
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
-  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { stateSettleMs: 5 });
   await assert.rejects(adapter.submit({ operationId: "message", task: ref, text: "Continue" }), error => error instanceof ActionRejectedError && /противоречивое состояние/u.test(error.message));
   assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" || message.method === "thread-follower-steer-turn"), false);
 });
@@ -827,7 +1324,8 @@ test("unconfirmed idle state and pending questions never start a new turn", asyn
   ]) {
     const server = new Server(); server.dataState = { ...state([], "completed"), ...overrides };
     const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
-    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+      () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { stateSettleMs: 5 });
     await assert.rejects(adapter.submit({ operationId: "message", task: ref, text: "Continue" }), ActionRejectedError);
     assert.equal(server.received.some(message => String(message.method).startsWith("thread-follower-")), false);
     assert.ok(server.destroyed);
@@ -902,6 +1400,28 @@ test("a reconnected subscription baselines missed history and emits only later u
   assert.deepEqual(next.events.filter(event => event.type === "progress").map(event => event.text), ["Fresh after reconnect"]);
 });
 
+test("a reconnect recovers only the undelivered final of a turn accepted from VK", () => {
+  const attached = projectSnapshot(state([], "completed"), null, 100);
+  const completed = state([
+    { type: "userMessage", id: "request", clientId: "operation", content: [{ type: "text", text: "From VK" }] },
+    { type: "agentMessage", id: "progress", phase: "commentary", text: "Accumulated progress" },
+    { type: "agentMessage", id: "answer", phase: "final_answer", text: "Recovered answer" },
+  ], "completed");
+  const completedHistory = (completed.turnHistory as IpcObject).history as IpcObject;
+  ((completedHistory.entitiesByKey as IpcObject).tail as IpcObject).turnId = "accepted-turn";
+  const baseline = projectSnapshot(completed, attached.checkpoint, 300, { rebaseline: true });
+  assert.equal(baseline.events.length, 0);
+  const recovered = projectSnapshot(completed, baseline.checkpoint, 400, {
+    rebaseline: true, recoverFinalTurnIds: ["accepted-turn"], finalRecorded: () => false,
+  });
+  assert.deepEqual(recovered.events.filter(event => event.type !== "status"), [
+    { type: "final", id: "answer", turnId: "accepted-turn", text: "Recovered answer" },
+  ]);
+  assert.equal(projectSnapshot(completed, recovered.checkpoint, 500, {
+    rebaseline: true, recoverFinalTurnIds: ["accepted-turn"], finalRecorded: () => true,
+  }).events.length, 0);
+});
+
 test("editing a Codex message does not replay history rebuilt with new item ids", () => {
   const attached = projectSnapshot({ id: ref.threadId, hostId: ref.hostId, rolloutPath: "C:/profiles/work/sessions/base.jsonl", turns: [] }, null, 100);
   const beforeEdit = { id: ref.threadId, hostId: ref.hostId, rolloutPath: "C:/profiles/work/sessions/base.jsonl", turns: [{
@@ -972,15 +1492,16 @@ test("projection excludes commands, tool calls and file changes entirely", () =>
   assert.equal(result.events.some(event => event.type === "progress"), false);
 });
 
-test("catalog excludes archived and subagent tasks, and uses the user's canonical title", t => {
+test("catalog includes API-created user tasks but excludes archived and subagent tasks", t => {
   const db = new Database(":memory:"); t.after(() => db.close());
   db.exec(`CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, thread_source TEXT, source TEXT, archived INTEGER, updated_at_ms INTEGER, updated_at INTEGER, is_pinned INTEGER, recency_at_ms INTEGER);
     INSERT INTO threads VALUES ('main', 'Renamed by user', 'Old title', '/fixture', 'user', 'vscode', 0, 1000, 1, 0, 1000);
+    INSERT INTO threads VALUES ('api', 'Created through API', '', '/fixture', 'agent_created_thread', 'vscode', 0, 900, 1, 0, 900);
     INSERT INTO threads VALUES ('agent', 'Agent', 'Agent', '/fixture', 'subagent', 'vscode', 0, 2000, 2, 0, 2000);
     INSERT INTO threads VALUES ('archived', 'Archived', 'Archived', '/fixture', 'user', 'vscode', 1, 3000, 3, 0, 3000);`);
   const tasks = readTaskCatalog(db);
-  assert.equal(tasks.length, 1); assert.equal(tasks[0]!.title, "Renamed by user");
-  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM threads").get(), { n: 3 });
+  assert.deepEqual(tasks.map(task => [task.threadId, task.title]), [["main", "Renamed by user"], ["api", "Created through API"]]);
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM threads").get(), { n: 4 });
   assert.equal(tasks[0]!.hostId, "local");
 });
 

@@ -1,4 +1,4 @@
-import type { DesktopTask, TaskRef } from "../desktop/contracts.js";
+import type { DesktopTask, TaskRef, TaskGoal, TransferCheckpoint } from "../desktop/contracts.js";
 import type { RemoteAttachment } from "../domain/models.js";
 
 export interface MessageHandle { readonly peerId: number; readonly conversationMessageId: number }
@@ -68,6 +68,36 @@ export interface Binding extends TaskRef {
   readonly paused: boolean;
 }
 
+export interface TaskTransferRecord {
+  readonly id: string;
+  readonly bindingId: string;
+  readonly startedAt: number;
+  readonly source: TaskRef & { readonly title: string };
+  readonly targetSourceId: string;
+  readonly targetProjectId: string | null;
+  readonly phase: "forking" | "preparingTarget" | "targetCreated" | "switched" | "complete" | "cancelled" | "failed" | "uncertain";
+  readonly target?: DesktopTask;
+  readonly detail?: string;
+  /** Legacy records are read-only until explicitly resumed by the owner. */
+  readonly version?: 2;
+  readonly revision?: number;
+  readonly updatedAt?: number;
+  readonly attempt?: number;
+  readonly retryAt?: number;
+  readonly blocked?: boolean;
+  readonly blockedReason?: "archiveOwner" | null;
+  /** A historical record closed from native archive + exact binding evidence,
+   * not a claim that a missing legacy history checkpoint was reconstructed. */
+  readonly legacyReconciled?: boolean;
+  readonly checkpoint?: TransferCheckpoint;
+  readonly forkSubmitted?: boolean;
+  readonly goal?: TaskGoal | null;
+  readonly goalPrepared?: boolean;
+  readonly step?: "snapshot" | "fork" | "metadata" | "open" | "goal" | "verify" | "archive";
+  readonly launchAttempted?: boolean;
+  readonly lease?: { readonly owner: string; readonly pid: number } | null;
+}
+
 export type TaskListFilter =
   | { readonly kind: "all" }
   | { readonly kind: "unassigned" }
@@ -103,12 +133,13 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "health" | "limits" | "projects" | "moveProject" | "moveProjectApply" | "models" | "efforts" | "select" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalApply" | "goalPause" | "goalResume" | "goalClear" | "goalClearApply" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "health" | "limits" | "limitsReset" | "limitsResetApply" | "projects" | "openDesktop" | "move" | "moveProject" | "moveProjectApply" | "moveSource" | "moveSourceSelect" | "moveSourceProject" | "moveSourceConfirm" | "moveSourceApply" | "moveSourceResume" | "moveSourceCancel" | "models" | "efforts" | "select" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalApply" | "goalPause" | "goalResume" | "goalClear" | "goalClearApply" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;
   readonly title?: string;
   readonly projectId?: string | null;
+  readonly sourceId?: string;
   readonly tokenBudget?: number | null;
 }
 

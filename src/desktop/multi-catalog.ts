@@ -24,6 +24,7 @@ function sourceProject(source: Source, project: DesktopProject, showLabel: boole
   return {
     ...project,
     id: source.id ? JSON.stringify([source.id, project.id]) : project.id,
+    ...(project.legacyIds ? { legacyIds: project.legacyIds.map(id => source.id ? JSON.stringify([source.id, id]) : id) } : {}),
     title: showLabel ? `[${source.label}] ${project.title}` : project.title,
   };
 }
@@ -143,7 +144,7 @@ export class MultiDesktopCatalog {
       if (entry.projects.status !== "fulfilled") continue;
       for (const project of entry.projects.value) {
         const visible = sourceProject(entry.source, project, showSource);
-        if (visible.id !== projectId) continue;
+        if (visible.id !== projectId && !visible.legacyIds?.includes(projectId)) continue;
         return { project: visible, rawProjectId: project.id, sourceHome: entry.source.home, sourceLabel: entry.source.label,
           ...(entry.source.id ? { sourceId: entry.source.id } : {}) };
       }

@@ -1,22 +1,31 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type AccountUsage, type DesktopTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
-import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, View } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type DesktopTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
+import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { formatHealthSummary } from "./health.js";
+import { TaskTransfers, transferStatus, type TransferredGoalUsage } from "./transfers.js";
 
 interface PanelState {
   id: string;
   messageKey: string;
   bindingId: string | null;
-  view: "home" | "projects" | "moveProject" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
+  view: "home" | "projects" | "limitsReset" | "move" | "moveProject" | "moveSource" | "moveSourceProject" | "moveSourceConfirm" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
   page: number;
   model?: string;
   title?: string;
   goalObjective?: string;
   goalTokenBudget?: number | null;
+  targetSourceId?: string;
+  targetSourceLabel?: string;
+  targetProjectId?: string | null;
+  targetProjectTitle?: string;
+  resetSourceId?: string;
+  resetSourceLabel?: string;
+  resetAccountLabel?: string;
+  resetOperationId?: string;
   note?: string;
   expiresAt: number;
   tokens: Record<string, { id: string; expiresAt: number }>;
@@ -69,6 +78,12 @@ export function taskGoalText(goal: TaskGoal | null): string {
 const renameRetryDelay = (attempts: number): number => Math.min(30 * 60_000, 30_000 * 2 ** Math.min(Math.max(0, attempts - 1), 6));
 export const taskDeepLink = (threadId: string): string => `codex://threads/${encodeURIComponent(threadId)}`;
 
+export function taskFailureText(failure: TaskDetails["failure"]): string | null {
+  if (failure === "usageLimit") return "Codex остановлен: исчерпан лимит аккаунта этого каталога. /limits — проверить аккаунт и время сброса. Перенос в другой каталог доступен через меню; автоматически аккаунт не меняется.";
+  if (failure === "systemError") return "Codex сообщает системную ошибку. Ход сейчас не выполняется. Подробности доступны в приложении Codex; сообщение можно повторить после устранения причины.";
+  return null;
+}
+
 const duration = (minutes: number): string => minutes % 1_440 === 0 ? `${minutes / 1_440} дн.` : minutes % 60 === 0 ? `${minutes / 60} ч.` : `${minutes} мин.`;
 const resetTime = (seconds: number): string => new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(seconds * 1_000));
 export function accountUsageText(usages: readonly AccountUsage[]): string {
@@ -95,6 +110,8 @@ export function accountUsageText(usages: readonly AccountUsage[]): string {
 export function taskCardText(binding: Binding, details: TaskDetails): string {
   const context = details.context ? `${details.context.percent.toFixed(1)}% · ${number(details.context.used)} / ${number(details.context.window)} токенов` : "нет данных";
   const lines = [short(binding.title), `Статус: ${statuses[details.status]}`, `Модель: ${details.model ?? "нет данных"}`, `Рассуждение: ${details.effort ?? "нет данных"}`];
+  const failure = taskFailureText(details.failure);
+  if (failure && details.status === "failed") lines.push(failure);
   if (binding.sourceLabel) lines.splice(1, 0, `Каталог: ${binding.sourceLabel}`);
   if (details.nextModel && (details.nextModel !== details.model || details.nextEffort !== details.effort)) lines.push(`Следующий ход: ${details.nextModel} · ${details.nextEffort ?? "по умолчанию"}`);
   lines.push(`Контекст: ${context}`, "Контекст — по последним данным Codex, не суммарный расход за задачу.", "", "Сообщение в беседе продолжает эту задачу. /menu — открыть меню снова.");
@@ -102,6 +119,7 @@ export function taskCardText(binding: Binding, details: TaskDetails): string {
 }
 
 export class TaskPanels {
+  readonly transfers: TaskTransfers;
   private readonly startedAt = Date.now();
   private readonly live = new Map<string, TaskDetails>();
   private readonly renameSyncing = new Set<string>();
@@ -110,7 +128,9 @@ export class TaskPanels {
   private catalogCount: number | null = null;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>) {}
+    private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>) {
+    this.transfers = new TaskTransfers(store, desktop);
+  }
 
   observe(bindingId: string, details: TaskDetails): void {
     this.live.set(bindingId, details);
@@ -132,6 +152,7 @@ export class TaskPanels {
   }
 
   async tick(): Promise<void> {
+    this.transfers.tick();
     if (Date.now() - this.lastCatalogAt > 30_000) {
       this.lastCatalogAt = Date.now();
       try {
@@ -163,6 +184,15 @@ export class TaskPanels {
   async text(input: BridgeInput): Promise<boolean> {
     const text = input.text.trim();
     const healthRequested = input.peerId === this.access.ownerId && text === "/health";
+    if (input.senderId === this.access.ownerId && text === "/open") {
+      const binding = this.store.byPeer(input.peerId);
+      if (!binding) return false;
+      if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
+      await (this.desktop.revealTask?.(binding) ?? this.desktop.ensureOpen!(binding));
+      this.store.markDesktopHandoff(binding.id, binding, "launched");
+      this.reply(input, { text: "Команда открытия отправлена настроенному приложению Codex." });
+      return true;
+    }
     if (input.senderId === this.access.ownerId && text === "/limits") {
       const binding = this.store.byPeer(input.peerId);
       const state = this.newState(input.peerId, binding?.id ?? null, "home", true);
@@ -178,10 +208,7 @@ export class TaskPanels {
     }
     if (["/menu", "/status", "Меню"].includes(text) || (input.peerId === this.access.ownerId && ["/start", "/health"].includes(text))) {
       if (healthRequested) await this.healthCheck?.();
-      const binding = this.store.byPeer(input.peerId);
-      const state = this.newState(input.peerId, binding?.id ?? null, "home", true);
-      if (binding) { await this.refresh(binding); this.renderTask(binding, state); }
-      else { this.lastCatalogAt = 0; await this.tick(); this.renderManager(state); }
+      await this.home(input.peerId, undefined, true);
       return true;
     }
     // Help and unknown slash commands belong to TaskManager. In particular,
@@ -228,16 +255,83 @@ export class TaskPanels {
       return;
     }
     if (action.command === "limits" && input.senderId === this.access.ownerId) { await this.renderLimits(input.peerId, state); return; }
+    if (action.command === "limitsReset" || action.command === "limitsResetApply") {
+      if (input.senderId !== this.access.ownerId || !this.desktop.capabilities.accountUsage || !this.desktop.accountUsage
+        || !this.desktop.capabilities.usageReset || !this.desktop.consumeUsageReset) {
+        throw new ActionRejectedError("Сброс лимита недоступен в этом подключении.");
+      }
+      if (action.command === "limitsReset") {
+        if (action.sourceId === undefined) throw new ActionRejectedError("Каталог для сброса лимита не определён.");
+        const task = this.usageResetTask(input.peerId, state.bindingId, action.sourceId);
+        const usages = await this.desktop.accountUsage!(state.bindingId ? task : undefined);
+        const usage = usages.find(item => item.sourceId === action.sourceId) ?? (usages.length === 1 ? usages[0] : undefined);
+        if (!usage || !usage.resetCredits) throw new ActionRejectedError("Для этого аккаунта нет доступного кредита сброса.");
+        const next = this.newState(input.peerId, state.bindingId, "limitsReset");
+        next.resetSourceId = action.sourceId; next.resetSourceLabel = usage.sourceLabel ?? "не указан";
+        next.resetAccountLabel = usage.accountLabel ?? "не определён"; next.resetOperationId = randomUUID();
+        this.show(input.peerId, next, {
+          text: `Использовать один кредит сброса лимита?\n\nКаталог: ${next.resetSourceLabel}\nАккаунт: ${next.resetAccountLabel}\nДоступно кредитов: ${usage.resetCredits}\n\nБудут сброшены только окна, которые Codex сейчас считает подходящими. Операция необратима.`,
+          buttons: [this.button(input.peerId, next, "Сбросить лимит", "limitsResetApply", { sourceId: action.sourceId }), this.button(input.peerId, next, "Отмена", "limits")],
+        });
+        return;
+      }
+      if (state.view !== "limitsReset" || action.sourceId === undefined || action.sourceId !== state.resetSourceId || !state.resetOperationId) {
+        throw new ActionRejectedError("Подтверждение сброса устарело. Открой /limits заново.");
+      }
+      this.consume(input);
+      const task = this.usageResetTask(input.peerId, state.bindingId, action.sourceId);
+      try {
+        const outcome = await this.desktop.consumeUsageReset(task, state.resetOperationId);
+        const notes: Record<typeof outcome, string> = {
+          reset: `Лимит аккаунта ${state.resetAccountLabel ?? "Codex"} сброшен. Использован один кредит.`,
+          alreadyRedeemed: "Этот запрос уже был успешно выполнен ранее; второй кредит не списан.",
+          nothingToReset: "Codex не нашёл окна лимита, которое сейчас можно сбросить. Кредит не списан.",
+          noCredit: "У аккаунта больше нет доступного кредита сброса.",
+        };
+        const next = this.newState(input.peerId, state.bindingId, "home");
+        await this.renderLimits(input.peerId, next, notes[outcome]);
+      } catch (error) {
+        if (!(error instanceof UncertainActionError)) throw error;
+        const retry = this.newState(input.peerId, state.bindingId, "limitsReset");
+        retry.resetSourceId = action.sourceId; retry.resetOperationId = state.resetOperationId;
+        if (state.resetSourceLabel !== undefined) retry.resetSourceLabel = state.resetSourceLabel;
+        if (state.resetAccountLabel !== undefined) retry.resetAccountLabel = state.resetAccountLabel;
+        this.show(input.peerId, retry, {
+          text: `Ответ Codex не получен. Неизвестно, был ли списан кредит.\n\nКаталог: ${retry.resetSourceLabel}\nАккаунт: ${retry.resetAccountLabel}\n\n«Проверить тот же запрос» использует прежний idempotency key и не сможет списать кредит повторно.`,
+          buttons: [this.button(input.peerId, retry, "Проверить тот же запрос", "limitsResetApply", { sourceId: action.sourceId }), this.button(input.peerId, retry, "Лимиты", "limits")],
+        });
+      }
+      return;
+    }
     if (action.command === "projects" && input.peerId === this.access.ownerId) {
       const projects = await this.desktop.listProjects();
       const next = this.newState(input.peerId, null, "projects");
       this.show(input.peerId, next, { text: `Проекты Codex · ${projects.length}\n\n${projects.map(project => `${short(project.title)}\n${project.workspace}`).join("\n\n").slice(0, 3_000)}\n\n${this.desktop.capabilities.createTask ? "Новая задача создаётся через меню менеджера." : "Создание новых задач через это подключение пока недоступно."}`, buttons: [this.button(input.peerId, next, "Меню", "home")] }); return;
     }
     const binding = this.bound(input.peerId, state.bindingId);
+    if (this.store.transferBlocksInput(binding.id) && ["moveProjectApply", "select", "renameApply", "archiveApply", "goalApply", "goalPause", "goalResume", "goalClearApply"].includes(action.command)) {
+      throw new ActionRejectedError("Перенос ещё выполняется. Изменения задачи доступны после его завершения; /menu показывает этап.");
+    }
     switch (action.command) {
+      case "openDesktop": {
+        if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
+        await (this.desktop.revealTask?.(binding) ?? this.desktop.ensureOpen!(binding));
+        this.store.markDesktopHandoff(binding.id, binding, "launched");
+        this.reply(input, { text: "Команда открытия отправлена настроенному приложению Codex. Дождись загрузки задачи и повтори сообщение." });
+        break;
+      }
+      case "move": {
+        const next = this.newState(input.peerId, binding.id, "move");
+        const buttons: Button[] = [];
+        if (this.desktop.capabilities.moveTask) buttons.push(this.button(input.peerId, next, "В проект", "moveProject"));
+        if (this.desktop.capabilities.transferTask && this.desktop.transferTask) buttons.push(this.button(input.peerId, next, "В другой каталог", "moveSource"));
+        buttons.push(this.button(input.peerId, next, "Назад", "home"));
+        this.show(input.peerId, next, { text: `Переместить «${short(binding.title)}»\n\nПроект — меняет только группировку внутри текущего каталога.\nДругой каталог — создаёт native fork истории в другом CODEX_HOME, переключает эту VK-беседу и архивирует исходную задачу.`, buttons });
+        break;
+      }
       case "moveProject": {
         if (!this.desktop.capabilities.moveTask) throw new ActionRejectedError("Перенос между проектами недоступен в текущем подключении.");
-        const projects = await this.desktop.listProjects();
+        const projects = await this.desktop.listProjects(binding.sourceId ?? "");
         const page = Math.max(0, Math.min(Math.floor(action.page ?? 0), Math.max(0, Math.ceil(projects.length / 6) - 1)));
         const visible = projects.slice(page * 6, page * 6 + 6);
         const next = this.newState(input.peerId, binding.id, "moveProject");
@@ -261,6 +355,74 @@ export class TaskPanels {
         this.store.ensureBinding(moved);
         const project = action.projectId === null ? null : (await this.desktop.listProjects()).find(item => item.id === action.projectId);
         await this.home(input.peerId, project ? `Задача перемещена в проект «${short(project.title)}».` : "Задача теперь без проекта.");
+        break;
+      }
+      case "moveSource": {
+        if (!this.desktop.capabilities.transferTask || !this.desktop.transferTask) throw new ActionRejectedError("Перенос между каталогами Codex недоступен.");
+        const sources = (this.desktop.listSources?.() ?? []).filter(source => source.id !== (binding.sourceId ?? ""));
+        if (!sources.length) throw new ActionRejectedError("Других каталогов Codex в конфигурации нет.");
+        const next = this.newState(input.peerId, binding.id, "moveSource");
+        this.show(input.peerId, next, { text: `Куда перенести «${short(binding.title)}»?\n\nИстория будет скопирована штатным fork Codex. Рабочая папка и текущая VK-беседа сохранятся.`,
+          buttons: [...sources.slice(0, 8).map(source => this.button(input.peerId, next, source.label, "moveSourceSelect", { sourceId: source.id })), this.button(input.peerId, next, "Назад", "move")] });
+        break;
+      }
+      case "moveSourceSelect": {
+        if (state.view !== "moveSource" || action.sourceId === undefined) throw new ActionRejectedError("Выбор каталога устарел.");
+        const source = (this.desktop.listSources?.() ?? []).find(item => item.id === action.sourceId);
+        if (!source || source.id === (binding.sourceId ?? "")) throw new ActionRejectedError("Целевой каталог недоступен или совпадает с текущим.");
+        await this.renderTransferProjects(binding, source.id, source.label, 0);
+        break;
+      }
+      case "moveSourceProject": {
+        if (state.view !== "moveSourceProject" || state.targetSourceId === undefined || !state.targetSourceLabel) throw new ActionRejectedError("Выбор каталога устарел.");
+        await this.renderTransferProjects(binding, state.targetSourceId, state.targetSourceLabel, action.page ?? 0);
+        break;
+      }
+      case "moveSourceConfirm": {
+        if (state.view !== "moveSourceProject" || state.targetSourceId === undefined || !state.targetSourceLabel
+          || action.sourceId !== state.targetSourceId || action.projectId === undefined) throw new ActionRejectedError("Выбор назначения устарел.");
+        const projects = await this.desktop.listProjects(state.targetSourceId);
+        const project = action.projectId === null ? null : projects.find(item => item.id === action.projectId);
+        if (action.projectId !== null && !project) throw new ActionRejectedError("Выбранный проект больше не доступен.");
+        const next = this.newState(input.peerId, binding.id, "moveSourceConfirm");
+        next.targetSourceId = state.targetSourceId; next.targetSourceLabel = state.targetSourceLabel;
+        next.targetProjectId = action.projectId; next.targetProjectTitle = project?.title ?? "Без проекта";
+        const account = await this.targetAccount(next.targetSourceId);
+        this.show(input.peerId, next, {
+          text: `Перенести задачу в «${next.targetSourceLabel}»?\n\nАккаунт назначения: ${account}\nПроект: ${next.targetProjectTitle}\n\nБудет создан новый thread ID с историей по последний завершённый ход. После проверки клиента, названия, проекта и цели эта VK-беседа переключится на него, а исходная задача будет архивирована. Активная цель сохранится на паузе; в новом аккаунте останется только неизрасходованный бюджет. Рабочие файлы не перемещаются. Во время переноса новые запросы в эту задачу не отправляются.`,
+          buttons: [this.button(input.peerId, next, "Перенести", "moveSourceApply", { sourceId: next.targetSourceId, projectId: next.targetProjectId }), this.button(input.peerId, next, "Отмена", "home")],
+        });
+        break;
+      }
+      case "moveSourceApply": {
+        if (state.view !== "moveSourceConfirm" || state.targetSourceId === undefined || state.targetProjectId === undefined
+          || action.sourceId !== state.targetSourceId || action.projectId !== state.targetProjectId) throw new ActionRejectedError("Подтверждение переноса устарело.");
+        this.consume(input);
+        const existing = this.store.transfer(binding.id);
+        if (existing && !["complete", "cancelled"].includes(existing.phase)
+          && (existing.targetSourceId !== state.targetSourceId || existing.targetProjectId !== state.targetProjectId)) {
+          throw new ActionRejectedError("Предыдущий перенос ещё не завершён. /menu покажет этап и причину; новую копию пока не создаю.");
+        }
+        const record: TaskTransferRecord = existing && !["complete", "cancelled"].includes(existing.phase) ? existing : {
+          id: randomUUID(), bindingId: binding.id, startedAt: Date.now(), source: {
+            hostId: binding.hostId, threadId: binding.threadId, title: binding.title,
+            ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), ...(binding.rolloutPath ? { rolloutPath: binding.rolloutPath } : {}),
+          }, targetSourceId: state.targetSourceId, targetProjectId: state.targetProjectId, phase: "forking",
+        };
+        if (existing && !["complete", "cancelled"].includes(existing.phase)) this.transfers.resume(binding.id);
+        else this.transfers.start(record);
+        this.waiting(binding, "Перенос запущен в фоне. /menu — этап и состояние операции.");
+        break;
+      }
+      case "moveSourceResume": {
+        const record = this.store.transfer(binding.id);
+        if (!record || ["complete", "cancelled"].includes(record.phase)) throw new ActionRejectedError("Незавершённого переноса нет.");
+        this.consume(input); this.transfers.resume(binding.id);
+        await this.home(input.peerId); break;
+      }
+      case "moveSourceCancel": {
+        this.consume(input); this.transfers.cancel(binding.id);
+        await this.home(input.peerId, "Перенос отменён. Исходная задача снова принимает запросы. Скопированная история, если есть, сохранена; цель автоматически не запускается.");
         break;
       }
       case "models": await this.models(binding, action.page ?? 0); break;
@@ -398,7 +560,12 @@ export class TaskPanels {
       }
       case "share": {
         const next = this.newState(input.peerId, binding.id, "share");
-        this.show(input.peerId, next, { text: "Можно получить локальную ссылку на задачу или файл с видимой перепиской.\n\nДиплинк открывает задачу в твоём Codex и не даёт другим людям доступ. Публичную ссылку этот мост не создаёт — для неё используй «Поделиться» в десктопе.", buttons: [this.button(input.peerId, next, "Диплинк", "link"), ...(this.desktop.capabilities.exportMarkdown ? [this.button(input.peerId, next, "Markdown-файл", "export")] : []), this.button(input.peerId, next, "Назад", "home")] }); break;
+        this.show(input.peerId, next, { text: "Можно явно открыть задачу в настроенном приложении Codex, получить локальную ссылку или файл с видимой перепиской.\n\nОбычные сообщения из VK никогда не выводят окно приложения поверх остальных. Публичную ссылку этот мост не создаёт — для неё используй «Поделиться» в десктопе.", buttons: [
+          ...((this.desktop.revealTask || this.desktop.ensureOpen) ? [this.button(input.peerId, next, "Открыть в Codex", "openDesktop")] : []),
+          this.button(input.peerId, next, "Диплинк", "link"),
+          ...(this.desktop.capabilities.exportMarkdown ? [this.button(input.peerId, next, "Markdown-файл", "export")] : []),
+          this.button(input.peerId, next, "Назад", "home"),
+        ] }); break;
       }
       case "path": {
         await this.refresh(binding);
@@ -438,7 +605,36 @@ export class TaskPanels {
       buttons.push(this.button(binding.peerId!, state, "Изменить", "goalObjective"), this.button(binding.peerId!, state, "Снять цель", "goalClear"));
     }
     buttons.push(this.button(binding.peerId!, state, "Обновить", "goal"), this.button(binding.peerId!, state, "Меню задачи", "home"));
-    this.show(binding.peerId!, state, { text: [taskGoalText(goal), note].filter(Boolean).join("\n\n"), buttons });
+    const previous = this.store.getValue<TransferredGoalUsage>(`transferred-goal:${taskKey(binding)}`);
+    const carry = goal && previous?.objective === goal.objective && previous.targetCreatedAt === goal.createdAt ? previous : null;
+    const history = carry ? `До переноса: ${number(carry.tokensUsed)} токенов, ${elapsed(carry.timeUsedSeconds)}. Этот расход сохранён в VKodex; Codex не умеет импортировать счётчики. Бюджет выше относится к оставшейся работе в этом каталоге.` : "";
+    this.show(binding.peerId!, state, { text: [taskGoalText(goal), history, note].filter(Boolean).join("\n\n"), buttons });
+  }
+
+  private async renderTransferProjects(binding: Binding, sourceId: string, sourceLabel: string, requestedPage: number): Promise<void> {
+    const projects = await this.desktop.listProjects(sourceId);
+    const pageCount = Math.max(1, Math.ceil(projects.length / 6));
+    const page = Math.max(0, Math.min(Math.floor(requestedPage), pageCount - 1));
+    const visible = projects.slice(page * 6, page * 6 + 6);
+    const next = this.newState(binding.peerId!, binding.id, "moveSourceProject");
+    next.page = page; next.targetSourceId = sourceId; next.targetSourceLabel = sourceLabel;
+    const buttons = visible.map(project => this.button(binding.peerId!, next, project.title, "moveSourceConfirm", { sourceId, projectId: project.id }));
+    buttons.push(this.button(binding.peerId!, next, "Без проекта", "moveSourceConfirm", { sourceId, projectId: null }));
+    if (page > 0) buttons.push(this.button(binding.peerId!, next, "Предыдущие", "moveSourceProject", { page: page - 1 }));
+    if (page + 1 < pageCount) buttons.push(this.button(binding.peerId!, next, "Следующие", "moveSourceProject", { page: page + 1 }));
+    buttons.push(this.button(binding.peerId!, next, "Назад", "moveSource"));
+    this.show(binding.peerId!, next, {
+      text: `Каталог назначения: ${sourceLabel}\nВыбери проект · ${page + 1}/${pageCount}\n\n${visible.map(project => `${short(project.title)}\n${project.workspace}`).join("\n\n") || "В этом каталоге нет проектов."}`,
+      buttons,
+    });
+  }
+
+  private async targetAccount(sourceId: string): Promise<string> {
+    if (!this.desktop.accountUsage) return "не удалось определить";
+    try {
+      const usages = await this.desktop.accountUsage({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
+      return usages[0]?.accountLabel ?? "не удалось определить";
+    } catch { return "не удалось определить"; }
   }
 
   private showGoalBudget(binding: Binding, state: PanelState): void {
@@ -566,7 +762,7 @@ export class TaskPanels {
     }
     return { label: short(label, 40), action: token.id };
   }
-  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId" | "tokenBudget">> = {}): Button {
+  private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId" | "sourceId" | "tokenBudget">> = {}): Button {
     return this.token(peerId, state, label, { type: "panel", screenId: state.id, command, ...(state.bindingId ? { bindingId: state.bindingId } : {}), ...extra });
   }
   private show(peerId: number, state: PanelState, view: View): void {
@@ -581,19 +777,40 @@ export class TaskPanels {
     if (this.desktop.capabilities.goals && this.desktop.getGoal && this.desktop.setGoal && this.desktop.clearGoal) buttons.push(button("Цель", "goal"));
     if (this.desktop.capabilities.renameTask) buttons.push(button("Переименовать", "rename"));
     if (this.desktop.capabilities.archiveTask) buttons.push(button("Архивировать", "archive"));
-    if (this.desktop.capabilities.moveTask) buttons.push(button("Переместить в проект", "moveProject"));
-    buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"), button("Диплинк", "link"));
+    if (this.desktop.capabilities.moveTask || this.desktop.capabilities.transferTask) buttons.push(button("Переместить", "move"));
+    buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"),
+      this.details(binding.id).status === "unavailable" && (this.desktop.revealTask || this.desktop.ensureOpen)
+        ? button("Открыть в Codex", "openDesktop") : button("Диплинк", "link"));
     if (this.desktop.capabilities.exportMarkdown) buttons.push(button("Markdown-файл", "export"));
+    const transfer = this.store.transfer(binding.id);
+    if (transfer && !["complete", "cancelled"].includes(transfer.phase)) {
+      if (buttons.length >= 10) {
+        const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться"].includes(item.label));
+        if (index >= 0) buttons.splice(index, 1);
+      }
+      buttons.push(button(transfer.phase === "switched" ? "Повторить архивацию" : "Продолжить перенос", "moveSourceResume"));
+      if (transfer.phase !== "switched") {
+        if (buttons.length >= 10) {
+          const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться", "Markdown-файл"].includes(item.label));
+          if (index >= 0) buttons.splice(index, 1);
+        }
+        buttons.push(button("Отменить перенос", "moveSourceCancel"));
+      }
+    }
     const rename = this.renameState(binding);
     if (rename && !rename.vkTitleUpdated) {
-      if (buttons.length >= 10) buttons.splice(buttons.findIndex(item => item.label === "Диплинк"), 1);
+      if (buttons.length >= 10) {
+        const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться"].includes(item.label));
+        if (index >= 0) buttons.splice(index, 1);
+      }
       buttons.push(this.button(binding.peerId, state, "Повторить для VK", "renameVk", { title: rename.title }));
     }
     const renameStatus = rename ? [
       rename.liveTitleUpdated ? "Codex: новое имя подтверждено в открытой задаче." : "Codex: новое имя сохранено в каталоге, но открытая задача его ещё не подтвердила. Для немедленного обновления окна используй переименование в самом Codex.",
       rename.vkTitleUpdated ? `VK: ${taskChatTitle(rename.title)}` : "VK: переименование не подтверждено. «Повторить для VK» проверит название и повторит только этот шаг.",
     ].join("\n") : "";
-    this.show(binding.peerId, state, { text: [taskCardText(binding, this.details(binding.id)), renameStatus, state.note].filter(Boolean).join("\n\n"), buttons });
+    const transferNote = transfer && !["complete", "cancelled"].includes(transfer.phase) ? transferStatus(transfer) : "";
+    this.show(binding.peerId, state, { text: [taskCardText(binding, this.details(binding.id)), renameStatus, transferNote, state.note].filter(Boolean).join("\n\n"), buttons });
   }
   private renderManager(state: PanelState): void {
     const bindings = this.store.bindings(); const active = bindings.filter(binding => binding.attached && binding.peerId !== null);
@@ -619,16 +836,36 @@ export class TaskPanels {
     this.show(this.access.ownerId, state, { text: text.join("\n"), buttons });
   }
   private waiting(binding: Binding, note: string): void { const state = this.newState(binding.peerId!, binding.id, "home"); state.note = note; this.renderTask(binding, state); }
-  private async renderLimits(peerId: number, state: PanelState): Promise<void> {
+  private usageResetTask(peerId: number, bindingId: string | null, sourceId: string): Binding | { hostId: "local"; threadId: string; sourceId?: string } {
+    if (bindingId) {
+      const binding = this.bound(peerId, bindingId);
+      if ((binding.sourceId ?? "") !== sourceId) throw new ActionRejectedError("Кнопка относится к другому каталогу Codex.");
+      return binding;
+    }
+    const source = (this.desktop.listSources?.() ?? []).find(item => item.id === sourceId);
+    if (!source) throw new ActionRejectedError("Каталог Codex больше не подключён.");
+    return { hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) };
+  }
+  private async renderLimits(peerId: number, state: PanelState, note?: string): Promise<void> {
     if (!this.desktop.capabilities.accountUsage || !this.desktop.accountUsage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
     const task = state.bindingId ? this.bound(peerId, state.bindingId) : undefined;
     const usages = await this.desktop.accountUsage(task);
-    this.show(peerId, state, { text: accountUsageText(usages), buttons: [this.button(peerId, state, "Обновить лимиты", "limits"), this.button(peerId, state, "Меню", "home")] });
+    const resettable = this.desktop.capabilities.usageReset && this.desktop.consumeUsageReset
+      ? usages.filter(usage => (usage.resetCredits ?? 0) > 0 && usage.sourceId !== undefined).slice(0, 8) : [];
+    const buttons = resettable.map(usage => this.button(peerId, state, usages.length === 1 ? "Сбросить лимит" : `Сбросить · ${usage.sourceLabel ?? "каталог"}`, "limitsReset", { sourceId: usage.sourceId! }));
+    buttons.push(this.button(peerId, state, "Обновить лимиты", "limits"), this.button(peerId, state, "Меню", "home"));
+    this.show(peerId, state, { text: [note, accountUsageText(usages)].filter(Boolean).join("\n\n"), buttons });
   }
-  private async home(peerId: number, note?: string): Promise<void> {
-    const binding = this.store.byPeer(peerId); const state = this.newState(peerId, binding?.id ?? null, "home");
+  private async home(peerId: number, note?: string, fresh = false): Promise<void> {
+    const binding = this.store.byPeer(peerId); const state = this.newState(peerId, binding?.id ?? null, "home", fresh);
     if (note) state.note = note;
-    if (binding) { await this.refresh(binding); this.renderTask(this.store.getBinding(binding.id)!, state); }
+    if (binding) {
+      try { await this.refresh(binding); }
+      catch (error) {
+        state.note = error instanceof DesktopUnavailableError ? error.message : "Не удалось обновить состояние Codex. /open — открыть задачу в настроенном приложении; затем повтори сообщение.";
+      }
+      this.renderTask(this.store.getBinding(binding.id)!, state);
+    }
     else { this.lastCatalogAt = 0; await this.tick(); this.renderManager(state); }
   }
 

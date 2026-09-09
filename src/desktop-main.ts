@@ -6,10 +6,12 @@ import { DesktopBridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
+import { AppServerTaskCreator } from "./desktop/app-server-creator.js";
+import { AppServerTaskTransfer } from "./desktop/app-server-transfer.js";
+import { SourceTaskLauncher } from "./desktop/launcher.js";
 import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
 import { createDesktopLogger } from "./desktop/logging.js";
 import { writeRuntimeProcessState } from "./desktop/process-state.js";
-import { SdkTaskExecutor } from "./desktop/sdk-executor.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 
 const formatFatalDetail = (value: unknown): string => {
@@ -30,10 +32,14 @@ store.assertPrimaryHome(config.codexHome);
 const gateway = new DesktopVkGateway(config, undefined, undefined, logger);
 const catalog = new MultiDesktopCatalog(config.codexHomes);
 const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
-const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata, new SdkTaskExecutor(catalog, metadata),
-  new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task)), new ProfileDesktopGoals(task => catalog.sourceHome(task)));
+const launcher = new SourceTaskLauncher(config.codexSources, task => catalog.sourceHome(task));
+const creator = new AppServerTaskCreator(catalog, metadata);
+const transfer = new AppServerTaskTransfer(catalog, metadata);
+const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
+  new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task), undefined, () => catalog.listSources()), new ProfileDesktopGoals(task => catalog.sourceHome(task)),
+  { launcher, creator, transfer });
 const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
-  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot);
+  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits);
 const startedAt = Date.now();
 let exitReason = "process_exit";
 let stopping = false;

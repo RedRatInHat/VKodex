@@ -27,6 +27,13 @@ export interface ProjectionOptions {
    * before the disconnect.
    */
   readonly rebaseline?: boolean;
+  /**
+   * Turns accepted from VK whose terminal result still has no durable delivery.
+   * Only their final answer may cross a reconnect baseline; accumulated progress
+   * and unrelated desktop history remain suppressed.
+   */
+  readonly recoverFinalTurnIds?: readonly string[];
+  readonly finalRecorded?: (eventId: string) => boolean;
 }
 
 export function turnsFromState(state: IpcObject): IpcObject[] {
@@ -52,7 +59,11 @@ export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" 
   const inProgress = rawTurns.filter(turn => turn.status === "inProgress");
   if (!inProgress.length) return "none";
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
-  if (runtimeStatus !== "idle" && runtimeStatus !== "notLoaded") return "live";
+  // A runtime error terminates activity even if restored history still contains
+  // an old inProgress entry. It must never route a new prompt as a steer.
+  if (runtimeStatus === "systemError") return "orphaned";
+  if (runtimeStatus === undefined || runtimeStatus === "active") return "live";
+  if (runtimeStatus !== "idle" && runtimeStatus !== "notLoaded") return "ambiguous";
   const started = inProgress.map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
   const terminal = rawTurns.filter(turn => ["completed", "failed", "interrupted"].includes(String(turn.status)))
     .map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
@@ -63,7 +74,7 @@ export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" 
 /**
  * Codex history can retain an orphaned `inProgress` turn after a crash or an
  * edited branch rebuild. An explicit runtime state is newer and authoritative:
- * `idle`/`notLoaded` means those historical entries are not live anymore.
+ * `idle`/`notLoaded`/`systemError` means historical entries are not live anymore.
  */
 export function activeTurnsFromState(state: IpcObject): IpcObject[] {
   if (inProgressState(state) !== "live") return [];
@@ -112,6 +123,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const semanticByIdentity: Record<string, string> = { ...previousSemantic };
   const previousSemanticCounts = counts(previousSemantic);
   const currentSemanticCounts = new Map<string, number>();
+  const recoverFinalTurnIds = new Set(options.recoverFinalTurnIds ?? []);
   const rolloutPath = typeof state.rolloutPath === "string" ? comparablePath(state.rolloutPath) : previous?.rolloutPath;
   const historyRebuilt = previous?.rolloutPath !== undefined && rolloutPath !== undefined && previous.rolloutPath !== rolloutPath;
   const events: TaskEvent[] = [];
@@ -134,7 +146,9 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
       : knownSemantic !== semantic;
     const digest = hash(JSON.stringify(event));
     const changed = seen[key] !== digest;
-    const accepted = changed && semanticallyNew && previous !== null && (!rebaseline || allowRebaseline);
+    const recoverFinal = event.type === "final" && recoverFinalTurnIds.has(event.turnId)
+      && !(options.finalRecorded?.(event.id) ?? false);
+    const accepted = recoverFinal || (changed && semanticallyNew && previous !== null && (!rebaseline || allowRebaseline));
     if (accepted) events.push(event);
     // A duplicate identity created only by history rewriting is deliberately
     // not remembered: otherwise every rewrite would inflate occurrence counts.

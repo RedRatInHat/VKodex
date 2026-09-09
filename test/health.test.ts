@@ -58,11 +58,41 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "codex_tasks", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("Codex task failures degrade health even with a connected stream", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 1,
+    requiredBindings: 0, connectedRequiredBindings: 0, failedBindings: 1,
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  assert.equal(report.state, "degraded");
+  assert.equal(report.checks.find(check => check.name === "codex_streams")!.state, "ok");
+  assert.equal(report.checks.find(check => check.name === "codex_tasks")!.state, "degraded");
+});
+
+test("health detects stuck and legacy transfers even when streams and the database are healthy", async t => {
+  const s = setup(t);
+  const task = (await s.desktop.listTasks())[0]!;
+  const binding = s.store.ensureBinding(task);
+  s.store.markTransfer({ id: "operation", bindingId: binding.id, source: task, startedAt: 90_000,
+    targetSourceId: "work", targetProjectId: null, phase: "preparingTarget" });
+  const report = await s.monitor.check();
+  assert.equal(report.checks.find(check => check.name === "task_transfers")?.state, "degraded");
+  s.store.updateTransfer(s.store.transfer(binding.id)!, { version: 2, updatedAt: 100_000 });
+  const retrying = await s.monitor.check();
+  assert.equal(retrying.checks.find(check => check.name === "task_transfers")?.state, "degraded");
+  s.store.updateTransfer(s.store.transfer(binding.id)!, { blocked: true });
+  assert.equal((await s.monitor.check()).checks.find(check => check.name === "task_transfers")?.state, "failed");
+  s.store.updateTransfer(s.store.transfer(binding.id)!, { phase: "complete" });
+  assert.equal((await s.monitor.check()).checks.find(check => check.name === "task_transfers")?.state, "ok");
 });
 
 test("health monitor degrades when an attached task points to a missing workspace", async t => {

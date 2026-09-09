@@ -4,7 +4,7 @@ import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type DesktopTask, type TaskRef } from "./contracts.js";
 import { parseModelsCache } from "./details.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
-import { assignTaskProjects, desktopProjects } from "./projects.js";
+import { assignTaskProjects, desktopProjects, readDesktopProjectState } from "./projects.js";
 
 export function parseTaskTitles(index: string): ReadonlyMap<string, string> {
   const latest = new Map<string, { title: string; updatedAt: number }>();
@@ -31,7 +31,7 @@ export function readTaskCatalog(database: Database, limit: number | null = 100, 
       ${columns.has("project_id") ? "project_id" : "NULL"} AS project_id,
       COALESCE(updated_at_ms, updated_at * 1000) AS updated_at
     FROM threads
-    WHERE archived = 0 AND thread_source = 'user' AND source IN ('vscode', 'cli', 'exec')
+    WHERE archived = 0 AND thread_source IN ('user', 'agent_created_thread') AND source IN ('vscode', 'cli', 'exec')
     ORDER BY is_pinned DESC, COALESCE(recency_at_ms, updated_at_ms, updated_at * 1000) DESC, id
     LIMIT ?
   `).all(limit ?? -1) as { id: string; name: string | null; title: string | null; cwd: string; updated_at: number; rollout_path: string | null; project_id: string | null }[];
@@ -67,7 +67,7 @@ export class LocalDesktopCatalog {
       // Filter and paginate in the manager, after loading project membership.
       // A global recent-task limit would hide older tasks in quiet projects.
       const tasks = readTaskCatalog(database, null, titles);
-      const state = await this.projectState();
+      const state = await this.projectState(database);
       try { return assignTaskProjects(tasks, state); }
       catch { return assignTaskProjects(tasks, null); }
     } catch (error) {
@@ -82,14 +82,21 @@ export class LocalDesktopCatalog {
     return desktopProjects(state);
   }
 
-  private async projectState(): Promise<IpcObject | null> {
+  private async projectState(database?: Database): Promise<IpcObject | null> {
+    let legacy: IpcObject | null = null;
     try {
       const value: unknown = JSON.parse(await readFile(path.join(this.codexHome, ".codex-global-state.json"), "utf8"));
-      return isObject(value) ? value : null;
+      legacy = isObject(value) ? value : null;
     } catch (error) {
       // A CLI-only home has no desktop project settings. An unreadable existing
       // file leaves membership unknown, while its tasks remain available in All.
-      return isObject(error) && error.code === "ENOENT" ? {} : null;
+      legacy = isObject(error) && error.code === "ENOENT" ? {} : null;
     }
+    let opened: Database | undefined;
+    try {
+      const db = database ?? (opened = new DatabaseConstructor(path.join(this.codexHome, "state_5.sqlite"), { readonly: true, fileMustExist: true }));
+      return readDesktopProjectState(db, legacy, this.codexHome);
+    } catch { return null; }
+    finally { opened?.close(); }
   }
 }

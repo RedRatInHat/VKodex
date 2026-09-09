@@ -13,6 +13,7 @@ export interface RuntimeHealthState {
   readonly connectedBindings: number;
   readonly requiredBindings: number;
   readonly connectedRequiredBindings: number;
+  readonly failedBindings?: number;
 }
 
 const severity: Record<HealthState, number> = { ok: 0, degraded: 1, failed: 2 };
@@ -118,6 +119,16 @@ export class BridgeHealthMonitor {
     const connectedState: HealthState = runtime.connectedRequiredBindings < runtime.requiredBindings ? "degraded" : "ok";
     checks.push({ name: "codex_streams", state: connectedState,
       detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}. Остальные беседы подключатся при активности.` });
+    const failedTasks = runtime.failedBindings ?? 0;
+    checks.push({ name: "codex_tasks", state: failedTasks ? "degraded" : "ok",
+      detail: failedTasks ? `Задач с ошибкой Codex: ${failedTasks}. Проверь /menu и /limits в соответствующей беседе. Это состояние задач, а не обрыв VK.` : "У подключённых задач нет подтверждённых системных ошибок Codex." });
+
+    const transfers = this.store.transfers().filter(record => !["complete", "cancelled"].includes(record.phase));
+    const blockedTransfers = transfers.filter(record => record.blocked || record.version !== 2);
+    const staleTransfers = transfers.filter(record => checkedAt - (record.updatedAt ?? record.startedAt) > 15 * 60_000);
+    const failedTransfers = transfers.some(record => record.version === 2 && (record.blocked || staleTransfers.includes(record)));
+    checks.push({ name: "task_transfers", state: failedTransfers ? "failed" : transfers.length ? "degraded" : "ok",
+      detail: transfers.length ? `Незавершённых переносов: ${transfers.length}; требуют проверки: ${blockedTransfers.length}; без прогресса более 15 мин: ${staleTransfers.length}. Этапы и причины доступны через /menu соответствующей задачи.` : "Незавершённых переносов нет." });
 
     const [vkResult, catalogResult, goalsResult, compatibilityResult] = await Promise.all([
       this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt),

@@ -1,4 +1,4 @@
-import { DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, type TaskRef } from "./contracts.js";
+import { DesktopRequestRejectedError, DesktopUnavailableError, TaskConnectionLostError, TaskNotOpenError, type TaskRef } from "./contracts.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { RevisionedState } from "./state.js";
 import { sameRolloutSource } from "./paths.js";
@@ -12,6 +12,8 @@ export class TaskSubscription {
   private disconnect: (() => void) | null = null;
   private closed = true;
   private recovering = false;
+  private lastFailure: Error | null = null;
+  private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private sourceVerified = false;
   private sourceRefreshRequested = false;
   private sourceProblem: "missing" | "mismatch" | null = null;
@@ -24,14 +26,43 @@ export class TaskSubscription {
     readonly task: TaskRef,
     private readonly onState: (state: IpcObject, initial: boolean) => void,
     private readonly onError: (error: Error) => void,
+    private readonly notifyOwnerOnClose = true,
   ) {}
 
-  get current(): IpcObject | null { return this.state.current; }
+  get current(): IpcObject | null { return this.recovering || this.sourceRefreshRequested ? null : this.state.current; }
   get owner(): string | null { return this.ownerId; }
+  get failure(): Error | null { return this.lastFailure; }
+
+  private async discoverOwner(timeoutMs: number): Promise<string> {
+    let reply: IpcObject;
+    try {
+      reply = await this.client.request("thread-owner-discovery", 1, {
+        hostId: this.task.hostId, conversationId: this.task.threadId,
+      }, { timeoutMs });
+    } catch (error) {
+      if (error instanceof DesktopRequestRejectedError && error.reason === "no-client-found") throw new TaskNotOpenError();
+      throw error;
+    }
+    if (typeof reply.handledByClientId !== "string") throw new TaskNotOpenError();
+    return reply.handledByClientId;
+  }
+
+  /** The IPC broker can survive a renderer/app restart. Its open socket alone
+   * does not prove that the owner of this particular task still exists. */
+  async verifyOwner(timeoutMs = 5_000): Promise<void> {
+    const generation = this.generation;
+    const owner = this.ownerId;
+    if (this.closed || !owner) throw new DesktopUnavailableError();
+    const currentOwner = await this.discoverOwner(timeoutMs);
+    if (this.closed || this.generation !== generation || this.ownerId !== owner) throw new DesktopUnavailableError();
+    if (currentOwner !== owner) throw new DesktopUnavailableError("Обработчик задачи в Codex сменился. Восстанавливаю подписку.");
+  }
 
   async start(timeoutMs = 5_000): Promise<void> {
     if (!this.closed) throw new Error("Subscription is already active");
     this.closed = false;
+    this.recovering = false;
+    this.lastFailure = null;
     this.sourceVerified = false;
     this.sourceRefreshRequested = false;
     this.sourceProblem = null;
@@ -42,21 +73,9 @@ export class TaskSubscription {
     try {
       await this.client.connect();
       checkActive();
-      let reply: IpcObject;
-      try {
-        reply = await this.client.request("thread-owner-discovery", 1, {
-          hostId: this.task.hostId, conversationId: this.task.threadId,
-        }, { timeoutMs });
-      } catch (error) {
-        // Current Codex builds may reject discovery for a known but unloaded
-        // task instead of returning an unhandled response. Discovery is read-only,
-        // so classifying this as not open safely enables the SDK fallback.
-        if (error instanceof DesktopRequestRejectedError) throw new TaskNotOpenError();
-        throw error;
-      }
+      const owner = await this.discoverOwner(timeoutMs);
       checkActive();
-      if (typeof reply.handledByClientId !== "string") throw new TaskNotOpenError();
-      this.ownerId = reply.handledByClientId;
+      this.ownerId = owner;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.close(this.sourceProblem ? this.sourceError() : new DesktopUnavailableError("Не получено состояние задачи."));
@@ -65,8 +84,9 @@ export class TaskSubscription {
         this.cancelStart = error => { clearTimeout(timer); reject(error); };
         this.disconnect = this.client.onDisconnect(error => {
           clearTimeout(timer);
-          this.close(error);
-          if (ready) this.onError(error); else reject(error);
+          const failure = new TaskConnectionLostError(error.message);
+          this.close(failure);
+          if (ready) this.onError(failure); else reject(failure);
         });
         this.unsubscribe = this.client.onBroadcast((message) => {
           if (this.closed || message.sourceClientId !== this.ownerId || message.method !== "thread-stream-state-changed") return;
@@ -79,6 +99,10 @@ export class TaskSubscription {
             if (ready) this.onError(error); else reject(error);
             return;
           }
+          // Patches already in flight cannot repair a missing base revision.
+          // Wait for the requested snapshot instead of treating each patch as
+          // a second recovery failure or accepting an unverified source.
+          if ((this.recovering || this.sourceRefreshRequested) && isObject(params.change) && params.change.type === "patches") return;
           try {
             const initial = this.state.current === null;
             const state = this.state.accept(params.change, candidate => {
@@ -86,6 +110,7 @@ export class TaskSubscription {
               this.validateSource(candidate);
             });
             this.recovering = false;
+            if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
             this.onState(state, initial);
             if (!ready) { ready = true; clearTimeout(timer); this.cancelStart = null; resolve(); }
           } catch (error) {
@@ -114,6 +139,13 @@ export class TaskSubscription {
             }
             this.recovering = true;
             this.state.reset();
+            if (ready && !this.recoveryTimer) {
+              this.recoveryTimer = setTimeout(() => {
+                this.recoveryTimer = null;
+                const failure = new TaskConnectionLostError("Codex не прислал новый снимок состояния задачи после разрыва последовательности событий.");
+                this.close(failure); this.onError(failure);
+              }, timeoutMs);
+            }
             this.follow(false);
             this.follow(true);
           }
@@ -162,11 +194,18 @@ export class TaskSubscription {
   close(error = new DesktopUnavailableError("Подписка на задачу отменена.")): void {
     if (this.closed) return;
     this.closed = true;
+    this.lastFailure = error;
+    if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
     if (this.sourceTimer) { clearTimeout(this.sourceTimer); this.sourceTimer = null; }
     this.cancelStart?.(error); this.cancelStart = null;
     this.unsubscribe?.(); this.unsubscribe = null;
     this.disconnect?.(); this.disconnect = null;
-    try { this.follow(false); } catch { /* The socket may already be closed. */ }
+    // The desktop owner currently treats following as task-wide rather than
+    // follower-scoped. A short-lived command subscription must therefore leave
+    // following enabled, otherwise closing it also silences the durable mirror.
+    if (this.notifyOwnerOnClose) {
+      try { this.follow(false); } catch { /* The socket may already be closed. */ }
+    }
     this.ownerId = null;
     this.state.reset();
   }

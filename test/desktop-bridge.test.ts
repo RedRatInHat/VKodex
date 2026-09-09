@@ -1,20 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Database } from "better-sqlite3";
+import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { APIError, VK } from "vk-io";
 import type { BridgeChat, BridgeInput, MessageHandle, View } from "../src/bridge/contracts.js";
 import { ChatRateLimitError, MENU_BUTTON } from "../src/bridge/contracts.js";
 import { AccessGate, DeliveryWorker } from "../src/bridge/delivery.js";
 import { TaskManager } from "../src/bridge/manager.js";
+import { TaskTransfers, transferStatus } from "../src/bridge/transfers.js";
+import { ArchiveOwnerRequiredError, TransferConflictError } from "../src/desktop/contracts.js";
+import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
-import { TaskFiles } from "../src/bridge/files.js";
+import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
-import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult } from "../src/desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { taskInput as desktopTaskInput } from "../src/desktop/desktop-tasks.js";
@@ -74,7 +77,7 @@ class Chat implements BridgeChat {
 }
 
 class Desktop implements DesktopTasks {
-  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, accountUsage: true, goals: false, editLastUserTurn: true };
+  capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, transferTask: false, accountUsage: true, usageReset: false, goals: false, editLastUserTurn: true };
   tasks: DesktopTask[] = [task];
   sources = [{ id: "", label: ".codex" }];
   projects: DesktopProject[] = [{ id: "project-a", title: "Project", workspace: "/project" }];
@@ -94,6 +97,9 @@ class Desktop implements DesktopTasks {
   readonly selections: { task: TaskRef; model: string; effort: string }[] = [];
   readonly renames: { task: TaskRef; title: string }[] = [];
   readonly archives: TaskRef[] = [];
+  readonly transfers: TransferTaskRequest[] = [];
+  readonly opened: TaskRef[] = [];
+  readonly moves: { task: TaskRef; projectId: string | null }[] = [];
   goal: TaskGoal | null = null;
   readonly goalUpdates: TaskGoalUpdate[] = [];
   goalClears = 0;
@@ -103,13 +109,17 @@ class Desktop implements DesktopTasks {
   usage: AccountUsage = { planType: "pro", limits: [
     { id: "codex", name: null, primary: { usedPercent: 9, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
     { id: "base_model_inference", name: "gpt-reserve", primary: { usedPercent: 0, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null },
-  ], accountLabel: "owner@example.com", sourceLabel: ".codex", credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
+  ], accountLabel: "owner@example.com", sourceLabel: ".codex", sourceId: "", credits: { hasCredits: false, unlimited: false, balance: "0" }, resetCredits: 0 };
+  readonly usageResets: { task: TaskRef; idempotencyKey: string }[] = [];
+  usageResetOutcome: UsageResetOutcome = "reset";
+  usageResetError: Error | null = null;
   selectError: Error | null = null;
+  inspectError: Error | null = null;
   renameError: Error | null = null;
   liveTitleUpdated = true;
   renameHook: (() => void) | null = null;
   exportHook: (() => void) | null = null;
-  async inspectTask() { return this.details; }
+  async inspectTask(_ref?: TaskRef) { if (this.inspectError) throw this.inspectError; return this.details; }
   async listModels(source?: TaskRef) { this.modelSources.push(source); return this.models; }
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
     if (!this.models.find(item => item.id === model)?.efforts.includes(effort)) throw new ActionRejectedError("Invalid model");
@@ -123,9 +133,19 @@ class Desktop implements DesktopTasks {
     return { liveTitleUpdated: this.liveTitleUpdated };
   }
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
+  async archiveTransferredSource(ref: TaskRef): Promise<void> { await this.archiveTask(ref); }
+  async isTaskArchived(ref: TaskRef): Promise<boolean> { return this.archives.some(task => task.threadId === ref.threadId); }
+  async transferCheckpoint() { return { lastTurnId: "boundary", rolloutPath: "/source.jsonl", size: 1, mtimeMs: 1 }; }
+  async verifyTransferSource(): Promise<void> {}
+  async verifyTransferTarget(): Promise<void> {}
   async exportMarkdown(): Promise<string> { this.exportHook?.(); return "# Fixture\n\nVisible conversation"; }
   async accountUsage(task?: TaskRef): Promise<readonly AccountUsage[]> { this.usageReads++; this.usageTasks.push(task); return [this.usage]; }
-  async getGoal(): Promise<TaskGoal | null> { return this.goal; }
+  async consumeUsageReset(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome> {
+    this.usageResets.push({ task, idempotencyKey });
+    if (this.usageResetError) throw this.usageResetError;
+    return this.usageResetOutcome;
+  }
+  async getGoal(_ref?: TaskRef): Promise<TaskGoal | null> { return this.goal; }
   async setGoal(ref: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
     this.goalUpdates.push(update);
     const previous = this.goal;
@@ -160,8 +180,20 @@ class Desktop implements DesktopTasks {
   async editLastUserTurn(request: EditLastUserTurnRequest) { this.messageEdits.push(request); return { turnId: "replacement-turn", operationId: "replacement-operation" }; }
   async interrupt(ref: TaskRef): Promise<void> { this.stops.push(ref); }
   async moveTask(ref: TaskRef, projectId: string | null): Promise<void> {
+    this.moves.push({ task: ref, projectId });
     this.tasks = this.tasks.map(item => item.threadId === ref.threadId ? { ...item, projectId } : item);
   }
+  async transferTask(request: TransferTaskRequest): Promise<DesktopTask> {
+    this.transfers.push(request);
+    if (request.existingTarget) return request.existingTarget;
+    request.onForkSubmitted?.();
+    const target: DesktopTask = { hostId: "local", threadId: `moved-${request.targetSourceId || "primary"}`, title: request.task.title,
+      workspace: task.workspace, projectId: request.projectId, rolloutPath: `/target/${request.targetSourceId || "primary"}.jsonl`, updatedAt: 20,
+      ...(request.targetSourceId ? { sourceId: request.targetSourceId, sourceLabel: ".codex-work" } : { sourceLabel: ".codex" }) };
+    this.tasks.push(target); request.onForkCreated?.(target); return target;
+  }
+  async ensureOpen(ref: TaskRef): Promise<void> { this.opened.push(ref); }
+  async revealTask(ref: TaskRef): Promise<void> { this.opened.push(ref); }
 }
 
 function setup(t: { after(fn: () => void): void }, enableHealth = false) {
@@ -203,7 +235,7 @@ function assertThinking(text: string, frame: "думаю..." | "думаю.." | 
 async function clickPanel(s: ReturnType<typeof setup>, label: string, peer = peerId): Promise<void> {
   const button = panelView(s, peer).buttons!.find(button => button.label === label);
   assert.ok(button, `Missing button ${label}`);
-  s.advance(); await s.handle("", peer, button.action); s.advance(); await s.worker.flush();
+  s.advance(); await s.handle("", peer, button.action); await s.manager.panels.transfers.idle(); s.advance(); await s.worker.flush();
 }
 
 const settleTitleSync = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
@@ -351,7 +383,7 @@ test("manager load command reports the PC snapshot without reaching a Codex task
 });
 
 test("account limits are available from the manager and task chat without reaching the agent", async t => {
-  const s = setup(t); s.attach(); await s.handle("/menu");
+  const s = setup(t); s.attach(); s.desktop.capabilities.usageReset = true; await s.handle("/menu");
   await clickPanel(s, "Лимиты Codex", access.ownerId);
   assert.equal(s.desktop.usageReads, 1);
   assert.match(panelView(s, access.ownerId).text, /Лимиты Codex[\s\S]*Каталог: \.codex[\s\S]*Аккаунт: owner@example\.com[\s\S]*Тариф: pro[\s\S]*7 дн\.: использовано 9\.0% · осталось 91\.0%/u);
@@ -365,6 +397,30 @@ test("account limits are available from the manager and task chat without reachi
   assert.equal(s.desktop.usageTasks[2]!.threadId, task.threadId);
   assert.match(panelView(s).text, /Заполнение контекста конкретной задачи/u);
   await clickPanel(s, "Меню"); assert.match(panelView(s).text, /Контекст:/u);
+});
+
+test("usage reset requires confirmation and safely retries an uncertain response", async t => {
+  const s = setup(t); s.attach();
+  s.desktop.capabilities.usageReset = true;
+  s.desktop.usage = { ...s.desktop.usage, resetCredits: 2 };
+  await s.handle("/limits", peerId);
+  assert.deepEqual(panelView(s).buttons!.map(button => button.label), ["Сбросить лимит", "Обновить лимиты", "Меню"]);
+  await clickPanel(s, "Сбросить лимит");
+  assert.match(panelView(s).text, /Аккаунт: owner@example\.com[\s\S]*Доступно кредитов: 2[\s\S]*Операция необратима/u);
+
+  s.desktop.usageResetError = new UncertainActionError();
+  await clickPanel(s, "Сбросить лимит");
+  assert.match(panelView(s).text, /Неизвестно, был ли списан кредит[\s\S]*прежний idempotency key/u);
+  assert.equal(s.desktop.usageResets.length, 1);
+  const operationId = s.desktop.usageResets[0]!.idempotencyKey;
+  assert.match(operationId, /^[0-9a-f-]{36}$/u);
+
+  s.desktop.usageResetError = null; s.desktop.usageResetOutcome = "alreadyRedeemed";
+  await clickPanel(s, "Проверить тот же запрос");
+  assert.equal(s.desktop.usageResets.length, 2);
+  assert.equal(s.desktop.usageResets[1]!.idempotencyKey, operationId);
+  assert.equal(s.desktop.usageResets[1]!.task.threadId, task.threadId);
+  assert.match(panelView(s).text, /второй кредит не списан[\s\S]*Лимиты Codex/u);
 });
 
 test("task goals can be inspected, budgeted, paused, resumed and cleared without becoming prompts", async t => {
@@ -431,6 +487,25 @@ test("task card only refreshes on request and never replaces an open model choos
   assert.deepEqual(panelView(s), chooser);
 });
 
+test("menu remains usable offline and invalidates a former mutation confirmation", async t => {
+  const s = setup(t); s.attach();
+  await s.handle("/menu", peerId); await clickPanel(s, "Архивировать");
+  const staleAction = panelView(s).buttons!.find(button => button.label === "Архивировать")!.action;
+  s.desktop.inspectError = new TaskNotOpenError();
+  await s.handle("/menu", peerId);
+  const menu = panelView(s);
+  assert.match(menu.text, /Нет связи с задачей/u);
+  assert.match(menu.text, /\/open/u);
+  assert.ok(menu.buttons!.some(button => button.label === "Открыть в Codex"));
+  assert.equal(s.desktop.opened.length, 0);
+  await s.handle("", peerId, staleAction);
+  assert.equal(s.desktop.archives.length, 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /устарело/u);
+  s.desktop.inspectError = null;
+  await s.handle("/menu", peerId);
+  assert.match(panelView(s).text, /Ожидает сообщения/u);
+});
+
 test("ticks, snapshots and restarts never open or revive menus", async t => {
   const s = setup(t); const binding = s.attach();
   s.manager.panels.observe(binding.id, s.desktop.details);
@@ -464,8 +539,8 @@ test("project move option persists the selected project without creating a task"
   const s = setup(t); const binding = s.attach();
   s.desktop.projects.push({ id: "project-b", title: "Second project", workspace: "/other" });
   await s.handle("/menu", peerId);
-  assert.ok(panelView(s).buttons!.length <= 12);
-  await clickPanel(s, "Переместить в проект");
+  assert.ok(panelView(s).buttons!.length <= 10);
+  await clickPanel(s, "Переместить"); await clickPanel(s, "В проект");
   assert.match(panelView(s).text, /Second project/u);
   await clickPanel(s, "Second project");
   assert.equal(s.desktop.tasks[0]!.projectId, "project-b");
@@ -675,6 +750,401 @@ test("expired rename draft never leaks the intended title to the agent", async t
   assert.equal(s.desktop.submissions.length, 0); assert.equal(s.desktop.renames.length, 0);
 });
 
+test("catalog transfer keeps the VK conversation, retargets streaming and archives the source", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Переместить");
+  await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+  await clickPanel(s, "Без проекта");
+  // The App Server transfer contract validates the last terminal turn itself;
+  // an unloaded or failed source must not depend on a live desktop snapshot.
+  s.desktop.inspectTask = async ref => { assert.notEqual(ref?.threadId, original.threadId); return s.desktop.details; };
+  await clickPanel(s, "Перенести");
+
+  const moved = s.store.byPeer(peerId)!;
+  assert.equal(moved.id, original.id); assert.equal(moved.threadId, "moved-work"); assert.equal(moved.sourceId, "work");
+  assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.opened.length, 1);
+  assert.equal(s.desktop.archives.length, 1); assert.equal(s.desktop.archives[0]!.threadId, task.threadId);
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+  assert.equal(s.store.getValue(`projection:${original.id}`), null);
+  assert.equal(s.store.streamGeneration(original.id), 2);
+});
+
+test("catalog transfer reapplies the target project after opening its Codex client", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [{ id: "work-project", title: "Target project", workspace: "/project" }] };
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Переместить");
+  await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+  await clickPanel(s, "Target project");
+  await clickPanel(s, "Перенести");
+
+  assert.equal(s.desktop.opened.length, 1);
+  assert.deepEqual(s.desktop.moves, [{ task: s.desktop.opened[0]!, projectId: "work-project" }]);
+  assert.equal(s.store.transfer(original.id)!.target?.projectId, "work-project");
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+});
+
+test("a switched transfer retries only source archiving and completes", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  let rejectArchive = true;
+  s.desktop.archiveTask = async ref => {
+    if (rejectArchive) throw new ActionRejectedError("source busy");
+    s.desktop.archives.push(ref); s.desktop.tasks = s.desktop.tasks.filter(task => task.threadId !== ref.threadId);
+  };
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Без проекта"); await clickPanel(s, "Перенести");
+  assert.equal(s.store.byPeer(peerId)!.threadId, "moved-work");
+  assert.equal(s.store.transfer(original.id)!.phase, "switched");
+  await s.handle("/menu", peerId);
+  assert.ok(panelView(s).buttons?.some(button => button.label === "Повторить архивацию"));
+  await s.handle("/menu", peerId);
+  assert.match(panelView(s).text, /Не завершена архивация источника/u);
+  assert.match(panelView(s).text, /source busy/u);
+  rejectArchive = false;
+  s.desktop.tasks = s.desktop.tasks.map(task => task.threadId === "moved-work" ? { ...task, projectId: "wrong-project" } : task);
+  await clickPanel(s, "Повторить архивацию");
+  await s.handle("/menu", peerId);
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.desktop.archives.length, 1);
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+  assert.equal(panelView(s).buttons?.some(button => button.label === "Повторить архивацию"), false);
+  assert.doesNotMatch(panelView(s).text, /source busy/u);
+});
+
+test("a reverse transfer cannot overwrite a legacy operation without a saved boundary", async t => {
+  const s = setup(t); const current = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  const oldSource: DesktopTask = { ...task, threadId: "old-work", sourceId: "work", sourceLabel: ".codex-work", projectId: null };
+  s.desktop.tasks.push(oldSource);
+  s.store.markTransfer({
+    id: "previous-transfer", bindingId: current.id, startedAt: 1, source: oldSource,
+    targetSourceId: "", targetProjectId: "project-a", phase: "switched", target: task,
+    detail: "source was busy",
+  });
+
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Без проекта"); await clickPanel(s, "Перенести");
+
+  assert.equal(s.store.byPeer(peerId)!.threadId, task.threadId);
+  assert.equal(s.desktop.archives.length, 0);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.transfer(current.id)!.id, "previous-transfer");
+});
+
+test("a rejected transfer retains its fork and offers a recovery action instead of starting over", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  const target = { ...task, threadId: "existing-fork", sourceId: "work", sourceLabel: ".codex-work", projectId: null };
+  s.desktop.tasks.push(target);
+  const record = { id: "original-operation", bindingId: binding.id, startedAt: 1, source: task, targetSourceId: "work", targetProjectId: null, phase: "failed" as const,
+    version: 2 as const, checkpoint: await s.desktop.transferCheckpoint(), goal: null };
+  s.store.markTransfer(record);
+  let attempts = 0;
+  s.desktop.transferTask = async request => {
+    attempts++; assert.equal(request.operationId, record.id);
+    if (attempts === 1) {
+      request.onForkCreated?.(target);
+      throw new ActionRejectedError("metadata failed after fork");
+    }
+    assert.equal(request.existingTarget?.threadId, target.threadId);
+    return target;
+  };
+  await s.handle("/menu", peerId); await clickPanel(s, "Продолжить перенос");
+  assert.equal(s.store.transfer(binding.id)?.phase, "preparingTarget");
+  assert.equal(s.store.transfer(binding.id)?.target?.threadId, target.threadId);
+  assert.equal(s.store.byPeer(peerId)!.threadId, task.threadId);
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Продолжить перенос");
+  assert.equal(s.store.transfer(binding.id)?.phase, "complete");
+  assert.equal(s.store.byPeer(peerId)!.threadId, target.threadId);
+  assert.equal(s.desktop.archives.length, 1);
+});
+
+function transferFixture(s: ReturnType<typeof setup>) {
+  const binding = s.attach();
+  return { id: "durable-transfer", bindingId: binding.id, startedAt: s.now(), source: { ...task },
+    targetSourceId: "work", targetProjectId: null, phase: "forking" as const };
+}
+
+test("background transfer retains its lock while the handler, manager and other conversations remain usable", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  const original = s.desktop.transferTask.bind(s.desktop);
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  s.desktop.transferTask = async request => { calls++; entered(); await released; return original(request); };
+  transfers.start(record); await started;
+  transfers.resume(record.bindingId); transfers.tick();
+  const secondWorker = new TaskTransfers(s.store, s.desktop, s.now);
+  secondWorker.tick(); await secondWorker.idle();
+  await s.handle("/help");
+  await s.handle("Do not send this to the old source", peerId);
+  assert.equal(calls, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.ok(s.chat.sent.some(message => message.peerId === access.ownerId && message.view.text.includes("команды менеджера")));
+  assert.ok(s.chat.sent.some(message => message.peerId === peerId && message.view.text.includes("задача переносится")));
+  release(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+});
+
+test("a stopped executor resumes its saved target after client recovery without another fork or foreground launch", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let unavailable = true;
+  s.desktop.ensureOpen = async ref => { s.desktop.opened.push(ref); if (unavailable) throw new TaskNotOpenError(); };
+  const first = new TaskTransfers(s.store, s.desktop, s.now);
+  first.start(record); await first.idle(); await first.stop();
+  const pending = s.store.transfer(record.bindingId)!;
+  assert.equal(pending.phase, "targetCreated"); assert.equal(pending.launchAttempted, true);
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+  unavailable = false; s.advance(30_000);
+  const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+  restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.opened.length, 1);
+});
+
+test("a changed source snapshot blocks switching and archival instead of hiding newer work", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let checks = 0;
+  s.desktop.verifyTransferSource = async () => { if (++checks === 2) throw new TransferConflictError("source advanced"); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+  assert.equal(s.desktop.archives.length, 0);
+  assert.equal(s.store.transfer(record.bindingId)?.blocked, true);
+  s.advance(900_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("source archival retries autonomously and ignores absence from a broken display catalog", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let failing = true;
+  const archive = s.desktop.archiveTask.bind(s.desktop);
+  s.desktop.archiveTransferredSource = async ref => { if (failing) throw new TaskNotOpenError(); await archive(ref); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  s.desktop.tasks = []; s.advance(30_000);
+  transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  failing = false; s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.archives.length, 1);
+});
+
+test("goal transfer preserves objective, remaining budget and accounting without activating two agents", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const sourceGoal: TaskGoal = { threadId: task.threadId, objective: "Finish the requested fixture", status: "active", tokenBudget: 100_000,
+    tokensUsed: 60_000, timeUsedSeconds: 120, createdAt: 1, updatedAt: 2 };
+  const goals = new Map<string, TaskGoal>([[task.threadId, sourceGoal]]);
+  const writes: { threadId: string; update: TaskGoalUpdate }[] = [];
+  let loseReply = true;
+  s.desktop.getGoal = async ref => goals.get(ref!.threadId) ?? null;
+  s.desktop.setGoal = async (ref, update) => {
+    writes.push({ threadId: ref.threadId, update });
+    const next = { ...(goals.get(ref.threadId) ?? { threadId: ref.threadId, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 3, updatedAt: 3 }), ...update } as TaskGoal;
+    goals.set(ref.threadId, next);
+    if (ref.threadId !== task.threadId && loseReply) { loseReply = false; throw new UncertainActionError(); }
+    return next;
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+  s.advance(30_000); transfers.tick(); await transfers.idle();
+  const moved = s.store.byPeer(peerId)!;
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.deepEqual(writes, [{ threadId: task.threadId, update: { status: "paused" } },
+    { threadId: moved.threadId, update: { objective: sourceGoal.objective, tokenBudget: 40_000, status: "paused" } }]);
+  const saved = s.store.getValue<{ tokensUsed: number; timeUsedSeconds: number }>(`transferred-goal:${JSON.stringify([moved.hostId, moved.threadId, moved.sourceId])}`)!;
+  assert.equal(saved.tokensUsed, 60_000); assert.equal(saved.timeUsedSeconds, 120);
+  assert.equal(s.desktop.goalContinuations, 0);
+});
+
+test("legacy unfinished transfers are reported but never automatically replayed", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.markTransfer({ ...record, phase: "preparingTarget" });
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.tick(); await transfers.idle();
+  assert.equal(s.desktop.transfers.length, 0);
+  transfers.resume(record.bindingId); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blocked, true);
+  assert.equal(s.desktop.transfers.length, 0); assert.equal(s.desktop.archives.length, 0);
+});
+
+test("a completed goal stays complete even when its final usage exceeded its budget", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const source: TaskGoal = { threadId: task.threadId, objective: "Completed fixture", status: "complete", tokenBudget: 1000,
+    tokensUsed: 1100, timeUsedSeconds: 5, createdAt: 1, updatedAt: 2 };
+  const goals = new Map([[task.threadId, source]]);
+  s.desktop.getGoal = async ref => goals.get(ref!.threadId) ?? null;
+  s.desktop.setGoal = async (ref, update) => {
+    const goal = { ...source, ...update, threadId: ref.threadId, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 3 };
+    goals.set(ref.threadId, goal); return goal;
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const target = s.store.transfer(record.bindingId)!.target!;
+  assert.equal(goals.get(target.threadId)?.status, "complete");
+  assert.equal(s.desktop.goalContinuations, 0);
+});
+
+test("an owner-held archive is not retried; read-only confirmation completes it after restart", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let archiveCalls = 0; let reads = 0;
+  s.desktop.archiveTransferredSource = async () => { archiveCalls++; throw new ArchiveOwnerRequiredError(); };
+  const archived = s.desktop.isTaskArchived.bind(s.desktop);
+  s.desktop.isTaskArchived = async ref => { reads++; return archived(ref); };
+  const first = new TaskTransfers(s.store, s.desktop, s.now);
+  first.start(record); await first.idle(); await first.stop();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, "archiveOwner");
+  assert.equal(s.store.transferBlocksInput(record.bindingId), false);
+  const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+  restarted.tick(); await restarted.idle(); const firstReads = reads;
+  restarted.tick(); await restarted.idle(); assert.equal(reads, firstReads);
+  s.advance(60_000); restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  s.desktop.archives.push(task); s.advance(60_000); restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(archiveCalls, 1); assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.store.transfer(record.bindingId)?.attempt, 1);
+});
+
+test("archive confirmation does not close a transfer after its goal or binding changes", async t => {
+  for (const change of ["goal", "binding"] as const) {
+    const s = setup(t); const record = transferFixture(s);
+    s.desktop.archiveTransferredSource = async () => { throw new ArchiveOwnerRequiredError(); };
+    const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+    transfers.start(record); await transfers.idle();
+    s.desktop.archives.push(task);
+    if (change === "goal") s.desktop.goal = { threadId: task.threadId, objective: "New goal", status: "paused", tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+    else {
+      const originalGet = s.store.getBinding.bind(s.store);
+      s.store.getBinding = id => { const value = originalGet(id); return value ? { ...value, threadId: "different-target" } : value; };
+    }
+    transfers.tick(); await transfers.idle();
+    assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  }
+});
+
+test("legacy switched records reconcile only native archived sources without inventing a history checkpoint", async t => {
+  const s = setup(t); const binding = s.attach();
+  const oldSource = { ...task, threadId: "archived-source", sourceId: "work" };
+  s.store.markTransfer({ id: "legacy-switched", bindingId: binding.id, startedAt: 1, source: oldSource,
+    target: task, targetSourceId: "", targetProjectId: task.projectId ?? null, phase: "switched" });
+  s.desktop.archives.push(oldSource);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.resume(binding.id); await transfers.idle();
+  const reconciled = s.store.transfer(binding.id)!;
+  assert.equal(reconciled.phase, "complete"); assert.equal(reconciled.legacyReconciled, true);
+  assert.equal(reconciled.checkpoint, undefined);
+  assert.match(transferStatus(reconciled), /Граница старой истории не была записана/u);
+  assert.equal(s.desktop.transfers.length, 0); assert.equal(s.desktop.opened.length, 0);
+  assert.equal(s.desktop.archives.length, 1);
+});
+
+test("cancelling a blocked pre-commit transfer releases input without deleting the saved copy", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.desktop.ensureOpen = async () => { throw new TaskNotOpenError(); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transferBlocksInput(record.bindingId), true);
+  const target = s.store.transfer(record.bindingId)!.target;
+  transfers.cancel(record.bindingId);
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "cancelled");
+  assert.equal(s.store.transfer(record.bindingId)?.target?.threadId, target?.threadId);
+  assert.equal(s.store.transferBlocksInput(record.bindingId), false);
+  await s.handle("Continue the original", peerId);
+  assert.equal(s.desktop.submissions.at(-1)?.task.threadId, task.threadId);
+  assert.equal(s.desktop.archives.length, 0);
+});
+
+test("repeated recoverable errors use bounded backoff and never cycle the foreground window", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.desktop.ensureOpen = async ref => { s.desktop.opened.push(ref); throw new TaskNotOpenError(); };
+  s.desktop.inspectError = new TaskNotOpenError();
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const firstRetryAt = s.store.transfer(record.bindingId)!.retryAt!;
+  transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.attempt, 1);
+  for (let attempt = 2; attempt <= 8; attempt++) {
+    s.advance(700_000); transfers.tick(); await transfers.idle();
+  }
+  const blocked = s.store.transfer(record.bindingId)!;
+  assert.ok(firstRetryAt > record.startedAt); assert.equal(blocked.blocked, true);
+  assert.equal(blocked.attempt, 8); assert.equal(s.desktop.opened.length, 1);
+  assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.archives.length, 0);
+});
+
+test("late transfer callbacks cannot overwrite a newer revision or a later operation", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.beginTransfer(record);
+  const current = s.store.updateTransfer(record, { step: "snapshot" }, s.now());
+  assert.throws(() => s.store.updateTransfer(record, { step: "archive" }), /Stale/u);
+  const completed = s.store.updateTransfer(current, { phase: "complete" }, s.now());
+  s.store.beginTransfer({ ...record, id: "later-operation" });
+  assert.throws(() => s.store.updateTransfer(completed, { phase: "switched" }), /Stale/u);
+  assert.equal(s.store.getValue<{ phase: string }>(`transfer-operation:${record.id}`)?.phase, "complete");
+});
+
+test("transfer revision reads reserve the writer before another connection can commit", async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-writer-"));
+  const file = path.join(directory, "state.sqlite");
+  const store = new BridgeStore(file); t.after(() => store.close());
+  const other = new DatabaseConstructor(file); t.after(() => other.close());
+  other.pragma("busy_timeout = 0");
+  const binding = store.ensureBinding(task);
+  store.beginTransfer({ id: "writer-op", bindingId: binding.id, source: task, startedAt: 1,
+    targetSourceId: "work", targetProjectId: null, phase: "forking", version: 2 });
+  const key = `transfer:${binding.id}`;
+  store.atomic(() => {
+    const current = store.transfer(binding.id)!;
+    assert.throws(() => other.prepare("UPDATE bridge_values SET value = ? WHERE key = ?")
+      .run(JSON.stringify({ ...current, revision: 999 }), key), { code: "SQLITE_BUSY" });
+    store.updateTransfer(current, { step: "snapshot" });
+  });
+  const saved = JSON.parse((other.prepare("SELECT value FROM bridge_values WHERE key = ?").get(key) as { value: string }).value);
+  assert.equal(saved.step, "snapshot");
+  assert.equal(saved.revision, 1);
+});
+
+test("transfer checkpoints and leases survive reopening SQLite; only a dead owner can be replaced", async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-journal-"));
+  const file = path.join(directory, "state.sqlite");
+  const first = new BridgeStore(file);
+  const binding = first.ensureBinding(task);
+  const record = { id: "persisted-op", bindingId: binding.id, source: task, startedAt: 1,
+    targetSourceId: "work", targetProjectId: null, phase: "forking" as const, version: 2 as const,
+    checkpoint: { lastTurnId: "persisted-boundary", rolloutPath: "/source.jsonl", size: 100, mtimeMs: 2 }, forkSubmitted: true };
+  first.beginTransfer(record);
+  first.claimTransfer(record, "old-owner", 123, () => true);
+  first.close();
+  const reopened = new BridgeStore(file); t.after(() => reopened.close());
+  const restored = reopened.transfer(binding.id)!;
+  assert.equal(restored.checkpoint?.lastTurnId, "persisted-boundary");
+  assert.equal(restored.forkSubmitted, true);
+  assert.equal(reopened.claimTransfer(restored, "new-owner", 124, () => true), null);
+  const claimed = reopened.claimTransfer(restored, "new-owner", 124, () => false)!;
+  assert.equal(claimed.lease?.owner, "new-owner");
+  assert.equal(claimed.forkSubmitted, true);
+});
+
 test("archive requires confirmation, rechecks current status, and only detaches after success", async t => {
   const s = setup(t); const binding = s.attach();
   await s.handle("/menu", peerId); await clickPanel(s, "Архивировать");
@@ -858,6 +1328,18 @@ test("a newly created chat is linked immediately and always returns its invite l
   await s.handle("", access.ownerId, action);
   assert.equal(s.chat.creates, 1);
   assert.equal(s.chat.memberReads, 0);
+  assert.equal(s.desktop.opened.length, 1, "reopening the VK binding must not focus Codex again");
+});
+
+test("ordinary task messages never open Codex, while /open is an explicit foreground action", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.markDesktopHandoff(binding.id, binding, "live");
+  await s.handle("continue in background", peerId);
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.desktop.opened.length, 0);
+  await s.handle("/open", peerId);
+  assert.equal(s.desktop.opened.length, 1);
+  assert.equal(s.desktop.submissions.length, 1);
 });
 
 test("failed invitation lookup preserves the chat and permits retry without recreation", async t => {
@@ -1814,7 +2296,7 @@ test("files enter the same task and completed output is uploaded once across ret
   const request = s.desktop.submissions[0]!; assert.equal(request.task.threadId, task.threadId);
   assert.equal(await readFile(request.inputFiles![0]!.path, "utf8"), "source bytes");
   await writeFile(path.join(request.outboxDir!, "reply.txt"), "result bytes");
-  files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
+  files.observe(binding.id, "idle", "submitted-turn"); await files.tick(); await s.worker.flush();
   assert.equal(s.chat.binaryUploads.length, 1); assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "result bytes");
   assert.deepEqual(s.chat.sent[0]!.view.attachments, ["doc-202_1"]); assert.equal(s.chat.sent[0]!.peerId, peerId);
   await files.collect(binding, true); s.store.recover(); const restored = new TaskFiles(root, s.store, s.chat, s.gate);
@@ -1823,6 +2305,79 @@ test("files enter the same task and completed output is uploaded once across ret
   await manager.handle(s.input("/files", peerId)); await s.worker.flush();
   assert.equal(s.chat.binaryUploads.length, 2); assert.match(s.chat.sent.at(-1)!.view.text, /файлов: 1/u);
   assert.equal(s.desktop.submissions.length, 1);
+});
+
+test("large VK documents stream to disk and incomplete oversized downloads are removed", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stream-test-"));
+  const target = path.join(root, "streamed.bin");
+  t.mock.method(globalThis, "fetch", async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.enqueue(new Uint8Array([4, 5]));
+      controller.close();
+    },
+  })));
+  assert.equal(await downloadVkFileToPath("https://sun1.userapi.com/file", target, 5), 5);
+  assert.deepEqual(await readFile(target), Buffer.from([1, 2, 3, 4, 5]));
+
+  const oversized = path.join(root, "oversized.bin");
+  await assert.rejects(downloadVkFileToPath("https://sun1.userapi.com/file", oversized, 4), /лимит размера/u);
+  await assert.rejects(readFile(oversized), /ENOENT/u);
+});
+
+test("VK document viewer pages resolve their temporary CDN file instead of becoming corrupt attachments", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stream-test-"));
+  const target = path.join(root, "video.mp4"); let requests = 0;
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+    requests++;
+    if (String(input).startsWith("https://vk.ru/doc")) return new Response(
+      '<script>Docs.initDoc({"docOwnerId":1,"docId":2,"docSize":5,"docUrl":"https:\\/\\/psv4.vkuserphoto.ru\\/video"})</script>',
+      { headers: { "content-type": "text/html; charset=windows-1251" } });
+    return new Response(new Uint8Array([0, 0, 0, 1, 2]), { headers: { "content-type": "video/mp4" } });
+  });
+  assert.equal(await downloadVkFileToPath("https://vk.ru/doc1_2?hash=fixture", target, 10, 1_000, 5), 5);
+  assert.equal(requests, 2);
+  assert.deepEqual(await readFile(target), Buffer.from([0, 0, 0, 1, 2]));
+});
+
+test("expired VK document pages and size mismatches never reach Codex as named files", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stream-test-"));
+  const expired = path.join(root, "expired.mp4");
+  const mock = t.mock.method(globalThis, "fetch", async () => new Response(
+    '<script>Docs.initDoc({"docSize":160000000,"docUrl":"\\/err404.php"})</script>',
+    { headers: { "content-type": "text/html" } }));
+  await assert.rejects(downloadVkFileToPath("https://vk.ru/doc1_2", expired, 200 * 1024 * 1024), /уже недоступна/u);
+  await assert.rejects(readFile(expired), /ENOENT/u);
+  mock.mock.restore();
+
+  const truncated = path.join(root, "truncated.mp4");
+  t.mock.method(globalThis, "fetch", async () => new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "video/mp4" } }));
+  await assert.rejects(downloadVkFileToPath("https://psv4.vkuserphoto.ru/video", truncated, 10, 1_000, 5), /неполное или неверное/u);
+  await assert.rejects(readFile(truncated), /ENOENT/u);
+});
+
+test("a failed streamed download never removes a pre-existing inbox file", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stream-test-"));
+  const target = path.join(root, "existing.bin");
+  await writeFile(target, "keep me");
+  t.mock.method(globalThis, "fetch", async () => new Response("replacement"));
+  await assert.rejects(downloadVkFileToPath("https://sun1.userapi.com/file", target, 100), /Не удалось скачать/u);
+  assert.equal(await readFile(target, "utf8"), "keep me");
+});
+
+test("a stale idle snapshot cannot collect a new turn's outbox before that exact turn finishes", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "operation", []);
+  files.finish(binding.id, "operation", false, "accepted-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
+
+  files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 0);
+
+  files.observe(binding.id, "idle", "accepted-turn"); await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "result");
 });
 
 test("an invalid old outbox does not block files from newer turns", async t => {
@@ -1869,10 +2424,21 @@ test("config accepts one owner and never includes private values in validation e
   const env = { VK_GROUP_TOKEN: "private-token-fixture", VK_GROUP_ID: "202", VK_OWNER_ID: "private-id-fixture" };
   assert.throws(() => loadDesktopBridgeConfig(env), error => error instanceof Error && !error.message.includes("private-id-fixture") && !error.message.includes("private-token-fixture"));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101,102" }));
-  assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101" }).access.ownerId, 101);
+  const defaults = loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101" });
+  assert.equal(defaults.access.ownerId, 101);
+  assert.deepEqual(defaults.inboundFileLimits, {
+    maxFiles: 10,
+    maxFileBytes: 200 * 1024 * 1024,
+    maxTotalBytes: 200 * 1024 * 1024,
+    timeoutMs: 600_000,
+  });
+  assert.deepEqual(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", MAX_INBOUND_FILES: "2", MAX_INBOUND_FILE_BYTES: "1048576", MAX_INBOUND_TOTAL_BYTES: "2097152", DOWNLOAD_TIMEOUT_MS: "90000" }).inboundFileLimits,
+    { maxFiles: 2, maxFileBytes: 1_048_576, maxTotalBytes: 2_097_152, timeoutMs: 90_000 });
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "30000" }).healthIntervalMs, 30_000);
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_PROJECTLESS_ROOT: "fixture-workspaces" }).projectlessRoot, path.resolve("fixture-workspaces"));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "29999" }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", MAX_INBOUND_FILE_BYTES: String(200 * 1024 * 1024 + 1) }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", MAX_INBOUND_FILE_BYTES: "2097152", MAX_INBOUND_TOTAL_BYTES: "1048576" }));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_PROJECTLESS_ROOT: "private\u0000path" }), error => error instanceof Error && !error.message.includes("private"));
 });
 

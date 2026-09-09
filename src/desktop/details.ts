@@ -9,6 +9,7 @@ export function taskDetails(state: IpcObject): TaskDetails {
   const turns = turnsFromState(state);
   const activeTurns = activeTurnsFromState(state);
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
+  const systemError = runtimeStatus === "systemError";
   const progressState = inProgressState(state);
   const running = runtimeStatus === "active" || progressState === "live";
   const turn = (running ? activeTurns.at(-1) : undefined) ?? turns.at(-1);
@@ -25,9 +26,11 @@ export function taskDetails(state: IpcObject): TaskDetails {
     ? { used: Math.min(used, window), window, percent: Math.min(100, used / window * 100) } : null;
   const nextModel = string(settings.model) ?? string(state.latestModel);
   const nextEffort = string(settings.effort) ?? string(state.latestReasoningEffort);
+  const error = Array.isArray(turn?.items) ? turn.items.filter(isObject).findLast(item => item.type === "error") : undefined;
   return {
     title: string(state.title),
-    status: Array.isArray(state.requests) && state.requests.length > 0 ? "approval" : running ? "running" : !idleKnown ? "unavailable" : turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "idle",
+    ...(systemError ? { failure: error?.errorInfo === "usageLimitExceeded" ? "usageLimit" as const : "systemError" as const } : {}),
+    status: systemError ? "failed" : Array.isArray(state.requests) && state.requests.length > 0 ? "approval" : running ? "running" : !idleKnown ? "unavailable" : turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "idle",
     workspace: string(state.cwd),
     model: running ? string(mode.model) ?? string(params.model) ?? nextModel : nextModel,
     effort: running ? string(mode.reasoning_effort) ?? string(params.effort) ?? nextEffort : nextEffort,

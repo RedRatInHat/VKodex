@@ -1,13 +1,32 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
+import DatabaseConstructor from "better-sqlite3";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
+import { mirrorLegacyProjectAssignment } from "./projects.js";
+import { comparablePath } from "./paths.js";
+import { closeAppServer } from "./app-server-process.js";
 
-type MetadataMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read";
-const methods = new Set<MetadataMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read"]);
+export type LocalAppServerMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
+const methods = new Set<LocalAppServerMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
+
+function rejectedMetadata(method: LocalAppServerMethod, error: unknown): ActionRejectedError {
+  const message = isObject(error) && typeof error.message === "string" ? error.message : "";
+  if (method === "thread/archive" && /invalid filename/iu.test(message)) {
+    return new ActionRejectedError("Codex не может архивировать задачу: файл её истории имеет нестандартное имя.");
+  }
+  if (method === "thread/archive" && /already has an active writer/iu.test(message)) {
+    return new ArchiveOwnerRequiredError();
+  }
+  if (method === "account/rateLimitResetCredit/consume") {
+    return new ActionRejectedError("Codex отклонил сброс лимита. Обнови /limits и проверь доступные кредиты выбранного аккаунта.");
+  }
+  return new ActionRejectedError("Codex отклонил операцию с метаданными. Проверь состояние задачи в десктопе.");
+}
 
 export function nativeCodexPath(): string {
   const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
@@ -26,8 +45,8 @@ export function nativeCodexPath(): string {
   throw new DesktopUnavailableError("Не найден локальный Codex CLI из зависимостей VKodex.");
 }
 
-// This short-lived process exposes a fixed allowlist of metadata, account and
-// goal methods. It cannot submit arbitrary task input or call turn APIs.
+// This short-lived process exposes a fixed allowlist for metadata, account and
+// goal methods. It cannot submit input or call turn APIs.
 export class MetadataRpc {
   constructor(
     private readonly codexHome: string,
@@ -38,7 +57,7 @@ export class MetadataRpc {
     private readonly timeoutMs = 30_000,
   ) {}
 
-  async call(method: MetadataMethod, params: IpcObject): Promise<IpcObject> {
+  async call(method: LocalAppServerMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
     const mutating = !["thread/read", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
@@ -46,16 +65,15 @@ export class MetadataRpc {
       let buffer = ""; let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
         if (finished) return;
-        finished = true; clearTimeout(timer); child.stdin.end();
-        const killTimer = setTimeout(() => child.kill(), 1_000);
-        killTimer.unref(); child.once("close", () => clearTimeout(killTimer));
-        if (error) reject(error); else resolve(result!);
+        finished = true; clearTimeout(timer);
+        void closeAppServer(child).then(() => { if (error) reject(error); else resolve(result!); },
+          () => reject(submitted && mutating ? new UncertainActionError() : new DesktopUnavailableError("Процесс метаданных Codex не завершился вовремя.")));
       };
       const failed = () => close(submitted && mutating ? new UncertainActionError() : new DesktopUnavailableError("Локальный API метаданных Codex не ответил."));
       const timer = setTimeout(failed, this.timeoutMs);
       const send = (message: IpcObject) => child.stdin.write(`${JSON.stringify(message)}\n`);
       child.stderr.resume();
-      child.on("error", failed); child.on("exit", failed); child.stdin.on("error", failed);
+      child.on("error", failed); child.on("close", failed); child.stdin.on("error", failed);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
         if (finished) return;
@@ -68,7 +86,7 @@ export class MetadataRpc {
           if (!isObject(message)) { failed(); return; }
           if (message.id !== 1 && message.id !== 2) continue;
           if (message.error) {
-            close(new ActionRejectedError("Codex отклонил операцию с метаданными. Проверь состояние задачи в десктопе.")); return;
+            close(rejectedMetadata(method, message.error)); return;
           }
           if (!isObject(message.result)) { failed(); return; }
           if (message.id === 1 && !submitted) {
@@ -136,17 +154,47 @@ export class NativeAccountUsage {
     if (limits.status === "rejected") throw limits.reason;
     return parseAccountUsage(limits.value, account.status === "fulfilled" ? parseAccountLabel(account.value) : null);
   }
+  async consumeReset(idempotencyKey: string): Promise<UsageResetOutcome> {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(idempotencyKey)) {
+      throw new ActionRejectedError("Некорректный идентификатор операции сброса лимита.");
+    }
+    const response = await this.rpc.call("account/rateLimitResetCredit/consume", { idempotencyKey });
+    const outcomes = new Set<UsageResetOutcome>(["reset", "nothingToReset", "noCredit", "alreadyRedeemed"]);
+    if (typeof response.outcome !== "string" || !outcomes.has(response.outcome as UsageResetOutcome)) {
+      throw new UncertainActionError();
+    }
+    return response.outcome as UsageResetOutcome;
+  }
 }
 
 export class ProfileAccountUsage implements AccountUsageProvider {
   constructor(
     private readonly homes: readonly string[],
     private readonly sourceHome: (task: TaskRef) => string,
-    private readonly createReader: (home: string) => Pick<NativeAccountUsage, "read"> = home => new NativeAccountUsage(new MetadataRpc(home)),
+    private readonly createReader: (home: string) => Pick<NativeAccountUsage, "read"> & Partial<Pick<NativeAccountUsage, "consumeReset">> = home => new NativeAccountUsage(new MetadataRpc(home)),
+    private readonly listSources: () => readonly { readonly id: string; readonly label: string }[] = () =>
+      homes.map((home, index) => ({ id: index === 0 ? "" : path.basename(home), label: path.basename(home) })),
   ) {}
+  private source(home: string): { readonly id: string; readonly label: string } | null {
+    for (const source of this.listSources()) {
+      try {
+        if (comparablePath(this.sourceHome({ hostId: "local", threadId: "", ...(source.id ? { sourceId: source.id } : {}) })) === comparablePath(home)) return source;
+      } catch { /* Ignore sources removed during this read. */ }
+    }
+    return null;
+  }
   async read(task?: TaskRef): Promise<readonly AccountUsage[]> {
     const homes = task ? [this.sourceHome(task)] : this.homes;
-    return Promise.all(homes.map(async home => ({ ...await this.createReader(home).read(), sourceLabel: path.basename(home) })));
+    return Promise.all(homes.map(async home => {
+      const source = this.source(home);
+      const sourceId = task?.sourceId ?? source?.id ?? (home === this.homes[0] ? "" : undefined);
+      return { ...await this.createReader(home).read(), sourceLabel: source?.label ?? path.basename(home), ...(sourceId === undefined ? {} : { sourceId }) };
+    }));
+  }
+  async consumeReset(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome> {
+    const reader = this.createReader(this.sourceHome(task));
+    if (!reader.consumeReset) throw new ActionRejectedError("Сброс лимита недоступен в этом подключении.");
+    return reader.consumeReset(idempotencyKey);
   }
 }
 
@@ -180,11 +228,45 @@ export class NativeDesktopMetadata implements DesktopMetadata {
   private local(task: TaskRef): void {
     if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("Метаданные доступны только для локальных задач.");
   }
+  private async currentTitle(task: TaskRef): Promise<string | null> {
+    const response = await this.rpc.call("thread/read", { threadId: task.threadId, includeTurns: false });
+    const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
+    if (!thread) throw new DesktopUnavailableError("Codex вернул другую задачу; изменение имени не подтверждено.");
+    return typeof thread.name === "string" && thread.name.trim() ? thread.name.trim() : null;
+  }
   async rename(task: TaskRef, title: string): Promise<void> {
-    this.local(task); await this.rpc.call("thread/name/set", { threadId: task.threadId, name: title });
+    this.local(task);
+    const write = () => this.rpc.call("thread/name/set", { threadId: task.threadId, name: title });
+    try {
+      await write();
+      return;
+    } catch (firstError) {
+      // Setting an exact title is idempotent. A short-lived App Server can time
+      // out either before initialization or after accepting the write. Read the
+      // selected thread back first; retry only transient failures and only when
+      // the requested title is still absent.
+      try { if (await this.currentTitle(task) === title) return; }
+      catch { /* Preserve the original mutation result below. */ }
+      if (!(firstError instanceof DesktopUnavailableError || firstError instanceof UncertainActionError)) throw firstError;
+      try {
+        await write();
+      } catch (retryError) {
+        try { if (await this.currentTitle(task) === title) return; }
+        catch { /* The retry error remains the best description of the failure. */ }
+        throw retryError;
+      }
+    }
   }
   async archive(task: TaskRef): Promise<void> {
     this.local(task); await this.rpc.call("thread/archive", { threadId: task.threadId });
+  }
+  async read(task: TaskRef): Promise<{ title: string | null; projectId: string | null }> {
+    this.local(task);
+    const response = await this.rpc.call("thread/read", { threadId: task.threadId, includeTurns: false });
+    const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
+    if (!thread || !(thread.projectId === null || typeof thread.projectId === "string")
+      || !(thread.name === null || typeof thread.name === "string")) throw new DesktopUnavailableError("Codex не подтвердил нативные метаданные выбранной задачи.");
+    return { title: typeof thread.name === "string" ? thread.name : null, projectId: typeof thread.projectId === "string" && thread.projectId ? thread.projectId : null };
   }
   async markdown(task: TaskRef): Promise<string> {
     this.local(task);
@@ -194,7 +276,20 @@ export class NativeDesktopMetadata implements DesktopMetadata {
   }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
     this.local(task);
-    await this.rpc.call("thread/metadata/update", { threadId: task.threadId, projectId: projectId ?? "" });
+    try {
+      await this.rpc.call("thread/metadata/update", { threadId: task.threadId, projectId: projectId ?? "" });
+    } catch (error) {
+      // Some App Server builds reject an unchanged project assignment. Treat
+      // that response as an idempotent success only after a read confirms both
+      // the same thread and the exact requested project.
+      if (!(error instanceof ActionRejectedError)) throw error;
+      let response: IpcObject;
+      try { response = await this.rpc.call("thread/read", { threadId: task.threadId, includeTurns: false }); }
+      catch { throw error; }
+      const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
+      const actual = thread && typeof thread.projectId === "string" && thread.projectId ? thread.projectId : null;
+      if (!thread || actual !== projectId) throw error;
+    }
   }
 }
 
@@ -206,7 +301,42 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   rename(task: TaskRef, title: string): Promise<void> { return this.createMetadata(this.sourceHome(task)).rename(task, title); }
   archive(task: TaskRef): Promise<void> { return this.createMetadata(this.sourceHome(task)).archive(task); }
   markdown(task: TaskRef): Promise<string> { return this.createMetadata(this.sourceHome(task)).markdown(task); }
-  assignProject(task: TaskRef, projectId: string | null): Promise<void> { return this.createMetadata(this.sourceHome(task)).assignProject(task, projectId); }
+  async read(task: TaskRef): Promise<{ title: string | null; projectId: string | null }> {
+    const metadata = this.createMetadata(this.sourceHome(task));
+    if (!metadata.read) throw new DesktopUnavailableError("Чтение нативных метаданных недоступно.");
+    return metadata.read(task);
+  }
+  async isArchived(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean> {
+    // Exact persisted state, including archived tasks. Absence from the active
+    // display catalog is NOT proof: that catalog may be unreadable or filtered.
+    let db: DatabaseConstructor.Database | undefined;
+    try {
+      const home = this.sourceHome(task);
+      db = new DatabaseConstructor(path.join(home, "state_5.sqlite"), { readonly: true, fileMustExist: true });
+      db.pragma("query_only = ON");
+      const row = db.prepare("SELECT archived FROM threads WHERE id = ?").get(task.threadId) as { archived: number } | undefined;
+      if (!row || (row.archived !== 0 && row.archived !== 1)) throw new Error("Missing archive state");
+      if (row.archived === 1 && checkpoint) {
+        const archived = db.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(task.threadId) as { rollout_path: string } | undefined;
+        const relative = archived && path.relative(home, archived.rollout_path);
+        if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid archive path");
+        const file = await stat(archived!.rollout_path);
+        if (file.size !== checkpoint.size || file.mtimeMs !== checkpoint.mtimeMs) {
+          throw new TransferConflictError("История источника изменилась перед архивацией. Архив сохранён, но перенос требует проверки новых сообщений.");
+        }
+      }
+      return row.archived === 1;
+    } catch (error) {
+      if (error instanceof TransferConflictError) throw error;
+      throw new DesktopUnavailableError("Исходный каталог не подтвердил состояние архива задачи.");
+    }
+    finally { db?.close(); }
+  }
+  async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
+    const home = this.sourceHome(task);
+    await this.createMetadata(home).assignProject(task, projectId);
+    await mirrorLegacyProjectAssignment(home, task.threadId, projectId);
+  }
 }
 
 const goalStatuses = new Set<TaskGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
@@ -276,7 +406,31 @@ export class ProfileDesktopGoals implements DesktopGoals {
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createGoals: (home: string) => DesktopGoals = home => new NativeDesktopGoals(new MetadataRpc(home)),
   ) {}
-  get(task: TaskRef): Promise<TaskGoal | null> { return this.createGoals(this.sourceHome(task)).get(task); }
+  async get(task: TaskRef): Promise<TaskGoal | null> {
+    const home = this.sourceHome(task);
+    try { return await this.createGoals(home).get(task); }
+    catch (error) {
+      if (!(error instanceof ActionRejectedError) || task.hostId !== "local") throw error;
+      // Native goal/get rejects archived threads in some versions. Read ONLY
+      // an exact archived row from this profile; never hide an active API error
+      // or recreate a missing database. Native timestamps are seconds.
+      let state: DatabaseConstructor.Database | undefined; let goals: DatabaseConstructor.Database | undefined;
+      try {
+        state = new DatabaseConstructor(path.join(home, "state_5.sqlite"), { readonly: true, fileMustExist: true });
+        const thread = state.prepare("SELECT archived FROM threads WHERE id = ?").get(task.threadId) as { archived: number } | undefined;
+        if (thread?.archived !== 1) throw error;
+        goals = new DatabaseConstructor(path.join(home, "goals_1.sqlite"), { readonly: true, fileMustExist: true });
+        const row = goals.prepare("SELECT * FROM thread_goals WHERE thread_id = ?").get(task.threadId) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        const status = row.status === "usage_limited" ? "usageLimited" : row.status === "budget_limited" ? "budgetLimited" : row.status;
+        return parseTaskGoal({ threadId: row.thread_id, objective: row.objective, status, tokenBudget: row.token_budget,
+          tokensUsed: row.tokens_used, timeUsedSeconds: row.time_used_seconds,
+          createdAt: typeof row.created_at_ms === "number" ? Math.floor(row.created_at_ms / 1000) : null,
+          updatedAt: typeof row.updated_at_ms === "number" ? Math.floor(row.updated_at_ms / 1000) : null }, task.threadId);
+      } catch { throw error; }
+      finally { goals?.close(); state?.close(); }
+    }
+  }
   set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> { return this.createGoals(this.sourceHome(task)).set(task, update); }
   clear(task: TaskRef): Promise<boolean> { return this.createGoals(this.sourceHome(task)).clear(task); }
 }

@@ -3,7 +3,7 @@ import test from "node:test";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { configuredCodexHomes } from "../src/bridge/config.js";
+import { configuredCodexHomes, configuredCodexSources } from "../src/bridge/config.js";
 import { BridgeStore, migrateBindingSources } from "../src/bridge/store.js";
 import { DesktopUnavailableError, taskKey, type AccountUsage, type DesktopMetadata, type DesktopTask } from "../src/desktop/contracts.js";
 import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
@@ -29,6 +29,24 @@ test("configured sources keep the primary, expand home paths, and deduplicate ex
 test("invalid source configuration fails without exposing its value", () => {
   for (const value of ["PRIVATE_PATH", '"PRIVATE_PATH"', '{"path":"PRIVATE_PATH"}', '[42]', '[""]', '["a\\u0000b"]', JSON.stringify(Array(17).fill("PRIVATE_PATH"))]) {
     assert.throws(() => configuredCodexHomes({ CODEX_EXTRA_HOMES: value }), error => error instanceof Error && !error.message.includes("PRIVATE_PATH"));
+  }
+});
+
+test("structured sources bind each Codex home to a launcher and legacy homes remain compatible", () => {
+  const executable = path.resolve("fixture-code.exe"); const userDataDir = path.resolve("fixture-vscode-profile");
+  const sources = configuredCodexSources({ CODEX_SOURCES: JSON.stringify([
+    { home: primary, launcher: { type: "desktop" } },
+    { home: extra, launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
+  ]) });
+  assert.deepEqual(sources, [
+    { home: primary, launcher: { type: "desktop" } },
+    { home: extra, launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
+  ]);
+  assert.deepEqual(configuredCodexSources({ CODEX_HOME: primary, CODEX_EXTRA_HOMES: JSON.stringify([extra]) }), [
+    { home: primary, launcher: { type: "desktop" } }, { home: extra },
+  ]);
+  for (const value of ["PRIVATE", "[]", '[{"home":"PRIVATE","launcher":{"type":"unknown"}}]', '[{"home":"a"},{"home":"a"}]']) {
+    assert.throws(() => configuredCodexSources({ CODEX_SOURCES: value }), error => error instanceof Error && !error.message.includes("PRIVATE"));
   }
 });
 
@@ -121,18 +139,21 @@ test("metadata uses the configured source home for rename, archive and export", 
 
 test("account limits use the selected task source while the manager reads every configured account", async () => {
   const combined = new MultiDesktopCatalog([primary, extra], catalog); const selected = (await combined.listTasks())[1]!;
-  const calls: string[] = [];
+  const calls: string[] = []; const resets: { home: string; key: string }[] = [];
   const profile = new ProfileAccountUsage([primary, extra], ref => combined.sourceHome(ref), home => ({ read: async (): Promise<AccountUsage> => {
     calls.push(home);
     return { accountLabel: home === primary ? "primary@example.com" : "extra@example.com", sourceLabel: null, planType: "pro",
       limits: [{ id: "codex", name: null, primary: { usedPercent: 1, windowMinutes: 10_080, resetsAt: 1_788_643_425 }, secondary: null }], credits: null, resetCredits: null };
-  } }));
+  }, consumeReset: async key => { resets.push({ home, key }); return "reset"; } }), () => combined.listSources());
   const manager = await profile.read();
   assert.deepEqual(manager.map(item => [item.sourceLabel, item.accountLabel]), [[path.basename(primary), "primary@example.com"], [path.basename(extra), "extra@example.com"]]);
+  assert.deepEqual(manager.map(item => item.sourceId), combined.listSources().map(source => source.id));
   assert.deepEqual(calls, [primary, extra]); calls.length = 0;
   const taskUsage = await profile.read(selected);
   assert.deepEqual(taskUsage.map(item => [item.sourceLabel, item.accountLabel]), [[path.basename(extra), "extra@example.com"]]);
   assert.deepEqual(calls, [extra]);
+  assert.equal(await profile.consumeReset(selected, "4fea0429-352c-4873-b963-bbb7a1a92e01"), "reset");
+  assert.deepEqual(resets, [{ home: extra, key: "4fea0429-352c-4873-b963-bbb7a1a92e01" }]);
   await assert.rejects(profile.read({ ...task, sourceId: "removed-source" }), DesktopUnavailableError);
 });
 

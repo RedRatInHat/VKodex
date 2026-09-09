@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type DesktopTasks, type TaskRef } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type DesktopTasks, type TaskRef } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -43,6 +43,7 @@ const taskHelp = [
   "/limits — лимиты аккаунта Codex",
   "/goal — цель задачи, бюджет и управление продолжением",
   "/files — проверить готовые исходящие файлы",
+  "/open — явно открыть эту задачу в настроенном Codex",
   "/stop — остановить текущий ход",
   "/detach — отключить трансляцию, не останавливая задачу",
   "",
@@ -98,19 +99,17 @@ export class TaskManager {
   async idle(): Promise<void> { await Promise.all([...this.tails.values()]); }
 
   private async watch(input: BridgeInput): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const timeout = new Promise<void>(resolve => {
-      timer = setTimeout(() => {
-        const binding = this.store.byPeer(input.peerId);
-        this.store.enqueue(`watchdog:${input.peerId}:${input.eventId}`, input.peerId, {
-          text: "VKodex не дождался ответа локального Codex за 45 секунд. Остальные беседы продолжают работать. Результат этой операции неизвестен: проверь десктоп и не повторяй изменяющую команду вслепую.",
-        }, binding?.id ?? null);
-        resolve();
-      }, 45_000);
-      timer.unref();
-    });
-    try { await Promise.race([this.dispatch(input), timeout]); }
-    finally { if (timer) clearTimeout(timer); }
+    const timer = setTimeout(() => {
+      const binding = this.store.byPeer(input.peerId);
+      this.store.enqueue(`watchdog:${input.peerId}:${input.eventId}`, input.peerId, {
+        text: "VKodex не дождался ответа локального Codex за 45 секунд. Остальные беседы продолжают работать. Результат этой операции неизвестен: проверь десктоп и не повторяй изменяющую команду вслепую.",
+      }, binding?.id ?? null);
+    }, 45_000);
+    timer.unref();
+    // The watchdog reports latency but cannot cancel a mutation. Retain this
+    // peer's lock until dispatch settles; other peers keep their own queues.
+    try { await this.dispatch(input); }
+    finally { clearTimeout(timer); }
   }
 
   private reply(input: BridgeInput, view: View): void {
@@ -177,7 +176,8 @@ export class TaskManager {
       this.store.finishInput(inboxKey, !(error instanceof ActionRejectedError));
       if (panelAction) this.panels.failure(input.peerId, error);
       const view = { text: error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError
-        ? error.message : "Операция не завершена. Проверь подключение к Codex; автоматического повтора команды не будет." };
+        ? error.message : "Операция не завершена. Проверь подключение к Codex; автоматического повтора команды не будет.",
+        ...(error instanceof TaskNotOpenError ? { buttons: [MENU_BUTTON] } : {}) };
       if (managerPeer) this.reply(input, view);
       else {
         const binding = this.store.byPeer(input.peerId);
@@ -580,7 +580,18 @@ export class TaskManager {
     this.store.setPaused(binding.id, false);
     this.store.setAttached(binding.id, true);
     const url = await this.chat.inviteLink(binding.peerId);
-    this.reply(input, { text: `${task.title}\n${url}`, buttons: [this.button("Отключить трансляцию", { type: "detach", bindingId: binding.id })] });
+    let handoffNote = "";
+    if (this.desktop.ensureOpen && this.store.claimInitialHandoff(binding.id, task)) {
+      try {
+        await this.desktop.ensureOpen(task);
+        this.store.markDesktopHandoff(binding.id, task, "launched");
+      } catch (error) {
+        // The VK binding is already committed and remains usable. Do not turn a
+        // launcher failure into a second conversation on the next click.
+        handoffNote = `\n\nVK-беседа создана, но приложение Codex не открылось: ${error instanceof Error ? error.message : "неизвестная ошибка"}\nОткрой /menu и нажми «Открыть в Codex».`;
+      }
+    }
+    this.reply(input, { text: `${task.title}\n${url}${handoffNote}`, buttons: [this.button("Отключить трансляцию", { type: "detach", bindingId: binding.id })] });
   }
 
   private async handleTask(input: BridgeInput): Promise<void> {
@@ -588,6 +599,9 @@ export class TaskManager {
     if (!binding || input.action) return;
     const text = input.text.trim();
     const ownerCommand = input.senderId === this.access.ownerId;
+    if (this.store.transferBlocksInput(binding.id) && !["/help", "/detach", "/stop", "/files"].includes(text)) {
+      throw new ActionRejectedError("Сообщение не отправлено: задача переносится между каталогами. /menu покажет текущий этап. Повтори запрос после завершения переноса.");
+    }
     if (input.editOfMessageId !== undefined) {
       await this.handleTaskEdit(input, binding, text);
       return;
@@ -626,13 +640,14 @@ export class TaskManager {
     try {
       const author = this.sharedAuthor(binding, input);
       const request = { task: binding, operationId, text, ...(author ? { author } : {}), ...prepared, beforeSend: async () => {
-        if (generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена во время подготовки запроса. Сообщение не отправлено.");
+        if (this.store.transferBlocksInput(binding.id) || generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена или начат перенос во время подготовки запроса. Сообщение не отправлено.");
       } };
       const receipt = this.desktop.submitWithReceipt
         ? await this.desktop.submitWithReceipt(request)
         : (await this.desktop.submit(request), null);
+      if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
       this.store.finishOperation(operationId, false);
-      this.files?.finish(binding.id, operationId, false);
+      this.files?.finish(binding.id, operationId, false, receipt?.turnId ?? undefined);
       const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
       if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
         messageId: Number(messageId), senderId: input.senderId, operationId,

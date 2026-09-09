@@ -16,6 +16,8 @@ export interface DesktopTask extends TaskRef {
 
 export interface DesktopProject {
   readonly id: string;
+  /** Previous IDs imported by Codex; accepted only through its persisted mapping. */
+  readonly legacyIds?: readonly string[];
   readonly title: string;
   readonly workspace: string;
   readonly workspaceRoots?: readonly string[];
@@ -43,6 +45,31 @@ export interface CreateTaskRequest {
   readonly environment: "local" | "worktree";
 }
 
+export interface TransferTaskRequest {
+  readonly operationId: string;
+  readonly startedAt: number;
+  readonly task: TaskRef & { readonly title: string };
+  /** Empty string identifies the primary CODEX_HOME. */
+  readonly targetSourceId: string;
+  /** Visible project id in the target source, or null for no project. */
+  readonly projectId: string | null;
+  readonly existingTarget?: DesktopTask;
+  /** Persist the fork identity before attempting any follow-up metadata write. */
+  readonly onForkCreated?: (target: DesktopTask) => void;
+  /** Durable boundary, captured before any fork is submitted. */
+  readonly checkpoint?: TransferCheckpoint;
+  /** Once submitted, retries may reconcile but must never create another fork. */
+  readonly forkSubmitted?: boolean;
+  readonly onForkSubmitted?: () => void;
+}
+
+export interface TransferCheckpoint {
+  readonly lastTurnId: string;
+  readonly rolloutPath: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
 export interface SubmitTaskRequest {
   readonly operationId: string;
   readonly task: TaskRef;
@@ -54,7 +81,7 @@ export interface SubmitTaskRequest {
 }
 
 export interface SubmitTaskReceipt {
-  readonly mode: "start" | "steer" | "fallback";
+  readonly mode: "start" | "steer";
   readonly turnId: string | null;
 }
 
@@ -78,6 +105,7 @@ export interface DesktopModel {
 
 export interface TaskDetails {
   readonly title?: string | null;
+  readonly failure?: "usageLimit" | "systemError";
   readonly status: "running" | "idle" | "failed" | "interrupted" | "approval" | "unavailable";
   readonly workspace: string | null;
   readonly model: string | null;
@@ -134,10 +162,15 @@ export interface AccountUsage {
   readonly limits: readonly AccountRateLimit[];
   readonly credits: { readonly hasCredits: boolean; readonly unlimited: boolean; readonly balance: string | null } | null;
   readonly resetCredits: number | null;
+  /** Stable configured source ID used for account-scoped actions. */
+  readonly sourceId?: string;
 }
+
+export type UsageResetOutcome = "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
 
 export interface AccountUsageProvider {
   read(task?: TaskRef): Promise<readonly AccountUsage[]>;
+  consumeReset?(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome>;
 }
 
 export interface DesktopMetadata {
@@ -145,6 +178,9 @@ export interface DesktopMetadata {
   archive(task: TaskRef): Promise<void>;
   markdown(task: TaskRef): Promise<string>;
   assignProject(task: TaskRef, projectId: string | null): Promise<void>;
+  /** Native persisted state, not a project inferred by the display catalog. */
+  read?(task: TaskRef): Promise<{ readonly title: string | null; readonly projectId: string | null }>;
+  isArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
 }
 
 export interface TaskRenameResult {
@@ -169,24 +205,37 @@ export interface DesktopCapabilities {
   readonly archiveTask?: boolean;
   readonly exportMarkdown?: boolean;
   readonly moveTask?: boolean;
+  readonly transferTask?: boolean;
   readonly accountUsage?: boolean;
+  readonly usageReset?: boolean;
   readonly goals?: boolean;
   readonly editLastUserTurn?: boolean;
 }
 
-export interface DirectTaskUpdate {
+export interface DesktopTaskCreator {
+  createTask(request: CreateTaskRequest): Promise<DesktopTask>;
+  interrupt(task: TaskRef): Promise<boolean>;
+  details(task: TaskRef): TaskDetails | null;
+  isActive(task: TaskRef): boolean;
+  onUpdate(listener: (update: TaskCreationUpdate) => void): () => void;
+}
+
+export interface DesktopTaskTransfer {
+  fork(request: TransferTaskRequest): Promise<DesktopTask>;
+  checkpoint?(task: TaskRef): Promise<TransferCheckpoint>;
+  verifySource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
+  verifyTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
+}
+
+/** Events from the atomic first turn that materializes a new Codex task. */
+export interface TaskCreationUpdate {
   readonly task: TaskRef;
   readonly event: TaskEvent;
   readonly details: TaskDetails;
 }
 
-export interface DirectTaskExecutor {
-  createTask(request: CreateTaskRequest): Promise<DesktopTask>;
-  submit(request: SubmitTaskRequest): Promise<void>;
-  interrupt(task: TaskRef): Promise<boolean>;
-  details(task: TaskRef): TaskDetails | null;
-  isRunning(task: TaskRef): boolean;
-  onUpdate(listener: (update: DirectTaskUpdate) => void): () => void;
+export interface DesktopTaskLauncher {
+  open(task: TaskRef): Promise<void>;
 }
 
 export interface DesktopCompatibility {
@@ -206,19 +255,31 @@ export interface DesktopTasks {
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
   interrupt(task: TaskRef): Promise<void>;
   moveTask(task: TaskRef, projectId: string | null): Promise<void>;
+  transferTask?(request: TransferTaskRequest): Promise<DesktopTask>;
+  transferCheckpoint?(task: TaskRef): Promise<TransferCheckpoint>;
+  verifyTransferSource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
+  verifyTransferTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
+  isTaskArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
   archiveTask(task: TaskRef): Promise<void>;
+  /** Archive a transfer source that was already verified idle before the fork. */
+  archiveTransferredSource?(task: TaskRef): Promise<void>;
   exportMarkdown(task: TaskRef): Promise<string>;
   accountUsage?(task?: TaskRef): Promise<readonly AccountUsage[]>;
+  consumeUsageReset?(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome>;
   getGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
   continueGoal?(task: TaskRef): Promise<void>;
-  isDirectlyManaged?(task: TaskRef): boolean;
-  onDirectUpdate?(listener: (update: DirectTaskUpdate) => void): () => void;
+  /** Bring the configured Codex client to the foreground after an explicit user action. */
+  revealTask?(task: TaskRef): Promise<void>;
+  /** One-time handoff used after a task or transfer is first linked to VK. */
+  ensureOpen?(task: TaskRef): Promise<void>;
+  isCreationActive?(task: TaskRef): boolean;
+  onCreationUpdate?(listener: (update: TaskCreationUpdate) => void): () => void;
   checkCompatibility?(): Promise<DesktopCompatibility>;
   compatibility?(): DesktopCompatibility;
 }
@@ -236,9 +297,17 @@ export class DesktopUnavailableError extends Error {
   }
 }
 
+/** A transient subscription loss; retrying is safe only before any task input is sent. */
+export class TaskConnectionLostError extends DesktopUnavailableError {
+  constructor(message = "Соединение с Codex прервалось до отправки сообщения.") {
+    super(message);
+    this.name = "TaskConnectionLostError";
+  }
+}
+
 /** The desktop explicitly rejected a read-only IPC request before any mutation. */
 export class DesktopRequestRejectedError extends DesktopUnavailableError {
-  constructor() {
+  constructor(readonly reason: "no-client-found" | "request-rejected" = "request-rejected") {
     super("Десктоп отклонил запрос.");
     this.name = "DesktopRequestRejectedError";
   }
@@ -247,7 +316,7 @@ export class DesktopRequestRejectedError extends DesktopUnavailableError {
 /** Discovery confirmed that no desktop client currently owns this task. */
 export class TaskNotOpenError extends DesktopUnavailableError {
   constructor() {
-    super("Задача не открыта в десктопе Codex. Продолжаю её через локальный Codex SDK.");
+    super("У задачи нет активного подключения в Codex. Автоматически восстановить его не удалось. Владельцу VKodex нужно проверить клиент выбранного каталога и открыть задачу через /open, затем повторить сообщение.");
     this.name = "TaskNotOpenError";
   }
 }
@@ -260,10 +329,30 @@ export class ActionRejectedError extends Error {
   }
 }
 
+/** A transfer snapshot conflict cannot be resolved by retrying the same write. */
+export class TransferConflictError extends ActionRejectedError {}
+
+/** The owning native client must release/archive its writer; repeating an
+ * external archive request cannot resolve this condition. */
+export class ArchiveOwnerRequiredError extends TransferConflictError {
+  constructor() {
+    super("Задача открыта другим процессом Codex, который удерживает её историю для записи. Архивируй её в приложении соответствующего каталога. VKodex автоматически проверит результат; принудительно закрывать Codex или снимать блокировку не нужно.");
+    this.name = "ArchiveOwnerRequiredError";
+  }
+}
+
 export class UncertainActionError extends Error {
   constructor() {
     super("Результат операции неизвестен. Автоматический повтор отключён, чтобы не создать дубликат.");
     this.name = "UncertainActionError";
+  }
+}
+
+export class ProjectAssignmentUnconfirmedError extends UncertainActionError {
+  constructor() {
+    super();
+    this.name = "ProjectAssignmentUnconfirmedError";
+    this.message = "API Codex принял запись проекта, но его назначение в приложении не подтверждено. Выбери нужный проект через меню задачи в Codex. Новую задачу создавать не нужно.";
   }
 }
 import type { LocalInputFile } from "../domain/models.js";

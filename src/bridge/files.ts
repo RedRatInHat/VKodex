@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readdir, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { ActionRejectedError, type TaskDetails } from "../desktop/contracts.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
@@ -9,13 +9,24 @@ import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 20 * 1024 * 1024, maxTotalBytes: 50 * 1024 * 1024, timeoutMs: 30_000 };
-interface FileJob { operationId: string; generation: number; directory: string; state: "prepared" | "accepted" | "uncertain"; done: boolean }
+export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
+export const INBOUND_FILE_LIMITS: InboundFileLimits = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 600_000 };
+interface FileJob {
+  operationId: string;
+  generation: number;
+  directory: string;
+  state: "prepared" | "accepted" | "uncertain";
+  done: boolean;
+  /** The Codex turn that must finish before its outbox is collected. */
+  turnId?: string;
+}
 class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
 }
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
 const mebibytes = (bytes: number): number => Math.ceil(bytes / (1024 * 1024));
+const VK_DOCUMENT_PAGE_LIMIT = 1024 * 1024;
 
 export function validateVkFileUrl(raw: string): URL {
   let url: URL;
@@ -56,6 +67,92 @@ export async function downloadVkFile(raw: string, maxBytes: number, timeoutMs = 
   } catch (error) {
     throw error instanceof ActionRejectedError ? error : new ActionRejectedError("Не удалось скачать вложение из VK. Сообщение не отправлено; повтори позже.");
   } finally { clearTimeout(timer); }
+}
+
+/** Download large VK documents directly to the private inbox instead of
+ * retaining the complete file in the bridge process heap. */
+export async function downloadVkFileToPath(raw: string, target: string, maxBytes: number,
+  timeoutMs = INBOUND_FILE_LIMITS.timeoutMs, expectedBytes?: number): Promise<number> {
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  let created = false;
+  try {
+    let url = validateVkFileUrl(raw);
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      const response = await fetch(url, { signal: controller.signal, redirect: "manual" });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        await response.body?.cancel();
+        const location = response.headers.get("location");
+        if (!location) throw new ActionRejectedError("VK вернул некорректное перенаправление файла.");
+        url = validateVkFileUrl(new URL(location, url).href); continue;
+      }
+      if (!response.ok || !response.body) throw new ActionRejectedError("Не удалось скачать вложение из VK. Сообщение не отправлено.");
+
+      // For large message documents VK currently returns a small document
+      // viewer with HTTP 200. The viewer contains a short-lived CDN URL in
+      // Docs.initDoc; saving that page under the original .mp4 name produces
+      // a convincing but corrupt attachment.
+      if (["vk.com", "vk.ru"].includes(url.hostname) && /^\/doc-?\d+_\d+/u.test(url.pathname)
+        && response.headers.get("content-type")?.toLowerCase().includes("text/html")) {
+        const contentLength = Number(response.headers.get("content-length"));
+        if (contentLength > VK_DOCUMENT_PAGE_LIMIT) { await response.body.cancel(); throw new ActionRejectedError("VK вернул слишком большую страницу вместо вложения."); }
+        const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let pageSize = 0;
+        try {
+          while (true) {
+            const next = await reader.read(); if (next.done) break;
+            pageSize += next.value.length;
+            if (pageSize > VK_DOCUMENT_PAGE_LIMIT) { controller.abort(); throw new ActionRejectedError("VK вернул слишком большую страницу вместо вложения."); }
+            chunks.push(next.value);
+          }
+        } finally { reader.releaseLock(); }
+        const page = Buffer.concat(chunks, pageSize).toString("latin1");
+        const marker = "Docs.initDoc("; const markerAt = page.indexOf(marker); const objectAt = markerAt < 0 ? -1 : page.indexOf("{", markerAt + marker.length);
+        let objectEnd = -1; let depth = 0; let quoted = false; let escaped = false;
+        for (let index = objectAt; index >= 0 && index < page.length; index++) {
+          const character = page[index]!;
+          if (quoted) {
+            if (escaped) escaped = false;
+            else if (character === "\\") escaped = true;
+            else if (character === '"') quoted = false;
+            continue;
+          }
+          if (character === '"') quoted = true;
+          else if (character === "{") depth++;
+          else if (character === "}" && --depth === 0) { objectEnd = index + 1; break; }
+        }
+        let init: { docUrl?: unknown; docSize?: unknown } | null = null;
+        try { init = objectAt >= 0 && objectEnd > objectAt ? JSON.parse(page.slice(objectAt, objectEnd)) as { docUrl?: unknown; docSize?: unknown } : null; }
+        catch { /* A malformed viewer must not be saved as the user's file. */ }
+        if (!init || typeof init.docUrl !== "string" || !init.docUrl) throw new ActionRejectedError("VK вернул страницу документа без ссылки на исходный файл. Отправь вложение повторно.");
+        if (typeof init.docSize === "number" && init.docSize > maxBytes) throw new ActionRejectedError("Вложения превышают лимит размера.");
+        const nextUrl = validateVkFileUrl(new URL(init.docUrl, url).href);
+        if (/^\/err404\.php$/u.test(nextUrl.pathname) || nextUrl.href === url.href) throw new ActionRejectedError("Временная ссылка VK на вложение уже недоступна. Отправь файл повторно.");
+        url = nextUrl; continue;
+      }
+
+      if (Number(response.headers.get("content-length")) > maxBytes) { await response.body.cancel(); throw new ActionRejectedError("Вложения превышают лимит размера."); }
+      handle = await open(target, "wx", 0o600); created = true;
+      const reader = response.body.getReader(); let size = 0;
+      try {
+        while (true) {
+          const next = await reader.read(); if (next.done) break;
+          size += next.value.length;
+          if (size > maxBytes) { controller.abort(); throw new ActionRejectedError("Вложения превышают лимит размера."); }
+          await handle.write(next.value);
+        }
+      } finally { reader.releaseLock(); }
+      if (expectedBytes !== undefined && size !== expectedBytes) throw new ActionRejectedError("VK вернул неполное или неверное содержимое вложения. Отправь файл повторно.");
+      return size;
+    }
+    throw new ActionRejectedError("Слишком много перенаправлений при загрузке вложения VK.");
+  } catch (error) {
+    if (handle) { await handle.close().catch(() => {}); handle = null; }
+    if (created) await rm(target, { force: true }).catch(() => {});
+    throw error instanceof ActionRejectedError ? error : new ActionRejectedError("Не удалось скачать вложение из VK. Сообщение не отправлено; повтори позже.");
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    clearTimeout(timer);
+  }
 }
 
 async function directory(root: string, ...segments: string[]): Promise<string> {
@@ -120,40 +217,57 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS): Promi
 
 export class TaskFiles {
   private readonly completed = new Set<string>();
+  private readonly completedTurns = new Map<string, Set<string>>();
   private readonly retries = new Map<string, number>();
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
   private stopped = false;
-  constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate) {}
+  constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
+    private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private async check(binding: Binding, generation: number): Promise<void> {
     if (this.stopped || binding.peerId === null || this.store.streamGeneration(binding.id) !== generation || !await this.gate.check(binding.peerId) || this.store.streamGeneration(binding.id) !== generation) throw new ActionRejectedError("Передача файлов остановлена: беседа больше не подключена.");
   }
   async prepare(binding: Binding, operationId: string, attachments: readonly RemoteAttachment[]): Promise<{ inputFiles: LocalInputFile[]; outboxDir: string }> {
-    if (attachments.length > FILE_LIMITS.maxFiles) throw new ActionRejectedError("За одно сообщение можно передать до 10 файлов.");
+    if (attachments.length > this.inboundLimits.maxFiles) throw new ActionRejectedError(`За одно сообщение можно передать до ${this.inboundLimits.maxFiles} файлов.`);
     const generation = this.store.streamGeneration(binding.id); await this.check(binding, generation);
     const jobDirectory = digest(`${binding.id}:${operationId}`);
     const inbox = await directory(this.root, jobDirectory, "inbox"); const outboxDir = await directory(this.root, jobDirectory, "outbox");
     const inputFiles: LocalInputFile[] = []; let total = 0;
     for (const [index, attachment] of attachments.entries()) {
-      if (attachment.sizeBytes !== undefined && attachment.sizeBytes > FILE_LIMITS.maxFileBytes) throw new ActionRejectedError("Вложение больше 20 МиБ.");
+      if (attachment.sizeBytes !== undefined && attachment.sizeBytes > this.inboundLimits.maxFileBytes) throw new ActionRejectedError(`Вложение больше ${mebibytes(this.inboundLimits.maxFileBytes)} МиБ.`);
+      if (attachment.sizeBytes !== undefined && total + attachment.sizeBytes > this.inboundLimits.maxTotalBytes) throw new ActionRejectedError(`Суммарный размер вложений больше ${mebibytes(this.inboundLimits.maxTotalBytes)} МиБ.`);
       await this.check(binding, generation);
-      const contents = await downloadVkFile(attachment.url, Math.min(FILE_LIMITS.maxFileBytes, FILE_LIMITS.maxTotalBytes - total));
-      total += contents.length;
       const originalName = safeFileName(attachment.fileName, `file-${index + 1}`); const target = path.join(inbox, `${index + 1}-${originalName}`);
-      await writeFile(target, contents, { flag: "wx", mode: 0o600 });
-      inputFiles.push({ path: target, originalName, kind: attachment.kind, sizeBytes: contents.length });
+      const size = await downloadVkFileToPath(attachment.url, target,
+        Math.min(this.inboundLimits.maxFileBytes, this.inboundLimits.maxTotalBytes - total), this.inboundLimits.timeoutMs, attachment.sizeBytes);
+      total += size;
+      inputFiles.push({ path: target, originalName, kind: attachment.kind, sizeBytes: size });
     }
     await this.check(binding, generation);
+    this.completed.delete(binding.id);
     this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, state: "prepared", done: false }]);
     return { inputFiles, outboxDir };
   }
-  finish(bindingId: string, operationId: string, uncertain: boolean): void {
-    this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId ? { ...job, state: uncertain ? "uncertain" : "accepted" } : job));
+  finish(bindingId: string, operationId: string, uncertain: boolean, turnId?: string): void {
+    this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId
+      ? { ...job, state: uncertain ? "uncertain" : "accepted", ...(turnId ? { turnId } : {}) }
+      : job));
   }
-  observe(bindingId: string, status: TaskDetails["status"]): void {
-    if (["idle", "failed", "interrupted"].includes(status)) this.completed.add(bindingId); else this.completed.delete(bindingId);
+  associateTurn(bindingId: string, operationId: string, turnId: string): void {
+    this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId && !job.turnId
+      ? { ...job, turnId, done: false }
+      : job));
+  }
+  observe(bindingId: string, status: TaskDetails["status"], turnId?: string | null): void {
+    if (["idle", "failed", "interrupted"].includes(status)) {
+      this.completed.add(bindingId);
+      if (turnId) {
+        const turns = this.completedTurns.get(bindingId) ?? new Set<string>();
+        turns.add(turnId); this.completedTurns.set(bindingId, turns);
+      }
+    } else if (!this.completedTurns.get(bindingId)?.size) this.completed.delete(bindingId);
   }
   collect(binding: Binding, manual = false): Promise<number> {
     const existing = this.collections.get(binding.id); if (existing) return existing;
@@ -164,7 +278,9 @@ export class TaskFiles {
     const generation = this.store.streamGeneration(binding.id); await this.check(binding, generation);
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
     let count = 0; let retryableFailure: OutputFilesError | null = null;
-    for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted" && (manual || !job.done))) {
+    const completedTurns = this.completedTurns.get(binding.id) ?? new Set<string>();
+    for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted"
+      && (manual || (!job.done && (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id)))))) {
       const outbox = await directory(this.root, job.directory, "outbox");
       let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
       try { outputFiles = await readOutputFiles(outbox); }

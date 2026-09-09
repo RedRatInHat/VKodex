@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { type DesktopTask, DesktopUnavailableError } from "../src/desktop/contracts.js";
 import { readTaskCatalog } from "../src/desktop/catalog.js";
-import { assignTaskProjects, desktopProjects } from "../src/desktop/projects.js";
+import { assignTaskProjects, desktopProjects, mirrorLegacyProjectAssignment, readDesktopProjectState } from "../src/desktop/projects.js";
 import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
 
 const task: DesktopTask = { hostId: "local", threadId: "fixture", title: "Fixture task", workspace: "D:/Fixture/First", updatedAt: 1 };
@@ -13,6 +16,83 @@ const state = {
     second: { id: "second", name: "Second", rootPaths: ["D:/Fixture/Second"] },
   },
 };
+
+test("partial project migration mirrors native assignment into the sidebar state", async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-mirror-"));
+  const database = new Database(path.join(home, "state_5.sqlite")); t.after(() => database.close());
+  database.exec(`CREATE TABLE project_idempotency_keys (key TEXT, project_id TEXT, created_at_ms INTEGER);
+    INSERT INTO project_idempotency_keys VALUES ('legacy-project', 'native-project', 1);`);
+  const migration = { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } };
+  const file = path.join(home, ".codex-global-state.json");
+  await writeFile(file, JSON.stringify({ "app-server-projects-migration-by-host": migration,
+    "thread-project-assignments": { untouched: { projectKind: "local", projectId: "other" } },
+    "projectless-thread-ids": ["fixture", "another"] }));
+  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), true);
+  let saved = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(saved["thread-project-assignments"].fixture, { projectKind: "local", projectId: "legacy-project" });
+  assert.deepEqual(saved["projectless-thread-ids"], ["another"]);
+  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", null), true);
+  saved = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(saved["thread-project-assignments"].fixture, undefined);
+  assert.deepEqual(saved["projectless-thread-ids"], ["another", "fixture"]);
+});
+
+test("fully migrated project state is not rewritten", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-native-"));
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({ "app-server-projects-migration-by-host": {
+    [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: true },
+  } });
+  await writeFile(file, original);
+  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), false);
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("imported native projects replace stale IDs while assignment migration controls sidebar membership", async t => {
+  const db = new Database(":memory:"); t.after(() => db.close());
+  db.exec(`CREATE TABLE projects (id TEXT, name TEXT, position INTEGER);
+    CREATE TABLE project_roots (project_id TEXT, path TEXT, position INTEGER);
+    CREATE TABLE project_idempotency_keys (key TEXT, project_id TEXT);
+    INSERT INTO projects VALUES ('native-first', 'First renamed', 0), ('native-second', 'Second', 1);
+    INSERT INTO project_roots VALUES ('native-first', 'D:/Fixture/First', 0), ('native-second', 'D:/Fixture/Second', 0);
+    INSERT INTO project_idempotency_keys VALUES ('first', 'native-first'), ('second', 'native-second');`);
+  const legacy = { ...state, "thread-project-assignments": { fixture: { projectKind: "local", projectId: "first" } } };
+  const next = readDesktopProjectState(db, legacy, "D:/Fixture/Home")!;
+  assert.equal(desktopProjects(next)[0]!.id, "native-first");
+  assert.equal(desktopProjects(next)[0]!.title, "First renamed");
+  assert.equal(assignTaskProjects([task], next)[0]!.projectId, "native-first");
+  assert.equal(assignTaskProjects([{ ...task, projectId: "native-second" }], next)[0]!.projectId, "native-second");
+  const migration = (complete: boolean) => ({ "local:D:/Fixture/Home": { projectsMigrated: true, threadAssignmentsMigrated: complete } });
+  const partial = readDesktopProjectState(db, { ...legacy, "app-server-projects-migration-by-host": migration(false) }, "D:/Fixture/Home")!;
+  assert.equal(assignTaskProjects([{ ...task, projectId: "native-second" }], partial)[0]!.projectId, "native-first");
+  const copied = { ...task, threadId: "new-copy", workspace: "D:/Outside", projectId: "native-second" };
+  assert.equal(assignTaskProjects([copied], partial)[0]!.projectId, "native-second");
+  assert.equal(assignTaskProjects([{ ...copied, workspace: task.workspace }], { ...partial, "projectless-thread-ids": [copied.threadId] })[0]!.projectId, null);
+  const migrated = readDesktopProjectState(db, { ...legacy, "app-server-projects-migration-by-host": migration(true) }, "D:/Fixture/Home")!;
+  assert.equal(assignTaskProjects([{ ...task, projectId: "native-second" }], migrated)[0]!.projectId, "native-second");
+  assert.equal(assignTaskProjects([{ ...task, projectId: null }], migrated)[0]!.projectId, null);
+  const combined = new MultiDesktopCatalog(["D:/Fixture/Home", "D:/Fixture/Extra"], () => ({
+    listTasks: async () => assignTaskProjects([task], next), listModels: async () => [], listProjects: async () => desktopProjects(next),
+  }));
+  const primary = await combined.resolveProject("first");
+  assert.equal(primary.rawProjectId, "native-first"); assert.equal(primary.project.id, "native-first");
+  const sourceId = combined.listSources()[1]!.id;
+  const extra = await combined.resolveProject(JSON.stringify([sourceId, "first"]));
+  assert.equal(extra.rawProjectId, "native-first"); assert.equal(extra.sourceId, sourceId);
+  assert.equal(extra.project.id, JSON.stringify([sourceId, "native-first"]));
+  assert.equal(legacy["thread-project-assignments"].fixture.projectId, "first");
+});
+
+test("empty native tables keep legacy projects only before Codex finishes migrating them", t => {
+  const db = new Database(":memory:"); t.after(() => db.close());
+  db.exec("CREATE TABLE projects (id TEXT, name TEXT, position INTEGER); CREATE TABLE project_roots (project_id TEXT, path TEXT, position INTEGER)");
+  assert.deepEqual(readDesktopProjectState(db, state, "D:/Fixture/Home"), state);
+  const native = readDesktopProjectState(db, { ...state,
+    "app-server-projects-migration-by-host": { "local:D:/Fixture/Home": { projectsMigrated: true, threadAssignmentsMigrated: true } },
+  }, "D:/Fixture/Home")!;
+  assert.deepEqual(desktopProjects(native), []);
+  assert.equal(assignTaskProjects([{ ...task, projectId: null }], native)[0]!.projectId, null);
+});
 
 test("desktop project catalog preserves all roots and includes projects without folders", () => {
   assert.deepEqual(desktopProjects(state)[0], { id: "first", title: "First", workspace: "D:/Fixture/First", workspaceRoots: ["D:/Fixture/First", "D:/Fixture/Shared"] });

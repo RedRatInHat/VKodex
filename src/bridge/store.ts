@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { taskKey, type DesktopTask, type TaskRef } from "../desktop/contracts.js";
-import type { Binding, Delivery, ManagerAction, MessageHandle, NewTaskDraft, View } from "./contracts.js";
+import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../desktop/contracts.js";
+import type { Binding, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../desktop/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
@@ -58,6 +58,17 @@ export interface EditableVkRequest {
   readonly inputFiles?: readonly LocalInputFile[];
   readonly outboxDir?: string;
 }
+
+interface AcceptedTaskTurn {
+  readonly turnId: string;
+  readonly operationId: string;
+}
+
+export interface DesktopHandoffState {
+  readonly taskKey: string;
+  readonly status: "launching" | "launched" | "live";
+  readonly updatedAt: number;
+}
 function binding(row: BindingRow): Binding {
   return { id: row.id, hostId: row.host_id, threadId: row.thread_id, title: row.title, peerId: row.peer_id, chatId: row.chat_id, chatState: row.chat_state, attached: row.attached === 1, paused: row.paused === 1,
     ...(row.source_id ? { sourceId: row.source_id } : {}), ...(row.source_label ? { sourceLabel: row.source_label } : {}), ...(row.rollout_path ? { rolloutPath: row.rollout_path } : {}) };
@@ -99,7 +110,9 @@ export class BridgeStore {
   }
 
   close(): void { this.db.close(); }
-  atomic<T>(operation: () => T): T { return this.db.transaction(operation)(); }
+  // Reserve the writer before reading a revision. A deferred read transaction
+  // cannot upgrade after another process commits, even with busy_timeout set.
+  atomic<T>(operation: () => T): T { return this.db.transaction(operation).immediate(); }
 
   assertOwner(ownerId: number, groupId: number): void {
     const fingerprint = createHash("sha256").update(JSON.stringify([ownerId, groupId])).digest("hex");
@@ -195,6 +208,112 @@ export class BridgeStore {
     });
   }
 
+  transfer(id: string): TaskTransferRecord | null { return this.getValue<TaskTransferRecord>(`transfer:${id}`); }
+
+  transfers(): readonly TaskTransferRecord[] {
+    return (this.db.prepare("SELECT value FROM bridge_values WHERE key LIKE 'transfer:%'").all() as { value: string }[])
+      .map(row => JSON.parse(row.value) as TaskTransferRecord).filter(Boolean);
+  }
+
+  transferBlocksInput(id: string): boolean {
+    const record = this.transfer(id);
+    return record?.version === 2 && !["complete", "cancelled", "switched"].includes(record.phase);
+  }
+
+  beginTransfer(record: TaskTransferRecord): void {
+    this.atomic(() => {
+      const current = this.transfer(record.bindingId);
+      if (current && !["complete", "cancelled"].includes(current.phase) && current.id !== record.id) throw new Error("A task transfer is already active");
+      if (current?.id === record.id) return;
+      const binding = this.getBinding(record.bindingId);
+      if (!binding || taskKey(binding) !== taskKey(record.source)) throw new Error("Transfer source binding changed");
+      // Invalidate input already preparing attachments before this transfer began.
+      this.setValue(`stream-generation:${record.bindingId}`, this.streamGeneration(record.bindingId) + 1);
+      this.markTransfer(record);
+    });
+  }
+
+  markTransfer(record: TaskTransferRecord): void {
+    this.setValue(`transfer:${record.bindingId}`, record);
+    this.setValue(`transfer-operation:${record.id}`, record);
+  }
+
+  /** Compare-and-set prevents delayed callbacks from overwriting newer progress. */
+  updateTransfer(previous: TaskTransferRecord, changes: Partial<TaskTransferRecord>, now = Date.now()): TaskTransferRecord {
+    return this.atomic(() => {
+      const current = this.transfer(previous.bindingId);
+      if (!current || current.id !== previous.id || (current.revision ?? 0) !== (previous.revision ?? 0)) {
+        throw new Error("Stale transfer update");
+      }
+      const next = { ...current, ...changes, revision: (current.revision ?? 0) + 1, updatedAt: now };
+      this.markTransfer(next);
+      // Keep operational history without duplicating private goal text or prompts.
+      this.setValue(`transfer-journal:${next.id}:${next.revision}`, {
+        at: now, phase: next.phase, step: next.step, attempt: next.attempt, blocked: next.blocked, retryAt: next.retryAt,
+      });
+      return next;
+    });
+  }
+
+  claimTransfer(previous: TaskTransferRecord, owner: string, pid: number, isAlive: (pid: number) => boolean, now = Date.now()): TaskTransferRecord | null {
+    return this.atomic(() => {
+      const current = this.transfer(previous.bindingId);
+      if (!current || current.id !== previous.id || (current.revision ?? 0) !== (previous.revision ?? 0)) return null;
+      // A watchdog timeout cannot revoke a live process's writer lease. Only a
+      // confirmed dead process permits takeover after a crash.
+      if (current.lease && current.lease.owner !== owner && isAlive(current.lease.pid)) return null;
+      const sources = [current.source.sourceId ?? "", current.targetSourceId];
+      if (this.transfers().some(other => other.id !== current.id && other.lease && isAlive(other.lease.pid)
+        && [other.source.sourceId ?? "", other.targetSourceId].some(source => sources.includes(source)))) return null;
+      return this.updateTransfer(current, { lease: { owner, pid } }, now);
+    });
+  }
+
+  releaseTransfer(bindingId: string, id: string, owner: string, now = Date.now()): void {
+    this.atomic(() => {
+      const current = this.transfer(bindingId);
+      if (current?.id === id && current.lease?.owner === owner) this.updateTransfer(current, { lease: null }, now);
+    });
+  }
+
+  completeTransfer(record: TaskTransferRecord, now = Date.now()): TaskTransferRecord {
+    return this.atomic(() => {
+      const binding = this.getBinding(record.bindingId);
+      if (record.phase !== "switched" || !record.target || !binding || taskKey(binding) !== taskKey(record.target)) throw new Error("Transfer target binding changed");
+      return this.updateTransfer(record, { phase: "complete", detail: "", blocked: false, blockedReason: null, retryAt: 0,
+        ...(!record.checkpoint ? { legacyReconciled: true } : {}) }, now);
+    });
+  }
+
+  switchTransfer(record: TaskTransferRecord, target: DesktopTask): Binding {
+    return this.atomic(() => {
+      const current = this.getBinding(record.bindingId);
+      if (!current || taskKey(current) !== taskKey(record.source)) throw new Error("Transfer source binding changed");
+      const conflict = this.db.prepare("SELECT id FROM bridge_bindings WHERE host_id = ? AND thread_id = ? AND source_id = ? AND id <> ?")
+        .get(target.hostId, target.threadId, target.sourceId ?? "", record.bindingId) as { id: string } | undefined;
+      if (conflict) throw new Error("Transfer target is already linked to another conversation");
+      const activity = this.getValue<{ key?: string }>(`activity:${record.bindingId}`);
+      if (activity?.key) this.db.prepare(`UPDATE bridge_delivery SET kind = 'delete', revision = revision + 1
+        WHERE key = ? AND handle IS NOT NULL AND kind = 'activity'`).run(activity.key);
+      this.db.prepare(`UPDATE bridge_bindings SET host_id = ?, thread_id = ?, title = ?, source_id = ?, source_label = ?, rollout_path = ?, attached = 1, paused = 0
+        WHERE id = ?`).run(target.hostId, target.threadId, target.title, target.sourceId ?? "", target.sourceLabel ?? null, target.rolloutPath ?? null, record.bindingId);
+      this.db.prepare("DELETE FROM bridge_events WHERE binding_id = ?").run(record.bindingId);
+      this.setValue(`projection:${record.bindingId}`, null);
+      this.setValue(`activity:${record.bindingId}`, null);
+      this.setValue(`task-details:${record.bindingId}`, null);
+      this.setValue(`editable-request:${record.bindingId}`, null);
+      this.setValue(`expected-edited-user:${record.bindingId}`, null);
+      this.setValue(`rename:${record.bindingId}`, null);
+      // A transferred task belongs to another configured Codex client. It gets
+      // exactly one new initial handoff; the previous task's marker must not be
+      // inherited by the target.
+      this.setValue(`desktop-handoff:${record.bindingId}`, null);
+      this.setValue(`stream-generation:${record.bindingId}`, this.streamGeneration(record.bindingId) + 1);
+      this.updateTransfer(record, { phase: "switched", target });
+      return this.getBinding(record.bindingId)!;
+    });
+  }
+
   claimInput(id: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_inbox(id, state) VALUES (?, 'processing')").run(id).changes === 1; }
   finishInput(id: string, uncertain = false): void { this.db.prepare("UPDATE bridge_inbox SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "done", id); }
 
@@ -262,9 +381,61 @@ export class BridgeStore {
     this.db.prepare("INSERT INTO bridge_values(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
   }
 
+  claimInitialHandoff(bindingId: string, task: TaskRef, now = Date.now()): boolean {
+    return this.atomic(() => {
+      const key = `desktop-handoff:${bindingId}`;
+      const expected = taskKey(task);
+      const current = this.getValue<DesktopHandoffState>(key);
+      if (current?.taskKey === expected) return false;
+      this.setValue(key, { taskKey: expected, status: "launching", updatedAt: now } satisfies DesktopHandoffState);
+      return true;
+    });
+  }
+
+  markDesktopHandoff(bindingId: string, task: TaskRef, status: DesktopHandoffState["status"], now = Date.now()): void {
+    const key = `desktop-handoff:${bindingId}`;
+    const expected = taskKey(task);
+    const current = this.getValue<DesktopHandoffState>(key);
+    const order: Record<DesktopHandoffState["status"], number> = { launching: 0, launched: 1, live: 2 };
+    if (current?.taskKey === expected && order[current.status] >= order[status]) return;
+    this.setValue(key, { taskKey: expected, status, updatedAt: now } satisfies DesktopHandoffState);
+  }
+
+  clearDesktopHandoff(bindingId: string, task: TaskRef): void {
+    const key = `desktop-handoff:${bindingId}`;
+    if (this.getValue<DesktopHandoffState>(key)?.taskKey === taskKey(task)) this.setValue(key, null);
+  }
+
+  pendingCreation(task: TaskRef): readonly TaskCreationUpdate[] {
+    const value = this.getValue<unknown>(`pending-creation:${taskKey(task)}`);
+    return Array.isArray(value) ? value as TaskCreationUpdate[] : [];
+  }
+
+  appendPendingCreation(update: TaskCreationUpdate): void {
+    this.atomic(() => {
+      const key = `pending-creation:${taskKey(update.task)}`;
+      this.setValue(key, [...this.pendingCreation(update.task), update].slice(-100));
+    });
+  }
+
+  clearPendingCreation(task: TaskRef): void { this.setValue(`pending-creation:${taskKey(task)}`, null); }
+
   recordOperation(id: string, task: TaskRef): void { this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task)); }
   finishOperation(id: string, uncertain: boolean): void { this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "accepted", id); }
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
+  rememberAcceptedTurn(bindingId: string, turnId: string, operationId: string): void {
+    const turns = this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId);
+    this.setValue(`accepted-turns:${bindingId}`, [...turns, { turnId, operationId }].slice(-16));
+  }
+  acceptedTurns(bindingId: string): readonly AcceptedTaskTurn[] {
+    const value = this.getValue<unknown>(`accepted-turns:${bindingId}`);
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is AcceptedTaskTurn => !!item && typeof item === "object"
+      && typeof (item as AcceptedTaskTurn).turnId === "string" && typeof (item as AcceptedTaskTurn).operationId === "string");
+  }
+  settleAcceptedTurn(bindingId: string, turnId: string): void {
+    this.setValue(`accepted-turns:${bindingId}`, this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId));
+  }
   saveEditableRequest(bindingId: string, request: EditableVkRequest): void { this.setValue(`editable-request:${bindingId}`, request); }
   editableRequest(bindingId: string): EditableVkRequest | null { return this.getValue<EditableVkRequest>(`editable-request:${bindingId}`); }
   expectEditedUser(bindingId: string, text: string, now = Date.now()): void {
@@ -277,6 +448,9 @@ export class BridgeStore {
     this.clearExpectedEditedUser(bindingId); return true;
   }
   rememberEvent(bindingId: string, eventId: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_events(binding_id, event_id) VALUES (?, ?)").run(bindingId, eventId).changes === 1; }
+  hasEvent(bindingId: string, eventId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM bridge_events WHERE binding_id = ? AND event_id = ?").get(bindingId, eventId));
+  }
   deliveryOrder(key: string): number { return (this.db.prepare("SELECT id FROM bridge_delivery WHERE key = ?").get(key) as { id: number } | undefined)?.id ?? 0; }
   latestPeerDeliveryOrder(peerId: number): number {
     return (this.db.prepare("SELECT MAX(id) AS id FROM bridge_delivery WHERE peer_id = ? AND kind IN ('send', 'commentary', 'panel', 'activity')").get(peerId) as { id: number | null }).id ?? 0;

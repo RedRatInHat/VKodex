@@ -1,4 +1,4 @@
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTasks, type DirectTaskExecutor, type DirectTaskUpdate, type EditLastUserTurnRequest, type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef } from "./contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskConnectionLostError, TaskNotOpenError, UncertainActionError, ProjectAssignmentUnconfirmedError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTaskCreator, type DesktopTaskLauncher, type DesktopTasks, type DesktopTaskTransfer, type EditLastUserTurnRequest, type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef, type TransferTaskRequest } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
@@ -26,7 +26,14 @@ export function taskInput(request: SubmitTaskRequest): { text: string; input: Ip
   };
 }
 
-function submissionMode(state: IpcObject): "start" | "steer" {
+class TransientSubmissionStateError extends ActionRejectedError {}
+
+// A loaded desktop task publishes its full projected history in the initial
+// snapshot. Large, long-running threads can legitimately take several seconds
+// to serialize and cross the IPC pipe.
+const TASK_SNAPSHOT_TIMEOUT_MS = 10_000;
+
+function submissionMode(state: IpcObject, allowEmpty = false): "start" | "steer" {
   const rawTurns: unknown[] = Array.isArray(state.turns) ? [...state.turns] : [];
   const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
   const entities = isObject(history) ? history.entitiesByKey : undefined;
@@ -41,12 +48,14 @@ function submissionMode(state: IpcObject): "start" | "steer" {
   // when steering; treating that placeholder as idle would start a second turn.
   const progressState = inProgressState(state);
   if (progressState === "live") return "steer";
-  if (progressState === "ambiguous") throw new ActionRejectedError("Codex сообщает противоречивое состояние хода. Открой задачу в Codex и повтори после обновления состояния; сообщение не отправлено.");
+  if (progressState === "ambiguous") throw new TransientSubmissionStateError("Codex сообщает противоречивое состояние хода. Открой задачу в Codex и повтори после обновления состояния; сообщение не отправлено.");
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
-  const runtimeReady = runtimeStatus === undefined || runtimeStatus === "idle" || runtimeStatus === "notLoaded";
+  const runtimeReady = runtimeStatus === undefined || runtimeStatus === "idle" || runtimeStatus === "notLoaded" || runtimeStatus === "systemError";
   if ((state.resumeState !== undefined && state.resumeState !== "resumed") || !runtimeReady) {
-    throw new ActionRejectedError("Десктоп ещё не подтвердил готовность задачи к следующему ходу. Сообщение не отправлено; повтори после восстановления состояния.");
+    throw new TransientSubmissionStateError("Десктоп ещё не подтвердил готовность задачи к следующему ходу. Сообщение не отправлено; повтори после восстановления состояния.");
   }
+  const hasTurnContainer = Array.isArray(state.turns) || isObject(entities);
+  if (allowEmpty && !rawTurns.length && hasTurnContainer) return "start";
   if (!rawTurns.some(turn => isObject(turn) && ["completed", "failed", "interrupted"].includes(String(turn.status)))) {
     throw new ActionRejectedError("Не удалось определить состояние задачи. Сообщение не отправлено; открой задачу в Codex и повтори.");
   }
@@ -57,9 +66,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   private compatibilityState: DesktopCompatibility = { state: "checking", message: "Проверка live-протокола ещё не завершена." };
 
   get capabilities() {
-    return { createTask: !!this.executor, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: !!this.catalog.listModels,
+    return { createTask: !!this.live?.creator, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: !!this.catalog.listModels,
       renameTask: !!this.metadata, archiveTask: !!this.metadata, exportMarkdown: !!this.metadata, moveTask: !!this.metadata && !!this.catalog.resolveProject,
-      accountUsage: !!this.usage, goals: !!this.goals, editLastUserTurn: true };
+      transferTask: !!this.live?.transfer && (this.catalog.listSources?.().length ?? 0) > 1,
+      accountUsage: !!this.usage, usageReset: !!this.usage?.consumeReset, goals: !!this.goals, editLastUserTurn: true };
   }
 
   constructor(
@@ -67,14 +77,45 @@ export class ConnectedDesktopTasks implements DesktopTasks {
       listProjects: (sourceId?: string) => Promise<readonly import("./contracts.js").DesktopProject[]>;
       catalogWarnings?: () => readonly string[];
       listSources?: () => readonly { readonly id: string; readonly label: string }[];
-      resolveProject?: (id: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>;
+      resolveProject?: (id: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string; readonly project?: { readonly id: string } }>;
     },
     private readonly createClient: () => DesktopIpcClient = () => new DesktopIpcClient(),
     private readonly metadata?: DesktopMetadata,
-    private readonly executor?: DirectTaskExecutor,
     private readonly usage?: AccountUsageProvider,
     private readonly goals?: DesktopGoals,
+    private readonly live?: { readonly creator?: DesktopTaskCreator; readonly launcher?: DesktopTaskLauncher; readonly transfer?: DesktopTaskTransfer; readonly stateSettleMs?: number },
   ) {}
+
+  private async withReadySubmission<T>(subscription: TaskSubscription, allowEmpty: boolean,
+    beforeSend: SubmitTaskRequest["beforeSend"], send: (mode: "start" | "steer", owner: string) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + (this.live?.stateSettleMs ?? 3_000);
+    const currentMode = (): "start" | "steer" => {
+      if (subscription.failure) throw subscription.failure;
+      const state = subscription.current;
+      if (!state || !subscription.owner) throw new TransientSubmissionStateError("Codex ещё восстанавливает состояние задачи; сообщение не отправлено.");
+      return submissionMode(state, allowEmpty);
+    };
+    while (true) {
+      let mode: "start" | "steer";
+      try {
+        currentMode();
+        await beforeSend?.();
+        // Access checks can yield to a disconnect, resync, or a new desktop
+        // turn. Revalidate after the last await, immediately before writing.
+        mode = currentMode();
+      }
+      catch (error) {
+        if (!(error instanceof TransientSubmissionStateError)) throw error;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw error;
+        await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+        continue;
+      }
+      // Errors after this point belong to the mutation and must not enter the
+      // state-wait loop, even if the connection drops before the reply arrives.
+      return send(mode, subscription.owner!);
+    }
+  }
 
   listTasks() { return this.catalog.listTasks(); }
   listSources() { return this.catalog.listSources?.() ?? [{ id: "", label: "Основной" }]; }
@@ -83,6 +124,11 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   async accountUsage(task?: TaskRef) {
     if (!this.usage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");
     return this.usage.read(task);
+  }
+
+  async consumeUsageReset(task: TaskRef, idempotencyKey: string) {
+    if (!this.usage?.consumeReset) throw new ActionRejectedError("Сброс лимита недоступен в этом подключении.");
+    return this.usage.consumeReset(task, idempotencyKey);
   }
 
   async listModels(task?: TaskRef) {
@@ -106,7 +152,6 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
 
   async continueGoal(task: TaskRef): Promise<void> {
-    if (this.executor?.isRunning(task) || this.executor?.details(task)) return;
     try {
       await this.follow(task, async (subscription, client) => {
         const state = subscription.current!;
@@ -128,26 +173,54 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     }
   }
 
+  /** Connect only to an owner that is already online. This method must never
+   * launch or focus an application as a side effect of a read or command. */
+  private async connect(task: TaskRef, timeoutMs = TASK_SNAPSHOT_TIMEOUT_MS): Promise<{ readonly subscription: TaskSubscription; readonly client: DesktopIpcClient }> {
+    const attempt = async (timeoutMs: number) => {
+      const client = this.createClient();
+      // Command clients are ephemeral. Sending `following: false` when they
+      // close disables the task-wide stream used by the persistent mirror.
+      const subscription = new TaskSubscription(client, task, () => {}, () => {}, false);
+      try { await subscription.start(timeoutMs); return { subscription, client }; }
+      catch (error) { subscription.close(); client.close(); throw error; }
+    };
+    return attempt(timeoutMs);
+  }
+
+  private async connectAfterLaunch(task: TaskRef): Promise<{ readonly subscription: TaskSubscription; readonly client: DesktopIpcClient }> {
+    const deadline = Date.now() + 30_000;
+    let latest: unknown = new TaskNotOpenError();
+    while (Date.now() < deadline) {
+      try { return await this.connect(task, Math.min(2_500, Math.max(250, deadline - Date.now()))); }
+      catch (error) {
+        latest = error;
+        if (!this.launchable(error)) throw error;
+        await new Promise(resolve => setTimeout(resolve, 350));
+      }
+    }
+    if (latest instanceof DesktopUnavailableError && !(latest instanceof TaskNotOpenError)) throw latest;
+    throw new ActionRejectedError("Настроенный клиент Codex не открыл задачу за 30 секунд. Проверь launcher и выбранный аккаунт.");
+  }
+
+  private launchable(error: unknown): boolean {
+    return error instanceof TaskNotOpenError || (error instanceof DesktopUnavailableError
+      && !/Версия событий|другой копии|путь истории|Выбранный каталог/u.test(error.message));
+  }
+
   private async follow<T>(task: TaskRef, work: (subscription: TaskSubscription, client: DesktopIpcClient) => Promise<T>): Promise<T> {
     const resolved = (await this.listTasks()).find(candidate => sameTask(candidate, task));
     if (!resolved) throw new ActionRejectedError("Задача не найдена в настроенных каталогах Codex.");
-    const client = this.createClient();
-    const subscription = new TaskSubscription(client, resolved, () => {}, () => {});
+    const { client, subscription } = await this.connect(resolved);
     try {
-      await subscription.start();
       if (!subscription.current || !subscription.owner) throw new ActionRejectedError("Не удалось подключиться к задаче.");
       return await work(subscription, client);
     } finally { subscription.close(); client.close(); }
   }
 
   async inspectTask(task: TaskRef) {
-    if (this.executor?.isRunning(task)) return this.executor.details(task)!;
-    try { return await this.follow(task, async subscription => taskDetails(subscription.current!)); }
-    catch (error) {
-      const direct = this.executor?.details(task);
-      if (error instanceof DesktopUnavailableError && direct) return direct;
-      throw error;
-    }
+    const creating = this.live?.creator?.details(task);
+    if (creating) return creating;
+    return this.follow(task, async subscription => taskDetails(subscription.current!));
   }
 
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
@@ -194,14 +267,78 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     if ((await this.listTasks()).some(candidate => sameTask(candidate, task))) throw new UncertainActionError();
   }
 
+  async archiveTransferredSource(task: TaskRef): Promise<void> {
+    if (!this.metadata?.isArchived) throw new ActionRejectedError("Проверяемое архивирование источника недоступно в текущем подключении.");
+    // The source was checked for an idle terminal state immediately before the
+    // immutable fork boundary was selected. Reconnecting or launching it here
+    // can focus an old Codex window and can block the recovery button for the
+    // full desktop timeout without adding any safety.
+    if (await this.metadata.isArchived(task)) return;
+    await this.metadata.archive(task);
+    if (!await this.metadata.isArchived(task)) throw new UncertainActionError();
+  }
+
+  async isTaskArchived(task: TaskRef, checkpoint?: import("./contracts.js").TransferCheckpoint): Promise<boolean> {
+    if (!this.metadata?.isArchived) throw new DesktopUnavailableError("Состояние архива недоступно.");
+    return this.metadata.isArchived(task, checkpoint);
+  }
+
+  async transferCheckpoint(task: TaskRef) {
+    if (!this.live?.transfer?.checkpoint) throw new ActionRejectedError("Снимок переноса недоступен.");
+    return this.live.transfer.checkpoint(task);
+  }
+  async verifyTransferSource(task: TaskRef, checkpoint: import("./contracts.js").TransferCheckpoint) {
+    if (!this.live?.transfer?.verifySource) throw new ActionRejectedError("Проверка исходной истории недоступна.");
+    return this.live.transfer.verifySource(task, checkpoint);
+  }
+  async verifyTransferTarget(request: TransferTaskRequest, target: import("./contracts.js").DesktopTask) {
+    if (!this.live?.transfer?.verifyTarget) throw new ActionRejectedError("Проверка переноса недоступна.");
+    return this.live.transfer.verifyTarget(request, target);
+  }
+
   async exportMarkdown(task: TaskRef): Promise<string> {
     if (!this.metadata) throw new ActionRejectedError("Экспорт недоступен в этом подключении.");
     return this.follow(task, async () => this.metadata!.markdown(task));
   }
 
   async createTask(request: CreateTaskRequest) {
-    if (!this.executor) throw new ActionRejectedError("Создание задач через текущее подключение недоступно.");
-    return this.executor.createTask(request);
+    if (!this.live?.creator) throw new ActionRejectedError("Создание задач через текущее подключение недоступно.");
+    return this.live.creator.createTask(request);
+  }
+
+  isCreationActive(task: TaskRef): boolean { return this.live?.creator?.isActive(task) ?? false; }
+  onCreationUpdate(listener: Parameters<NonNullable<DesktopTasks["onCreationUpdate"]>>[0]): () => void {
+    return this.live?.creator?.onUpdate(listener) ?? (() => {});
+  }
+
+  async ensureOpen(task: TaskRef): Promise<void> {
+    const resolved = (await this.listTasks()).find(candidate => sameTask(candidate, task));
+    if (!resolved) throw new ActionRejectedError("Задача не найдена в настроенных каталогах Codex.");
+    // The atomic creation session owns the first turn until it finishes. Open
+    // the configured client now, but do not wait for follower ownership that
+    // cannot exist while another App Server is executing that turn.
+    if (this.live?.creator?.isActive(resolved)) {
+      if (!this.live.launcher) throw new ActionRejectedError("Для каталога новой задачи не настроено приложение Codex.");
+      await this.live.launcher.open(resolved);
+      return;
+    }
+    try {
+      const { client, subscription } = await this.connect(resolved);
+      subscription.close(); client.close();
+      return;
+    } catch (error) {
+      if (!this.live?.launcher || !this.launchable(error)) throw error;
+    }
+    await this.live.launcher.open(resolved);
+    const { client, subscription } = await this.connectAfterLaunch(resolved);
+    subscription.close(); client.close();
+  }
+
+  async revealTask(task: TaskRef): Promise<void> {
+    const resolved = (await this.listTasks()).find(candidate => sameTask(candidate, task));
+    if (!resolved) throw new ActionRejectedError("Задача не найдена в настроенных каталогах Codex.");
+    if (!this.live?.launcher) throw new ActionRejectedError("Для каталога задачи не настроено приложение Codex.");
+    await this.live.launcher.open(resolved);
   }
 
   private async interruptState(task: TaskRef, expectedTurnId: string | undefined): Promise<"running" | "stopped" | "unknown"> {
@@ -228,15 +365,53 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     });
   }
 
+  /**
+   * Owner discovery remains usable in a known Codex renderer failure where the
+   * task stops publishing stream snapshots. /stop explicitly targets whatever
+   * turn is current, so an unscoped v3 request is safe only before any previous
+   * interrupt write was attempted and only when the thread ID is unambiguous
+   * across configured CODEX_HOME catalogs.
+   */
+  private async interruptWithoutSnapshot(task: TaskRef): Promise<void> {
+    const tasks = await this.listTasks();
+    const resolved = tasks.find(candidate => sameTask(candidate, task));
+    if (!resolved) throw new ActionRejectedError("Задача не найдена в настроенных каталогах Codex.");
+    const copies = tasks.filter(candidate => candidate.hostId === resolved.hostId && candidate.threadId === resolved.threadId);
+    if (copies.some(candidate => (candidate.sourceId ?? "") !== (resolved.sourceId ?? ""))) {
+      throw new ActionRejectedError("У задачи есть копии в нескольких каталогах Codex. Открой нужную копию и повтори /stop.");
+    }
+    const client = this.createClient();
+    try {
+      await client.connect();
+      let discovery: IpcObject;
+      try {
+        discovery = await client.request("thread-owner-discovery", 1, {
+          hostId: resolved.hostId, conversationId: resolved.threadId,
+        }, { timeoutMs: 5_000 });
+      } catch (error) {
+        if (error instanceof DesktopRequestRejectedError && error.reason === "no-client-found") throw new TaskNotOpenError();
+        throw error;
+      }
+      if (typeof discovery.handledByClientId !== "string" || !discovery.handledByClientId) throw new TaskNotOpenError();
+      const reply = await client.request("thread-follower-interrupt-turn", 3, {
+        conversationId: resolved.threadId, mode: "user-stop",
+      }, { targetClientId: discovery.handledByClientId, timeoutMs: 30_000, mutating: true });
+      const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+      if (!isObject(result) || result.ok !== true || typeof result.interruptedTurnId !== "string" || !result.interruptedTurnId) throw new UncertainActionError();
+    } finally { client.close(); }
+  }
+
   async interrupt(task: TaskRef): Promise<void> {
-    if (await this.executor?.interrupt(task)) return;
     if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
+    if (await this.live?.creator?.interrupt(task)) return;
     let expectedTurnId: string | undefined;
+    let interruptAttempted = false;
     try {
       await this.follow(task, async (subscription, client) => {
         const running = activeTurnsFromState(subscription.current!).at(-1);
         expectedTurnId = typeof running?.turnId === "string" && running.turnId ? running.turnId : undefined;
         if (!running && taskDetails(subscription.current!).status !== "running") throw new ActionRejectedError("В задаче нет выполняющегося хода.");
+        interruptAttempted = true;
         const reply = await client.request("thread-follower-interrupt-turn", expectedTurnId ? 4 : 3, {
           conversationId: task.threadId, mode: "user-stop", ...(expectedTurnId ? { expectedTurnId } : {}),
         }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
@@ -247,6 +422,14 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     }
     catch (error) {
       if (!(error instanceof UncertainActionError || error instanceof DesktopUnavailableError)) throw error;
+    }
+
+    // No snapshot means the normal path failed before writing anything. Do not
+    // make /stop depend on that read-only stream when owner discovery can still
+    // route the explicit user command to the correct unique task.
+    if (!interruptAttempted) {
+      await this.interruptWithoutSnapshot(task);
+      return;
     }
 
     let state = await this.interruptState(task, expectedTurnId);
@@ -268,14 +451,26 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   async moveTask(task: TaskRef, projectId: string | null): Promise<void> {
     if (!this.metadata || !this.catalog.resolveProject) throw new ActionRejectedError("Перенос между проектами недоступен в текущем подключении.");
     let rawProjectId: string | null = null;
+    let expectedProjectId = projectId;
     if (projectId !== null) {
       const resolved = await this.catalog.resolveProject(projectId);
       if ((resolved.sourceId ?? "") !== (task.sourceId ?? "")) throw new ActionRejectedError("Нельзя перенести задачу между разными каталогами CODEX_HOME.");
       rawProjectId = resolved.rawProjectId;
+      expectedProjectId = resolved.project?.id ?? projectId;
     }
     await this.metadata.assignProject(task, rawProjectId);
     const current = (await this.listTasks()).find(candidate => sameTask(candidate, task));
-    if (!current || current.projectId !== projectId) throw new UncertainActionError();
+    if (!current) throw new UncertainActionError();
+    const confirmed = this.metadata.read ? (await this.metadata.read(task)).projectId === rawProjectId : current.projectId === expectedProjectId;
+    if (!confirmed) throw new ProjectAssignmentUnconfirmedError();
+  }
+
+  async transferTask(request: TransferTaskRequest) {
+    if (!this.live?.transfer) throw new ActionRejectedError("Перенос между каталогами Codex недоступен в текущем подключении.");
+    if ((request.task.sourceId ?? "") === request.targetSourceId) throw new ActionRejectedError("Задача уже находится в выбранном каталоге Codex.");
+    const source = (await this.listTasks()).find(task => sameTask(task, request.task));
+    if (!source?.rolloutPath) throw new ActionRejectedError("Codex не сообщил путь истории задачи. Обнови список и повтори перенос.");
+    return this.live.transfer.fork({ ...request, task: { ...request.task, rolloutPath: source.rolloutPath } });
   }
 
   async submit(request: SubmitTaskRequest): Promise<void> {
@@ -286,52 +481,71 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     const text = request.text.trim();
     if ((!text && !request.inputFiles?.length) || text.length > 16_000) throw new ActionRejectedError("Пришли текст до 16000 символов или вложение.");
     const prepared = taskInput(request);
+    if (this.live?.creator?.isActive(request.task)) {
+      throw new ActionRejectedError("Первый ход новой задачи ещё выполняется. Дождись завершения или отправь /stop.");
+    }
     const task = (await this.listTasks()).find(task => sameTask(task, request.task));
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
     // Subscription ownership is per IPC client. Closing a temporary follower on the
     // shared event client would also unsubscribe the long-lived mirror.
-    try {
-      return await this.submitLive(request, task, prepared);
-    } catch (error) {
-      if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
-      if (!(error instanceof TaskNotOpenError) || !this.executor) throw error;
-      await this.executor.submit(request);
-      return { mode: "fallback", turnId: null };
-    }
+    if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
+    return this.submitLive(request, task, prepared);
   }
 
-  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: ReturnType<typeof taskInput>): Promise<SubmitTaskReceipt> {
-    const client = this.createClient(); const subscription = new TaskSubscription(client, task, () => {}, () => {});
-    try {
-      await subscription.start();
-      await request.beforeSend?.();
-      const state = subscription.current;
-      if (!state || !subscription.owner) throw new ActionRejectedError("Не удалось подключиться к задаче.");
-      if (submissionMode(state) === "start") {
-        const reply = await client.request("thread-follower-start-turn", 2, {
-          conversationId: task.threadId,
-          turnStart: {
-            request: { threadId: task.threadId, clientUserMessageId: request.operationId, input: prepared.input },
-            context: { inheritThreadSettings: true },
-          },
-        }, { targetClientId: subscription.owner, timeoutMs: 30_000, mutating: true });
-        const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
-        if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
-        return { mode: "start", turnId: result.turn.id };
+  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: ReturnType<typeof taskInput>, allowEmpty = false): Promise<SubmitTaskReceipt> {
+    let opened = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let connection: Awaited<ReturnType<ConnectedDesktopTasks["connect"]>> | undefined;
+      let inputSent = false;
+      try {
+        try { connection = await this.connect(task); }
+        catch (error) {
+          // Recover missing ownership only for new input, at most once per
+          // request. A generic IPC error never justifies opening a window.
+          if (!(error instanceof TaskNotOpenError) || !this.live?.launcher || opened) throw error;
+          await request.beforeSend?.();
+          opened = true;
+          await this.live.launcher.open(task);
+          connection = await this.connectAfterLaunch(task);
+        }
+        const { client, subscription } = connection;
+        await request.beforeSend?.();
+        return await this.withReadySubmission(subscription, allowEmpty, request.beforeSend, async (mode, owner) => {
+          inputSent = true;
+          if (mode === "start") {
+            const reply = await client.request("thread-follower-start-turn", 2, {
+              conversationId: task.threadId,
+              turnStart: {
+                request: { threadId: task.threadId, clientUserMessageId: request.operationId, input: prepared.input },
+                context: { inheritThreadSettings: true },
+              },
+            }, { targetClientId: owner, timeoutMs: 30_000, mutating: true });
+            const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+            if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+            return { mode: "start", turnId: result.turn.id };
+          }
+          const reply = await client.request("thread-follower-steer-turn", 1, {
+            conversationId: task.threadId,
+            clientUserMessageId: request.operationId,
+            input: prepared.input,
+            attachments: prepared.attachments,
+            restoreMessage: {
+              id: request.operationId, text: prepared.text, createdAt: Date.now(),
+              context: { prompt: prepared.text, addedFiles: [], fileAttachments: [], imageAttachments: [], commentAttachments: [], ideContext: null },
+            },
+          }, { targetClientId: owner, timeoutMs: 30_000, mutating: true });
+          if (!isObject(reply.result) || !isObject(reply.result.result) || typeof reply.result.result.turnId !== "string" || !reply.result.result.turnId) throw new UncertainActionError();
+          return { mode: "steer", turnId: reply.result.result.turnId };
+        });
+      } catch (error) {
+        // Only reattach when no start/steer request has been attempted. Source,
+        // protocol and access errors retain their original reason and fail.
+        if (inputSent || !(error instanceof TaskConnectionLostError) || attempt > 0) throw error;
+      } finally {
+        connection?.subscription.close(); connection?.client.close();
       }
-      const reply = await client.request("thread-follower-steer-turn", 1, {
-        conversationId: task.threadId,
-        clientUserMessageId: request.operationId,
-        input: prepared.input,
-        attachments: prepared.attachments,
-        restoreMessage: {
-          id: request.operationId, text: prepared.text, createdAt: Date.now(),
-          context: { prompt: prepared.text, addedFiles: [], fileAttachments: [], imageAttachments: [], commentAttachments: [], ideContext: null },
-        },
-      }, { targetClientId: subscription.owner, timeoutMs: 30_000, mutating: true });
-      if (!isObject(reply.result) || !isObject(reply.result.result) || typeof reply.result.result.turnId !== "string" || !reply.result.result.turnId) throw new UncertainActionError();
-      return { mode: "steer", turnId: reply.result.result.turnId };
-    } finally { subscription.close(); client.close(); }
+    }
+    throw new TaskConnectionLostError();
   }
 
   async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
@@ -376,8 +590,6 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     });
   }
 
-  isDirectlyManaged(task: TaskRef): boolean { return (this.executor?.details(task) ?? null) !== null; }
-  onDirectUpdate(listener: (update: DirectTaskUpdate) => void): () => void { return this.executor?.onUpdate(listener) ?? (() => {}); }
   compatibility(): DesktopCompatibility { return this.compatibilityState; }
 
   async checkCompatibility(): Promise<DesktopCompatibility> {
@@ -395,7 +607,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
       return this.compatibilityState;
     }
     for (const task of tasks) {
-      const client = this.createClient(); const subscription = new TaskSubscription(client, task, () => {}, () => {});
+      const client = this.createClient(); const subscription = new TaskSubscription(client, task, () => {}, () => {}, false);
       try {
         await subscription.start(1_500);
         this.compatibilityState = { state: "ok", message: "Live stream protocol v11 подтверждён открытой задачей." };

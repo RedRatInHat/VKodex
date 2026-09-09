@@ -99,6 +99,7 @@ export class DesktopIpcClient {
     this.stream = stream;
     const decoder = new FrameDecoder();
     stream.on("data", (chunk: Buffer) => {
+      if (this.stream !== stream) return;
       try { for (const message of decoder.push(chunk)) this.receive(message); }
       catch (error) {
         // JSON parser errors can quote private task content. Expose only our
@@ -106,16 +107,17 @@ export class DesktopIpcClient {
         this.close(error instanceof DesktopUnavailableError ? error : new DesktopUnavailableError("Не удалось прочитать состояние Codex: несовместимый или повреждённый пакет IPC."));
       }
     });
-    stream.once("error", () => this.close());
+    stream.once("error", () => { if (this.stream === stream) this.close(); });
     stream.once("close", () => this.disconnected(stream));
     try {
       const reply = await this.request("initialize", 0, { clientType: "vkodex" });
+      if (this.stream !== stream || stream.destroyed) throw new DesktopUnavailableError();
       if (!isObject(reply.result) || typeof reply.result.clientId !== "string") {
         throw new DesktopUnavailableError("Десктоп вернул несовместимый ответ подключения.");
       }
       this.clientId = reply.result.clientId;
     } catch (error) {
-      this.close();
+      if (this.stream === stream) this.close();
       throw error;
     }
   }
@@ -178,7 +180,8 @@ export class DesktopIpcClient {
       this.pending.delete(message.requestId);
       if (message.resultType === "success") pending.resolve(message);
       // Internal protocol errors are not a reliable proof that a write did not happen.
-      else pending.reject(pending.mutating ? new UncertainActionError() : new DesktopRequestRejectedError());
+      else pending.reject(pending.mutating ? new UncertainActionError()
+        : new DesktopRequestRejectedError(message.error === "no-client-found" ? "no-client-found" : "request-rejected"));
       return;
     }
     if (message.type === "broadcast" && Array.isArray(message.targetClientIds) && message.targetClientIds.includes(this.clientId)) {
