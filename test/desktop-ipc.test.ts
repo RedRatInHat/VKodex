@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { Duplex } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
+import { appendFile, mkdtemp, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
@@ -19,7 +21,7 @@ import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } fr
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { BridgeStore } from "../src/bridge/store.js";
-import type { BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
+import type { Binding, BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
 const questionRequest = { id: 42, method: "item/tool/requestUserInput", params: { threadId: "fixture-task", turnId: "fixture-turn", itemId: "call-question",
@@ -146,6 +148,54 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
+
+const rolloutFinal = (timestamp: number, id: string, turnId: string, text: string) => JSON.stringify({
+  timestamp: new Date(timestamp).toISOString(), type: "response_item",
+  payload: { type: "message", id, role: "assistant", phase: "final_answer",
+    content: [{ type: "output_text", text }], internal_chat_message_metadata_passthrough: { turn_id: turnId } },
+}) + "\n";
+
+test("rollout fallback catches a final written between stream failure and the first poll", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  await writeFile(rolloutPath, rolloutFinal(80_000, "old-final", "old-turn", "Old answer"));
+  const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  const fallback = s.runtime as unknown as {
+    enableRolloutFallback(binding: Binding): void;
+    mirrorRolloutFallback(binding: Binding): Promise<void>;
+  };
+  fallback.enableRolloutFallback(binding); // Stream fails at 100_000.
+  await appendFile(rolloutPath, rolloutFinal(101_000, "new-final", "new-turn", "Recovered answer"));
+  s.advance(2_000); // First disk poll happens after the final was written.
+  await fallback.mirrorRolloutFallback(binding);
+  const deliveries = s.store.pendingDeliveries().map(delivery => delivery.view.text);
+  assert.ok(deliveries.some(text => text.includes("Recovered answer")));
+  assert.ok(deliveries.every(text => !text.includes("Old answer")));
+});
+
+test("rollout fallback recovers an accepted VK turn that finished before reconnection", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  await writeFile(rolloutPath, rolloutFinal(80_000, "old-final", "old-turn", "Old answer")
+    + rolloutFinal(95_000, "accepted-final", "accepted-turn", "Accepted answer"));
+  const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  s.store.recordOperation("accepted-operation", binding, "vk-inbox", binding.id, 90_000);
+  s.store.finishOperation("accepted-operation", "accepted");
+  s.store.rememberAcceptedTurn(binding.id, "accepted-turn", "accepted-operation");
+  assert.equal(s.store.oldestAcceptedTurnAt(binding.id), 90_000);
+  const fallback = s.runtime as unknown as {
+    enableRolloutFallback(binding: Binding): void;
+    mirrorRolloutFallback(binding: Binding): Promise<void>;
+  };
+  fallback.enableRolloutFallback(binding); // Fresh process only notices the failure at 100_000.
+  await fallback.mirrorRolloutFallback(binding);
+  const deliveries = s.store.pendingDeliveries().map(delivery => delivery.view.text);
+  assert.ok(deliveries.some(text => text.includes("Accepted answer")));
+  assert.ok(deliveries.every(text => !text.includes("Old answer")));
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+});
 
 test("runtime reconciles an uncertain prompt from Codex history after restart", async t => {
   const s = runtimeSetup(t);

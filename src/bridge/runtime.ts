@@ -33,6 +33,7 @@ export class DesktopBridgeRuntime {
   private readonly ownerChecks = new Map<string, Promise<void>>();
   /** Tasks whose desktop owner exists but does not emit stream snapshots. */
   private readonly rolloutFallback = new Set<string>();
+  private readonly rolloutFallbackSince = new Map<string, number>();
   private readonly rolloutPollAfter = new Map<string, number>();
   private readonly rollout = new RolloutTailer();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -178,14 +179,16 @@ export class DesktopBridgeRuntime {
     this.files?.observe(bindingId, "unavailable");
   }
 
-  private enableRolloutFallback(binding: Binding): void {
+  private enableRolloutFallback(binding: Binding, since = this.now()): void {
     if (!binding.rolloutPath) return;
     this.rolloutFallback.add(binding.id);
+    this.rolloutFallbackSince.set(binding.id, Math.min(this.rolloutFallbackSince.get(binding.id) ?? since, since));
     this.rolloutPollAfter.delete(binding.id);
   }
 
   private disableRolloutFallback(binding: Binding): void {
     this.rolloutFallback.delete(binding.id);
+    this.rolloutFallbackSince.delete(binding.id);
     this.rolloutPollAfter.delete(binding.id);
     this.rollout.clear(binding);
   }
@@ -200,7 +203,13 @@ export class DesktopBridgeRuntime {
     if (this.now() < (this.rolloutPollAfter.get(binding.id) ?? 0)) return;
     this.rolloutPollAfter.set(binding.id, this.now() + 1_000);
     const checkpoint = this.store.getValue<ProjectionCheckpoint>(`projection:${binding.id}`);
-    const events = await this.rollout.poll(binding, checkpoint?.since ?? this.now());
+    // A final can land after stream failure but before this first poll. Keep
+    // the connection boundary and accepted VK turn durable across restarts;
+    // the event journal suppresses anything the live stream already delivered.
+    const since = Math.min(checkpoint?.since ?? Infinity,
+      this.store.oldestAcceptedTurnAt(binding.id) ?? Infinity,
+      this.rolloutFallbackSince.get(binding.id) ?? this.now());
+    const events = await this.rollout.poll(binding, since);
     if (!events.length || this.stopped || !this.store.getBinding(binding.id)?.attached) return;
     this.store.atomic(() => {
       for (const event of events) {
@@ -219,9 +228,10 @@ export class DesktopBridgeRuntime {
   private subscriptionFailed(bindingId: string, subscription: TaskSubscription, error: Error): void {
     if (this.subscriptions.get(bindingId) !== subscription) return;
     const binding = this.store.getBinding(bindingId);
+    const lastVerifiedAt = this.ownerVerifiedAt.get(bindingId);
     this.closeSubscription(bindingId);
     if (this.stopped || !binding?.attached || !sameTask(binding, subscription.task)) return;
-    this.enableRolloutFallback(binding);
+    this.enableRolloutFallback(binding, lastVerifiedAt ?? this.now());
     this.manager.panels.disconnected(bindingId, error instanceof TaskNotOpenError);
     this.retryAfter.set(bindingId, this.now() + 5_000);
     const reason = error instanceof DesktopUnavailableError ? error.message : "Подключение к десктопу Codex недоступно.";
@@ -365,6 +375,7 @@ export class DesktopBridgeRuntime {
       }, error => this.subscriptionFailed(binding.id, subscription, error));
       this.subscriptions.set(binding.id, subscription);
       this.subscriptionTasks.set(binding.id, taskKey(task));
+      const connectStartedAt = this.now();
       const start = (async () => {
         try {
           await subscription.start();
@@ -378,7 +389,7 @@ export class DesktopBridgeRuntime {
           subscription.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id);
           const current = this.store.getBinding(binding.id);
           if (this.stopped || !current?.attached) return;
-          this.enableRolloutFallback(current);
+          this.enableRolloutFallback(current, connectStartedAt);
           this.activity.disconnected(binding.id);
           this.files?.observe(binding.id, "unavailable");
           this.retryAfter.set(binding.id, this.now() + 5_000);

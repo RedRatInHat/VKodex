@@ -609,6 +609,15 @@ export class BridgeStore {
     return value.filter((item): item is AcceptedTaskTurn => !!item && typeof item === "object"
       && typeof (item as AcceptedTaskTurn).turnId === "string" && typeof (item as AcceptedTaskTurn).operationId === "string");
   }
+  oldestAcceptedTurnAt(bindingId: string): number | null {
+    let oldest: number | null = null;
+    const statement = this.db.prepare("SELECT created_at AS createdAt FROM bridge_operation_inputs WHERE operation_id = ? AND binding_id = ?");
+    for (const turn of this.acceptedTurns(bindingId)) {
+      const row = statement.get(turn.operationId, bindingId) as { createdAt: number } | undefined;
+      if (row && Number.isSafeInteger(row.createdAt) && row.createdAt > 0) oldest = Math.min(oldest ?? row.createdAt, row.createdAt);
+    }
+    return oldest;
+  }
   settleAcceptedTurn(bindingId: string, turnId: string): void {
     this.setValue(`accepted-turns:${bindingId}`, this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId));
   }
