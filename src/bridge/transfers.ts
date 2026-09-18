@@ -229,12 +229,23 @@ export class TaskTransfers {
         }
         const target = record.target!;
         step("open");
-        // A retry after an automatic restart checks ownership without repeatedly
-        // bringing windows to the foreground. An explicit Resume allows one launch.
+        // Persist the intent before opening. If that process dies between the
+        // write and the launch, a different executor must probe the target and
+        // retry. Within one executor, never cycle the foreground window.
         if (!record.launchAttempted) {
-          save({ launchAttempted: true }); await this.desktop.ensureOpen(target);
+          save({ launchAttempted: true, launchOwner: this.owner }); await this.desktop.ensureOpen(target);
         }
-        const live = await this.desktop.inspectTask(target);
+        let live;
+        if (record.launchOwner !== this.owner) {
+          try { live = await this.desktop.inspectTask(target); }
+          catch {
+            // ensureOpen probes the owner before using the configured launcher.
+            // Repeating it after a lost response cannot create another fork.
+            save({ launchOwner: this.owner });
+            await this.desktop.ensureOpen(target);
+          }
+        }
+        live ??= await this.desktop.inspectTask(target);
         if (!["idle", "failed", "interrupted"].includes(live.status)) throw new DesktopUnavailableError("Клиент назначения пока не готов к следующему ходу.");
         step("metadata");
         await this.desktop.renameTask(target, record.source.title);

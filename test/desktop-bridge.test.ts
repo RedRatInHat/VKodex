@@ -955,6 +955,30 @@ test("a stopped executor resumes its saved target after client recovery without 
   assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.opened.length, 1);
 });
 
+test("a new executor recovers a saved launch intent that never reached the target client", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let launchCalls = 0;
+  s.desktop.inspectError = new TaskNotOpenError();
+  s.desktop.ensureOpen = async ref => {
+    s.desktop.opened.push(ref);
+    launchCalls++;
+    if (launchCalls === 1) throw new TaskNotOpenError();
+    s.desktop.inspectError = null;
+  };
+  const first = new TaskTransfers(s.store, s.desktop, s.now);
+  first.start(record); await first.idle(); await first.stop();
+  const pending = s.store.transfer(record.bindingId)!;
+  assert.equal(pending.phase, "targetCreated");
+  assert.equal(pending.launchAttempted, true);
+  assert.ok(pending.launchOwner);
+  s.advance(30_000);
+  const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+  restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.desktop.opened.length, 2);
+});
+
 test("a changed source snapshot blocks switching and archival instead of hiding newer work", async t => {
   const s = setup(t); const record = transferFixture(s);
   let checks = 0;

@@ -99,6 +99,9 @@ export interface TaskTransferRecord {
   readonly goalPrepared?: boolean;
   readonly step?: "snapshot" | "fork" | "metadata" | "open" | "goal" | "verify" | "archive";
   readonly launchAttempted?: boolean;
+  /** Executor that last attempted the idempotent target connection. A new
+   * executor may retry after first checking whether the target is live. */
+  readonly launchOwner?: string;
   readonly lease?: { readonly owner: string; readonly pid: number } | null;
 }
 
