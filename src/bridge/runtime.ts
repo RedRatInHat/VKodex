@@ -16,6 +16,7 @@ import type { BridgeHealthSnapshot } from "./contracts.js";
 import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
+import { comparablePath } from "../desktop/paths.js";
 
 export class DesktopBridgeRuntime {
   private readonly gate: AccessGate;
@@ -197,13 +198,22 @@ export class DesktopBridgeRuntime {
   /**
    * A rare renderer failure leaves owner discovery alive while it stops
    * publishing thread-stream snapshots. The rollout is append-only and keeps
-   * the same visible assistant message IDs, so it is a safe recovery source.
+   * stable visible assistant message IDs until Codex rebuilds the branch.
    */
   private async mirrorRolloutFallback(binding: Binding): Promise<void> {
     if (!this.rolloutFallback.has(binding.id) || !binding.attached || binding.peerId === null) return;
     if (this.now() < (this.rolloutPollAfter.get(binding.id) ?? 0)) return;
     this.rolloutPollAfter.set(binding.id, this.now() + 1_000);
     const checkpoint = this.store.getValue<ProjectionCheckpoint>(`projection:${binding.id}`);
+    // A rewritten Codex branch may assign new item IDs to answers already
+    // delivered from the old rollout. Without an owner snapshot there is no
+    // authoritative way to distinguish those from new direct-app turns.
+    // Recover only turns whose VK submission was durably accepted; wait for the
+    // live stream to reconcile the rest of the rebuilt history.
+    const historyRebuilt = !!checkpoint?.rolloutPath && !!binding.rolloutPath
+      && comparablePath(checkpoint.rolloutPath) !== comparablePath(binding.rolloutPath);
+    const acceptedTurnIds = historyRebuilt
+      ? new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId)) : null;
     // A final can land after stream failure but before this first poll. Keep
     // the connection boundary and accepted VK turn durable across restarts;
     // the event journal suppresses anything the live stream already delivered.
@@ -213,7 +223,11 @@ export class DesktopBridgeRuntime {
     let events: readonly TaskEvent[];
     try {
       events = await this.rollout.poll(binding, since);
-      if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
+      if (historyRebuilt) {
+        const previous = this.store.getValue<{ at: number; kind: string }>(`rollout-failure:${binding.id}`);
+        if (previous?.kind !== "historyRebuilt") this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: "historyRebuilt" });
+      }
+      else if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
     } catch (error) {
       this.store.setValue(`rollout-failure:${binding.id}`, {
         at: this.now(), kind: error instanceof RolloutRecordTooLargeError ? "recordTooLarge" : "readFailed",
@@ -223,6 +237,7 @@ export class DesktopBridgeRuntime {
     if (!events.length || this.stopped || !this.store.getBinding(binding.id)?.attached) return;
     this.store.atomic(() => {
       for (const event of events) {
+        if (acceptedTurnIds && !acceptedTurnIds.has(event.turnId)) continue;
         this.mirror.accept(binding.id, event);
         if (event.type === "final") {
           this.store.settleAcceptedTurn(binding.id, event.turnId);

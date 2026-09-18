@@ -121,6 +121,10 @@ test("health identifies a blocked rollout recovery without exposing its history"
   assert.equal(check.state, "failed");
   assert.match(check.detail, /Fixture.*безопасного предела/u);
   assert.doesNotMatch(check.detail, /[{}]/u);
+  store.setValue("rollout-failure:fixture", { at: now, kind: "historyRebuilt" });
+  const rebuilt = (await monitor.check(true)).checks.find(item => item.name === "rollout_recovery:fixture")!;
+  assert.equal(rebuilt.state, "failed");
+  assert.match(rebuilt.detail, /пересобранную ветку.*подтверждённые VK-ходы/u);
   store.setValue("rollout-failure:fixture", null);
   assert.equal((await monitor.check(true)).checks.some(item => item.name === "rollout_recovery:fixture"), false);
 });

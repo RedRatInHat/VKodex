@@ -198,6 +198,34 @@ test("rollout fallback recovers an accepted VK turn that finished before reconne
   assert.deepEqual(s.store.acceptedTurns(binding.id), []);
 });
 
+test("rollout fallback does not replay a rebuilt branch with fresh message IDs", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
+  const originalPath = path.join(root, "original.jsonl");
+  const rebuiltPath = path.join(root, "rebuilt.jsonl");
+  await writeFile(rebuiltPath, rolloutFinal(101_000, "rewritten-final", "rewritten-turn", "Previously delivered answer")
+    + rolloutFinal(102_000, "accepted-final", "accepted-turn", "New accepted answer"));
+  const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: rebuiltPath });
+  s.store.setValue(`projection:${binding.id}`, {
+    since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], seen: {}, semanticByIdentity: {}, rolloutPath: originalPath,
+  });
+  s.store.recordOperation("accepted-operation", binding, "vk-inbox", binding.id, 95_000);
+  s.store.finishOperation("accepted-operation", "accepted");
+  s.store.rememberAcceptedTurn(binding.id, "accepted-turn", "accepted-operation");
+  const fallback = s.runtime as unknown as {
+    enableRolloutFallback(binding: Binding): void;
+    mirrorRolloutFallback(binding: Binding): Promise<void>;
+  };
+  fallback.enableRolloutFallback(binding);
+  s.advance(3_000);
+  await fallback.mirrorRolloutFallback(binding);
+  const deliveries = s.store.pendingDeliveries().map(delivery => delivery.view.text);
+  assert.ok(deliveries.every(text => !text.includes("Previously delivered answer")));
+  assert.ok(deliveries.some(text => text.includes("New accepted answer")));
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+  assert.equal(s.store.getValue<{ kind: string }>(`rollout-failure:${binding.id}`)?.kind, "historyRebuilt");
+});
+
 test("rollout fallback reports an oversized record and recovers after the file is corrected", async t => {
   const s = runtimeSetup(t);
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));

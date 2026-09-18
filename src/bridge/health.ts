@@ -152,13 +152,15 @@ export class BridgeHealthMonitor {
         : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
-      const rolloutFailure = this.store.getValue<{ at: number; kind: "recordTooLarge" | "readFailed" }>(`rollout-failure:${binding.id}`);
+      const rolloutFailure = this.store.getValue<{ at: number; kind: "recordTooLarge" | "readFailed" | "historyRebuilt" }>(`rollout-failure:${binding.id}`);
       const failureAt = rolloutFailure && Number.isSafeInteger(rolloutFailure.at) && Math.abs(rolloutFailure.at) <= 8.64e15
         ? new Date(rolloutFailure.at).toISOString() : "неизвестно";
       if (rolloutFailure) checks.push({ name: `rollout_recovery:${binding.id}`,
-        state: rolloutFailure.kind === "recordTooLarge" ? "failed" : "degraded",
+        state: rolloutFailure.kind === "readFailed" ? "degraded" : "failed",
         detail: `«${binding.title.slice(0, 120)}» (${binding.source}): резервное чтение истории ${rolloutFailure.kind === "recordTooLarge"
-          ? "остановлено на записи больше безопасного предела" : "не удалось завершить"}; последний сбой ${failureAt}. Живое подключение повторяется; сообщения не следует дублировать вручную.` });
+          ? "остановлено на записи больше безопасного предела" : rolloutFailure.kind === "historyRebuilt"
+            ? "обнаружило пересобранную ветку; без снимка владельца доставляются только подтверждённые VK-ходы, чтобы не повторить старые ответы"
+            : "не удалось завершить"}; последний сбой ${failureAt}. Живое подключение повторяется; сообщения не следует дублировать вручную.` });
       if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
       const problem = binding.failure === "usageLimit" ? "исчерпан лимит аккаунта"
         : binding.failure === "systemError" ? "Codex сообщил системную ошибку"
