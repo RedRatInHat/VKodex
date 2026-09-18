@@ -35,27 +35,58 @@ export class RolloutTailer {
     const key = this.key(task);
     const saved = this.cursors.get(key);
     const fresh = !saved || saved.offset > info.size;
-    const start = fresh ? Math.max(0, info.size - this.initialWindowBytes) : saved.offset;
+    const start = fresh ? await this.initialOffset(path, info.size, since) : saved.offset;
     if (start >= info.size) return [];
     const length = Math.min(this.maxReadBytes, info.size - start);
     const buffer = Buffer.allocUnsafe(length);
     const handle = await open(path, "r");
-    try { await handle.read(buffer, 0, length, start); } finally { await handle.close(); }
+    let bytesRead = 0;
+    try { ({ bytesRead } = await handle.read(buffer, 0, length, start)); } finally { await handle.close(); }
+    const data = buffer.subarray(0, bytesRead);
 
-    // A read can begin in the middle of a JSONL record. Do not parse that
-    // fragment; subsequent reads always resume after a complete LF-delimited
-    // record. Codex rollouts use UTF-8, and LF is an ASCII byte.
-    const first = fresh && start > 0 ? buffer.indexOf(0x0a) + 1 : 0;
-    const last = buffer.lastIndexOf(0x0a);
+    // The initial probe returns a complete JSONL record boundary; saved
+    // cursors also point immediately after LF. Codex rollouts use UTF-8.
+    const first = 0;
+    const last = data.lastIndexOf(0x0a);
     if (last < first) return [];
     this.cursors.set(key, { offset: start + last + 1 });
-    const lines = buffer.subarray(first, last).toString("utf8").split("\n");
+    const lines = data.subarray(first, last).toString("utf8").split("\n");
     const records: RolloutRecord[] = [];
     for (const line of lines) {
       const record = parseRecord(line);
       if (record && record.timestamp >= since) records.push(record);
     }
     return records.map(record => record.event);
+  }
+
+  private async initialOffset(path: string, size: number, since: number): Promise<number> {
+    // A fixed tail window can silently skip a final when a busy task appends
+    // more than that window during an outage. Expand backwards until the first
+    // complete record predates the recovery boundary. Codex rollouts are
+    // chronological append-only logs; if a probe cannot be parsed, scan from
+    // the beginning instead of guessing a safe offset.
+    let window = Math.min(this.initialWindowBytes, size);
+    const handle = await open(path, "r");
+    try {
+      while (window < size) {
+        const start = size - window;
+        const length = Math.min(this.maxReadBytes, window);
+        const buffer = Buffer.allocUnsafe(length);
+        const { bytesRead } = await handle.read(buffer, 0, length, start);
+        const data = buffer.subarray(0, bytesRead);
+        const first = data.indexOf(0x0a) + 1;
+        const last = first > 0 ? data.indexOf(0x0a, first) : -1;
+        if (last < first) return 0;
+        try {
+          const record = JSON.parse(data.subarray(first, last).toString("utf8")) as { timestamp?: unknown };
+          const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+          if (!Number.isFinite(timestamp)) return 0;
+          if (timestamp < since) return start + first;
+        } catch { return 0; }
+        window = Math.min(size, window * 2);
+      }
+      return 0;
+    } finally { await handle.close(); }
   }
 
   private key(task: TaskRef): string { return JSON.stringify([task.sourceId ?? "", task.threadId, task.rolloutPath ?? ""]); }

@@ -206,7 +206,7 @@ export class DesktopBridgeRuntime {
     // A final can land after stream failure but before this first poll. Keep
     // the connection boundary and accepted VK turn durable across restarts;
     // the event journal suppresses anything the live stream already delivered.
-    const since = Math.min(checkpoint?.since ?? Infinity,
+    const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
       this.store.oldestAcceptedTurnAt(binding.id) ?? Infinity,
       this.rolloutFallbackSince.get(binding.id) ?? this.now());
     const events = await this.rollout.poll(binding, since);
