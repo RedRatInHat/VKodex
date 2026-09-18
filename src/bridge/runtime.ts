@@ -1,13 +1,13 @@
 import { DesktopIpcClient, isObject } from "../desktop/ipc-client.js";
 import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { TaskSubscription } from "../desktop/subscription.js";
-import { RolloutTailer } from "../desktop/rollout-tailer.js";
+import { RolloutRecordTooLargeError, RolloutTailer } from "../desktop/rollout-tailer.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type TaskCreationUpdate, type TaskDetails } from "../desktop/contracts.js";
+import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type TaskCreationUpdate, type TaskDetails, type TaskEvent } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
@@ -191,6 +191,7 @@ export class DesktopBridgeRuntime {
     this.rolloutFallbackSince.delete(binding.id);
     this.rolloutPollAfter.delete(binding.id);
     this.rollout.clear(binding);
+    if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
   }
 
   /**
@@ -209,7 +210,16 @@ export class DesktopBridgeRuntime {
     const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
       this.store.oldestAcceptedTurnAt(binding.id) ?? Infinity,
       this.rolloutFallbackSince.get(binding.id) ?? this.now());
-    const events = await this.rollout.poll(binding, since);
+    let events: readonly TaskEvent[];
+    try {
+      events = await this.rollout.poll(binding, since);
+      if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
+    } catch (error) {
+      this.store.setValue(`rollout-failure:${binding.id}`, {
+        at: this.now(), kind: error instanceof RolloutRecordTooLargeError ? "recordTooLarge" : "readFailed",
+      });
+      return;
+    }
     if (!events.length || this.stopped || !this.store.getBinding(binding.id)?.attached) return;
     this.store.atomic(() => {
       for (const event of events) {

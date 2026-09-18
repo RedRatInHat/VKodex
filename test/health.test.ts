@@ -79,6 +79,24 @@ test("Codex task failures degrade health even with a connected stream", async t 
   assert.equal(report.checks.find(check => check.name === "codex_tasks")!.state, "degraded");
 });
 
+test("health identifies a blocked rollout recovery without exposing its history", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  store.setValue("rollout-failure:fixture", { at: now, kind: "recordTooLarge" });
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+    bindings: [{ id: "fixture", title: "Fixture", source: ".codex", status: "idle", connected: false,
+      lastConfirmedAt: null, failure: null }],
+  }), undefined, () => now);
+  const check = (await monitor.check(true)).checks.find(item => item.name === "rollout_recovery:fixture")!;
+  assert.equal(check.state, "failed");
+  assert.match(check.detail, /Fixture.*безопасного предела/u);
+  assert.doesNotMatch(check.detail, /[{}]/u);
+  store.setValue("rollout-failure:fixture", null);
+  assert.equal((await monitor.check(true)).checks.some(item => item.name === "rollout_recovery:fixture"), false);
+});
+
 test("health escalates a prompt whose Codex acceptance remains unconfirmed", async t => {
   const s = setup(t);
   const task = (await s.desktop.listTasks())[0]!;

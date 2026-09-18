@@ -17,6 +17,7 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject }
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
+import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } from "../src/desktop/questions.js";
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
@@ -195,6 +196,27 @@ test("rollout fallback recovers an accepted VK turn that finished before reconne
   assert.ok(deliveries.some(text => text.includes("Accepted answer")));
   assert.ok(deliveries.every(text => !text.includes("Old answer")));
   assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+});
+
+test("rollout fallback reports an oversized record and recovers after the file is corrected", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  await writeFile(rolloutPath, rolloutFinal(101_000, "large", "turn", "x".repeat(1024)));
+  const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  const fallback = s.runtime as unknown as {
+    rollout: RolloutTailer;
+    enableRolloutFallback(binding: Binding): void;
+    mirrorRolloutFallback(binding: Binding): Promise<void>;
+  };
+  fallback.rollout = new RolloutTailer(128, 128, 300);
+  fallback.enableRolloutFallback(binding);
+  for (let attempt = 0; attempt < 4; attempt++) { await fallback.mirrorRolloutFallback(binding); s.advance(1_001); }
+  assert.equal(s.store.getValue<{ kind: string }>(`rollout-failure:${binding.id}`)?.kind, "recordTooLarge");
+  await writeFile(rolloutPath, rolloutFinal(102_000, "fixed", "turn", "Recovered"));
+  for (let attempt = 0; attempt < 3; attempt++) { await fallback.mirrorRolloutFallback(binding); s.advance(1_001); }
+  assert.equal(s.store.getValue(`rollout-failure:${binding.id}`), null);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("Recovered")));
 });
 
 test("runtime reconciles an uncertain prompt from Codex history after restart", async t => {

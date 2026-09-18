@@ -2,7 +2,7 @@ import { open, stat } from "node:fs/promises";
 import { normalize } from "node:path";
 import type { TaskEvent, TaskRef } from "./contracts.js";
 
-interface Cursor { readonly offset: number; }
+interface Cursor { readonly offset: number; readonly pending: Buffer; readonly anchor: Buffer; }
 
 interface RolloutRecord {
   readonly timestamp: number;
@@ -18,9 +18,11 @@ interface RolloutRecord {
 export class RolloutTailer {
   private readonly cursors = new Map<string, Cursor>();
 
-  constructor(private readonly initialWindowBytes = 8 * 1024 * 1024, private readonly maxReadBytes = 16 * 1024 * 1024) {
+  constructor(private readonly initialWindowBytes = 8 * 1024 * 1024, private readonly maxReadBytes = 16 * 1024 * 1024,
+    private readonly maxRecordBytes = 32 * 1024 * 1024) {
     if (!Number.isInteger(initialWindowBytes) || initialWindowBytes <= 0) throw new RangeError("Initial rollout window must be positive");
     if (!Number.isInteger(maxReadBytes) || maxReadBytes <= 0) throw new RangeError("Maximum rollout read must be positive");
+    if (!Number.isInteger(maxRecordBytes) || maxRecordBytes <= 0) throw new RangeError("Maximum rollout record must be positive");
   }
 
   clear(task: TaskRef): void { this.cursors.delete(this.key(task)); }
@@ -34,7 +36,7 @@ export class RolloutTailer {
 
     const key = this.key(task);
     const saved = this.cursors.get(key);
-    const fresh = !saved || saved.offset > info.size;
+    const fresh = !saved || saved.offset > info.size || !await this.matchesAnchor(path, saved);
     const start = fresh ? await this.initialOffset(path, info.size, since) : saved.offset;
     if (start >= info.size) return [];
     const length = Math.min(this.maxReadBytes, info.size - start);
@@ -42,21 +44,42 @@ export class RolloutTailer {
     const handle = await open(path, "r");
     let bytesRead = 0;
     try { ({ bytesRead } = await handle.read(buffer, 0, length, start)); } finally { await handle.close(); }
-    const data = buffer.subarray(0, bytesRead);
+    if (bytesRead === 0) return [];
+    const data = saved && !fresh && saved.pending.length
+      ? Buffer.concat([saved.pending, buffer.subarray(0, bytesRead)]) : buffer.subarray(0, bytesRead);
 
-    // The initial probe returns a complete JSONL record boundary; saved
-    // cursors also point immediately after LF. Codex rollouts use UTF-8.
-    const first = 0;
+    // A single tool record may span multiple bounded reads. Keep its bytes
+    // until LF rather than repeatedly reading the same first block forever.
     const last = data.lastIndexOf(0x0a);
-    if (last < first) return [];
-    this.cursors.set(key, { offset: start + last + 1 });
-    const lines = data.subarray(first, last).toString("utf8").split("\n");
+    const pending = last < 0 ? data : data.subarray(last + 1);
+    if (pending.length > this.maxRecordBytes) throw new RolloutRecordTooLargeError();
+    const complete = last < 0 ? Buffer.alloc(0) : data.subarray(0, last);
+    if (complete.length > this.maxRecordBytes && !complete.includes(0x0a)) throw new RolloutRecordTooLargeError();
+    if (last < 0) {
+      this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending), anchor: this.anchor(buffer, bytesRead) });
+      return [];
+    }
+    const lines = complete.toString("utf8").split("\n");
     const records: RolloutRecord[] = [];
     for (const line of lines) {
+      if (Buffer.byteLength(line) > this.maxRecordBytes) throw new RolloutRecordTooLargeError();
       const record = parseRecord(line);
       if (record && record.timestamp >= since) records.push(record);
     }
+    this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending), anchor: this.anchor(buffer, bytesRead) });
     return records.map(record => record.event);
+  }
+
+  private anchor(buffer: Buffer, length: number): Buffer { return Buffer.from(buffer.subarray(Math.max(0, length - 64), length)); }
+
+  private async matchesAnchor(path: string, cursor: Cursor): Promise<boolean> {
+    if (cursor.anchor.length === 0 || cursor.offset < cursor.anchor.length) return false;
+    const buffer = Buffer.allocUnsafe(cursor.anchor.length);
+    const handle = await open(path, "r");
+    try {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, cursor.offset - buffer.length);
+      return bytesRead === buffer.length && buffer.equals(cursor.anchor);
+    } finally { await handle.close(); }
   }
 
   private async initialOffset(path: string, size: number, since: number): Promise<number> {
@@ -90,6 +113,10 @@ export class RolloutTailer {
   }
 
   private key(task: TaskRef): string { return JSON.stringify([task.sourceId ?? "", task.threadId, task.rolloutPath ?? ""]); }
+}
+
+export class RolloutRecordTooLargeError extends Error {
+  constructor() { super("Codex rollout record exceeds the bounded recovery reader"); this.name = "RolloutRecordTooLargeError"; }
 }
 
 function rolloutPath(value: string): string {

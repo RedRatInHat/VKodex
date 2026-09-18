@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
+import { RolloutRecordTooLargeError, RolloutTailer } from "../src/desktop/rollout-tailer.js";
 
 const task = (rolloutPath: string) => ({ hostId: "local", threadId: "thread", rolloutPath });
 const line = (timestamp: string, item: unknown) => JSON.stringify({ timestamp, type: "response_item", payload: item }) + "\n";
@@ -48,4 +48,24 @@ test("rollout tailer begins at a complete record when its lookback starts mid-li
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), [
     { type: "final", id: "recent", turnId: "new-turn", text: "New answer" },
   ]);
+});
+
+test("rollout tailer advances through one visible record larger than a read block", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  const answer = "Recovered ".repeat(70);
+  await writeFile(rollout, line("2026-09-03T10:00:00.000Z", message("large", "turn", "final_answer", answer)));
+  const tailer = new RolloutTailer(128, 128, 2048);
+  const events = [];
+  for (let attempt = 0; attempt < 12; attempt++) events.push(...await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")));
+  assert.deepEqual(events, [{ type: "final", id: "large", turnId: "turn", text: answer }]);
+});
+
+test("oversized rollout records fail explicitly instead of leaving the recovery cursor stuck", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  await writeFile(rollout, line("2026-09-03T10:00:00.000Z", message("too-large", "turn", "final_answer", "x".repeat(1024))));
+  const tailer = new RolloutTailer(128, 128, 256);
+  await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z"));
+  await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z"));
+  await assert.rejects(tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), RolloutRecordTooLargeError);
+  await assert.rejects(tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), RolloutRecordTooLargeError);
 });
