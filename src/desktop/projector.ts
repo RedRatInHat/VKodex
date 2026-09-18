@@ -6,6 +6,8 @@ import { parseAsyncQuestionReply } from "./questions.js";
 
 export interface ProjectionCheckpoint {
   readonly since: number;
+  /** Time of the last owner snapshot, used to identify whole turns completed while disconnected. */
+  readonly lastObservedAt?: number;
   readonly activeAtAttach: readonly string[];
   /** Turns that were running in the last accepted live snapshot. */
   readonly active?: readonly string[];
@@ -23,9 +25,8 @@ export interface ProjectionCheckpoint {
 
 export interface ProjectionOptions {
   /**
-   * The snapshot is the first one from a new subscription. Treat its history
-   * as a baseline, except for the final result of a turn observed running
-   * before the disconnect.
+   * The snapshot is the first one from a new subscription. Suppress accumulated
+   * progress, but recover new complete turns since the last owner snapshot.
    */
   readonly rebaseline?: boolean;
   /**
@@ -119,6 +120,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const activeAtAttach = previous?.activeAtAttach ?? (attachedActive ? [String(attachedActive.turnId)] : []);
   const previouslyActive = new Set(previous?.active ?? []);
   const rebaseline = previous !== null && options.rebaseline === true;
+  const lastObservedAt = previous?.lastObservedAt;
   const seen: Record<string, string> = { ...previous?.seen };
   const previousSemantic = previous?.semanticByIdentity ?? {};
   const semanticByIdentity: Record<string, string> = { ...previousSemantic };
@@ -160,6 +162,8 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
     const turnId = String(turn.turnId);
     const turnEligible = eligible(turn);
     if (!turnEligible) continue;
+    const startedWhileDisconnected = rebaseline && lastObservedAt !== undefined
+      && Number(turn.turnStartedAtMs) > lastObservedAt;
     const items = (turn.items as unknown[]).filter(isObject);
     const origins = new Map<string, string>();
     for (const item of items) {
@@ -174,7 +178,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         const operationId = origins.get(id) ?? (typeof item.clientId === "string" ? item.clientId : undefined);
         const answers = parseAsyncQuestionReply(item.content);
         const text = answers.length ? answers.map(a => `Ответ на вопрос Codex «${a.question}»: ${a.answer}`).join("\n") : userText(item.content);
-        if (text) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) });
+        if (text) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) }, startedWhileDisconnected);
       } else if (item.type === "agentMessage" && typeof item.text === "string") {
         if (item.delivery === "async") continue; // Rendered as an actionable question card.
         // The first snapshot is a baseline even when the turn is already active.
@@ -183,7 +187,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         // to the same item (or genuinely new content) is emitted.
         if (item.phase === "commentary") emitSemantic({ type: "progress", id, turnId, text: item.text });
         else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") {
-          emitSemantic({ type: "final", id, turnId, text: item.text }, previouslyActive.has(turnId));
+          emitSemantic({ type: "final", id, turnId, text: item.text }, previouslyActive.has(turnId) || startedWhileDisconnected);
         }
       }
     }
@@ -192,5 +196,5 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   }
   const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
-  return { checkpoint: { since, activeAtAttach, active, seen, semanticByIdentity, ...(rolloutPath ? { rolloutPath } : {}) }, events };
+  return { checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen, semanticByIdentity, ...(rolloutPath ? { rolloutPath } : {}) }, events };
 }

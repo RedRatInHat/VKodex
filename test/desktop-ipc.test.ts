@@ -1722,20 +1722,30 @@ test("snapshot projection baselines all initial history and reasoning, then emit
   assert.equal(projectSnapshot(completed, next.checkpoint).events.length, 0);
 });
 
-test("a reconnected subscription baselines missed history and emits only later updates", () => {
+test("a reconnected subscription recovers new finals but not accumulated progress", () => {
   const attached = projectSnapshot(state([], "completed"), null, 100);
   const missed = {
     id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
-      missed: { turnId: "missed", turnStartedAtMs: 200, status: "completed", items: Array.from({ length: 100 }, (_, index) => (
-        { type: "agentMessage", id: `old-${index}`, phase: index === 99 ? "final_answer" : "commentary", text: `Old ${index}` }
-      )) },
+      old: { turnId: "old", turnStartedAtMs: 50, status: "completed", items: [
+        { type: "agentMessage", id: "old-final", phase: "final_answer", text: "Before linking" },
+      ] },
+      missed: { turnId: "missed", turnStartedAtMs: 200, status: "completed", items: [
+        { type: "userMessage", id: "direct-user", content: [{ type: "text", text: "Sent in Codex while offline" }] },
+        ...Array.from({ length: 100 }, (_, index) => (
+          { type: "agentMessage", id: `old-${index}`, phase: index === 99 ? "final_answer" : "commentary", text: `Old ${index}` }
+        )),
+      ] },
       current: { turnId: "current", turnStartedAtMs: 300, status: "inProgress", items: [
         { type: "agentMessage", id: "accumulated", phase: "commentary", text: "Accumulated while offline" },
       ] },
     } } },
   };
   const reconnected = projectSnapshot(missed, attached.checkpoint, 400, { rebaseline: true });
-  assert.equal(reconnected.events.some(event => event.type === "progress" || event.type === "final" || event.type === "user"), false);
+  assert.deepEqual(reconnected.events.filter(event => event.type !== "status"), [
+    { type: "user", id: "direct-user", turnId: "missed", text: "Sent in Codex while offline" },
+    { type: "final", id: "old-99", turnId: "missed", text: "Old 99" },
+  ]);
+  assert.equal(projectSnapshot(missed, reconnected.checkpoint, 450, { rebaseline: true }).events.length, 0);
   const updated = structuredClone(missed);
   const current = (updated.turnHistory as IpcObject).history as IpcObject;
   const entities = current.entitiesByKey as IpcObject;
