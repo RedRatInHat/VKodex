@@ -979,6 +979,104 @@ test("a new executor recovers a saved launch intent that never reached the targe
   assert.equal(s.desktop.opened.length, 2);
 });
 
+test("every durable transfer stage resumes after executor loss without another target copy", async t => {
+  for (const crashStep of ["snapshot", "fork", "open", "metadata", "goal", "verify", "archive"] as const) {
+    const s = setup(t); const record = transferFixture(s);
+    const update = s.store.updateTransfer.bind(s.store);
+    let crashed = false;
+    s.store.updateTransfer = (previous, changes, now) => {
+      const saved = update(previous, changes, now);
+      if (!crashed && changes.step === crashStep) {
+        crashed = true;
+        throw new Error(`simulated executor loss after ${crashStep}`);
+      }
+      return saved;
+    };
+    const first = new TaskTransfers(s.store, s.desktop, s.now);
+    first.start(record); await first.idle(); await first.stop();
+    assert.equal(crashed, true, `stage ${crashStep} was not reached`);
+    assert.notEqual(s.store.transfer(record.bindingId)?.phase, "complete");
+    s.store.updateTransfer = update;
+    const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+    restarted.tick(); await restarted.idle();
+    assert.equal(s.store.transfer(record.bindingId)?.phase, "complete", `stage ${crashStep} did not recover`);
+    assert.equal(s.store.byPeer(peerId)?.threadId, "moved-work");
+    assert.equal(s.desktop.tasks.filter(candidate => candidate.threadId === "moved-work").length, 1);
+    assert.equal(s.desktop.archives.length, 1);
+  }
+});
+
+test("a lost fork submission remains uncertain instead of sending another fork", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const update = s.store.updateTransfer.bind(s.store);
+  let crashed = false;
+  s.store.updateTransfer = (previous, changes, now) => {
+    const saved = update(previous, changes, now);
+    if (!crashed && changes.forkSubmitted) {
+      crashed = true;
+      throw new Error("simulated executor loss before fork dispatch");
+    }
+    return saved;
+  };
+  const fork = s.desktop.transferTask.bind(s.desktop);
+  s.desktop.transferTask = async request => {
+    if (request.forkSubmitted && !request.existingTarget) throw new TransferConflictError("fork outcome unconfirmed");
+    return fork(request);
+  };
+  const first = new TaskTransfers(s.store, s.desktop, s.now);
+  first.start(record); await first.idle(); await first.stop();
+  assert.equal(crashed, true);
+  s.store.updateTransfer = update;
+  const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+  restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blocked, true);
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.desktop.archives.length, 0);
+});
+
+test("a saved fork target and an atomic VK switch survive lost acknowledgments", async t => {
+  for (const crashAt of ["target", "switch"] as const) {
+    const s = setup(t); const record = transferFixture(s);
+    if (crashAt === "target") {
+      const update = s.store.updateTransfer.bind(s.store);
+      let crashed = false;
+      s.store.updateTransfer = (previous, changes, now) => {
+        const saved = update(previous, changes, now);
+        if (!crashed && changes.phase === "preparingTarget" && changes.target) {
+          crashed = true;
+          throw new Error("simulated executor loss after target identity was saved");
+        }
+        return saved;
+      };
+      const first = new TaskTransfers(s.store, s.desktop, s.now);
+      first.start(record); await first.idle(); await first.stop();
+      assert.equal(crashed, true);
+      assert.equal(s.store.transfer(record.bindingId)?.target?.threadId, "moved-work");
+      s.store.updateTransfer = update;
+    } else {
+      const switched = s.store.switchTransfer.bind(s.store);
+      let crashed = false;
+      s.store.switchTransfer = (previous, target) => {
+        const binding = switched(previous, target);
+        if (!crashed) { crashed = true; throw new Error("simulated executor loss after VK switch"); }
+        return binding;
+      };
+      const first = new TaskTransfers(s.store, s.desktop, s.now);
+      first.start(record); await first.idle(); await first.stop();
+      assert.equal(crashed, true);
+      assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+      s.store.switchTransfer = switched;
+    }
+    const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+    restarted.tick(); await restarted.idle();
+    assert.equal(s.store.transfer(record.bindingId)?.phase, "complete", `${crashAt} did not recover`);
+    assert.equal(s.store.byPeer(peerId)?.threadId, "moved-work");
+    assert.equal(s.desktop.tasks.filter(candidate => candidate.threadId === "moved-work").length, 1);
+    assert.equal(s.desktop.archives.length, 1);
+  }
+});
+
 test("a changed source snapshot blocks switching and archival instead of hiding newer work", async t => {
   const s = setup(t); const record = transferFixture(s);
   let checks = 0;
