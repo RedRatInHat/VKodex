@@ -161,6 +161,25 @@ export class BridgeHealthMonitor {
           ? "остановлено на записи больше безопасного предела" : rolloutFailure.kind === "historyRebuilt"
             ? "обнаружило пересобранную ветку; без снимка владельца доставляются только подтверждённые VK-ходы, чтобы не повторить старые ответы"
             : "не удалось завершить"}; последний сбой ${failureAt}. Живое подключение повторяется; сообщения не следует дублировать вручную.` });
+      const acceptedTurns = this.store.acceptedTurns(binding.id);
+      const acceptedAt = this.store.oldestAcceptedTurnAt(binding.id);
+      const legacyKey = `health:legacy-accepted:${binding.id}`;
+      let legacySince: number | null = null;
+      if (acceptedTurns.length && acceptedAt === null) {
+        // Older accepted operations have no input timestamp. Persist the first
+        // observation so a bridge restart cannot reset their alert grace period.
+        const signature = JSON.stringify(acceptedTurns.map(turn => turn.turnId).sort());
+        const previous = this.store.getValue<{ signature: string; firstSeenAt: number }>(legacyKey);
+        if (previous?.signature === signature) legacySince = previous.firstSeenAt;
+        else { legacySince = checkedAt; this.store.setValue(legacyKey, { signature, firstSeenAt: checkedAt }); }
+      } else if (this.store.getValue(legacyKey) !== null) this.store.setValue(legacyKey, null);
+      const acceptedAge = Math.max(0, checkedAt - (acceptedAt ?? legacySince ?? checkedAt));
+      const threshold = acceptedAt === null ? 5 * 60_000 : 2 * 60_000;
+      if (acceptedTurns.length && acceptedAge > threshold && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
+        const state: HealthState = binding.status === "unavailable" ? "degraded" : "failed";
+        checks.push({ name: `codex_pending_final:${binding.id}`, state,
+          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): принятый VK-запрос остаётся без подтверждения завершения ${Math.round(acceptedAge / 1_000)} с при состоянии Codex «${binding.status}». Мост сверяет историю и не повторяет запрос автоматически.` });
+      }
       if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
       const problem = binding.failure === "usageLimit" ? "исчерпан лимит аккаунта"
         : binding.failure === "systemError" ? "Codex сообщил системную ошибку"

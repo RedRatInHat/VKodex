@@ -333,6 +333,11 @@ export class BridgeStore {
       this.setValue(`projection:${record.bindingId}`, null);
       this.setValue(`activity:${record.bindingId}`, null);
       this.setValue(`task-details:${record.bindingId}`, null);
+      // Delivery recovery belongs to the source task identity. Carrying its
+      // accepted turn IDs into the fork makes an idle target look unfinished
+      // and may recover a source answer through the target conversation.
+      this.setValue(`accepted-turns:${record.bindingId}`, []);
+      this.setValue(`health:legacy-accepted:${record.bindingId}`, null);
       this.setValue(`editable-request:${record.bindingId}`, null);
       this.setValue(`expected-edited-user:${record.bindingId}`, null);
       this.setValue(`rename:${record.bindingId}`, null);
@@ -606,8 +611,10 @@ export class BridgeStore {
   acceptedTurns(bindingId: string): readonly AcceptedTaskTurn[] {
     const value = this.getValue<unknown>(`accepted-turns:${bindingId}`);
     if (!Array.isArray(value)) return [];
+    const current = this.getBinding(bindingId);
     return value.filter((item): item is AcceptedTaskTurn => !!item && typeof item === "object"
-      && typeof (item as AcceptedTaskTurn).turnId === "string" && typeof (item as AcceptedTaskTurn).operationId === "string");
+      && typeof (item as AcceptedTaskTurn).turnId === "string" && typeof (item as AcceptedTaskTurn).operationId === "string"
+      && !!current && this.isOwnOperation((item as AcceptedTaskTurn).operationId, current));
   }
   oldestAcceptedTurnAt(bindingId: string): number | null {
     let oldest: number | null = null;

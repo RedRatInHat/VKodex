@@ -199,6 +199,9 @@ export class TaskTransfers {
           if (record.target || record.forkSubmitted || record.phase !== "forking") {
             throw new TransferConflictError("У старого переноса нет сохранённой границы истории. Автоматическое переключение и архивация запрещены.");
           }
+          if (this.store.acceptedTurns(record.bindingId).length) {
+            throw new TransferConflictError("У исходной задачи есть принятый VK-ход без подтверждённого завершения. Перенос остановлен до сверки ответа; запрос не повторяется.");
+          }
           step("snapshot");
           // First check idle, then save the goal BEFORE pausing it. A crash after
           // set(paused) must not replace the original active status in the journal.

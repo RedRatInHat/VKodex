@@ -209,6 +209,44 @@ test("health names a disconnected running task but ignores an idle detached owne
   assert.equal(report.checks.some(check => check.name === "codex_task:idle"), false);
 });
 
+test("health detects an accepted VK turn stranded behind an idle or unavailable task", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding(task);
+  store.setChat(binding.id, 2_000_000_001, 1);
+  store.setAttached(binding.id, true);
+  store.recordOperation("accepted-op", binding, "vk-inbox", binding.id, 100_000);
+  store.finishOperation("accepted-op", "accepted");
+  store.rememberAcceptedTurn(binding.id, "accepted-turn", "accepted-op");
+  let status = "running";
+  let now = 300_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1,
+    connectedBindings: 1, requiredBindings: status === "running" ? 1 : 0,
+    connectedRequiredBindings: status === "running" ? 1 : 0,
+    bindings: [{ id: binding.id, title: binding.title, source: ".codex", status, connected: true,
+      lastConfirmedAt: now, failure: null }],
+  }), undefined, () => now);
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_pending_final:${binding.id}`), false);
+  status = "idle";
+  const stranded = (await monitor.check(true)).checks.find(check => check.name === `codex_pending_final:${binding.id}`)!;
+  assert.equal(stranded.state, "failed");
+  assert.match(stranded.detail, /Fixture.*без подтверждения завершения/u);
+  status = "unavailable";
+  assert.equal((await monitor.check(true)).checks.find(check => check.name === `codex_pending_final:${binding.id}`)?.state, "degraded");
+  store.settleAcceptedTurn(binding.id, "accepted-turn");
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_pending_final:${binding.id}`), false);
+  store.recordOperation("legacy-op", binding);
+  store.finishOperation("legacy-op", "accepted");
+  store.rememberAcceptedTurn(binding.id, "legacy-turn", "legacy-op");
+  status = "idle";
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_pending_final:${binding.id}`), false);
+  now += 6 * 60_000;
+  assert.equal((await monitor.check(true)).checks.find(check => check.name === `codex_pending_final:${binding.id}`)?.state, "failed");
+  store.settleAcceptedTurn(binding.id, "legacy-turn");
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_pending_final:${binding.id}`), false);
+});
+
 test("health detects stuck and legacy transfers even when streams and the database are healthy", async t => {
   const s = setup(t);
   const task = (await s.desktop.listTasks())[0]!;

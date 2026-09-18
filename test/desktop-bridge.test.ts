@@ -789,6 +789,12 @@ test("expired rename draft never leaks the intended title to the agent", async t
 
 test("catalog transfer keeps the VK conversation, retargets streaming and archives the source", async t => {
   const s = setup(t); const original = s.attach();
+  // Simulate a legacy marker inherited from an earlier transfer. It is not a
+  // pending turn of the current source and must neither block nor reach target.
+  s.store.recordOperation("source-operation", { ...original, threadId: "older-source" });
+  s.store.finishOperation("source-operation", "accepted");
+  s.store.rememberAcceptedTurn(original.id, "source-turn", "source-operation");
+  s.store.setValue(`health:legacy-accepted:${original.id}`, { signature: "old", firstSeenAt: 1 });
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
   s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
@@ -808,6 +814,9 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   assert.equal(s.desktop.archives.length, 1); assert.equal(s.desktop.archives[0]!.threadId, task.threadId);
   assert.equal(s.store.transfer(original.id)!.phase, "complete");
   assert.equal(s.store.getValue(`projection:${original.id}`), null);
+  assert.deepEqual(s.store.acceptedTurns(original.id), []);
+  assert.deepEqual(s.store.getValue(`accepted-turns:${original.id}`), []);
+  assert.equal(s.store.getValue(`health:legacy-accepted:${original.id}`), null);
   assert.equal(s.store.streamGeneration(original.id), 2);
 });
 
@@ -1203,6 +1212,21 @@ test("a returned idle owner resumes only the saved archive stage", async t => {
   assert.equal(archiveCalls, 2);
   assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
   assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("transfer cannot discard an accepted VK turn whose completion is still unknown", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.recordOperation("accepted-operation", record.source, "vk-inbox", record.bindingId, s.now());
+  s.store.finishOperation("accepted-operation", "accepted");
+  s.store.rememberAcceptedTurn(record.bindingId, "accepted-turn", "accepted-operation");
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const saved = s.store.transfer(record.bindingId)!;
+  assert.equal(saved.blocked, true);
+  assert.match(saved.detail ?? "", /принятый VK-ход без подтверждённого завершения/u);
+  assert.equal(saved.checkpoint, undefined);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
 });
 
 test("an uncertain archive is read-only until native state confirms it", async t => {
