@@ -322,6 +322,10 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
   ) {}
+  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
+    if (task.hostId !== "local") return "missing";
+    return await inspectThroughOwner(this.sourceHome(task), task.threadId, undefined, 3_000) === null ? "missing" : "ready";
+  }
   async archiveRetryReady(task: TaskRef): Promise<boolean> {
     if (task.hostId !== "local") return false;
     const home = this.sourceHome(task);

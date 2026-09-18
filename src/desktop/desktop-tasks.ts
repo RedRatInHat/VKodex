@@ -346,6 +346,11 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return await this.metadata?.archiveRetryReady?.(task) ?? false;
   }
 
+  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
+    if (!this.metadata?.ownerAdapterStatus) throw new DesktopUnavailableError("Проверка адаптера клиента-владельца недоступна.");
+    return this.metadata.ownerAdapterStatus(task);
+  }
+
   async transferCheckpoint(task: TaskRef) {
     if (!this.live?.transfer?.checkpoint) throw new ActionRejectedError("Снимок переноса недоступен.");
     return this.live.transfer.checkpoint(task);

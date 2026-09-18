@@ -79,6 +79,34 @@ test("Codex task failures degrade health even with a connected stream", async t 
   assert.equal(report.checks.find(check => check.name === "codex_tasks")!.state, "degraded");
 });
 
+test("health distinguishes a live task stream from a missing native owner adapter", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding(task);
+  store.setChat(binding.id, 2_000_000_001, 1);
+  store.setAttached(binding.id, true);
+  const otherTask = { ...task, threadId: "other", title: "Other task" };
+  const other = store.ensureBinding(otherTask);
+  store.setChat(other.id, 2_000_000_002, 2);
+  store.setAttached(other.id, true);
+  let adapter: "ready" | "missing" = "missing";
+  const desktop = Object.assign(new HealthDesktop(), { ownerAdapterStatus: async (ref: TaskRef) => ref.threadId === otherTask.threadId ? adapter : "ready" as const });
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, desktop, new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 2, connectedBindings: 2, requiredBindings: 2, connectedRequiredBindings: 2,
+    bindings: [binding, other].map(item => ({ id: item.id, title: item.title, source: ".codex", status: "running", connected: true,
+      lastConfirmedAt: now, failure: null })),
+  }), undefined, () => now, undefined, () => true);
+  const missing = await monitor.check(true);
+  assert.equal(missing.checks.find(check => check.name === "codex_streams")?.state, "ok");
+  assert.equal(missing.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "degraded");
+  assert.match(missing.checks.find(check => check.name === "codex_owner_adapter:primary")!.detail, /Other task/u);
+  adapter = "ready";
+  const recovered = await monitor.check(true);
+  assert.equal(recovered.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "ok");
+});
+
 test("health identifies a blocked rollout recovery without exposing its history", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const now = 100_000;

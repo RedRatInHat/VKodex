@@ -187,6 +187,8 @@ export interface DesktopMetadata {
   isArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
   /** Read-only check before retrying a previously rejected source archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
+  /** Read-only native owner probe for transfer readiness. */
+  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing">;
 }
 
 export interface TaskRenameResult {
@@ -275,6 +277,7 @@ export interface DesktopTasks {
   isTaskArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
   /** Read-only check used to resume a previously rejected archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
+  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing">;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;

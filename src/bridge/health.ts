@@ -185,10 +185,10 @@ export class BridgeHealthMonitor {
         detail: `«${record.source.title.slice(0, 120)}»: этап ${record.step ?? record.phase}, последнее изменение ${new Date(record.updatedAt ?? record.startedAt).toISOString()}. ${reason} /menu задачи — подробности.` });
     }
 
-    const [vkResult, catalogResult, goalsResult, compatibilityResult] = await Promise.all([
-      this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt),
+    const [vkResult, catalogResult, goalsResult, compatibilityResult, ownerAdapters] = await Promise.all([
+      this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt), this.checkOwnerAdapters(runtime),
     ]);
-    checks.push(...vkResult, ...catalogResult, goalsResult, compatibilityResult);
+    checks.push(...vkResult, ...catalogResult, goalsResult, compatibilityResult, ...ownerAdapters);
 
     let snapshot: BridgeHealthSnapshot = {
       state: aggregate(checks), checkedAt, pid: process.pid,
@@ -213,6 +213,33 @@ export class BridgeHealthMonitor {
       const result = await withTimeout(this.chat.health(), 20_000);
       return result.length ? result : [{ name: "vk", state: "failed", detail: "VK-адаптер вернул пустой результат проверки." }];
     } catch { return [{ name: "vk", state: "failed", detail: "VK API не завершил безопасную проверку за 20 секунд." }]; }
+  }
+
+  private async checkOwnerAdapters(runtime: RuntimeHealthState): Promise<readonly HealthCheckResult[]> {
+    if (!this.desktop.ownerAdapterStatus) return [];
+    const profiles = new Map<string, { tasks: NonNullable<ReturnType<BridgeStore["getBinding"]>>[]; label: string }>();
+    for (const item of runtime.bindings ?? []) {
+      if (!item.connected) continue;
+      const task = this.store.getBinding(item.id);
+      if (!task?.attached || task.peerId === null) continue;
+      const source = task.sourceId || "primary";
+      const profile = profiles.get(source);
+      if (profile) profile.tasks.push(task);
+      else profiles.set(source, { tasks: [task], label: item.source });
+    }
+    return Promise.all([...profiles].map(async ([source, { tasks, label }]) => {
+      const results = await Promise.all(tasks.map(async task => {
+        try { return await withTimeout(this.desktop.ownerAdapterStatus!(task), 5_000); }
+        catch { return "unknown" as const; }
+      }));
+      const missing = results.filter(status => status === "missing").length;
+      const unknown = results.filter(status => status === "unknown").length;
+      const affected = tasks.filter((_, index) => results[index] !== "ready").slice(0, 3).map(task => `«${task.title.slice(0, 80)}»`).join(", ");
+      return { name: `codex_owner_adapter:${source}`, state: missing || unknown ? "degraded" : "ok",
+        detail: missing || unknown
+          ? `${label}: адаптер владельца не подтверждён для ${missing + unknown} из ${tasks.length} подключённых задач (отсутствует: ${missing}, проверка не удалась: ${unknown}). ${affected}. Архивация источника при переносе может быть недоступна.`
+          : `${label}: адаптер владельца отвечает для ${tasks.length} подключённых задач.` } satisfies HealthCheckResult;
+    }));
   }
 
   private async checkCatalog(): Promise<readonly HealthCheckResult[]> {
