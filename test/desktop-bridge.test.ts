@@ -3,7 +3,7 @@ import test from "node:test";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { APIError, VK } from "vk-io";
 import type { BridgeChat, BridgeInput, MessageHandle, View } from "../src/bridge/contracts.js";
-import { ChatRateLimitError, MENU_BUTTON } from "../src/bridge/contracts.js";
+import { ChatRateLimitError, FileUploadRejectedError, MENU_BUTTON } from "../src/bridge/contracts.js";
 import { AccessGate, DeliveryWorker } from "../src/bridge/delivery.js";
 import { TaskManager } from "../src/bridge/manager.js";
 import { TaskTransfers, transferStatus } from "../src/bridge/transfers.js";
@@ -15,12 +15,13 @@ import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { BridgeStore } from "../src/bridge/store.js";
+import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
 import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { taskInput as desktopTaskInput } from "../src/desktop/desktop-tasks.js";
+import { pendingCodexQuestions, type CodexQuestions } from "../src/desktop/questions.js";
 
 // Deliberately fictional fixture IDs; production identity is supplied only through local configuration.
 const access = { ownerId: 101, groupId: 202 };
@@ -77,6 +78,15 @@ class Chat implements BridgeChat {
 }
 
 class Desktop implements DesktopTasks {
+  questions: readonly CodexQuestions[] = [];
+  readonly questionAnswers: { task: TaskRef; question: CodexQuestions; answers: Readonly<Record<string, string>> }[] = [];
+  questionError: Error | null = null;
+  async pendingQuestions() { return this.questions; }
+  async answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>, _operationId: string, beforeSend: () => Promise<void>): Promise<void> {
+    await beforeSend(); this.questionAnswers.push({ task, question, answers });
+    if (this.questionError) throw this.questionError;
+    this.questions = this.questions.filter(q => q.key !== question.key);
+  }
   capabilities = { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true, renameTask: true, archiveTask: true, exportMarkdown: true, moveTask: true, transferTask: false, accountUsage: true, usageReset: false, goals: false, editLastUserTurn: true };
   tasks: DesktopTask[] = [task];
   sources = [{ id: "", label: ".codex" }];
@@ -85,11 +95,21 @@ class Desktop implements DesktopTasks {
   projectsError: Error | null = null;
   readonly creations: CreateTaskRequest[] = [];
   readonly submissions: SubmitTaskRequest[] = [];
+  readonly queued: SubmitTaskRequest[] = [];
+  queueError: Error | null = null;
+  async queue(request: SubmitTaskRequest): Promise<string> {
+    await request.beforeSend?.();
+    this.queued.push(request);
+    if (this.queueError) throw this.queueError;
+    return "native-queue-id";
+  }
   readonly messageEdits: EditLastUserTurnRequest[] = [];
   submitReceipt: SubmitTaskReceipt = { mode: "start", turnId: "submitted-turn" };
   readonly stops: TaskRef[] = [];
   createError: Error | null = null;
   submitError: Error | null = null;
+  reconciledTurnId: string | null = null;
+  async findAcceptedInput(_task: TaskRef, _operationId: string): Promise<string | null> { return this.reconciledTurnId; }
   submitHook: (() => Promise<void>) | null = null;
   details: TaskDetails = { status: "idle", workspace: "/project", model: "model-a", effort: "medium", nextModel: "model-a", nextEffort: "medium", context: { used: 25_000, window: 100_000, percent: 25 } };
   models: DesktopModel[] = [{ id: "model-a", title: "Model A", efforts: ["low", "medium", "high"], defaultEffort: "medium" }, { id: "model-b", title: "Model B", efforts: ["high"], defaultEffort: "high" }];
@@ -134,7 +154,11 @@ class Desktop implements DesktopTasks {
   }
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
   async archiveTransferredSource(ref: TaskRef): Promise<void> { await this.archiveTask(ref); }
-  async isTaskArchived(ref: TaskRef): Promise<boolean> { return this.archives.some(task => task.threadId === ref.threadId); }
+  archiveRetryReady?: (ref: TaskRef) => Promise<boolean>;
+  verifyLegacyArchivedPair?: (source: TaskRef, target: DesktopTask, checkpoint: import("../src/desktop/contracts.js").TransferCheckpoint) => Promise<void>;
+  async isTaskArchived(ref: TaskRef, _checkpoint?: import("../src/desktop/contracts.js").TransferCheckpoint): Promise<boolean> {
+    return this.archives.some(task => task.threadId === ref.threadId);
+  }
   async transferCheckpoint() { return { lastTurnId: "boundary", rolloutPath: "/source.jsonl", size: 1, mtimeMs: 1 }; }
   async verifyTransferSource(): Promise<void> {}
   async verifyTransferTarget(): Promise<void> {}
@@ -222,6 +246,19 @@ function setup(t: { after(fn: () => void): void }, enableHealth = false) {
   return { store, chat, desktop, gate, manager, worker, mirror, input, handle, attach, now: () => time,
     healthChecks: () => healthChecks, loadChecks: () => loadChecks, advance: (ms = 6_000) => { time += ms; } };
 }
+
+test("split VK prompt reaches Codex once and original fragments cannot replay or replace it", async t => {
+  const s = setup(t); const binding = s.attach();
+  const parts = ["a".repeat(8000), "b".repeat(8000), "last part"].map((text, i) => ({ ...s.input(text, peerId), eventId: `message:${900 + i}` }));
+  const pending = parts.map(input => s.manager.handle(input));
+  await s.manager.idle(); await Promise.all(pending);
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.desktop.submissions[0]!.text, parts.map(input => input.text).join("\n"));
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  for (const input of parts) await restarted.handle(input);
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.editableRequest(binding.id), null);
+});
 
 function panelView(s: ReturnType<typeof setup>, peer = peerId): View {
   const sent = s.chat.sent.filter(message => message.peerId === peer && message.view.buttons?.length).at(-1)!;
@@ -1024,6 +1061,100 @@ test("an owner-held archive is not retried; read-only confirmation completes it 
   assert.equal(s.store.transfer(record.bindingId)?.attempt, 1);
 });
 
+test("a returned idle owner resumes only the saved archive stage", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let ownerReady = false; let archiveCalls = 0;
+  const archive = s.desktop.archiveTransferredSource.bind(s.desktop);
+  s.desktop.archiveRetryReady = async () => ownerReady;
+  s.desktop.archiveTransferredSource = async ref => {
+    archiveCalls++;
+    if (!ownerReady) throw new ArchiveOwnerRequiredError();
+    await archive(ref);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  assert.equal(archiveCalls, 1);
+  s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(archiveCalls, 1);
+  ownerReady = true; s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(archiveCalls, 2);
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("an uncertain archive is read-only until native state confirms it", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let archiveCalls = 0;
+  s.desktop.archiveRetryReady = async () => true;
+  s.desktop.archiveTransferredSource = async () => { archiveCalls++; throw new UncertainActionError(); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, "archiveUnknown");
+  assert.equal(archiveCalls, 1);
+  assert.throws(() => transfers.resume(record.bindingId), /не повторит/u);
+  s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(archiveCalls, 1);
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "switched");
+  s.desktop.archives.push(task); s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(archiveCalls, 1);
+});
+
+test("a legacy archived source can finish after semantic comparison with the switched target", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let archived = false; let pairChecks = 0;
+  s.desktop.isTaskArchived = async (_ref, checkpoint) => {
+    if (archived && checkpoint) throw new TransferConflictError("Archived rollout path changed");
+    return archived;
+  };
+  s.desktop.archiveTransferredSource = async () => { archived = true; };
+  s.desktop.verifyLegacyArchivedPair = async (source, target, checkpoint) => {
+    pairChecks++;
+    assert.equal(source.threadId, task.threadId);
+    assert.notEqual(target.threadId, source.threadId);
+    assert.equal(checkpoint.lastTurnId, "boundary");
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(pairChecks, 1);
+  assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("an older blocked switched transfer reconciles an archived source without retrying its write", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let writes = 0; let archived = false;
+  s.desktop.archiveTransferredSource = async () => { writes++; throw new TransferConflictError("Legacy owner refused"); };
+  s.desktop.isTaskArchived = async (_ref, checkpoint) => {
+    if (archived && checkpoint) throw new TransferConflictError("Rollout moved during archival");
+    return archived;
+  };
+  s.desktop.verifyLegacyArchivedPair = async () => {};
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, null);
+  assert.equal(writes, 1);
+  archived = true; s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(writes, 1);
+});
+
+test("an older blocked transfer reports a changed source instead of retrying its archive", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let writes = 0;
+  s.desktop.archiveTransferredSource = async () => { writes++; throw new TransferConflictError("Legacy owner refused"); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, null);
+  s.desktop.verifyTransferSource = async () => { throw new TransferConflictError("Source received another completed turn"); };
+  s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, "sourceChanged");
+  assert.match(s.store.transfer(record.bindingId)?.detail ?? "", /another completed turn/u);
+  assert.equal(writes, 1);
+  assert.throws(() => transfers.resume(record.bindingId), /автоматическая архивация запрещена/u);
+});
+
 test("archive confirmation does not close a transfer after its goal or binding changes", async t => {
   for (const change of ["goal", "binding"] as const) {
     const s = setup(t); const record = transferFixture(s);
@@ -1378,7 +1509,7 @@ test("a solo task chat omits attribution until a second author writes", async t 
   const s = setup(t); s.attach();
   await s.manager.handle({ ...s.input("owner only", peerId), senderName: "Owner User" });
   assert.equal(s.desktop.submissions[0]!.author, undefined);
-  assert.equal(desktopTaskInput(s.desktop.submissions[0]!).text, "owner only");
+  assert.match(desktopTaskInput(s.desktop.submissions[0]!).text, /^owner only\n\n# VKodex response format/u);
 
   await s.manager.handle({ ...s.input("shared request", peerId), senderId: 999, senderName: "Second User" });
   assert.deepEqual(s.desktop.submissions[1]!.author, { id: 999, name: "Second User" });
@@ -1527,6 +1658,27 @@ test("VK rename refuses mismatched readback and rechecks access immediately befo
     await assert.rejects(gateway.renameConversation(access.ownerId, "New title", async () => {}), ActionRejectedError);
     await assert.rejects(gateway.renameConversation(peerId, "Line\nbreak", async () => {}), ActionRejectedError);
   }
+});
+
+test("VK reconciliation recovers an unseen message once using the shared inbox gate", async t => {
+  const s = setup(t); s.attach(); s.store.observePeerMessage(peerId, 100);
+  const vk = new VK({ token: "fixture-token" });
+  t.mock.method(vk.updates, "startPolling", async () => {});
+  t.mock.method(vk.updates, "stop", async () => {});
+  t.mock.method(vk.api, "callWithRequest", async () => ({ count: 1, items: [{ id: 0, conversation_message_id: 101, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0, text: "Recovered prompt", attachments: [] }] }) as never);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner");
+  const inputs: BridgeInput[] = [];
+  await gateway.start(async input => { inputs.push(input); await s.manager.handle(input); });
+  gateway.startReconciliation(s.store);
+  for (let i = 0; i < 100 && !s.store.hasInput(JSON.stringify([peerId, "message:101"])); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await gateway.stop();
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0]!.text, "Recovered prompt");
+  assert.equal(s.store.getValue(`vk-inbound-cursor:${peerId}`), 101);
+  gateway.startReconciliation(s.store);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await gateway.stop();
+  assert.equal(inputs.length, 1);
 });
 
 test("VK service events do not detach a task and message edits keep their original conversation id", async t => {
@@ -2369,7 +2521,7 @@ test("a stale idle snapshot cannot collect a new turn's outbox before that exact
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
   const prepared = await files.prepare(binding, "operation", []);
-  files.finish(binding.id, "operation", false, "accepted-turn");
+  files.finish(binding.id, "operation", "accepted", "accepted-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
 
   files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
@@ -2383,9 +2535,9 @@ test("a stale idle snapshot cannot collect a new turn's outbox before that exact
 test("an invalid old outbox does not block files from newer turns", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
-  const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", false);
+  const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", "accepted");
   for (let index = 0; index <= 10; index++) await writeFile(path.join(invalid.outboxDir, `${index}.txt`), "fixture");
-  const valid = await files.prepare(binding, "valid-output", []); files.finish(binding.id, "valid-output", false);
+  const valid = await files.prepare(binding, "valid-output", []); files.finish(binding.id, "valid-output", "accepted");
   await writeFile(path.join(valid.outboxDir, "result.txt"), "new result");
 
   files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
@@ -2408,7 +2560,7 @@ test("attachment transfer stops on explicit detach during download or upload and
   await assert.rejects(files.prepare(binding, "download", [{ key: "a", kind: "file", fileName: "a.txt", url: "https://sun1.userapi.com/file" }]), /остановлена/u);
   assert.equal(s.desktop.submissions.length, 0);
   download.mock.restore(); s.store.setAttached(binding.id, true);
-  const prepared = await files.prepare(binding, "upload", []); files.finish(binding.id, "upload", false);
+  const prepared = await files.prepare(binding, "upload", []); files.finish(binding.id, "upload", "accepted");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
   t.mock.method(s.chat, "uploadFile", async () => { s.store.stopStreaming(binding.id); return "doc-202_1"; });
   await assert.rejects(files.collect(binding, true), /остановлена/u); await s.worker.flush(); assert.equal(s.chat.sent.length, 0);
@@ -2453,4 +2605,373 @@ test("VK inline keyboards reject more than ten buttons even if they fit within s
   assert.equal(keyboard.buttons.length, 5);
   assert.equal(keyboard.buttons.flat().length, 10);
   assert.throws(() => vkKeyboard({ text: "tasks", buttons }), /ten buttons/u);
+});
+
+
+test("queue strips only its prefix, preserves command-like prompt, and never steers or duplicates", async t => {
+  const s = setup(t); s.attach(); s.desktop.details = { ...s.desktop.details, status: "running" };
+  const input = { ...s.input("/queue\n/stop\nDo this later", peerId), senderId: 999 };
+  await s.manager.handle(input); await s.manager.handle(input); await s.worker.flush();
+  assert.equal(s.desktop.queued.length, 1);
+  assert.equal(s.desktop.queued[0]!.text, "/stop\nDo this later");
+  assert.equal(s.desktop.submissions.length, 0); assert.equal(s.desktop.stops.length, 0);
+  await s.handle("/queue", peerId);
+  assert.equal(s.desktop.queued.length, 1);
+});
+
+test("uncertain native queue insertion never falls back to a turn or retries", async t => {
+  const s = setup(t); s.attach(); s.desktop.queueError = new UncertainActionError();
+  const input = s.input("/queue later", peerId);
+  await s.manager.handle(input); await s.manager.handle(input);
+  assert.equal(s.desktop.queued.length, 1); assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("queued outbox waits for its actual native turn, not the current turn completion", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-queue-files-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "queued-op", []);
+  files.markQueued(binding.id, "queued-op"); files.finish(binding.id, "queued-op", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
+  files.observe(binding.id, "idle", "previous-turn");
+  assert.equal(await files.collect(binding), 0);
+  files.associateTurn(binding.id, "queued-op", "queued-turn");
+  assert.equal(await files.collect(binding), 0);
+  files.observe(binding.id, "idle", "queued-turn");
+  assert.equal(await files.collect(binding), 1);
+  assert.equal(await files.collect(binding), 0);
+});
+
+test("MP4 document uploads declare type, byte length and a large-file timeout", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  const bytes = Buffer.from("fixture-mp4");
+  const upload = t.mock.method(vk.upload, "conduct", async ({ params }: Parameters<typeof vk.upload.conduct>[0]) => {
+    assert.deepEqual(params.source, { values: [{ value: bytes, filename: "trailer.MP4", contentLength: bytes.length, contentType: "video/mp4" }], timeout: 600_000 });
+    return { type: "doc", doc: { owner_id: -202, id: 17 } };
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  assert.equal(await gateway.uploadFile(peerId, "trailer.MP4", bytes, "file"), "doc-202_17");
+  assert.equal(upload.mock.callCount(), 1);
+});
+
+test("manager restores a persisted VK burst into one task turn after restart", async t => {
+  const s = setup(t); s.attach();
+  const parts = ["x".repeat(3500), "y".repeat(3500), "done"].map((text, index) => ({
+    ...s.input(text, peerId), eventId: `message:${1200 + index}`,
+  }));
+  for (const [index, input] of parts.entries()) s.store.receiveInput(input, Date.now() - 20_000 + index);
+  s.store.saveInputBatch({ id: "crashed-burst", peerId, parts, startedAt: Date.now() - 20_000,
+    updatedAt: Date.now() - 20_000, state: "collecting" });
+  s.store.recover();
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  restarted.recoverInputs();
+  await restarted.idle();
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.desktop.submissions[0]?.text, parts.map(item => item.text).join("\n"));
+  assert.deepEqual(s.store.inputBatches(), []);
+  for (const part of parts) await restarted.handle(part);
+  assert.equal(s.desktop.submissions.length, 1);
+});
+
+test("an incoming VK event saved before dispatch recovers without duplicate submission", async t => {
+  const s = setup(t); s.attach();
+  const input = { ...s.input("Recovered prompt", peerId), eventId: "message:1250" };
+  assert.equal(s.store.receiveInput(input, 100_000), true);
+  assert.equal(s.store.inputState(JSON.stringify([peerId, input.eventId])), "received");
+  s.store.recover();
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  restarted.recoverInputs();
+  await restarted.handle(input); // Concurrent VK Long Poll replay of the same ID.
+  await restarted.idle();
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.desktop.submissions[0]?.text, input.text);
+  assert.equal(s.store.inputState(JSON.stringify([peerId, input.eventId])), "done");
+  assert.deepEqual(s.store.reserveReplayableInputs(), []);
+});
+
+test("a claimed VK operation is never replayed merely because the process restarted", t => {
+  const s = setup(t);
+  const input = { ...s.input("Possibly handled"), eventId: "message:1260" };
+  assert.equal(s.store.receiveInput(input, 100_000), true);
+  const key = JSON.stringify([input.peerId, input.eventId]);
+  assert.equal(s.store.claimInput(key), true);
+  s.store.recover();
+  assert.equal(s.store.inputState(key), "uncertain");
+  assert.deepEqual(s.store.reserveReplayableInputs(), []);
+});
+
+test("VK reconciliation does not advance past an uncommitted prompt and replays it after recovery", async t => {
+  const s = setup(t); s.attach(); s.store.observePeerMessage(peerId, 200);
+  const vk = new VK({ token: "fixture-token" });
+  t.mock.method(vk.updates, "startPolling", async () => {});
+  t.mock.method(vk.updates, "stop", async () => {});
+  t.mock.method(vk.api, "callWithRequest", async () => ({ count: 1, items: [
+    { id: 0, conversation_message_id: 201, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0, text: "Not sent yet", attachments: [] },
+  ] }) as never);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner");
+  const key = JSON.stringify([peerId, "message:201"]);
+  let attempts = 0;
+  await gateway.start(async () => {
+    attempts++;
+    assert.equal(s.store.claimInput(key), true);
+    if (attempts === 1) s.store.markInputPreparing([key]);
+    else s.store.finishInput(key);
+  });
+  gateway.startReconciliation(s.store);
+  for (let i = 0; i < 100 && attempts === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await gateway.stop();
+  assert.equal(attempts, 1);
+  assert.equal(s.store.getValue(`vk-inbound-cursor:${peerId}`), 200);
+  // An older process could have observed the VK ID, or even checkpointed it,
+  // before the local preparation was interrupted. Recovery must rewind both.
+  s.store.observePeerMessage(peerId, 201);
+  s.store.setValue(`vk-inbound-cursor:${peerId}`, 201);
+  s.store.recover();
+  assert.equal(s.store.inputState(key), "retryable");
+  gateway.startReconciliation(s.store);
+  for (let i = 0; i < 100 && attempts < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  await gateway.stop();
+  assert.equal(attempts, 2);
+  assert.equal(s.store.getValue(`vk-inbound-cursor:${peerId}`), 201);
+});
+
+test("inbox recovery replays only prompts stopped before Codex submission", t => {
+  const s = setup(t);
+  const prepared = JSON.stringify([peerId, "message:10"]);
+  const submitted = JSON.stringify([peerId, "message:11"]);
+  const generic = JSON.stringify([peerId, "callback:12"]);
+  assert.equal(s.store.claimInput(prepared), true);
+  assert.equal(s.store.claimInput(submitted), true);
+  assert.equal(s.store.claimInput(generic), true);
+  s.store.markInputPreparing([prepared, submitted]);
+  s.store.markInputSending([submitted]);
+  assert.equal(s.store.inputSettled(prepared), false);
+  s.store.recover();
+  assert.equal(s.store.inputState(prepared), "retryable");
+  assert.equal(s.store.hasInput(prepared), false);
+  assert.equal(s.store.claimInput(prepared), true);
+  assert.equal(s.store.claimInput(prepared), false);
+  assert.equal(s.store.inputState(submitted), "uncertain");
+  assert.equal(s.store.claimInput(submitted), false);
+  assert.equal(s.store.inputState(generic), "uncertain");
+  assert.equal(s.store.claimInput(generic), false);
+});
+
+test("legacy inbox schema upgrades without losing deduplication records", () => {
+  const db = new DatabaseConstructor(":memory:");
+  try {
+    db.exec("CREATE TABLE bridge_inbox (id TEXT PRIMARY KEY, state TEXT NOT NULL)");
+    db.prepare("INSERT INTO bridge_inbox(id, state) VALUES (?, 'done')").run("legacy-event");
+    migrateInboxJournal(db);
+    migrateInboxJournal(db);
+    const row = db.prepare("SELECT state, payload, received_at, replay_after FROM bridge_inbox WHERE id = ?")
+      .get("legacy-event") as { state: string; payload: string | null; received_at: number | null; replay_after: number | null };
+    assert.deepEqual(row, { state: "done", payload: null, received_at: null, replay_after: null });
+  } finally { db.close(); }
+});
+
+test("prompt journal and inbox leave the replayable state in one transaction", t => {
+  const s = setup(t); const binding = s.attach();
+  const keys = [JSON.stringify([peerId, "message:31"]), JSON.stringify([peerId, "message:32"])];
+  for (const key of keys) assert.equal(s.store.claimInput(key), true);
+  s.store.markInputPreparing(keys);
+  assert.throws(() => s.store.beginPromptDispatch("bad-operation", binding, [...keys, "missing"], binding.id));
+  assert.equal(s.store.operationState("bad-operation"), null);
+  assert.deepEqual(keys.map(key => s.store.inputState(key)), ["preparing", "preparing"]);
+  s.store.beginPromptDispatch("one-operation", binding, keys, binding.id);
+  assert.deepEqual(keys.map(key => s.store.inputState(key)), ["sending", "sending"]);
+  assert.equal(s.store.operationState("one-operation"), "sending");
+  s.store.recover();
+  assert.deepEqual(keys.map(key => s.store.inputState(key)), ["uncertain", "uncertain"]);
+  assert.equal(s.store.operationState("one-operation"), "uncertain");
+});
+
+test("a detached chat settles every merged VK fragment atomically", async t => {
+  const s = setup(t); const binding = s.attach(); s.store.setAttached(binding.id, false);
+  await s.manager.handle({ ...s.input("part one\npart two", peerId), eventId: "merged:message:20,message:21",
+    mergedEventIds: ["message:20", "message:21"] });
+  assert.equal(s.store.inputSettled(JSON.stringify([peerId, "message:20"])), true);
+  assert.equal(s.store.inputSettled(JSON.stringify([peerId, "message:21"])), true);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("a known Codex refusal is rejected in the journal while a lost result stays uncertain", async t => {
+  const s = setup(t); s.attach();
+  s.desktop.submitError = new ActionRejectedError("Unsupported model");
+  await s.handle("First request", peerId);
+  const rejectedId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.store.operationState(rejectedId), "rejected");
+  assert.match(s.chat.sent.at(-1)!.view.text, /Unsupported model/u);
+  s.desktop.submitError = new UncertainActionError();
+  await s.handle("Second request", peerId);
+  const uncertainId = s.desktop.submissions[1]!.operationId;
+  assert.equal(s.store.operationState(uncertainId), "uncertain");
+  s.store.recover();
+  assert.equal(s.store.operationState(rejectedId), "rejected");
+  assert.equal(s.store.operationState(uncertainId), "uncertain");
+});
+
+test("a lost Codex acknowledgment is confirmed from native history without resubmitting", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.submitError = new UncertainActionError();
+  s.desktop.reconciledTurnId = "accepted-turn";
+  await s.handle("One prompt", peerId);
+  const operationId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.deepEqual(s.store.acceptedTurns(binding.id), [{ turnId: "accepted-turn", operationId }]);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Codex принял запрос/u);
+});
+
+test("VK upload errors are checked before docs.save and a later retry can succeed", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  const calls: string[] = [];
+  t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
+    calls.push(method);
+    if (method === "docs.getMessagesUploadServer") return { upload_url: "https://upload.vk.com/fixture" } as never;
+    if (method === "docs.save") return { type: "doc", doc: { owner_id: -202, id: 17, access_key: "fixture" } } as never;
+    throw new Error("Unexpected API call");
+  });
+  const responses: unknown[] = [{ error: "no_free_space/var/www/pi", error_descr: "private server response" }, {}, { error: "wrong_file" }, { file: "fixture-upload-token" }];
+  t.mock.method(vk.upload, "upload", async () => responses.shift());
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  const send = () => gateway.uploadFile(peerId, "installer.exe", Buffer.from("fixture"), "file");
+  await assert.rejects(send, /На сервере загрузки VK закончилось свободное место/u);
+  await assert.rejects(send, /Сервер загрузки VK не подтвердил приём файла/u);
+  await assert.rejects(send, FileUploadRejectedError);
+  assert.equal(calls.filter(method => method === "docs.save").length, 0);
+  assert.equal(await send(), "doc-202_17_fixture");
+  assert.equal(calls.filter(method => method === "docs.getMessagesUploadServer").length, 4);
+  assert.equal(calls.filter(method => method === "docs.save").length, 1);
+});
+
+test("a rejected output does not block other files or retry automatically after restart", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rejected-files-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "rejected-op", []); files.finish(binding.id, "rejected-op", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "installer.exe"), "fixture");
+  await writeFile(path.join(prepared.outboxDir, "readme.txt"), "readme");
+  const upload = t.mock.method(s.chat, "uploadFile", async (_peer: number, name: string) => {
+    if (name.endsWith(".exe")) throw new FileUploadRejectedError("VK rejected wrong_file");
+    return "doc-202_1";
+  });
+  files.observe(binding.id, "idle"); assert.equal(await files.collect(binding), 1);
+  assert.equal(upload.mock.callCount(), 2);
+  const restarted = new TaskFiles(root, s.store, s.chat, s.gate); restarted.observe(binding.id, "idle");
+  assert.equal(await restarted.collect(binding), 0); assert.equal(upload.mock.callCount(), 2);
+  await s.worker.flush(); assert.ok(s.chat.sent.some(message => message.view.text.includes("wrong_file")));
+  assert.equal(await restarted.collect(binding, true), 0); assert.equal(upload.mock.callCount(), 3);
+});
+
+
+const questionState = (count = 1) => ({ requests: [{ id: "question-request", method: "item/tool/requestUserInput", params: { turnId: "question-turn", itemId: "question-call",
+  questions: Array.from({ length: count }, (_, i) => ({ id: `q${i}`, question: `Question ${i + 1}?`, options: [{ label: "Alpha", description: "First" }, { label: "Beta", description: "Second" }] })) } }] });
+
+test("VK question buttons and quoted free text produce one complete native response", async t => {
+  const s = setup(t); const binding = s.attach();
+  const state = questionState(2); s.desktop.questions = pendingCodexQuestions(state);
+  s.manager.questions.observe(binding, state); await s.worker.flush();
+  const card = s.chat.sent.find(m => m.view.buttons?.some(b => b.label.startsWith("1. Alpha")))!;
+  assert.ok(card);
+  const first = card.view.buttons![0]!.action;
+  await s.handle("", peerId, first);
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  await s.handle("", peerId, first); // Previous step's button cannot answer the next question.
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  await s.manager.handle({ ...s.input("Late reply to first question", peerId), replyToMessageId: card.handle.conversationMessageId });
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  const second = s.chat.sent.find(m => m.view.text.includes("Question 2?"))!;
+  await s.manager.handle({ ...s.input("My own answer", peerId), replyToMessageId: second.handle.conversationMessageId });
+  await s.worker.flush();
+  assert.deepEqual(s.desktop.questionAnswers[0]!.answers, { q0: "Alpha", q1: "My own answer" });
+  await s.manager.handle({ ...s.input("Duplicate", peerId), replyToMessageId: card.handle.conversationMessageId });
+  assert.equal(s.desktop.questionAnswers.length, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.ok(s.chat.edits.some(m => m.view.buttons?.length === 0));
+});
+
+test("questions recover without duplicate cards, close when answered elsewhere, and stay owner scoped", async t => {
+  const s = setup(t); const binding = s.attach(); const state = questionState();
+  s.desktop.questions = pendingCodexQuestions(state);
+  s.manager.questions.observe(binding, state); await s.worker.flush();
+  const card = s.chat.sent[0]!;
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  restarted.questions.observe(binding, state); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  await restarted.handle({ ...s.input("No", peerId), senderId: 999, replyToMessageId: card.handle.conversationMessageId });
+  await restarted.handle({ ...s.input("", peerId, card.view.buttons![0]!.action), senderId: 999 });
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  s.desktop.questions = [];
+  restarted.questions.observe(binding, { requests: [] });
+  await restarted.handle(s.input("", peerId, card.view.buttons![0]!.action));
+  await s.worker.flush();
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.ok(s.chat.edits.some(m => m.view.buttons?.length === 0));
+});
+
+test("uncertain question answer is never replayed by another button or after restart", async t => {
+  const s = setup(t); const binding = s.attach(); const state = questionState();
+  s.desktop.questions = pendingCodexQuestions(state); s.desktop.questionError = new UncertainActionError();
+  s.manager.questions.observe(binding, state); await s.worker.flush();
+  const action = s.chat.sent[0]!.view.buttons![0]!.action;
+  await s.handle("", peerId, action);
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  restarted.questions.observe(binding, state);
+  await restarted.handle(s.input("", peerId, action));
+  assert.equal(s.desktop.questionAnswers.length, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("secret questions expose no answer buttons and refresh does not start a turn", async t => {
+  const s = setup(t); s.attach(); const state = questionState();
+  Object.assign(state.requests[0]!.params.questions[0]!, { isSecret: true });
+  s.desktop.questions = pendingCodexQuestions(state);
+  await s.handle("/questions", peerId);
+  const card = s.chat.sent[0]!;
+  assert.equal(card.view.buttons?.length, 0);
+  await s.manager.handle({ ...s.input("do not send", peerId), replyToMessageId: card.handle.conversationMessageId });
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
+
+test("VK Long Poll replies and callback buttons use the native question handler", async t => {
+  const s = setup(t); const binding = s.attach(); const state = questionState(2);
+  s.desktop.questions = pendingCodexQuestions(state);
+  s.manager.questions.observe(binding, state); await s.worker.flush();
+  const first = s.chat.sent[0]!;
+  const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
+  t.mock.method(vk.api, "call", async () => 1);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
+  await gateway.start(input => s.manager.handle(input));
+  await vk.updates.handleWebhookUpdate({ type: "message_event", group_id: access.groupId, event_id: "callback-test", v: "5.199", object: {
+    user_id: access.ownerId, peer_id: peerId, event_id: "question-callback", conversation_message_id: first.handle.conversationMessageId,
+    payload: { action: first.view.buttons![1]!.action },
+  } });
+  await s.worker.flush();
+  const second = s.chat.sent.find(m => m.view.text.includes("Question 2?"))!;
+  await vk.updates.handleWebhookUpdate({ type: "message_new", group_id: access.groupId, event_id: "reply-test", v: "5.199", object: {
+    message: { id: 0, conversation_message_id: 50, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0, text: "Free answer", attachments: [],
+      reply_message: { id: 0, conversation_message_id: second.handle.conversationMessageId, peer_id: peerId, from_id: -access.groupId, date: 100, text: second.view.text, attachments: [] } }, client_info: {},
+  } });
+  assert.deepEqual(s.desktop.questionAnswers[0]!.answers, { q0: "Beta", q1: "Free answer" });
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
+test("a process crash during question submission preserves the uncertain state", async t => {
+  const s = setup(t); const binding = s.attach(); const state = questionState();
+  s.desktop.questions = pendingCodexQuestions(state);
+  s.manager.questions.observe(binding, state); await s.worker.flush();
+  const action = s.chat.sent[0]!.view.buttons![0]!.action;
+  const key = `questions:${binding.id}`;
+  const cards = s.store.getValue<Record<string, unknown>[]>(key)!;
+  s.store.setValue(key, cards.map(c => ({ ...c, status: "sending", operationId: "lost-operation" })));
+  const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
+  restarted.questions.observe(binding, state);
+  assert.equal(s.store.getValue<Record<string, unknown>[]>(key)![0]!.status, "uncertain");
+  await restarted.handle(s.input("", peerId, action));
+  assert.equal(s.desktop.questionAnswers.length, 0);
+  assert.equal(s.desktop.submissions.length, 0);
 });

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { InputBatcher } from "./input-batcher.js";
 import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type DesktopTasks, type TaskRef } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
@@ -11,6 +12,7 @@ import { taskInput } from "../desktop/desktop-tasks.js";
 import path from "node:path";
 import os from "node:os";
 import { comparablePath } from "../desktop/paths.js";
+import { TaskQuestions } from "./questions.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -45,6 +47,8 @@ const taskHelp = [
   "/files — проверить готовые исходящие файлы",
   "/open — явно открыть эту задачу в настроенном Codex",
   "/stop — остановить текущий ход",
+  "/queue <промпт> — добавить запрос в штатную очередь Codex",
+  "/questions — показать открытые вопросы Codex и обновить кнопки",
   "/detach — отключить трансляцию, не останавливая задачу",
   "",
   "Обычный текст, фотографии и документы продолжают эту задачу.",
@@ -70,8 +74,11 @@ function enteredPath(text: string): string {
 }
 
 export class TaskManager {
+  private readonly inputBatcher: InputBatcher;
+  private readonly activeInputs = new Set<string>();
   private readonly tails = new Map<number, Promise<void>>();
   readonly panels: TaskPanels;
+  readonly questions: TaskQuestions;
 
   constructor(
     private readonly access: OwnerAccess,
@@ -83,9 +90,40 @@ export class TaskManager {
     healthCheck?: () => Promise<BridgeHealthSnapshot>,
     private readonly loadReport: () => Promise<string> = systemLoadText,
     private readonly projectlessRoot: string = path.join(os.tmpdir(), "VKodex", "workspaces"),
-  ) { this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck); }
+  ) {
+    this.inputBatcher = new InputBatcher(input => this.enqueueInput(input), input => input.peerId !== access.ownerId
+      && ![access.groupId, -access.groupId].includes(input.senderId) && !!store.byPeer(input.peerId)?.attached,
+      1500, 3000, store);
+    this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck);
+    this.questions = new TaskQuestions(desktop, store, gate, access.ownerId);
+  }
 
   handle(input: BridgeInput): Promise<void> {
+    const managerPeer = input.peerId === this.access.ownerId;
+    if (managerPeer && input.senderId !== this.access.ownerId) return Promise.resolve();
+    if (!managerPeer && [this.access.groupId, -this.access.groupId].includes(input.senderId)) return Promise.resolve();
+    if (input.action && input.senderId !== this.access.ownerId) return Promise.resolve();
+    const key = JSON.stringify([input.peerId, input.eventId]);
+    if (this.activeInputs.has(key) || !this.store.receiveInput(input)) return Promise.resolve();
+    this.activeInputs.add(key);
+    try { return this.inputBatcher.handle(input).finally(() => this.activeInputs.delete(key)); }
+    catch (error) { this.activeInputs.delete(key); throw error; }
+  }
+
+  recoverInputs(): void { this.inputBatcher.restore(); this.replaySavedInputs(); }
+  replaySavedInputs(): void {
+    let inputs: readonly BridgeInput[];
+    try {
+      inputs = this.store.reserveReplayableInputs();
+      if (this.store.getValue("inbound-recovery-error") !== null) this.store.setValue("inbound-recovery-error", null);
+    } catch {
+      this.store.setValue("inbound-recovery-error", { at: Date.now() });
+      throw new Error("Durable VK input journal could not be replayed");
+    }
+    for (const input of inputs) void this.handle(input).catch(() => {});
+  }
+
+  private enqueueInput(input: BridgeInput): Promise<void> {
     // Each VK conversation is ordered independently. A disconnected Codex task
     // must never hold the manager or another linked conversation behind it.
     const previous = this.tails.get(input.peerId) ?? Promise.resolve();
@@ -96,7 +134,7 @@ export class TaskManager {
     return work;
   }
 
-  async idle(): Promise<void> { await Promise.all([...this.tails.values()]); }
+  async idle(): Promise<void> { await this.inputBatcher.idle(); await Promise.all([...this.tails.values()]); }
 
   private async watch(input: BridgeInput): Promise<void> {
     const timer = setTimeout(() => {
@@ -136,33 +174,38 @@ export class TaskManager {
     if (input.action && input.senderId !== this.access.ownerId) return;
     const inboxKey = JSON.stringify([input.peerId, input.eventId]);
     if (!this.store.claimInput(inboxKey)) return;
+    const mergedKeys = (input.mergedEventIds ?? []).map(id => JSON.stringify([input.peerId, id]));
+    for (const key of mergedKeys) this.store.claimInput(key);
+    const finish = (uncertain = false) => this.store.finishInputs([inboxKey, ...mergedKeys], uncertain);
     let panelAction = false;
     try {
       if (!managerPeer) {
         let binding = this.store.byPeer(input.peerId);
-        if (!binding) { this.inactiveInput(input, null); this.store.finishInput(inboxKey); return; }
+        if (!binding) { this.inactiveInput(input, null); finish(); return; }
         if (binding.paused) {
           await this.gate.clearLegacyPause(input.peerId, binding.id);
           binding = this.store.byPeer(input.peerId)!;
         } else if (!binding.attached) {
-          this.inactiveInput(input, binding); this.store.finishInput(inboxKey); return;
+          this.inactiveInput(input, binding); finish(); return;
         }
-        if (!await this.gate.check(input.peerId)) { this.store.finishInput(inboxKey); return; }
+        if (!await this.gate.check(input.peerId)) { finish(); return; }
       }
       const incomingId = /^message:(\d+)$/u.exec(input.eventId);
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
       if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
+      if (!managerPeer && !input.action && await this.questions.text(input)) { finish(); return; }
       if (input.attachments?.length && (!this.files || managerPeer || input.action || input.text.trim().startsWith("/"))) throw new ActionRejectedError("Вложения отправляй отдельным сообщением в связанную беседу задачи.");
       if (input.action) {
         // This read-only shortcut always opens the current peer's menu, even
         // after older panel tokens expire. Manager ownership was checked above.
         if (input.action === MENU_BUTTON.action) {
           await this.panels.text({ ...input, text: "/menu" });
-          this.store.finishInput(inboxKey); return;
+          finish(); return;
         }
         const action = this.store.scopedAction(input.action, input.peerId, managerPeer);
         if (!action) throw new ActionRejectedError("Кнопка устарела или относится к другой беседе. Открой /menu заново.");
-        if (action.type === "panel") { panelAction = true; await this.panels.action(input, action); }
+        if (action.type === "question") await this.questions.action(input, action);
+        else if (action.type === "panel") { panelAction = true; await this.panels.action(input, action); }
         else if (managerPeer) await this.handleAction(input, action);
         else throw new ActionRejectedError("Эта кнопка доступна только в менеджере.");
       } else if (!managerPeer && input.senderId !== this.access.ownerId) {
@@ -171,9 +214,9 @@ export class TaskManager {
         if (managerPeer) await this.handleManager(input);
         else await this.handleTask(input);
       }
-      this.store.finishInput(inboxKey);
+      finish();
     } catch (error) {
-      this.store.finishInput(inboxKey, !(error instanceof ActionRejectedError));
+      finish(!(error instanceof ActionRejectedError));
       if (panelAction) this.panels.failure(input.peerId, error);
       const view = { text: error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError
         ? error.message : "Операция не завершена. Проверь подключение к Codex; автоматического повтора команды не будет.",
@@ -597,57 +640,72 @@ export class TaskManager {
   private async handleTask(input: BridgeInput): Promise<void> {
     const binding: Binding | null = this.store.byPeer(input.peerId);
     if (!binding || input.action) return;
-    const text = input.text.trim();
+    const queued = /^\/queue(?:\s|$)/u.test(input.text.trim());
+    const text = queued ? input.text.trim().replace(/^\/queue(?:\s+|$)/u, "").trim() : input.text.trim();
     const ownerCommand = input.senderId === this.access.ownerId;
     if (this.store.transferBlocksInput(binding.id) && !["/help", "/detach", "/stop", "/files"].includes(text)) {
       throw new ActionRejectedError("Сообщение не отправлено: задача переносится между каталогами. /menu покажет текущий этап. Повтори запрос после завершения переноса.");
     }
     if (input.editOfMessageId !== undefined) {
+      if (queued) throw new ActionRejectedError("Правку запроса в очереди выполняй в Codex. Новый запрос из VK добавляется отдельным сообщением /queue.");
       await this.handleTaskEdit(input, binding, text);
       return;
     }
-    if (ownerCommand && text === "/help") {
+    if (!queued && ownerCommand && text === "/help") {
       this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: taskHelp, buttons: [MENU_BUTTON] }, binding.id);
       return;
     }
-    if (ownerCommand && text === "/detach") {
+    if (!queued && ownerCommand && text === "/detach") {
       this.store.stopStreaming(binding.id);
       this.reply(input, { text: "Трансляция отключена; задача Codex продолжает работать." });
       return;
     }
-    if (ownerCommand && text === "/stop") {
+    if (!queued && ownerCommand && text === "/stop") {
       if (!this.desktop.capabilities.interruptTurn) throw new ActionRejectedError("Остановка через текущий адаптер ещё не подтверждена. Останови ход в десктопе.");
       await this.desktop.interrupt(binding);
       this.reply(input, { text: "Запрос остановки передан в Codex." });
       return;
     }
-    if (ownerCommand && text === "/files") {
+    if (!queued && ownerCommand && text === "/files") {
       if (!this.files) throw new ActionRejectedError("Передача файлов не настроена.");
       const count = await this.files.collect(binding, true);
       this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: count ? `Подготовлено к отправке файлов: ${count}.` : "Новых выходных файлов пока нет. В запросе агенту попроси сохранить результат в папку отправки VKodex." }, binding.id);
       return;
     }
     if (!text && !input.attachments?.length) throw new ActionRejectedError("Пришли текст или вложение для этой задачи.");
-    if (text.length > 16_000) throw new ActionRejectedError("Допустим текст до 16000 символов.");
-    if (ownerCommand && text.startsWith("/")) {
+    if (text.length > (input.mergedEventIds ? 64_000 : 16_000)) throw new ActionRejectedError("Превышен лимит текста запроса.");
+    if (!queued && ownerCommand && text.startsWith("/")) {
       this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: unknownCommand(taskHelp), buttons: [MENU_BUTTON] }, binding.id);
       return;
     }
     const operationId = randomUUID();
     const generation = this.store.streamGeneration(binding.id);
+    const inboxKeys = [JSON.stringify([input.peerId, input.eventId]), ...(input.mergedEventIds ?? []).map(id => JSON.stringify([input.peerId, id]))];
+    this.store.markInputPreparing(inboxKeys);
     const prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []);
-    this.store.recordOperation(operationId, binding);
+    this.store.beginPromptDispatch(operationId, binding, inboxKeys, binding.id);
     try {
       const author = this.sharedAuthor(binding, input);
       const request = { task: binding, operationId, text, ...(author ? { author } : {}), ...prepared, beforeSend: async () => {
         if (this.store.transferBlocksInput(binding.id) || generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена или начат перенос во время подготовки запроса. Сообщение не отправлено.");
       } };
+      // A single edited VK fragment must never replace the complete merged turn.
+      if (input.mergedEventIds) this.store.clearEditableRequest(binding.id);
+      if (queued) {
+        if (!this.desktop.queue) throw new ActionRejectedError("Штатная очередь недоступна в этом подключении Codex.");
+        this.files?.markQueued(binding.id, operationId);
+        await this.desktop.queue(request);
+        this.store.finishOperation(operationId, "accepted");
+        this.files?.finish(binding.id, operationId, "accepted");
+        this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
+        return;
+      }
       const receipt = this.desktop.submitWithReceipt
         ? await this.desktop.submitWithReceipt(request)
         : (await this.desktop.submit(request), null);
       if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
-      this.store.finishOperation(operationId, false);
-      this.files?.finish(binding.id, operationId, false, receipt?.turnId ?? undefined);
+      this.store.finishOperation(operationId, "accepted");
+      this.files?.finish(binding.id, operationId, "accepted", receipt?.turnId ?? undefined);
       const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
       if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
         messageId: Number(messageId), senderId: input.senderId, operationId,
@@ -655,8 +713,22 @@ export class TaskManager {
         ...(request.author ? { author: request.author } : {}), ...prepared,
       });
     } catch (error) {
-      this.store.finishOperation(operationId, true);
-      this.files?.finish(binding.id, operationId, true);
+      // A lost RPC acknowledgment is not necessarily a lost prompt. The native
+      // userMessage clientId is the immutable operation ID sent to Codex.
+      if (!(error instanceof ActionRejectedError) && this.desktop.findAcceptedInput) {
+        const acceptedTurn = await this.desktop.findAcceptedInput(binding, operationId).catch(() => null);
+        if (acceptedTurn) {
+          this.store.rememberAcceptedTurn(binding.id, acceptedTurn, operationId);
+          this.store.finishOperation(operationId, "accepted");
+          this.files?.finish(binding.id, operationId, "accepted", acceptedTurn);
+          this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
+            { text: "Codex принял запрос; подтверждение ответа задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
+          return;
+        }
+      }
+      const state = error instanceof ActionRejectedError ? "rejected" : "uncertain";
+      this.store.finishOperation(operationId, state);
+      this.files?.finish(binding.id, operationId, state);
       throw error;
     }
   }

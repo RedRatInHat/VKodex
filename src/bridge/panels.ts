@@ -41,7 +41,7 @@ interface RenameState {
 }
 
 const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
-const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ в Codex", unavailable: "Нет связи с задачей" };
+const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ или подтверждение", unavailable: "Нет связи с задачей" };
 const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ").trim().slice(0, length);
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
 const goalStatuses: Record<TaskGoalStatus, string> = {

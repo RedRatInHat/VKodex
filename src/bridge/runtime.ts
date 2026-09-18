@@ -1,4 +1,4 @@
-import { DesktopIpcClient } from "../desktop/ipc-client.js";
+import { DesktopIpcClient, isObject } from "../desktop/ipc-client.js";
 import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { TaskSubscription } from "../desktop/subscription.js";
 import { RolloutTailer } from "../desktop/rollout-tailer.js";
@@ -43,6 +43,8 @@ export class DesktopBridgeRuntime {
   private lastTickAt: number;
   private updateStartedAt: number | null = null;
   private lastHealthAt = 0;
+  private operationReconciliation: Promise<void> | null = null;
+  private lastOperationReconciliationAt = 0;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
     private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string,
@@ -93,6 +95,7 @@ export class DesktopBridgeRuntime {
     if (this.timer || this.stopped) throw new Error("Bridge runtime can only be started once");
     for (const binding of this.store.bindings()) if (binding.attached && binding.paused) this.store.setPaused(binding.id, false);
     this.store.recover();
+    this.manager.recoverInputs();
     this.lastHealthAt = this.now();
     this.timer = setInterval(() => {
       this.lastTickAt = this.now();
@@ -100,6 +103,8 @@ export class DesktopBridgeRuntime {
       // A slow/offline task must not hold up delivery from other subscriptions.
       void this.delivery.flush().catch(() => {});
       void this.files?.tick().catch(() => {});
+      try { this.manager.replaySavedInputs(); } catch { /* Health reports a broken journal. */ }
+      this.reconcileUncertainOperation();
       void this.tick().catch(() => {});
     }, 1_000);
     // Establish subscriptions before the first report so a healthy restart does
@@ -113,14 +118,46 @@ export class DesktopBridgeRuntime {
       || (this.readySubscriptions.has(binding.id) && this.now() - (this.ownerVerifiedAt.get(binding.id) ?? 0) <= 45_000);
     const connected = active.filter(isConnected).length;
     const required = active.filter(binding => ["running", "approval"].includes(this.store.getValue<TaskDetails>(`task-details:${binding.id}`)?.status ?? ""));
+    const bindings = active.map(binding => {
+      const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+      return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
+        status: details?.status ?? "unavailable", connected: isConnected(binding),
+        lastConfirmedAt: this.ownerVerifiedAt.get(binding.id) ?? null, failure: details?.failure ?? null };
+    });
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
-      failedBindings: active.filter(binding => this.store.getValue<TaskDetails>(`task-details:${binding.id}`)?.failure !== undefined).length };
+      failedBindings: bindings.filter(binding => binding.failure !== null).length, bindings };
   }
 
   private checkHealth(force = false): Promise<BridgeHealthSnapshot> {
     this.lastHealthAt = this.now();
     return this.healthCheckOverride?.(force) ?? this.health.check(force);
+  }
+
+  private reconcileUncertainOperation(): void {
+    if (this.stopped || !this.desktop.findAcceptedInput || this.operationReconciliation
+      || this.now() - this.lastOperationReconciliationAt < 30_000) return;
+    this.lastOperationReconciliationAt = this.now();
+    const operation = this.store.uncertainPromptOperations(this.now(), 1)[0];
+    if (!operation) return;
+    this.store.markOperationChecked(operation.id, this.now());
+    const binding = this.store.getBinding(operation.bindingId);
+    if (!binding || !binding.attached || binding.peerId === null || taskKey(binding) !== operation.taskKey) return;
+    const work = this.desktop.findAcceptedInput(binding, operation.id).then(turnId => {
+      if (!turnId || this.stopped) return;
+      const current = this.store.getBinding(binding.id);
+      if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== operation.taskKey
+        || this.store.operationState(operation.id) !== "uncertain") return;
+      this.store.atomic(() => {
+        this.store.finishOperation(operation.id, "accepted");
+        this.store.rememberAcceptedTurn(binding.id, turnId, operation.id);
+        this.files?.finish(binding.id, operation.id, "accepted", turnId);
+        this.store.enqueue(`reconciled-operation:${operation.id}`, current.peerId!, {
+          text: "Codex подтвердил ранее неопределённый запрос. Повторно отправлять его не нужно.", silent: true,
+        }, binding.id);
+      });
+    }).catch(() => {}).finally(() => { if (this.operationReconciliation === work) this.operationReconciliation = null; });
+    this.operationReconciliation = work;
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -227,6 +264,12 @@ export class DesktopBridgeRuntime {
     this.activity.tick();
     await Promise.allSettled(this.store.bindings().map(binding => this.mirrorRolloutFallback(binding)));
     await this.manager.panels.tick();
+    // Re-reading every profile catalog for each conversation made a full
+    // reconnect proportional to the number of bindings. During a renderer
+    // outage, serial five-second subscription attempts could hold one update
+    // for minutes and make the health report itself stale.
+    let listedTasks: Awaited<ReturnType<DesktopTasks["listTasks"]>> | null = null;
+    const starting = new Set<Promise<void>>();
     for (const listed of this.store.bindings()) {
       let binding = listed;
       let existing = this.subscriptions.get(binding.id);
@@ -256,7 +299,8 @@ export class DesktopBridgeRuntime {
       }
       if (!existing && this.now() < (this.retryAfter.get(binding.id) ?? 0)) continue;
       if (existing) { this.verifySubscription(binding.id, existing); continue; }
-      const task = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+      listedTasks ??= await this.desktop.listTasks();
+      const task = listedTasks.find(task => sameTask(task, binding));
       const current = this.store.getBinding(binding.id);
       if (this.stopped || !current?.attached) { this.closeSubscription(binding.id); continue; }
       if (!task) {
@@ -275,6 +319,17 @@ export class DesktopBridgeRuntime {
           this.readySubscriptions.add(binding.id);
           this.disableRolloutFallback(current);
           this.store.markDesktopHandoff(binding.id, task, "live", this.now());
+          // Native queued submissions acquire a turn later, including while the bridge is offline.
+          const pendingFiles = this.files?.pendingQueuedOperations(binding.id);
+          for (const turn of pendingFiles?.size ? turnsFromState(state) : []) {
+            if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
+            for (const item of turn.items.filter(isObject)) {
+              if (item.type === "userMessage" && typeof item.clientId === "string" && pendingFiles!.has(item.clientId)) {
+                this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
+                if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
+              }
+            }
+          }
           const editable = this.store.editableRequest(binding.id);
           if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
           const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
@@ -296,6 +351,7 @@ export class DesktopBridgeRuntime {
           }
           this.store.setValue(checkpointKey, projected.checkpoint);
           const details = taskDetails(state);
+          this.manager.questions.observe(current, state);
           this.manager.panels.observe(binding.id, details);
           const failure = taskFailureText(details.failure);
           if (failure) {
@@ -309,33 +365,45 @@ export class DesktopBridgeRuntime {
       }, error => this.subscriptionFailed(binding.id, subscription, error));
       this.subscriptions.set(binding.id, subscription);
       this.subscriptionTasks.set(binding.id, taskKey(task));
-      try {
-        await subscription.start();
-        this.readySubscriptions.add(binding.id);
-        this.ownerVerifiedAt.set(binding.id, this.now());
-        this.store.markDesktopHandoff(binding.id, task, "live", this.now());
-      }
-      catch (error) {
-        this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
-        subscription.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id);
-        const current = this.store.getBinding(binding.id);
-        if (this.stopped || !current?.attached) continue;
-        this.enableRolloutFallback(current);
-        this.activity.disconnected(binding.id);
-        this.files?.observe(binding.id, "unavailable");
-        this.retryAfter.set(binding.id, this.now() + 5_000);
-        // A configured launcher may still be bringing the owner online. Keep
-        // probing without filling the manager conversation with expected retries.
-        if (error instanceof TaskNotOpenError) continue;
-        const reason = error instanceof DesktopUnavailableError ? error.message : "Не удалось получить состояние Codex.";
-        this.store.enqueue(`unavailable:${binding.id}`, this.access.ownerId, {
-          text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
-        });
-      }
-      if (this.stopped) { subscription.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id); return; }
+      const start = (async () => {
+        try {
+          await subscription.start();
+          if (this.stopped || this.subscriptions.get(binding.id) !== subscription) return;
+          this.readySubscriptions.add(binding.id);
+          this.ownerVerifiedAt.set(binding.id, this.now());
+          this.store.markDesktopHandoff(binding.id, task, "live", this.now());
+        } catch (error) {
+          if (this.subscriptions.get(binding.id) !== subscription) return;
+          this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
+          subscription.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id);
+          const current = this.store.getBinding(binding.id);
+          if (this.stopped || !current?.attached) return;
+          this.enableRolloutFallback(current);
+          this.activity.disconnected(binding.id);
+          this.files?.observe(binding.id, "unavailable");
+          this.retryAfter.set(binding.id, this.now() + 5_000);
+          // A configured launcher may still be bringing the owner online. Keep
+          // probing without filling the manager conversation with expected retries.
+          if (error instanceof TaskNotOpenError) return;
+          const reason = error instanceof DesktopUnavailableError ? error.message : "Не удалось получить состояние Codex.";
+          this.store.enqueue(`unavailable:${binding.id}`, this.access.ownerId, {
+            text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
+          });
+        }
+      })();
+      starting.add(start);
+      void start.finally(() => starting.delete(start));
+      // Limit concurrent native subscriptions without serializing unrelated
+      // conversations behind an unavailable client.
+      if (starting.size >= 6) await Promise.race(starting);
+      if (this.stopped) break;
       this.closeInactiveSubscriptions();
     }
-    await this.delivery.flush();
+    await Promise.all(starting);
+    // VK writes have their own serialized worker and may take many seconds.
+    // Keep task reconciliation independent from that queue; the one-second
+    // timer also flushes it, and stop() waits for its in-flight operation.
+    void this.delivery.flush().catch(() => {});
   }
 
   async stop(): Promise<void> {
@@ -344,6 +412,9 @@ export class DesktopBridgeRuntime {
     this.activity.stop();
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    // Deliver buffered incoming text before closing its native connection.
+    await this.manager.idle();
+    await this.operationReconciliation?.catch(() => {});
     for (const subscription of this.subscriptions.values()) subscription.close();
     this.subscriptions.clear();
     this.subscriptionTasks.clear();

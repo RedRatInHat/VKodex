@@ -3,12 +3,25 @@ import { PassThrough } from "node:stream";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createServer } from "node:net";
 import test from "node:test";
 import { OwnerTransport, OwnerTransportError } from "../src/desktop/owner-transport.js";
-import { archiveThroughOwner, serveOwnerChannel } from "../src/desktop/owner-channel.js";
-import { ProfileDesktopMetadata } from "../src/desktop/metadata.js";
+import { archiveThroughOwner, inspectThroughOwner, serveOwnerChannel } from "../src/desktop/owner-channel.js";
+import { ProfileDesktopMetadata, unownedArchiveReady } from "../src/desktop/metadata.js";
 import { UncertainActionError } from "../src/desktop/contracts.js";
 import { ownerEnvironment, resolveOwnerExecutable } from "../src/desktop/owner-launcher.js";
+import { comparablePath } from "../src/desktop/paths.js";
+
+test("an unowned archive retry requires an unloaded task and terminal latest turn", () => {
+  const read = { thread: { id: "source", status: { type: "notLoaded" } } };
+  const turns = { data: [{ id: "last-turn", status: "completed" }] };
+  assert.equal(unownedArchiveReady(read, turns, "source"), true);
+  assert.equal(unownedArchiveReady(read, { data: [{ id: "last-turn", status: "inProgress" }] }, "source"), false);
+  assert.equal(unownedArchiveReady({ thread: { id: "other", status: { type: "notLoaded" } } }, turns, "source"), false);
+  assert.equal(unownedArchiveReady({ thread: { id: "source", status: { type: "active" } } }, turns, "source"), false);
+  assert.equal(unownedArchiveReady(read, { data: [] }, "source"), false);
+});
 
 test("owner launcher follows the installed extension registry and rejects ambiguous or escaped locations", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-version-"));
@@ -74,6 +87,15 @@ test("VS Code readiness is confirmed by a native response without initialized no
   await f.transport.archiveIdle(threadId);
   assert.equal(f.requests.filter(r => r.method === "initialize").length, 1);
   assert.equal(f.requests.some(r => r.method === "initialized"), false);
+  f.transport.close();
+});
+
+test("owner inspection reads an already loaded task without resuming or mutating it", async () => {
+  const f = fixture(); f.initialize();
+  assert.equal(await f.transport.inspectTask(threadId), "idle");
+  assert.deepEqual(f.requests.filter(request => request.method === "thread/read").map(request => request.params),
+    [{ threadId, includeTurns: false }]);
+  assert.equal(f.requests.some(request => request.method === "thread/resume" || request.method === "turn/start"), false);
   f.transport.close();
 });
 
@@ -212,6 +234,47 @@ test("private owner channel selects the matching profile and retires discovery o
     assert.equal(archives, 1);
   } finally { await channel.close(); }
   assert.equal(await archiveThroughOwner(home, threadId, root), false);
+});
+
+test("owner channel exposes only the selected owner's task status", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-inspect-"));
+  const channel = await serveOwnerChannel(root, {
+    ownsTask: async id => id === threadId,
+    inspectTask: async () => "active",
+    archiveIdle: async () => { throw new Error("unexpected archive"); },
+  }, root);
+  try {
+    assert.equal(await inspectThroughOwner(root, threadId, root), "active");
+    assert.equal(await inspectThroughOwner(root, "22222222-2222-4222-8222-222222222222", root), null);
+  } finally { await channel.close(); }
+});
+
+test("a legacy owner cannot silently receive archive after the protocol changes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-legacy-"));
+  const home = path.join(root, "profile");
+  const id = randomUUID(); const token = randomBytes(32).toString("hex");
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\vkodex-owner-${id}` : path.join(os.tmpdir(), `vkodex-owner-${id}.sock`);
+  let archives = 0;
+  const server = createServer(socket => {
+    socket.once("data", bytes => {
+      const request = JSON.parse(String(bytes).trim()) as { operation: string };
+      if (request.operation === "archive") archives++;
+      socket.end(JSON.stringify(request.operation === "probe" ? { ok: true, owned: true } : { ok: true }) + "\n");
+    });
+  });
+  await new Promise<void>(resolve => server.listen(endpoint, resolve));
+  const directory = path.join(root, createHash("sha256").update(comparablePath(home)).digest("hex"));
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, `${process.pid}-${id}.json`), JSON.stringify({
+    version: 1, home: comparablePath(home), endpoint, token, pid: process.pid,
+  }));
+  try {
+    await assert.rejects(archiveThroughOwner(home, threadId, root), (error: unknown) =>
+      error instanceof OwnerTransportError && error.outcome === "outdated");
+    await assert.rejects(inspectThroughOwner(home, threadId, root), (error: unknown) =>
+      error instanceof OwnerTransportError && error.outcome === "outdated");
+    assert.equal(archives, 0);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
 test("ambiguous owners cannot receive an archive", async () => {

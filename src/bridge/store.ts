@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../desktop/contracts.js";
-import type { Binding, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
+import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../desktop/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
@@ -26,6 +26,14 @@ export function migrateBindingSources(db: Database): void {
       if ((db.pragma("foreign_key_check") as unknown[]).length) throw new Error("Binding migration failed reference validation");
     })();
   } finally { db.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`); }
+}
+
+export function migrateInboxJournal(db: Database): void {
+  const columns = new Set((db.prepare("PRAGMA table_info(bridge_inbox)").all() as { name: string }[]).map(column => column.name));
+  if (!columns.has("payload")) db.exec("ALTER TABLE bridge_inbox ADD COLUMN payload TEXT");
+  if (!columns.has("received_at")) db.exec("ALTER TABLE bridge_inbox ADD COLUMN received_at INTEGER");
+  if (!columns.has("replay_after")) db.exec("ALTER TABLE bridge_inbox ADD COLUMN replay_after INTEGER");
+  db.exec("CREATE INDEX IF NOT EXISTS bridge_inbox_replay ON bridge_inbox(state, replay_after)");
 }
 
 interface BindingRow { id: string; host_id: string; thread_id: string; title: string; peer_id: number | null; chat_id: number | null; chat_state: Binding["chatState"]; attached: number; paused: number; source_id: string; source_label: string | null; rollout_path: string | null }
@@ -69,6 +77,14 @@ export interface DesktopHandoffState {
   readonly status: "launching" | "launched" | "live";
   readonly updatedAt: number;
 }
+export interface SavedInputBatch {
+  readonly id: string;
+  readonly peerId: number;
+  readonly parts: readonly BridgeInput[];
+  readonly startedAt: number;
+  readonly updatedAt: number;
+  readonly state: "collecting" | "dispatching";
+}
 function binding(row: BindingRow): Binding {
   return { id: row.id, hostId: row.host_id, threadId: row.thread_id, title: row.title, peerId: row.peer_id, chatId: row.chat_id, chatState: row.chat_state, attached: row.attached === 1, paused: row.paused === 1,
     ...(row.source_id ? { sourceId: row.source_id } : {}), ...(row.source_label ? { sourceLabel: row.source_label } : {}), ...(row.rollout_path ? { rolloutPath: row.rollout_path } : {}) };
@@ -84,10 +100,21 @@ export class BridgeStore {
     this.db.pragma("busy_timeout = 5000");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS bridge_bindings (${bindingColumns});
-      CREATE TABLE IF NOT EXISTS bridge_inbox (id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS bridge_inbox (
+        id TEXT PRIMARY KEY, state TEXT NOT NULL, payload TEXT, received_at INTEGER, replay_after INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS bridge_input_batches (
+        peer_id INTEGER PRIMARY KEY, batch_id TEXT NOT NULL, parts TEXT NOT NULL, started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL, state TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS bridge_actions (id TEXT PRIMARY KEY, payload TEXT NOT NULL, expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_values (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
+        operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id),
+        binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), inbox_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL, last_checked_at INTEGER
+      );
       CREATE TABLE IF NOT EXISTS bridge_events (binding_id TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(binding_id, event_id));
       CREATE TABLE IF NOT EXISTS bridge_task_senders (
         binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), sender_id INTEGER NOT NULL,
@@ -101,6 +128,7 @@ export class BridgeStore {
       );
     `);
     migrateBindingSources(this.db);
+    migrateInboxJournal(this.db);
     const actionColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_actions)").all() as { name: string }[]).map(column => column.name));
     if (!actionColumns.has("peer_id")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN peer_id INTEGER");
     if (!actionColumns.has("consumed")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
@@ -152,7 +180,11 @@ export class BridgeStore {
           AND json_array_length(view, '$.buttons') > ?
           AND (first_view IS NULL OR json_array_length(first_view, '$.buttons') > ?)`).run(VK_MAX_INLINE_BUTTONS, VK_MAX_INLINE_BUTTONS);
       this.db.prepare("UPDATE bridge_bindings SET chat_state = 'uncertain' WHERE chat_state = 'creating'").run();
-      this.db.prepare("UPDATE bridge_inbox SET state = 'uncertain' WHERE state = 'processing'").run();
+      // Only a task prompt still preparing local attachments is known not to
+      // have reached Codex. All other in-flight handlers may have mutated state.
+      this.db.prepare("UPDATE bridge_inbox SET state = 'retryable' WHERE state = 'preparing'").run();
+      this.db.prepare("UPDATE bridge_inbox SET state = 'uncertain', payload = NULL WHERE state IN ('processing', 'sending')").run();
+      this.db.prepare("UPDATE bridge_inbox SET replay_after = 0 WHERE state IN ('received', 'retryable')").run();
       this.db.prepare("UPDATE bridge_operations SET state = 'uncertain' WHERE state = 'sending'").run();
       const draft = this.getDraft();
       if (draft?.stage === "creating") this.saveDraft({ ...draft, stage: "uncertain" });
@@ -314,8 +346,112 @@ export class BridgeStore {
     });
   }
 
-  claimInput(id: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_inbox(id, state) VALUES (?, 'processing')").run(id).changes === 1; }
-  finishInput(id: string, uncertain = false): void { this.db.prepare("UPDATE bridge_inbox SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "done", id); }
+  receiveInput(input: BridgeInput, now = Date.now()): boolean {
+    const id = JSON.stringify([input.peerId, input.eventId]);
+    const payload = JSON.stringify(input);
+    if (Buffer.byteLength(payload) > 256 * 1024) throw new Error("VK input exceeds the durable journal limit");
+    if (this.db.prepare(`INSERT OR IGNORE INTO bridge_inbox(id, state, payload, received_at, replay_after)
+      VALUES (?, 'received', ?, ?, ?)`).run(id, payload, now, now + 10_000).changes === 1) return true;
+    const state = this.inputState(id);
+    // A duplicate event can still join a pending long-message batch. Preserve
+    // the originally journaled payload; a changed VK message has its own event.
+    if (state !== "received" && state !== "retryable") return false;
+    this.db.prepare(`UPDATE bridge_inbox SET payload = COALESCE(payload, ?),
+      received_at = COALESCE(received_at, ?), replay_after = COALESCE(replay_after, ?)
+      WHERE id = ? AND state IN ('received', 'retryable')`).run(payload, now, now + 10_000, id);
+    return true;
+  }
+  reserveReplayableInputs(now = Date.now(), limit = 100): readonly BridgeInput[] {
+    // Most ticks have no backlog. Avoid taking an SQLite writer lock just to
+    // observe an empty journal while another process updates Codex metadata.
+    const due = this.db.prepare(`SELECT 1 FROM bridge_inbox
+      WHERE state IN ('received', 'retryable') AND payload IS NOT NULL AND COALESCE(replay_after, 0) <= ? LIMIT 1`).get(now);
+    if (!due) return [];
+    return this.atomic(() => {
+      const rows = this.db.prepare(`SELECT id, payload FROM bridge_inbox
+        WHERE state IN ('received', 'retryable') AND payload IS NOT NULL AND COALESCE(replay_after, 0) <= ?
+        ORDER BY received_at, rowid LIMIT ?`).all(now, limit) as { id: string; payload: string }[];
+      const inputs = rows.map(row => {
+        const input: unknown = JSON.parse(row.payload);
+        if (!input || typeof input !== "object" || Array.isArray(input)
+          || typeof (input as BridgeInput).eventId !== "string" || typeof (input as BridgeInput).text !== "string"
+          || !Number.isSafeInteger((input as BridgeInput).peerId) || !Number.isSafeInteger((input as BridgeInput).senderId)
+          || JSON.stringify([(input as BridgeInput).peerId, (input as BridgeInput).eventId]) !== row.id)
+          throw new Error("Invalid durable VK input");
+        return input as BridgeInput;
+      });
+      for (const row of rows) this.db.prepare("UPDATE bridge_inbox SET replay_after = ? WHERE id = ?").run(now + 30_000, row.id);
+      return inputs;
+    });
+  }
+  replayableInputStats(): { count: number; oldestAt: number | null } {
+    return this.db.prepare(`SELECT COUNT(*) AS count, MIN(received_at) AS oldestAt FROM bridge_inbox
+      WHERE state IN ('received', 'retryable')`).get() as { count: number; oldestAt: number | null };
+  }
+  claimInput(id: string): boolean {
+    if (this.db.prepare("INSERT OR IGNORE INTO bridge_inbox(id, state) VALUES (?, 'processing')").run(id).changes === 1) return true;
+    return this.db.prepare("UPDATE bridge_inbox SET state = 'processing' WHERE id = ? AND state IN ('received', 'retryable')").run(id).changes === 1;
+  }
+  inputState(id: string): "received" | "processing" | "preparing" | "sending" | "retryable" | "uncertain" | "done" | null {
+    const row = this.db.prepare("SELECT state FROM bridge_inbox WHERE id = ?").get(id) as { state: string } | undefined;
+    const state = row?.state;
+    return state === "received" || state === "processing" || state === "preparing" || state === "sending" || state === "retryable"
+      || state === "uncertain" || state === "done" ? state : null;
+  }
+  hasInput(id: string): boolean { const state = this.inputState(id); return state !== null && state !== "received" && state !== "retryable"; }
+  inputSettled(id: string): boolean { return ["done", "uncertain"].includes(this.inputState(id) ?? ""); }
+  saveInputBatch(batch: SavedInputBatch): void {
+    this.db.prepare(`INSERT INTO bridge_input_batches(peer_id, batch_id, parts, started_at, updated_at, state)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(peer_id) DO UPDATE SET
+      batch_id = excluded.batch_id, parts = excluded.parts, started_at = excluded.started_at,
+      updated_at = excluded.updated_at, state = excluded.state`)
+      .run(batch.peerId, batch.id, JSON.stringify(batch.parts), batch.startedAt, batch.updatedAt, batch.state);
+  }
+  inputBatches(): readonly SavedInputBatch[] {
+    return (this.db.prepare("SELECT peer_id, batch_id, parts, started_at, updated_at, state FROM bridge_input_batches ORDER BY peer_id").all() as
+      { peer_id: number; batch_id: string; parts: string; started_at: number; updated_at: number; state: string }[]).map(row => {
+        const parts: unknown = JSON.parse(row.parts);
+        if (!Array.isArray(parts) || !parts.length || !parts.every(part => part && typeof part === "object"
+          && typeof part.eventId === "string" && typeof part.text === "string" && part.peerId === row.peer_id)
+          || !["collecting", "dispatching"].includes(row.state)) throw new Error("Invalid saved VK input batch");
+        return { id: row.batch_id, peerId: row.peer_id, parts: parts as BridgeInput[], startedAt: row.started_at,
+          updatedAt: row.updated_at, state: row.state as SavedInputBatch["state"] };
+      });
+  }
+  inputBatchStats(): { count: number; oldestAt: number | null; dispatching: number } {
+    return this.db.prepare(`SELECT COUNT(*) AS count, MIN(updated_at) AS oldestAt,
+      SUM(CASE WHEN state = 'dispatching' THEN 1 ELSE 0 END) AS dispatching
+      FROM bridge_input_batches`).get() as { count: number; oldestAt: number | null; dispatching: number };
+  }
+  removeInputBatch(peerId: number, batchId: string): void {
+    this.db.prepare("DELETE FROM bridge_input_batches WHERE peer_id = ? AND batch_id = ?").run(peerId, batchId);
+  }
+  oldestRetryableMessage(peerId: number): number | null {
+    let oldest: number | null = null;
+    const rows = this.db.prepare("SELECT id FROM bridge_inbox WHERE state = 'retryable'").all() as { id: string }[];
+    for (const row of rows) {
+      try {
+        const key: unknown = JSON.parse(row.id);
+        if (!Array.isArray(key) || key[0] !== peerId || typeof key[1] !== "string") continue;
+        const match = /^message:(\d+)$/u.exec(key[1]);
+        const id = match ? Number(match[1]) : 0;
+        if (Number.isSafeInteger(id) && id > 0 && (oldest === null || id < oldest)) oldest = id;
+      } catch { /* An unrelated legacy inbox key must not block reconciliation. */ }
+    }
+    return oldest;
+  }
+  markInputPreparing(ids: readonly string[]): void {
+    this.atomic(() => { for (const id of ids) this.db.prepare("UPDATE bridge_inbox SET state = 'preparing' WHERE id = ? AND state = 'processing'").run(id); });
+  }
+  markInputSending(ids: readonly string[]): void {
+    this.atomic(() => { for (const id of ids) this.db.prepare("UPDATE bridge_inbox SET state = 'sending' WHERE id = ? AND state = 'preparing'").run(id); });
+  }
+  finishInput(id: string, uncertain = false): void {
+    this.db.prepare("UPDATE bridge_inbox SET state = ?, payload = NULL WHERE id = ?").run(uncertain ? "uncertain" : "done", id);
+  }
+  finishInputs(ids: readonly string[], uncertain = false): void {
+    this.atomic(() => { for (const id of ids) this.finishInput(id, uncertain); });
+  }
 
   action(value: ManagerAction, now = Date.now(), peerId: number | null = null): string {
     const id = randomUUID();
@@ -420,8 +556,48 @@ export class BridgeStore {
 
   clearPendingCreation(task: TaskRef): void { this.setValue(`pending-creation:${taskKey(task)}`, null); }
 
-  recordOperation(id: string, task: TaskRef): void { this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task)); }
-  finishOperation(id: string, uncertain: boolean): void { this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(uncertain ? "uncertain" : "accepted", id); }
+  recordOperation(id: string, task: TaskRef, inboxKey?: string, bindingId?: string, now = Date.now()): void {
+    this.atomic(() => {
+      this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
+      if (inboxKey && bindingId) this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, created_at) VALUES (?, ?, ?, ?)")
+        .run(id, bindingId, inboxKey, now);
+    });
+  }
+  beginPromptDispatch(id: string, task: TaskRef, inboxKeys: readonly string[], bindingId: string, now = Date.now()): void {
+    if (!inboxKeys.length) throw new Error("Prompt dispatch requires an inbox key");
+    this.atomic(() => {
+      for (const key of inboxKeys) {
+        if (this.inputState(key) !== "preparing") throw new Error("VK input is not prepared for Codex dispatch");
+      }
+      this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
+      this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, created_at) VALUES (?, ?, ?, ?)")
+        .run(id, bindingId, inboxKeys[0], now);
+      for (const key of inboxKeys) this.db.prepare("UPDATE bridge_inbox SET state = 'sending' WHERE id = ?").run(key);
+    });
+  }
+  uncertainPromptOperations(now = Date.now(), limit = 10): readonly { id: string; taskKey: string; bindingId: string; inboxKey: string }[] {
+    return this.db.prepare(`SELECT op.id AS id, op.task_key AS taskKey, input.binding_id AS bindingId, input.inbox_key AS inboxKey
+      FROM bridge_operations AS op JOIN bridge_operation_inputs AS input ON input.operation_id = op.id
+      WHERE op.state = 'uncertain' AND (input.last_checked_at IS NULL OR input.last_checked_at <= ?)
+      ORDER BY op.rowid DESC LIMIT ?`).all(now - 5 * 60_000, limit) as { id: string; taskKey: string; bindingId: string; inboxKey: string }[];
+  }
+  uncertainPromptStats(): { count: number; oldestAt: number | null } {
+    const row = this.db.prepare(`SELECT COUNT(*) AS count, MIN(input.created_at) AS oldestAt
+      FROM bridge_operations AS op JOIN bridge_operation_inputs AS input ON input.operation_id = op.id
+      WHERE op.state = 'uncertain'`).get() as { count: number; oldestAt: number | null };
+    return row;
+  }
+  markOperationChecked(id: string, now = Date.now()): void {
+    this.db.prepare("UPDATE bridge_operation_inputs SET last_checked_at = ? WHERE operation_id = ?").run(now, id);
+  }
+  finishOperation(id: string, state: "accepted" | "rejected" | "uncertain"): void {
+    this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(state, id);
+  }
+  operationState(id: string): "sending" | "accepted" | "rejected" | "uncertain" | null {
+    const row = this.db.prepare("SELECT state FROM bridge_operations WHERE id = ?").get(id) as { state: string } | undefined;
+    const state = row?.state;
+    return state === "sending" || state === "accepted" || state === "rejected" || state === "uncertain" ? state : null;
+  }
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
   rememberAcceptedTurn(bindingId: string, turnId: string, operationId: string): void {
     const turns = this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId);
@@ -437,6 +613,7 @@ export class BridgeStore {
     this.setValue(`accepted-turns:${bindingId}`, this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId));
   }
   saveEditableRequest(bindingId: string, request: EditableVkRequest): void { this.setValue(`editable-request:${bindingId}`, request); }
+  clearEditableRequest(bindingId: string): void { this.setValue(`editable-request:${bindingId}`, null); }
   editableRequest(bindingId: string): EditableVkRequest | null { return this.getValue<EditableVkRequest>(`editable-request:${bindingId}`); }
   expectEditedUser(bindingId: string, text: string, now = Date.now()): void {
     this.setValue(`expected-edited-user:${bindingId}`, { digest: createHash("sha256").update(text).digest("hex"), expiresAt: now + 60_000 });
@@ -546,6 +723,11 @@ export class BridgeStore {
   }
   saveHandle(id: number, handle: MessageHandle): void {
     this.db.prepare("UPDATE bridge_delivery SET handle = ? WHERE id = ?").run(JSON.stringify(handle), id);
+  }
+
+  deliveryHandle(key: string): MessageHandle | null {
+    const row = this.db.prepare("SELECT handle FROM bridge_delivery WHERE key = ?").get(key) as { handle: string | null } | undefined;
+    return row?.handle ? JSON.parse(row.handle) as MessageHandle : null;
   }
 
   delivered(delivery: Delivery, handle: MessageHandle): void {

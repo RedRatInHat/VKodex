@@ -71,6 +71,7 @@ process.once("unhandledRejection", reason => fatalShutdown("unhandled_rejection"
 try {
   logger.info("VKodex desktop bridge is starting");
   await gateway.start(input => runtime.handle(input));
+  gateway.startReconciliation(store);
   runtime.start();
   logger.info("VKodex desktop bridge and VK Long Poll are ready");
 } catch (error) {

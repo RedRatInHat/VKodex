@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { ActionRejectedError, DesktopUnavailableError, UncertainActionError } from "../src/desktop/contracts.js";
-import { parseModelsCache, taskDetails } from "../src/desktop/details.js";
+import { parseModelsCache, parseNativeModels, taskDetails } from "../src/desktop/details.js";
 import { conversationMarkdown, MetadataRpc, NativeAccountUsage, NativeDesktopGoals, NativeDesktopMetadata, parseAccountLabel, parseAccountUsage, parseTaskGoal } from "../src/desktop/metadata.js";
 import type { IpcObject } from "../src/desktop/ipc-client.js";
 import { TransferRpc } from "../src/desktop/app-server-transfer.js";
@@ -47,6 +47,16 @@ test("model cache supplies visible ordered IDs and supported efforts without har
   assert.deepEqual(result.map(model => model.id), ["model-b", "model-a"]);
   assert.deepEqual(result[0]!.efforts, ["novel-effort"]);
   for (const fetchedAt of ["invalid", new Date(now - 25 * 60 * 60_000).toISOString(), new Date(now + 60 * 60_000).toISOString()]) assert.throws(() => parseModelsCache({ fetched_at: fetchedAt, models: [model] }, now), DesktopUnavailableError);
+});
+
+test("native model list exposes every account-visible model and its actual efforts", () => {
+  const entry = { model: "gpt-example-spark", displayName: "Example Spark", hidden: false,
+    supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }], defaultReasoningEffort: "low" };
+  const models = parseNativeModels({ data: [entry, { ...entry, model: "other" },
+    { ...entry, model: "internal", hidden: true }, { ...entry, model: "invalid", defaultReasoningEffort: "high" }], nextCursor: null });
+  assert.deepEqual(models.map(model => model.id), ["gpt-example-spark", "other"]);
+  assert.deepEqual(models[0]!.efforts, ["low", "medium"]);
+  assert.throws(() => parseNativeModels({ data: [entry], nextCursor: "more" }), DesktopUnavailableError);
 });
 
 test("Markdown contains only user and visible agent text and rejects incomplete or oversized history", () => {
@@ -369,4 +379,19 @@ test("an unchanged native project assignment is accepted only after exact readba
     return { thread: { id: "fixture", projectId: "project-b" } };
   } });
   await assert.rejects(mismatch.assignProject(task, "project-a"), /rejected/u);
+});
+
+
+test("native queue appends by operation ID without reading or replacing existing queue", async () => {
+  const calls: { method: string; params: IpcObject }[] = [];
+  const metadata = new NativeDesktopMetadata({ call: async (method, params) => {
+    calls.push({ method, params });
+    return { queuedSubmission: { id: "native-id", clientUserMessageId: params.clientUserMessageId } };
+  } });
+  const request = { task: { hostId: "local", threadId: "task" }, operationId: "op", text: "later" };
+  const input = [{ type: "text", text: "later" }];
+  assert.equal(await metadata.queue(request, input), "native-id");
+  assert.deepEqual(calls, [{ method: "thread/queue/add", params: { threadId: "task", clientUserMessageId: "op", input } }]);
+  const bad = new NativeDesktopMetadata({ call: async () => ({ queuedSubmission: { id: "wrong" } }) });
+  await assert.rejects(bad.queue(request, input), UncertainActionError);
 });

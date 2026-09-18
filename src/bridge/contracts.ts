@@ -7,6 +7,8 @@ export interface View { readonly text: string; readonly buttons?: readonly Butto
 
 export const VK_MAX_INLINE_BUTTONS = 10;
 export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
+/** A file-specific VK rejection: automatic retries of identical bytes cannot help. */
+export class FileUploadRejectedError extends Error {}
 export class ChatRateLimitError extends Error {
   constructor(readonly retryAfterMs: number) { super("VK временно ограничил частоту запросов. Отправка продолжится после паузы."); }
 }
@@ -43,6 +45,7 @@ export interface BridgeChat {
 export interface OwnerAccess { readonly ownerId: number; readonly groupId: number }
 
 export interface BridgeInput {
+  readonly mergedEventIds?: readonly string[];
   readonly eventId: string;
   readonly peerId: number;
   readonly senderId: number;
@@ -55,6 +58,7 @@ export interface BridgeInput {
   readonly attachmentError?: string;
   /** Present only for an incoming VK message_edit event. */
   readonly editOfMessageId?: number;
+  readonly replyToMessageId?: number;
 }
 
 export interface Binding extends TaskRef {
@@ -85,7 +89,7 @@ export interface TaskTransferRecord {
   readonly attempt?: number;
   readonly retryAt?: number;
   readonly blocked?: boolean;
-  readonly blockedReason?: "archiveOwner" | null;
+  readonly blockedReason?: "archiveOwner" | "archiveUnknown" | "sourceChanged" | null;
   /** A historical record closed from native archive + exact binding evidence,
    * not a claim that a missing legacy history checkpoint was reconstructed. */
   readonly legacyReconciled?: boolean;
@@ -105,6 +109,7 @@ export type TaskListFilter =
 
 export type ManagerAction =
   | PanelAction
+  | { readonly type: "question"; readonly bindingId: string; readonly key: string; readonly fingerprint: string; readonly index: number; readonly option: number }
   | { readonly type: "browseProjects"; readonly page: number }
   | { readonly type: "list"; readonly page: number; readonly filter?: TaskListFilter }
   | { readonly type: "open"; readonly task: DesktopTask }

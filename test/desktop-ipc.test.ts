@@ -6,18 +6,24 @@ import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
+import { withVkResponseFormat } from "../src/desktop/vk-response-format.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
+import { completedHistoryDigest } from "../src/desktop/history-digest.js";
+import { findAcceptedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
+import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } from "../src/desktop/questions.js";
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import type { BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
+const questionRequest = { id: 42, method: "item/tool/requestUserInput", params: { threadId: "fixture-task", turnId: "fixture-turn", itemId: "call-question",
+  questions: [{ id: "choice", question: "Which option?", options: [{ label: "Alpha", description: "First" }, { label: "Beta", description: "Second" }] }] } };
 const state = (items: IpcObject[] = [], status = "inProgress"): IpcObject => ({ id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
   tail: { turnId: "fixture-turn", turnStartedAtMs: 100, status, items },
 } } } });
@@ -35,7 +41,9 @@ class Server extends Duplex {
   startResult: IpcObject = { turn: { id: "next-turn", status: "inProgress", items: [] } };
   onFollow: (() => void) | null = null;
   onDiscovery: (() => void) | null = null;
-  settingsReply: IpcObject = { ok: true };
+  settingsReply: IpcObject = { applied: true };
+  settingsVersion = 2;
+  settingsVersionError = "request-version-mismatch";
   readonly interruptReplies: ("success" | "error" | "malformed-stopped")[] = [];
   interruptReply: (() => "success" | "error" | "malformed-stopped") | null = null;
   override _read(): void {}
@@ -66,6 +74,11 @@ class Server extends Duplex {
         if (!this.answerWrites) return;
         result = { result: { turnId: "fixture-turn" } };
       }
+      if (message.method === "thread-follower-submit-user-input") {
+        if (!this.answerWrites) return;
+        result = { ok: true };
+        this.dataState = { ...this.dataState, requests: [] }; this.snapshot();
+      }
       if (message.method === "thread-follower-start-turn") {
         if (this.disconnectOnStart) { this.destroy(); return; }
         if (!this.answerWrites) return;
@@ -76,6 +89,10 @@ class Server extends Duplex {
         result = { result: this.startResult };
       }
       if (message.method === "thread-follower-update-thread-settings") {
+        if (message.version !== this.settingsVersion) {
+          this.send({ type: "response", requestId: message.requestId, resultType: "error", error: this.settingsVersionError });
+          return;
+        }
         result = this.settingsReply;
         this.dataState = { ...this.dataState, latestThreadSettings: (message.params as IpcObject).threadSettings };
         this.snapshot();
@@ -127,8 +144,24 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, client, () => now, undefined, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
-  return { access, peerId, server, store, binding, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
+  return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
+
+test("runtime reconciles an uncertain prompt from Codex history after restart", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "recovered-vk-operation";
+  const inboxKey = JSON.stringify([s.peerId, "message:123"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.finishInput(inboxKey, true);
+  s.desktop.findAcceptedInput = async (_task, id) => id === operationId ? "native-turn" : null;
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "native-turn", operationId }]);
+  assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
+});
 
 test("a rejected scheduled health report cannot terminate the runtime", async t => {
   let checks = 0;
@@ -164,6 +197,45 @@ test("health keeps checking while the initial task subscription is still pending
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(settled, false);
   assert.equal(checks, 1);
+});
+
+test("reconnection shares one catalog read across subscriptions and starts them concurrently", async t => {
+  const s = runtimeSetup(t);
+  const tasks = [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }];
+  for (let index = 1; index <= 2; index++) {
+    const task = { ...ref, threadId: `fixture-task-${index}`, title: `Fixture ${index}`, workspace: "/fixture", updatedAt: 1 };
+    tasks.push(task);
+    const binding = s.store.ensureBinding(task);
+    s.store.setChat(binding.id, s.peerId + index, 17 + index);
+  }
+  let catalogReads = 0;
+  s.desktop.listTasks = async () => { catalogReads++; return tasks; };
+  s.server.onFollow = () => {}; // All three owners are slow to provide a snapshot.
+  const pending = s.runtime.tick();
+  for (let attempt = 0; attempt < 100 && s.follows().filter(Boolean).length < 3; attempt++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  // Panels and health may each read the catalog independently; the reconnect
+  // batch itself must not add one read per attached conversation.
+  assert.ok(catalogReads <= 3, `Too many catalog reads: ${catalogReads}`);
+  assert.equal(s.follows().filter(Boolean).length, 3);
+  await pending;
+});
+
+test("a stalled VK send does not hold up task reconciliation", async t => {
+  const s = runtimeSetup(t);
+  let release!: () => void;
+  let sending = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.chat.send = async peerId => { sending = true; await gate; return { peerId, conversationMessageId: 1 }; };
+  s.store.enqueue("stalled-vk-send", s.peerId, { text: "Fixture reply" }, s.binding.id);
+  try {
+    await Promise.race([
+      s.runtime.tick(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("VK send blocked runtime update")), 200)),
+    ]);
+    assert.equal(sending, true);
+  } finally { release(); }
 });
 
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
@@ -578,6 +650,8 @@ test("active-task submit uses the existing task and inherits its model and permi
   const attributed = ((request.params as IpcObject).input as IpcObject[])[0]!.text;
   assert.match(String(attributed), /VK author: "Second User"/u); assert.match(String(attributed), /VK sender ID: 999/u);
   assert.match(String(attributed), /# User request\nA follow-up/u);
+  assert.match(String(attributed), /Не используй Markdown-таблицы/u);
+  assert.match(String(attributed), /Если последним станет запрос, отправленный напрямую через Codex.*полностью игнорируй/u);
   for (const forbidden of ["model", "approvalPolicy", "sandbox", "permissions", "serviceTier"]) assert.equal(Object.hasOwn(request.params as object, forbidden), false);
   assert.ok(server.destroyed);
 });
@@ -613,7 +687,7 @@ test("model choice updates only next-turn model and effort through the actual ow
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [], listModels: async () => [{ id: "fixture-model", title: "Fixture", efforts: ["high"], defaultEffort: "high" }] }, () => new DesktopIpcClient(() => server, 50));
   await adapter.selectModel(ref, "fixture-model", "high");
   const request = server.received.find(message => message.method === "thread-follower-update-thread-settings")!;
-  assert.equal(request.targetClientId, "owner"); assert.equal(request.version, 1);
+  assert.equal(request.targetClientId, "owner"); assert.equal(request.version, 2);
   assert.deepEqual(request.params, { conversationId: ref.threadId, threadSettings: { model: "fixture-model", effort: "high" } });
   assert.equal(server.received.filter(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))).length, 0);
   assert.ok(server.destroyed);
@@ -673,6 +747,27 @@ test("interrupt targets the active desktop turn and requires a confirmed turn id
   const request = server.received.find(message => message.method === "thread-follower-interrupt-turn")!;
   assert.equal(request.version, 4); assert.equal(request.targetClientId, "owner");
   assert.deepEqual(request.params, { conversationId: ref.threadId, mode: "user-stop", expectedTurnId: "fixture-turn" });
+});
+
+test("model settings v2 refusal is rejected without retry or starting a turn", async () => {
+  const server = new Server(); server.settingsReply = { applied: false };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [], listModels: async () => [{ id: "fixture-model", title: "Fixture", efforts: ["high"], defaultEffort: "high" }] }, () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.selectModel(ref, "fixture-model", "high"), ActionRejectedError);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-update-thread-settings").length, 1);
+  assert.equal(server.received.some(message => /thread-follower-(?:start|steer)-turn/u.test(String(message.method))), false);
+});
+
+test("model settings fall back to v1 only after explicit pre-dispatch version rejection", async () => {
+  for (const rejection of ["request-version-mismatch", "no-client-found"]) {
+  const server = new Server(); server.settingsVersion = 1; server.settingsReply = { ok: true };
+  server.settingsVersionError = rejection;
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [], listModels: async () => [{ id: "fixture-model", title: "Fixture", efforts: ["high"], defaultEffort: "high" }] }, () => new DesktopIpcClient(() => server, 50));
+  await adapter.selectModel(ref, "fixture-model", "high");
+  assert.deepEqual(server.received.filter(message => message.method === "thread-follower-update-thread-settings").map(message => message.version), [2, 1]);
+  assert.equal(server.received.some(message => /thread-follower-(?:start|steer)-turn/u.test(String(message.method))), false);
+  }
 });
 
 test("interrupt reaches a unique task when owner discovery works but snapshots are silent", async () => {
@@ -793,9 +888,96 @@ test("App Server creator materializes a new task with its atomic first turn", as
     return { events: events() };
   } }) }) as never, async () => worktree);
   const task = await creator.createTask({ operationId: "create-op", projectId: "visible", sourceId: "work", title: "Created", prompt: "Initial prompt", model: "model-a", effort: "high", environment: "worktree" });
-  assert.equal(calls.length, 1); assert.equal(calls[0]?.prompt, "Initial prompt");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]?.prompt ?? "", /^Initial prompt\n\n# VKodex response format/u);
+  assert.match(calls[0]?.prompt ?? "", /Не используй Markdown-таблицы/u);
+  assert.match(calls[0]?.prompt ?? "", /Если последним станет запрос, отправленный напрямую через Codex.*полностью игнорируй/u);
   assert.equal(task.threadId, "created-thread"); assert.equal(task.sourceId, "work"); assert.equal(task.workspace, worktree);
   assert.deepEqual(metadata, ["project:raw", "name:Created"]);
+});
+
+test("App Server creator rejects a model absent from its own CLI before creating a task", async () => {
+  let started = 0;
+  const profileRoot = path.resolve("fixture-app-server-home");
+  const workspace = path.resolve("fixture-project");
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => ({ project: { id: "visible", title: "Project", workspace }, rawProjectId: "raw", sourceHome: profileRoot, sourceId: "work", sourceLabel: ".codex-work" }),
+    sourceHome: () => profileRoot, listTasks: async () => [],
+    listModels: async task => {
+      assert.equal(task?.sourceId, "work");
+      return [{ id: "gpt-5.6-sol", title: "5.6 Sol", efforts: ["high"], defaultEffort: "high" }];
+    },
+  }, {
+    rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+  }, (() => { started++; throw new Error("The unsupported model must not create a task"); }) as never);
+  await assert.rejects(creator.createTask({ operationId: "unsupported-model", projectId: "visible", sourceId: "work",
+    title: "Test", prompt: "Test", model: "gpt-6-astra", effort: "high", environment: "local" }),
+  /не поддерживает выбранную модель/u);
+  assert.equal(started, 0);
+});
+
+test("transfer history digest covers every page and ignores fork-assigned item IDs", async () => {
+  const pages = (firstText: string, itemId: string) => async (params: IpcObject): Promise<IpcObject> => params.cursor
+    ? { data: [{ id: "last", status: "completed", items: [{ id: "agent-2", type: "agentMessage", text: "Final" }] }], nextCursor: null }
+    : { data: [{ id: "first", status: "completed", items: [{ id: itemId, type: "userMessage", content: [{ type: "text", text: firstText }] }] }], nextCursor: "second" };
+  const source = await completedHistoryDigest("source", "last", pages("Original", "source-item"));
+  assert.equal(source, await completedHistoryDigest("target", "last", pages("Original", "fork-item")));
+  assert.notEqual(source, await completedHistoryDigest("target", "last", pages("Changed", "fork-item")));
+  await assert.rejects(completedHistoryDigest("source", "wrong-boundary", pages("Original", "source-item")), ActionRejectedError);
+});
+
+test("a switched target may have newer turns while the copied boundary stays identical", async () => {
+  const list = async (): Promise<IpcObject> => ({ data: [
+    { id: "boundary", status: "completed", items: [{ id: "original", type: "userMessage", text: "Move me" }] },
+    { id: "new-turn", status: "inProgress", items: [] },
+  ], nextCursor: null });
+  const original = await completedHistoryDigest("source", "boundary", async () => ({ data: [
+    { id: "boundary", status: "completed", items: [{ id: "copied", type: "userMessage", text: "Move me" }] },
+  ], nextCursor: null }));
+  assert.equal(await completedHistoryDigest("target", "boundary", list, { allowNewerTurns: true }), original);
+  await assert.rejects(completedHistoryDigest("source", "boundary", list), ActionRejectedError);
+  await assert.rejects(completedHistoryDigest("target", "missing", list, { allowNewerTurns: true }), ActionRejectedError);
+});
+
+test("legacy archived transfer verifies the source and target history prefix", async () => {
+  const source = { hostId: "local", threadId: "source", sourceId: "work" };
+  const target = { hostId: "local", threadId: "target", title: "Copied", workspace: "/target", updatedAt: 1 };
+  const checkpoint = { lastTurnId: "boundary", rolloutPath: "/old/source.jsonl", size: 1, mtimeMs: 1 };
+  let archived = true; let targetText = "Original"; let sourceNewTurn = false;
+  const transfer = new AppServerTaskTransfer({ sourceHome: (task: typeof source) => task.sourceId ? "/work" : "/base" } as never,
+    { isArchived: async () => archived } as never,
+    (_home: string) => ({ call: async (_method: string, params: IpcObject) => ({ data: params.itemsView === "summary"
+      ? [{ id: params.threadId === "source" && !sourceNewTurn ? "boundary" : "later", status: "completed", items: [] }]
+      : [{ id: "boundary", status: "completed", items: [{ id: params.threadId === "source" ? "source-item" : "target-item",
+        type: "userMessage", text: params.threadId === "source" ? "Original" : targetText }] },
+        ...(params.threadId === "target" ? [{ id: "later", status: "inProgress", items: [] }] : [])], nextCursor: null }) }) as never);
+  await transfer.verifyLegacyArchivedPair(source, target, checkpoint);
+  targetText = "Changed";
+  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  targetText = "Original"; sourceNewTurn = true;
+  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  sourceNewTurn = false; archived = false;
+  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+});
+
+test("accepted input reconciliation finds the native client ID across paginated turns", async () => {
+  const list = async (params: IpcObject): Promise<IpcObject> => params.cursor
+    ? { data: [{ id: "accepted-turn", status: "completed", items: [{ type: "userMessage", clientId: "vk-operation" }] }], nextCursor: null }
+    : { data: [{ id: "newer-turn", status: "completed", items: [{ type: "userMessage", clientId: "another-operation" }] }], nextCursor: "older" };
+  assert.equal(await findAcceptedInputTurn("thread", "vk-operation", list), "accepted-turn");
+  assert.equal(await findAcceptedInputTurn("thread", "missing", list), null);
+  await assert.rejects(findAcceptedInputTurn("thread", "missing", async () => ({ data: [], nextCursor: "loop" })), DesktopUnavailableError);
+});
+
+test("semantic transfer checkpoints ignore harmless file metadata changes but retain legacy checks", async () => {
+  const file = path.resolve("fixture-source.jsonl");
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => path.dirname(file) } as never,
+    { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} });
+  transfer.checkpoint = async () => ({ lastTurnId: "last", rolloutPath: file, size: 200, mtimeMs: 20, semanticDigest: "same-content" });
+  const task = { hostId: "local", threadId: "source" };
+  await transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "same-content" });
+  await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "different" }), TransferConflictError);
+  await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10 }), TransferConflictError);
 });
 
 test("desktop transfer delegates from the catalog without opening an idle source task", async () => {
@@ -1107,7 +1289,7 @@ test("an idle or unloaded task starts the next turn through its owner with inher
     assert.deepEqual(request.params, {
       conversationId: ref.threadId,
       turnStart: {
-        request: { threadId: ref.threadId, clientUserMessageId: "message", input: [{ type: "text", text: "Continue", text_elements: [] }] },
+        request: { threadId: ref.threadId, clientUserMessageId: "message", input: [{ type: "text", text: withVkResponseFormat("Continue"), text_elements: [] }] },
         context: { inheritThreadSettings: true },
       },
     });
@@ -1217,7 +1399,7 @@ test("editing the last standalone VK turn uses the desktop owner and returns the
   const result = await adapter.editLastUserTurn({ task: ref, operationId: "vk-operation", expectedOperationId: "vk-operation", expectedTurnId: "fixture-turn", text: "Corrected request" });
   const request = server.received.find(message => message.method === "thread-follower-edit-last-user-turn")!;
   assert.equal(request.version, 1); assert.equal(request.targetClientId, "owner");
-  assert.deepEqual(request.params, { conversationId: ref.threadId, turnId: "fixture-turn", message: "Corrected request" });
+  assert.deepEqual(request.params, { conversationId: ref.threadId, turnId: "fixture-turn", message: withVkResponseFormat("Corrected request") });
   assert.deepEqual(result, { turnId: "replacement-turn", operationId: "replacement-operation" });
 });
 
@@ -1352,7 +1534,7 @@ test("invalid text is rejected before opening a desktop connection", async () =>
   let connections = 0;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => { connections++; return new DesktopIpcClient(); });
-  for (const text of [" ", "x".repeat(16_001)]) await assert.rejects(adapter.submit({ operationId: "message", task: ref, text }), ActionRejectedError);
+  for (const text of [" ", "x".repeat(64_001)]) await assert.rejects(adapter.submit({ operationId: "message", task: ref, text }), ActionRejectedError);
   assert.equal(connections, 0);
 });
 
@@ -1544,4 +1726,58 @@ test("desktop index overrides SQLite names and initial prompts without changing 
   assert.equal(names.get("short"), "Short legacy title");
   assert.doesNotMatch(JSON.stringify(tasks), /private initial prompt/u);
   assert.deepEqual(db.prepare("SELECT * FROM threads ORDER BY id").all(), before);
+});
+
+
+test("native questions distinguish blocking requests, async questions, and approvals", () => {
+  const snapshot = { ...state([{ type: "agentMessage", id: "ask-1", delivery: "async", text: "", questions: [{ title: "Choose", options: ["One", "Two"] }] }]),
+    requests: [questionRequest, { ...questionRequest, id: 43, completed: true }, { id: 99, method: "item/commandExecution/requestApproval", params: {} }] };
+  const questions = pendingCodexQuestions(snapshot);
+  assert.equal(questions.length, 2);
+  assert.equal(questions[0]!.requestId, 42);
+  assert.equal(questions[1]!.kind, "async");
+  const q = questions[1]!.questions[0]!;
+  assert.equal(q.id, JSON.stringify(["request_user_input_async", "ask-1", 0]));
+  const text = asyncQuestionReply([{ questionItemId: q.id, question: q.title, answer: "Two" }]);
+  assert.equal(parseAsyncQuestionReply([{ type: "text", text }])[0]!.answer, "Two");
+  const asyncItem = { type: "agentMessage", id: "ask-1", delivery: "async", text: "", questions: [{ title: "Choose", options: ["One", "Two"] }] };
+  assert.equal(pendingCodexQuestions(state([asyncItem, { type: "steeringUserMessage", status: "pending", input: [{ type: "text", text }] }])).length, 1);
+  assert.equal(pendingCodexQuestions(state([asyncItem, { type: "steeringUserMessage", status: "accepted", input: [{ type: "text", text }] }])).length, 0);
+  assert.equal(pendingCodexQuestions(state([asyncItem], "completed")).length, 0);
+  assert.equal(taskDetails(state([asyncItem])).status, "running");
+});
+
+test("blocking question answers use the owner request ID and native answer map", async () => {
+  const server = new Server(); server.dataState = { ...state(), requests: [questionRequest] };
+  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+  let gated = false;
+  await desktop.answerQuestions(ref, pendingCodexQuestions(server.dataState)[0]!, { choice: "custom answer" }, "answer-op", async () => { gated = true; });
+  assert.ok(gated);
+  const write = server.received.find(m => m.method === "thread-follower-submit-user-input")!;
+  assert.equal(write.version, 1);
+  assert.deepEqual(write.params, { conversationId: ref.threadId, requestId: 42, response: { answers: { choice: { answers: ["custom answer"] } } } });
+  assert.equal(server.received.some(m => m.method === "thread-follower-start-turn" || m.method === "thread-follower-steer-turn"), false);
+});
+
+test("async answers use Codex's question-reply envelope and never start a new turn", async () => {
+  const server = new Server(); server.dataState = state([{ type: "agentMessage", id: "async-q", delivery: "async", text: "Question?" }]);
+  const question = pendingCodexQuestions(server.dataState)[0]!;
+  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+  await desktop.answerQuestions(ref, question, { "async-q": "Yes" }, "async-op", async () => {});
+  const write = server.received.find(m => m.method === "thread-follower-steer-turn")!;
+  const p = write.params as IpcObject;
+  assert.equal(p.clientUserMessageId, "async-op");
+  assert.deepEqual(parseAsyncQuestionReply(p.input), [{ questionItemId: "async-q", question: "Question?", answer: "Yes" }]);
+  assert.equal(server.received.some(m => m.method === "thread-follower-start-turn"), false);
+});
+
+test("closed or changed native questions cannot become ordinary prompts", async () => {
+  for (const changed of [false, true]) {
+    const server = new Server();
+    const question = pendingCodexQuestions({ ...state(), requests: [questionRequest] })[0]!;
+    server.dataState = { ...state(), requests: changed ? [{ ...questionRequest, params: { ...questionRequest.params, questions: [{ id: "choice", question: "Changed question?", options: [] }] } }] : [] };
+    const desktop = new ConnectedDesktopTasks({ listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
+    await assert.rejects(desktop.answerQuestions(ref, question, { choice: "Yes" }, "op", async () => {}), ActionRejectedError);
+    assert.equal(server.received.some(m => String(m.method).startsWith("thread-follower-")), false);
+  }
 });

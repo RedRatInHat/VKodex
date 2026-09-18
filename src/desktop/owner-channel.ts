@@ -13,6 +13,8 @@ interface Descriptor {
   token: string;
   pid: number;
 }
+interface VerifiedOwner extends Descriptor { readonly capabilities: readonly ("inspect" | "archive")[] }
+const OWNER_PROTOCOL = 2;
 
 function registry(home: string, root?: string): string {
   const base = root ?? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"), "VKodex", "owner-transports");
@@ -26,7 +28,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 /** Private local endpoint. It cannot execute arbitrary native methods or start turns. */
 export async function serveOwnerChannel(
   home: string,
-  owner: Pick<OwnerTransport, "ownsTask" | "archiveIdle">,
+  owner: Pick<OwnerTransport, "ownsTask" | "archiveIdle"> & Partial<Pick<OwnerTransport, "inspectTask">>,
   root?: string,
 ): Promise<{ close(): Promise<void> }> {
   const id = randomUUID();
@@ -51,9 +53,14 @@ export async function serveOwnerChannel(
         try { request = JSON.parse(buffer.trim()); } catch { socket.destroy(); return; }
         if (!object(request) || typeof request.token !== "string" || request.token.length !== token.length
           || !timingSafeEqual(Buffer.from(request.token), Buffer.from(token)) || !taskId(request.threadId)
-          || !["probe", "archive"].includes(String(request.operation))) { socket.destroy(); return; }
+          || !["probe", "inspect", "archive"].includes(String(request.operation))) { socket.destroy(); return; }
         try {
-          if (request.operation === "probe") socket.end(JSON.stringify({ ok: true, owned: await owner.ownsTask(request.threadId) }) + "\n");
+          if (request.operation === "probe") socket.end(JSON.stringify({ ok: true, owned: await owner.ownsTask(request.threadId),
+            protocol: OWNER_PROTOCOL, capabilities: owner.inspectTask ? ["inspect", "archive"] : ["archive"] }) + "\n");
+          else if (request.operation === "inspect") {
+            if (!owner.inspectTask) throw new OwnerTransportError("unavailable", "Owner inspection is unavailable.");
+            socket.end(JSON.stringify({ ok: true, status: await owner.inspectTask(request.threadId) }) + "\n");
+          }
           else { await owner.archiveIdle(request.threadId); socket.end('{"ok":true}\n'); }
         } catch (error) {
           const outcome = error instanceof OwnerTransportError ? error.outcome : request.operation === "archive" ? "unknown" : "unavailable";
@@ -77,7 +84,7 @@ export async function serveOwnerChannel(
   };
 }
 
-function callOwner(descriptor: Descriptor, operation: "probe" | "archive", threadId: string, timeoutMs: number): Promise<Record<string, unknown>> {
+function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "archive", threadId: string, timeoutMs: number): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(descriptor.endpoint); let sent = false; let done = false; let buffer = "";
     const finish = (error?: OwnerTransportError, result?: Record<string, unknown>) => {
@@ -101,12 +108,12 @@ function callOwner(descriptor: Descriptor, operation: "probe" | "archive", threa
   });
 }
 
-/** No endpoint/owner is a discovery miss. A submitted archive is NEVER retried elsewhere. */
-export async function archiveThroughOwner(home: string, threadId: string, root?: string, timeoutMs = 35_000): Promise<boolean> {
+/** A failed probe cannot prove that no client owns the task. */
+async function findOwner(home: string, threadId: string, root?: string, timeoutMs = 35_000): Promise<VerifiedOwner | null> {
   const directory = registry(home, root);
   let files: string[];
   try { files = await readdir(directory); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw new OwnerTransportError("unavailable", "Owner registry is unreadable."); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw new OwnerTransportError("unavailable", "Owner registry is unreadable."); }
   if (!taskId(threadId)) throw new OwnerTransportError("rejected", "Invalid task ID.");
   const descriptors: Descriptor[] = [];
   for (const file of files.filter(file => /^\d+-[0-9a-f-]+\.json$/u.test(file))) {
@@ -121,14 +128,39 @@ export async function archiveThroughOwner(home: string, threadId: string, root?:
   const probes = await Promise.allSettled(descriptors.map(async d => {
     const response = await callOwner(d, "probe", threadId, Math.min(timeoutMs, 3000));
     if (typeof response.owned !== "boolean") throw new OwnerTransportError("unavailable", "Invalid owner probe response.");
-    return response.owned ? d : null;
+    if (!response.owned) return null;
+    if (response.protocol !== OWNER_PROTOCOL) throw new OwnerTransportError("outdated", "Owner adapter protocol is outdated; restart the selected Codex client with the current VKodex adapter.");
+    if (!Array.isArray(response.capabilities) || response.capabilities.some(value => value !== "inspect" && value !== "archive"))
+      throw new OwnerTransportError("unavailable", "Owner adapter reported invalid capabilities.");
+    return { ...d, capabilities: response.capabilities as ("inspect" | "archive")[] };
   }));
   // A failed probe cannot prove absence or uniqueness of an owner. In particular,
   // do not switch to an external writer while a registered IDE is initializing.
+  const outdated = probes.find((probe): probe is PromiseRejectedResult => probe.status === "rejected"
+    && probe.reason instanceof OwnerTransportError && probe.reason.outcome === "outdated");
+  if (outdated) throw outdated.reason;
   if (probes.some(p => p.status === "rejected")) throw new OwnerTransportError("unavailable", "Could not confirm all registered native owners.");
   const owners = probes.flatMap(p => p.status === "fulfilled" && p.value ? [p.value] : []);
-  if (!owners.length) return false;
+  if (!owners.length) return null;
   if (owners.length !== 1) throw new OwnerTransportError("rejected", "Multiple native owners reported the same task.");
-  await callOwner(owners[0]!, "archive", threadId, timeoutMs);
+  return owners[0]!;
+}
+
+/** Read the selected live owner, without launching or resuming a task. */
+export async function inspectThroughOwner(home: string, threadId: string, root?: string, timeoutMs = 35_000): Promise<"idle" | "active" | "systemError" | null> {
+  const owner = await findOwner(home, threadId, root, timeoutMs);
+  if (!owner) return null;
+  if (!owner.capabilities.includes("inspect")) throw new OwnerTransportError("outdated", "Owner adapter cannot inspect tasks; restart the selected Codex client with the current VKodex adapter.");
+  const response = await callOwner(owner, "inspect", threadId, timeoutMs);
+  if (!["idle", "active", "systemError"].includes(String(response.status))) throw new OwnerTransportError("unavailable", "Owner returned an invalid task state.");
+  return response.status as "idle" | "active" | "systemError";
+}
+
+/** No endpoint/owner is a discovery miss. A submitted archive is NEVER retried elsewhere. */
+export async function archiveThroughOwner(home: string, threadId: string, root?: string, timeoutMs = 35_000): Promise<boolean> {
+  const owner = await findOwner(home, threadId, root, timeoutMs);
+  if (!owner) return false;
+  if (!owner.capabilities.includes("archive")) throw new OwnerTransportError("outdated", "Owner adapter cannot archive tasks; restart the selected Codex client with the current VKodex adapter.");
+  await callOwner(owner, "archive", threadId, timeoutMs);
   return true;
 }

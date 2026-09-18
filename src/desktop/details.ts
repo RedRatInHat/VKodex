@@ -54,3 +54,24 @@ export function parseModelsCache(value: unknown, now = Date.now()): DesktopModel
   if (!models.length) throw new DesktopUnavailableError("В локальном списке Codex нет доступных моделей.");
   return models;
 }
+
+/** The App Server returns the models currently available to this Codex account. */
+export function parseNativeModels(value: unknown): DesktopModel[] {
+  if (!isObject(value) || !Array.isArray(value.data) || value.nextCursor !== null) {
+    throw new DesktopUnavailableError("Codex не вернул полный список моделей.");
+  }
+  const models: DesktopModel[] = [];
+  const seen = new Set<string>();
+  for (const item of value.data) {
+    if (!isObject(item) || item.hidden === true || typeof item.model !== "string" || !item.model.trim() || seen.has(item.model)) continue;
+    const efforts = Array.isArray(item.supportedReasoningEfforts)
+      ? item.supportedReasoningEfforts.filter(isObject).map(level => level.reasoningEffort).filter((effort): effort is string => typeof effort === "string" && !!effort)
+      : [];
+    if (!efforts.length || typeof item.defaultReasoningEffort !== "string" || !efforts.includes(item.defaultReasoningEffort)) continue;
+    seen.add(item.model);
+    models.push({ id: item.model, title: string(item.displayName) ?? item.model,
+      efforts: [...new Set(efforts)], defaultEffort: item.defaultReasoningEffort });
+  }
+  if (!models.length) throw new DesktopUnavailableError("Codex не сообщил доступных моделей.");
+  return models;
+}

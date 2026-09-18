@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { link, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, open, readFile, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -53,4 +53,17 @@ test("output file snapshots preserve bytes and reject oversized files, symlinks 
   await assert.rejects(readOutputFiles(root), /Ссылки/u);
   const other = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-")); await symlink(outside, path.join(other, "linked"));
   await assert.rejects(readOutputFiles(other), /Ссылки/u);
+});
+
+test("outgoing files exceed the old 20 MiB ceiling but remain bounded at 200 MiB", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-large-output-"));
+  const handle = await open(path.join(root, "trailer.mp4"), "w");
+  try {
+    await handle.truncate(76 * 1024 * 1024);
+    const files = await readOutputFiles(root);
+    assert.equal(files[0]!.contents.length, 76 * 1024 * 1024);
+    assert.equal(files[0]!.kind, "file");
+    await handle.truncate(200 * 1024 * 1024 + 1);
+    await assert.rejects(readOutputFiles(root), /200/u);
+  } finally { await handle.close(); }
 });

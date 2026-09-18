@@ -62,6 +62,7 @@ export function encodeFrame(message: IpcObject): Buffer {
 }
 
 interface PendingRequest {
+  readonly method: string;
   readonly resolve: (value: IpcObject) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
@@ -143,7 +144,7 @@ export class DesktopIpcClient {
         this.pending.delete(requestId);
         reject(options.mutating ? new UncertainActionError() : new DesktopUnavailableError("Десктоп не ответил вовремя."));
       }, timeoutMs);
-      this.pending.set(requestId, { resolve, reject, timer, mutating: options.mutating ?? false });
+      this.pending.set(requestId, { method, resolve, reject, timer, mutating: options.mutating ?? false });
       try {
         this.write({
           type: "request", requestId, method, version, params, timeoutMs,
@@ -179,6 +180,8 @@ export class DesktopIpcClient {
       clearTimeout(pending.timer);
       this.pending.delete(message.requestId);
       if (message.resultType === "success") pending.resolve(message);
+      else if (message.error === "request-version-mismatch") pending.reject(new DesktopRequestRejectedError("request-version-mismatch"));
+      else if (message.error === "no-client-found" && pending.method === "thread-follower-update-thread-settings") pending.reject(new DesktopRequestRejectedError("no-client-found"));
       // Internal protocol errors are not a reliable proof that a write did not happen.
       else pending.reject(pending.mutating ? new UncertainActionError()
         : new DesktopRequestRejectedError(message.error === "no-client-found" ? "no-client-found" : "request-rejected"));

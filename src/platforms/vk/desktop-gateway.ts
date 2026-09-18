@@ -1,7 +1,8 @@
-import { APIError, VK, type MessageContext, type MessageEventContext } from "vk-io";
+import { APIError, VK, MessageContext, UpdateSource, DocumentAttachment, type MessageEventContext } from "vk-io";
+import { BridgeStore } from "../../bridge/store.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
-import { ChatRateLimitError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
+import { ChatRateLimitError, FileUploadRejectedError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../desktop/contracts.js";
 import { isObject } from "../../desktop/ipc-client.js";
@@ -82,6 +83,62 @@ export async function collectVkFiles(message: unknown): Promise<RemoteAttachment
 }
 
 export class DesktopVkGateway implements BridgeChat {
+  private receiveMessage?: (context: MessageContext) => Promise<void>;
+  private reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  private reconcileBusy = false;
+  private reconcileCheckedAt = 0;
+  private reconcileError = false;
+  private recoveredAt = 0;
+
+  startReconciliation(store: BridgeStore): void {
+    if (this.reconcileTimer) return;
+    const run = async () => {
+      if (this.reconcileBusy || !this.receiveMessage) return;
+      this.reconcileBusy = true;
+      let failed = false;
+      try {
+        for (const binding of store.bindings()) {
+          if (!binding.attached || binding.peerId === null) continue;
+          const peer = binding.peerId;
+          const key = `vk-inbound-cursor:${peer}`;
+          const baseline = store.getValue<number>(key) ?? store.latestPeerMessage(peer);
+          const retryable = store.oldestRetryableMessage(peer);
+          const cursor = retryable === null ? baseline : baseline > 0 ? Math.min(baseline, retryable - 1) : retryable - 1;
+          // A newly linked chat has no trusted baseline. Never import its old history.
+          if (!cursor && retryable === null) continue;
+          store.setValue(key, cursor);
+          try {
+            const result = await this.vk.api.messages.getByConversationMessageId({ peer_id: peer, conversation_message_ids: Array.from({ length: 50 }, (_, index) => cursor + index + 1) });
+            for (const message of result.items.sort((a, b) => a.conversation_message_id! - b.conversation_message_id!)) {
+              const id = message.conversation_message_id;
+              if (!id || id <= cursor || message.peer_id !== peer) continue;
+              // Allow in-flight Long Poll events to enter the same deduplication gate first.
+              if (message.date * 1_000 > Date.now() - 5_000) break;
+              const current = store.getBinding(binding.id);
+              if (!current?.attached || current.peerId !== peer) break;
+              const inboxKey = JSON.stringify([peer, `message:${id}`]);
+              if (message.from_id > 0 && !message.action && !message.out && !store.hasInput(inboxKey)) {
+                const payload = { client_info: {}, message: { ...message, out: 0, important: Boolean(message.important) } } as unknown as ConstructorParameters<typeof MessageContext>[0]["payload"];
+                const context = new MessageContext({ api: this.vk.api, upload: this.vk.upload, source: UpdateSource.WEBHOOK, updateType: "message_new", groupId: this.config.access.groupId, payload });
+                await this.receiveMessage(context);
+                if (!store.inputSettled(inboxKey)) break;
+                this.recoveredAt = Date.now();
+                this.logger?.warn({ peerId: peer, messageId: id }, "Recovered missing VK incoming message");
+              }
+              // A Long Poll handler may still be preparing an attachment or
+              // waiting for Codex. Do not checkpoint past that VK message yet.
+              if (message.from_id > 0 && !message.action && !message.out && !store.inputSettled(inboxKey)) break;
+              store.setValue(key, id);
+            }
+          } catch { failed = true; }
+        }
+        this.reconcileCheckedAt = Date.now(); this.reconcileError = failed;
+      } finally { this.reconcileBusy = false; }
+    };
+    this.reconcileTimer = setInterval(() => { void run().catch(() => { this.reconcileError = true; }); }, 15_000);
+    this.reconcileTimer.unref();
+    void run().catch(() => { this.reconcileError = true; });
+  }
   private writeTail: Promise<void> = Promise.resolve();
   private nextWriteAt = 0;
   private queuedWrites = 0;
@@ -121,10 +178,14 @@ export class DesktopVkGateway implements BridgeChat {
   constructor(private readonly config: DesktopBridgeConfig, private readonly vk = new VK({ token: config.token, pollingGroupId: config.access.groupId, apiVersion: "5.199", apiRetryLimit: 0 }), private readonly writeIntervalMs = 2_000, private readonly logger?: Logger,
     private readonly senderNameLookup?: (senderId: number) => Promise<string>) {
     // vk-io's default middleware error handler prints the full exception.
-    this.vk.updates.use(async (_context, next) => {
+    this.vk.updates.use(async (context, next) => {
+      // Record metadata before message filters; never log text, attachments or tokens.
+      const event = context as unknown as { peerId?: number; conversationMessageId?: number; senderId?: number; type?: string; subTypes?: string[] };
+      const receipt = { peerId: event.peerId, messageId: event.conversationMessageId, senderId: event.senderId, type: event.type, subTypes: event.subTypes };
+      this.logger?.info(receipt, "VK ingress received");
       try { await next(); }
       catch {
-        if (this.logger) this.logger.error("VKodex could not handle an incoming VK event");
+        if (this.logger) this.logger.error(receipt, "VKodex could not handle an incoming VK event");
         else process.stderr.write("VKodex could not handle an incoming VK event.\n");
       }
     });
@@ -160,7 +221,7 @@ export class DesktopVkGateway implements BridgeChat {
   async start(onInput: (input: BridgeInput) => Promise<void>): Promise<void> {
     // Membership service messages are irrelevant: a linked task chat accepts
     // prompts from every sender except the community itself.
-    this.vk.updates.on("message", async (context: MessageContext) => {
+    this.receiveMessage = async (context: MessageContext) => {
       if (context.eventType) return;
       if (!context.is(["message_new", "message_edit"]) || context.isOutbox) return;
       if ([this.config.access.groupId, -this.config.access.groupId].includes(context.senderId)) return;
@@ -172,6 +233,7 @@ export class DesktopVkGateway implements BridgeChat {
         const text = context.text ?? "";
         const digest = createHash("sha256").update(JSON.stringify([id, context.updatedAt ?? 0, text])).digest("hex").slice(0, 16);
         await onInput({ eventId: `message-edit:${id}:${digest}`, peerId: context.peerId, senderId: context.senderId, senderName, text,
+          ...(context.replyMessage?.conversationMessageId ? { replyToMessageId: context.replyMessage.conversationMessageId } : {}),
           editOfMessageId: id, ...(hasVkAttachments(context) ? { hasAttachments: true } : {}) });
         return;
       }
@@ -179,8 +241,11 @@ export class DesktopVkGateway implements BridgeChat {
       try { attachments = await collectVkFiles(context); }
       catch (error) { attachmentError = error instanceof ActionRejectedError ? error.message : "Не удалось получить вложения из VK. Сообщение не отправлено."; }
       await onInput({ eventId: `message:${id}`, peerId: context.peerId, senderId: context.senderId, senderName, text: context.text ?? "", attachments,
+        ...(context.replyMessage?.conversationMessageId ? { replyToMessageId: context.replyMessage.conversationMessageId } : {}),
         ...(attachmentError ? { hasAttachments: true, attachmentError } : {}) });
-    });
+      this.logger?.info({ peerId: context.peerId, messageId: id }, "VK ingress handler completed");
+    };
+    this.vk.updates.on("message", this.receiveMessage);
     this.vk.updates.on("message_event", async (context: MessageEventContext) => {
       if (context.userId !== this.config.access.ownerId) return;
       const payload: unknown = context.eventPayload;
@@ -199,6 +264,8 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async stop(): Promise<void> {
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    this.reconcileTimer = undefined;
     this.pollingStarted = false;
     await this.vk.updates.stop();
   }
@@ -214,6 +281,7 @@ export class DesktopVkGateway implements BridgeChat {
     const writesState = writeAge > 30_000 ? "failed" : this.queuedWrites > 10 || this.lastWriteFailureAt > this.lastWriteSuccessAt ? "degraded" : "ok";
     const pollingActive = this.pollingStarted && this.vk.updates.isStarted;
     return [
+      { name: "vk_inbound_reconciliation", state: this.reconcileError || (this.reconcileCheckedAt > 0 && Date.now() - this.reconcileCheckedAt > 120_000) ? "degraded" : this.recoveredAt && Date.now() - this.recoveredAt < 15 * 60_000 ? "degraded" : "ok", detail: this.reconcileError ? "Не удалось сверить входящие сообщения с VK." : this.recoveredAt && Date.now() - this.recoveredAt < 15 * 60_000 ? "Обнаружены и восстановлены сообщения, пропущенные Long Poll." : `Последняя сверка входящих: ${this.reconcileCheckedAt ? new Date(this.reconcileCheckedAt).toISOString() : "ещё не выполнена"}.` },
       { name: "vk_long_poll", state: pollingActive ? "ok" : "failed", detail: pollingActive ? "Локальный Bots Long Poll запущен." : "Внутренний polling-цикл vk-io не работает." },
       { name: "vk_api", state: failed.length ? "failed" : "ok", detail: failed.length ? failed.map(check => check.detail).join(" ").slice(0, 500) : "Токен, сообщения, события и Long Poll server подтверждены VK." },
       { name: "vk_writes", state: writesState, detail: `Запросов на запись в очереди: ${this.queuedWrites}${writeAge ? `; текущий выполняется ${Math.round(writeAge / 1_000)} с` : ""}.` },
@@ -280,18 +348,43 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async uploadDocument(peerId: number, name: string, contents: string): Promise<string> {
-    const attachment = await this.vk.upload.messageDocument({ peer_id: peerId, title: name, source: { value: Buffer.from(contents, "utf8"), filename: name } });
-    return attachment.toString();
+    return this.uploadFile(peerId, name, Buffer.from(contents, "utf8"), "file");
   }
 
   async uploadFile(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string> {
-    const source = { value: contents, filename: name };
+    const source = { values: [{ value: contents, filename: name, contentLength: contents.length,
+      ...(/\.mp4$/iu.test(name) ? { contentType: "video/mp4" } : {}) }], timeout: 600_000 };
     let attachment: string | undefined;
     if (kind === "image") {
       try { attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString(); }
       catch { /* Preserve unsupported image formats as documents. */ }
     }
-    attachment ??= (await this.vk.upload.messageDocument({ peer_id: peerId, title: name, source })).toString();
+    if (!attachment) {
+      // vk-io forwards upload-server errors to docs.save as if they were a
+      // successful upload. Preserve the actual failure before it is masked by
+      // API error 100 ("file is undefined"). Never log upload tokens or URLs.
+      const saved = await this.vk.upload.conduct({
+        field: "file", params: { peer_id: peerId, title: name, type: "doc", source },
+        getServer: this.vk.api.docs.getMessagesUploadServer, serverParams: ["type", "peer_id"],
+        saveParams: ["title", "tags"], maxFiles: 1, attachmentType: "doc",
+        saveFiles: async uploaded => {
+          const storageFull = isObject(uploaded) && typeof uploaded.error === "string" && /^no_free_space(?:\/|$)/u.test(uploaded.error);
+          if (isObject(uploaded) && uploaded.error === "wrong_file") {
+            this.logger?.warn({ peerId, bytes: contents.length, reason: "wrong_file" }, "VK document upload rejected");
+            throw new FileUploadRejectedError("VK отклонил файл: wrong_file. Это отказ принять формат или содержимое, а не лимит размера VKodex. Автоматические повторы этого файла остановлены.");
+          }
+          if (!isObject(uploaded) || uploaded.error !== undefined || typeof uploaded.file !== "string" || !uploaded.file.trim()) {
+            this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response" }, "VK document upload rejected");
+            throw new ActionRejectedError(storageFull
+              ? "На сервере загрузки VK закончилось свободное место. Файл не отправлен; лимит размера VKodex здесь ни при чём. Повтори /files позже."
+              : "Сервер загрузки VK не подтвердил приём файла. Файл не отправлен; повтори /files позже.");
+          }
+          return this.vk.api.docs.save({ file: uploaded.file, title: name });
+        },
+      });
+      if (!isObject(saved) || saved.type !== "doc" || !isObject(saved.doc) || typeof saved.doc.id !== "number" || typeof saved.doc.owner_id !== "number") throw new ActionRejectedError("VK не подтвердил сохранение документа. Повтори /files позже.");
+      attachment = new DocumentAttachment({ api: this.vk.api, payload: { ...saved.doc, id: saved.doc.id, owner_id: saved.doc.owner_id } }).toString();
+    }
     if (!/^(?:photo|doc)-?\d+_\d+(?:_[a-zA-Z0-9_-]+)?$/u.test(attachment)) throw new ActionRejectedError("VK не подтвердил загрузку файла. Повтори /files позже.");
     return attachment;
   }

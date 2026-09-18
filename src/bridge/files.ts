@@ -5,18 +5,20 @@ import { ActionRejectedError, type TaskDetails } from "../desktop/contracts.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
 import type { Binding, BridgeChat } from "./contracts.js";
+import { FileUploadRejectedError } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 
-export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 20 * 1024 * 1024, maxTotalBytes: 50 * 1024 * 1024, timeoutMs: 30_000 };
+export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 30_000 };
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
 export const INBOUND_FILE_LIMITS: InboundFileLimits = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 600_000 };
 interface FileJob {
   operationId: string;
   generation: number;
   directory: string;
-  state: "prepared" | "accepted" | "uncertain";
+  state: "prepared" | "accepted" | "rejected" | "uncertain";
   done: boolean;
+  queued?: boolean;
   /** The Codex turn that must finish before its outbox is collected. */
   turnId?: string;
 }
@@ -250,14 +252,21 @@ export class TaskFiles {
     this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, state: "prepared", done: false }]);
     return { inputFiles, outboxDir };
   }
-  finish(bindingId: string, operationId: string, uncertain: boolean, turnId?: string): void {
+  finish(bindingId: string, operationId: string, state: "accepted" | "rejected" | "uncertain", turnId?: string): void {
     this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId
-      ? { ...job, state: uncertain ? "uncertain" : "accepted", ...(turnId ? { turnId } : {}) }
+      ? { ...job, state, ...(turnId ? { turnId } : {}) }
       : job));
   }
+  markQueued(bindingId: string, operationId: string): void {
+    this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId ? { ...job, queued: true } : job));
+  }
+  pendingQueuedOperations(bindingId: string): ReadonlySet<string> {
+    return new Set(this.jobs(bindingId).filter(job => job.queued && !job.turnId).map(job => job.operationId));
+  }
   associateTurn(bindingId: string, operationId: string, turnId: string): void {
+    if (!this.jobs(bindingId).some(job => job.operationId === operationId && !job.turnId)) return;
     this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId && !job.turnId
-      ? { ...job, turnId, done: false }
+      ? { ...job, turnId, done: false, queued: false }
       : job));
   }
   observe(bindingId: string, status: TaskDetails["status"], turnId?: string | null): void {
@@ -279,7 +288,7 @@ export class TaskFiles {
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
     let count = 0; let retryableFailure: OutputFilesError | null = null;
     const completedTurns = this.completedTurns.get(binding.id) ?? new Set<string>();
-    for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted"
+    for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted" && !job.queued
       && (manual || (!job.done && (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id)))))) {
       const outbox = await directory(this.root, job.directory, "outbox");
       let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
@@ -296,10 +305,18 @@ export class TaskFiles {
       for (const file of outputFiles) {
         const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
         if (this.store.getValue<boolean>(`${key}:queued`)) continue;
+        if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) continue;
         await this.check(binding, generation);
         let attachment = this.store.getValue<string>(`${key}:uploaded`);
         if (!attachment) {
-          attachment = await this.chat.uploadFile(binding.peerId!, file.name, file.contents, file.kind);
+          try { attachment = await this.chat.uploadFile(binding.peerId!, file.name, file.contents, file.kind); }
+          catch (error) {
+            if (!(error instanceof FileUploadRejectedError)) throw error;
+            await this.check(binding, generation);
+            this.store.setValue(`${key}:rejected`, true);
+            this.store.enqueue(`${key}:error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен. ${error.message}`, silent: true }, binding.id);
+            continue;
+          }
           this.store.setValue(`${key}:uploaded`, attachment);
         }
         await this.check(binding, generation);

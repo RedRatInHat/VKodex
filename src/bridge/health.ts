@@ -14,6 +14,15 @@ export interface RuntimeHealthState {
   readonly requiredBindings: number;
   readonly connectedRequiredBindings: number;
   readonly failedBindings?: number;
+  readonly bindings?: readonly {
+    readonly id: string;
+    readonly title: string;
+    readonly source: string;
+    readonly status: string;
+    readonly connected: boolean;
+    readonly lastConfirmedAt: number | null;
+    readonly failure: "usageLimit" | "systemError" | null;
+  }[];
 }
 
 const severity: Record<HealthState, number> = { ok: 0, degraded: 1, failed: 2 };
@@ -122,6 +131,36 @@ export class BridgeHealthMonitor {
     const failedTasks = runtime.failedBindings ?? 0;
     checks.push({ name: "codex_tasks", state: failedTasks ? "degraded" : "ok",
       detail: failedTasks ? `Задач с ошибкой Codex: ${failedTasks}. Проверь /menu и /limits в соответствующей беседе. Это состояние задач, а не обрыв VK.` : "У подключённых задач нет подтверждённых системных ошибок Codex." });
+    const uncertainPrompts = this.store.uncertainPromptStats();
+    const uncertainAge = uncertainPrompts.oldestAt === null ? 0 : Math.max(0, checkedAt - uncertainPrompts.oldestAt);
+    checks.push({ name: "codex_uncertain_inputs", state: uncertainAge > 10 * 60_000 ? "failed" : uncertainPrompts.count ? "degraded" : "ok",
+      detail: uncertainPrompts.count
+        ? `Запросов без подтверждения: ${uncertainPrompts.count}; старейший ожидает ${Math.round(uncertainAge / 1_000)} с. Мост сверяет clientUserMessageId с историей Codex; промпты автоматически не дублируются.`
+        : "Новых запросов с неизвестным результатом отправки нет." });
+    const inputBatches = this.store.inputBatchStats();
+    const batchAge = inputBatches.oldestAt === null ? 0 : Math.max(0, checkedAt - inputBatches.oldestAt);
+    checks.push({ name: "vk_inbound_batches", state: batchAge > 2 * 60_000 ? "failed" : batchAge > 30_000 ? "degraded" : "ok",
+      detail: inputBatches.count
+        ? `Пачек длинных VK-запросов: ${inputBatches.count}; отправляются: ${inputBatches.dispatching}; старейшая ожидает ${Math.round(batchAge / 1_000)} с. Мост восстановит подготовленную пачку, но не повторит потенциально принятую Codex.`
+        : "Зависших частей длинных VK-запросов нет." });
+    const replayable = this.store.replayableInputStats();
+    const replayAge = replayable.oldestAt === null ? 0 : Math.max(0, checkedAt - replayable.oldestAt);
+    const recoveryError = this.store.getValue<{ at: number }>("inbound-recovery-error");
+    checks.push({ name: "vk_inbound_journal",
+      state: recoveryError || replayAge > 10 * 60_000 ? "failed" : replayable.count ? "degraded" : "ok",
+      detail: recoveryError ? "Журнал входящих VK-запросов не удалось восстановить. Автоматическая отправка остановлена для повреждённых записей."
+        : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
+          : "Необработанных входящих VK-запросов нет." });
+    for (const binding of runtime.bindings ?? []) {
+      if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
+      const problem = binding.failure === "usageLimit" ? "исчерпан лимит аккаунта"
+        : binding.failure === "systemError" ? "Codex сообщил системную ошибку"
+          : "нет подтверждённой связи с владельцем выполняющейся задачи";
+      const lastSeen = binding.lastConfirmedAt === null ? "подтверждения ещё не было"
+        : `последнее подтверждение ${new Date(binding.lastConfirmedAt).toISOString()}`;
+      checks.push({ name: `codex_task:${binding.id}`, state: binding.failure === "systemError" ? "failed" : "degraded",
+        detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${problem}; ${lastSeen}. Мост повторяет подключение; проверь /menu задачи.` });
+    }
 
     const transfers = this.store.transfers().filter(record => !["complete", "cancelled"].includes(record.phase));
     const blockedTransfers = transfers.filter(record => record.blocked || record.version !== 2);
@@ -129,11 +168,20 @@ export class BridgeHealthMonitor {
     const failedTransfers = transfers.some(record => record.version === 2 && (record.blocked || staleTransfers.includes(record)));
     checks.push({ name: "task_transfers", state: failedTransfers ? "failed" : transfers.length ? "degraded" : "ok",
       detail: transfers.length ? `Незавершённых переносов: ${transfers.length}; требуют проверки: ${blockedTransfers.length}; без прогресса более 15 мин: ${staleTransfers.length}. Этапы и причины доступны через /menu соответствующей задачи.` : "Незавершённых переносов нет." });
+    for (const record of transfers.filter(record => record.blocked || staleTransfers.includes(record))) {
+      const reason = record.blockedReason === "sourceChanged" ? "После копирования изменились история или цель источника; автоматическая архивация запрещена."
+        : record.blockedReason === "archiveUnknown" ? "Результат архивации неизвестен; выполняется только проверка чтением."
+          : record.blockedReason === "archiveOwner" ? "Ожидается безопасная готовность клиента-владельца для архивации."
+            : record.blocked ? "Операция требует проверки; автоматический повтор остановлен."
+              : "Этап не продвинулся более 15 минут.";
+      checks.push({ name: `transfer:${record.id}`, state: record.blocked ? "failed" : "degraded",
+        detail: `«${record.source.title.slice(0, 120)}»: этап ${record.step ?? record.phase}, последнее изменение ${new Date(record.updatedAt ?? record.startedAt).toISOString()}. ${reason} /menu задачи — подробности.` });
+    }
 
     const [vkResult, catalogResult, goalsResult, compatibilityResult] = await Promise.all([
       this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt),
     ]);
-    checks.push(...vkResult, catalogResult, goalsResult, compatibilityResult);
+    checks.push(...vkResult, ...catalogResult, goalsResult, compatibilityResult);
 
     let snapshot: BridgeHealthSnapshot = {
       state: aggregate(checks), checkedAt, pid: process.pid,
@@ -160,7 +208,7 @@ export class BridgeHealthMonitor {
     } catch { return [{ name: "vk", state: "failed", detail: "VK API не завершил безопасную проверку за 20 секунд." }]; }
   }
 
-  private async checkCatalog(): Promise<HealthCheckResult> {
+  private async checkCatalog(): Promise<readonly HealthCheckResult[]> {
     try {
       const tasks = await withTimeout(this.desktop.listTasks(), 15_000);
       const warnings = this.desktop.catalogWarnings?.() ?? [];
@@ -172,10 +220,26 @@ export class BridgeHealthMonitor {
         ...(missingWorkspaces ? [`У ${missingWorkspaces} подключённых задач рабочая папка недоступна.`] : []),
         ...warnings,
       ];
-      return problems.length
+      const catalog: HealthCheckResult = problems.length
         ? { name: "codex_catalog", state: "degraded", detail: `Найдено задач: ${tasks.length}. ${problems.join(" ").slice(0, 500)}` }
         : { name: "codex_catalog", state: "ok", detail: `Все настроенные каталоги прочитаны; найдено задач: ${tasks.length}.` };
-    } catch { return { name: "codex_catalog", state: "failed", detail: "Каталог задач Codex не прочитан за 15 секунд." }; }
+      if (!this.desktop.isTaskArchived) return [catalog];
+      const missing = this.store.bindings().filter(binding => binding.attached && binding.peerId !== null
+        && !tasks.some(task => sameTask(task, binding)));
+      const checks = await Promise.all(missing.map(async binding => {
+        try {
+          if (!await withTimeout(this.desktop.isTaskArchived!(binding), 5_000)) return null;
+          return { name: `archived_binding:${binding.id}`, state: "failed", detail:
+            `VK-беседа «${binding.title.slice(0, 120)}» привязана к архивной задаче (${binding.sourceLabel || binding.sourceId || ".codex"}). Выбери актуальную копию в менеджере; /open архив не восстановит.` } satisfies HealthCheckResult;
+        } catch {
+          return { name: `archive_lookup:${binding.id}`, state: "degraded", detail:
+            `Не удалось проверить архивный статус отсутствующей в каталоге задачи «${binding.title.slice(0, 120)}».` } satisfies HealthCheckResult;
+        }
+      }));
+      const found: HealthCheckResult[] = [];
+      for (const check of checks) if (check) found.push(check);
+      return [catalog, ...found];
+    } catch { return [{ name: "codex_catalog", state: "failed", detail: "Каталог задач Codex не прочитан за 15 секунд." }]; }
   }
 
   private async checkGoals(): Promise<HealthCheckResult> {
@@ -202,6 +266,19 @@ export class BridgeHealthMonitor {
 
   private notifyTransition(snapshot: BridgeHealthSnapshot): void {
     const notified = this.store.getValue<HealthState>("health:last-notified-state");
+    const issueStates = this.store.getValue<Record<string, HealthState>>("health:last-notified-issues") ?? {};
+    const previousRuns = this.store.getValue<Record<string, number>>("health:issue-runs") ?? {};
+    const issues = snapshot.checks.filter(check => check.state !== "ok");
+    const issueRuns: Record<string, number> = {};
+    const activeIssues: Record<string, HealthState> = {};
+    for (const issue of issues) {
+      const key = `${issue.name}:${issue.state}`;
+      issueRuns[key] = (previousRuns[key] ?? 0) + 1;
+      if (issueStates[issue.name]) activeIssues[issue.name] = severity[issue.state] < severity[issueStates[issue.name]!]
+        ? issue.state : issueStates[issue.name]!;
+    }
+    this.store.setValue("health:issue-runs", issueRuns);
+    this.store.setValue("health:last-notified-issues", activeIssues);
     if (snapshot.state === "ok") {
       this.store.setValue("health:unhealthy-runs", 0);
       this.store.setValue("health:last-observed-state", "ok");
@@ -220,11 +297,17 @@ export class BridgeHealthMonitor {
     this.store.setValue("health:last-observed-state", snapshot.state);
     this.store.setValue("health:unhealthy-runs", streak);
     const threshold = snapshot.state === "failed" ? 2 : 10;
-    if (streak < threshold || notified === snapshot.state || (notified && notified !== "ok" && severity[notified] > severity[snapshot.state])) return;
-    const failures = snapshot.checks.filter(check => check.state !== "ok").slice(0, 5).map(check => `${check.name}: ${check.detail}`);
+    const newIssues = issues.filter(issue => severity[activeIssues[issue.name] ?? "ok"] < severity[issue.state]
+      && issueRuns[`${issue.name}:${issue.state}`]! >= (issue.state === "failed" ? 2 : 10));
+    const aggregateChanged = streak >= threshold && notified !== snapshot.state
+      && (!notified || notified === "ok" || severity[notified] <= severity[snapshot.state]);
+    if (!aggregateChanged && !newIssues.length) return;
+    const failures = [...newIssues, ...issues.filter(issue => !newIssues.includes(issue))]
+      .slice(0, 5).map(check => `${check.name}: ${check.detail}`);
     this.store.enqueue(`health-alert:${snapshot.checkedAt}:${snapshot.state}`, this.access.ownerId, {
       text: `VKodex: health check ${labels[snapshot.state]}.\n${failures.join("\n")}\n\n/menu или /health — актуальное состояние.`,
     });
     this.store.setValue("health:last-notified-state", snapshot.state);
+    this.store.setValue("health:last-notified-issues", Object.fromEntries(issues.map(issue => [issue.name, issue.state])));
   }
 }

@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type DesktopTask, type TaskRef } from "./contracts.js";
-import { parseModelsCache } from "./details.js";
+import { parseNativeModels } from "./details.js";
+import { MetadataRpc } from "./metadata.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { assignTaskProjects, desktopProjects, readDesktopProjectState } from "./projects.js";
 
@@ -49,7 +50,23 @@ export class LocalDesktopCatalog {
   constructor(private readonly codexHome: string) {}
 
   async listModels(_task?: TaskRef): Promise<readonly DesktopModel[]> {
-    try { return parseModelsCache(JSON.parse(await readFile(path.join(this.codexHome, "models_cache.json"), "utf8"))); }
+    try {
+      const rpc = new MetadataRpc(this.codexHome);
+      const data: unknown[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const page = await rpc.call("model/list", { limit: 500, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")) {
+          throw new DesktopUnavailableError("Codex вернул некорректный список моделей.");
+        }
+        data.push(...page.data);
+        cursor = page.nextCursor;
+        if (cursor && (cursors.has(cursor) || cursors.size >= 20)) throw new DesktopUnavailableError("Codex не завершил выдачу списка моделей.");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      return parseNativeModels({ data, nextCursor: null });
+    }
     catch (error) {
       if (error instanceof DesktopUnavailableError) throw error;
       throw new DesktopUnavailableError("Не удалось прочитать список моделей. Открой Codex и его выбор модели.");

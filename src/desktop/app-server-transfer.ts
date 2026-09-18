@@ -13,6 +13,7 @@ import { nativeCodexPath } from "./metadata.js";
 import type { MultiDesktopCatalog } from "./multi-catalog.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
+import { completedHistoryDigest } from "./history-digest.js";
 
 type TransferMethod = "thread/fork" | "thread/list" | "thread/turns/list";
 
@@ -293,17 +294,20 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     }
     const before = await stat(task.rolloutPath);
     const lastTurnId = await this.lastTerminalTurn(home, task.threadId);
+    const semanticDigest = await completedHistoryDigest(task.threadId, lastTurnId,
+      params => this.createRpc(home).call("thread/turns/list", params));
     const after = await stat(task.rolloutPath);
     if (!after.isFile() || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
       throw new DesktopUnavailableError("История ещё обновляется; снимок переноса будет повторён после завершения записи.");
     }
-    return { lastTurnId, rolloutPath: task.rolloutPath, size: after.size, mtimeMs: after.mtimeMs };
+    return { lastTurnId, rolloutPath: task.rolloutPath, size: after.size, mtimeMs: after.mtimeMs, semanticDigest };
   }
 
   async verifySource(task: TaskRef, expected: TransferCheckpoint): Promise<void> {
     const actual = await this.checkpoint(task);
     if (actual.lastTurnId !== expected.lastTurnId || comparablePath(actual.rolloutPath) !== comparablePath(expected.rolloutPath)
-      || actual.size !== expected.size || actual.mtimeMs !== expected.mtimeMs) {
+      || (expected.semanticDigest ? actual.semanticDigest !== expected.semanticDigest
+        : actual.size !== expected.size || actual.mtimeMs !== expected.mtimeMs)) {
       throw new TransferConflictError("Исходная история изменилась после снимка. Переключение и архивация остановлены, чтобы не потерять новые сообщения.");
     }
   }
@@ -321,6 +325,35 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     }
     if (await this.lastTerminalTurn(this.catalog.sourceHome(target), target.threadId) !== request.checkpoint.lastTurnId) {
       throw new TransferConflictError("Последний ход копии не совпадает со снимком исходной задачи.");
+    }
+    if (request.checkpoint.semanticDigest && await completedHistoryDigest(target.threadId, request.checkpoint.lastTurnId,
+      params => this.createRpc(this.catalog.sourceHome(target)).call("thread/turns/list", params)) !== request.checkpoint.semanticDigest) {
+      throw new TransferConflictError("Содержимое истории копии не совпадает с исходной задачей. VK-беседа не переключена.");
+    }
+  }
+
+  async verifyLegacyArchivedPair(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void> {
+    if (checkpoint.semanticDigest || !this.metadata.isArchived || source.threadId === target.threadId
+      || comparablePath(this.catalog.sourceHome(source)) === comparablePath(this.catalog.sourceHome(target))) {
+      throw new TransferConflictError("Старая архивная копия не соответствует межкаталожному переносу.");
+    }
+    if (!await this.metadata.isArchived(source)) throw new TransferConflictError("Источник ещё не архивирован.");
+    const sourceHome = this.catalog.sourceHome(source);
+    const targetHome = this.catalog.sourceHome(target);
+    try {
+      if (await this.lastTerminalTurn(sourceHome, source.threadId) !== checkpoint.lastTurnId) {
+        throw new TransferConflictError("После снимка у источника появились новые ходы.");
+      }
+      const [sourceDigest, targetDigest] = await Promise.all([
+        completedHistoryDigest(source.threadId, checkpoint.lastTurnId,
+          params => this.createRpc(sourceHome).call("thread/turns/list", params)),
+        completedHistoryDigest(target.threadId, checkpoint.lastTurnId,
+          params => this.createRpc(targetHome).call("thread/turns/list", params), { allowNewerTurns: true }),
+      ]);
+      if (sourceDigest !== targetDigest) throw new TransferConflictError("Архив источника и копия содержат разную историю.");
+    } catch (error) {
+      if (error instanceof TransferConflictError || error instanceof DesktopUnavailableError) throw error;
+      throw new TransferConflictError("Старую архивную историю не удалось подтвердить до сохранённой границы.");
     }
   }
 
@@ -364,6 +397,8 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       // Ancestry alone is not enough: a fork of an older fork also contains the
       // source ID. Check the exact copied boundary before accepting recovery.
       if (await this.lastTerminalTurn(this.catalog.sourceHome(match), match.threadId) !== request.checkpoint.lastTurnId) return null;
+      if (request.checkpoint.semanticDigest && await completedHistoryDigest(match.threadId, request.checkpoint.lastTurnId,
+        params => this.createRpc(this.catalog.sourceHome(match)).call("thread/turns/list", params)) !== request.checkpoint.semanticDigest) return null;
     }
     return match ?? null;
   }

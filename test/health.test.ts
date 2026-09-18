@@ -28,6 +28,7 @@ class HealthDesktop implements DesktopTasks {
   compatibilityChecks = 0;
   goalReads = 0;
   async listTasks(): Promise<readonly DesktopTask[]> { return [{ hostId: "local", threadId: "fixture", title: "Fixture", workspace: "/fixture", updatedAt: 1 }]; }
+  async isTaskArchived(_task: TaskRef): Promise<boolean> { return false; }
   async listProjects(): Promise<readonly DesktopProject[]> { return []; }
   async createTask(_request: CreateTaskRequest): Promise<DesktopTask> { throw new Error("not used"); }
   async submit(_request: SubmitTaskRequest): Promise<void> { throw new Error("not used"); }
@@ -58,7 +59,7 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "codex_tasks", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
@@ -78,6 +79,86 @@ test("Codex task failures degrade health even with a connected stream", async t 
   assert.equal(report.checks.find(check => check.name === "codex_tasks")!.state, "degraded");
 });
 
+test("health escalates a prompt whose Codex acceptance remains unconfirmed", async t => {
+  const s = setup(t);
+  const task = (await s.desktop.listTasks())[0]!;
+  const binding = s.store.ensureBinding(task);
+  s.store.recordOperation("unknown-prompt", binding, "inbox-key", binding.id, 100_000);
+  s.store.finishOperation("unknown-prompt", "uncertain");
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "codex_uncertain_inputs")?.state, "degraded");
+  s.advance(11 * 60_000);
+  const report = await s.monitor.check(true);
+  assert.equal(report.checks.find(check => check.name === "codex_uncertain_inputs")?.state, "failed");
+});
+
+test("health reports a saved VK burst that remains unprocessed", async t => {
+  const s = setup(t);
+  s.store.saveInputBatch({ id: "stuck-burst", peerId: 2_000_000_001,
+    parts: [{ eventId: "message:1", peerId: 2_000_000_001, senderId: 101, text: "x".repeat(3000) }],
+    startedAt: 100_000, updatedAt: 100_000, state: "collecting" });
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_inbound_batches")?.state, "ok");
+  s.advance(31_000);
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_inbound_batches")?.state, "degraded");
+  s.advance(2 * 60_000);
+  assert.equal((await s.monitor.check(true)).checks.find(check => check.name === "vk_inbound_batches")?.state, "failed");
+});
+
+test("health escalates unprocessed durable VK input without exposing its text", async t => {
+  const s = setup(t);
+  const input = { eventId: "message:99", peerId: 2_000_000_001, senderId: 101, text: "private fixture prompt" };
+  s.store.receiveInput(input, 100_000);
+  let check = (await s.monitor.check(true)).checks.find(item => item.name === "vk_inbound_journal")!;
+  assert.equal(check.state, "degraded");
+  assert.doesNotMatch(check.detail, /private fixture/u);
+  s.advance(11 * 60_000);
+  check = (await s.monitor.check(true)).checks.find(item => item.name === "vk_inbound_journal")!;
+  assert.equal(check.state, "failed");
+  s.store.setValue("inbound-recovery-error", { at: 100_000 });
+  assert.equal((await s.monitor.check(true)).checks.find(item => item.name === "vk_inbound_journal")?.state, "failed");
+});
+
+test("health identifies each failed task and alerts when a second task fails", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  let now = 100_000;
+  const bindings = [
+    { id: "first", title: "First", source: ".codex", status: "failed", connected: true, lastConfirmedAt: 90_000, failure: "systemError" as const },
+  ];
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: bindings.length,
+    connectedBindings: bindings.length, requiredBindings: 0, connectedRequiredBindings: 0,
+    failedBindings: bindings.length, bindings,
+  }), undefined, () => now);
+  await monitor.check(true);
+  now += 60_000; await monitor.check(true);
+  const initial = store.pendingDeliveries()[0]!;
+  assert.match(initial.view.text, /First/u);
+  store.delivered(initial, { peerId: access.ownerId, conversationMessageId: 1 });
+  bindings.push({ id: "second", title: "Second", source: ".codex-work", status: "failed", connected: true,
+    lastConfirmedAt: 120_000, failure: "systemError" });
+  now += 60_000; await monitor.check(true);
+  now += 60_000; await monitor.check(true);
+  const later = store.pendingDeliveries();
+  assert.equal(later.length, 1);
+  assert.match(later[0]!.view.text, /Second/u);
+});
+
+test("health names a disconnected running task but ignores an idle detached owner", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 2, connectedBindings: 0, requiredBindings: 1, connectedRequiredBindings: 0,
+    bindings: [
+      { id: "running", title: "Active task", source: ".codex-work", status: "running", connected: false, lastConfirmedAt: 75_000, failure: null },
+      { id: "idle", title: "Idle task", source: ".codex", status: "idle", connected: false, lastConfirmedAt: null, failure: null },
+    ],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  assert.equal(report.checks.find(check => check.name === "codex_task:running")?.state, "degraded");
+  assert.match(report.checks.find(check => check.name === "codex_task:running")!.detail, /Active task.*последнее подтверждение/u);
+  assert.equal(report.checks.some(check => check.name === "codex_task:idle"), false);
+});
+
 test("health detects stuck and legacy transfers even when streams and the database are healthy", async t => {
   const s = setup(t);
   const task = (await s.desktop.listTasks())[0]!;
@@ -90,9 +171,25 @@ test("health detects stuck and legacy transfers even when streams and the databa
   const retrying = await s.monitor.check();
   assert.equal(retrying.checks.find(check => check.name === "task_transfers")?.state, "degraded");
   s.store.updateTransfer(s.store.transfer(binding.id)!, { blocked: true });
-  assert.equal((await s.monitor.check()).checks.find(check => check.name === "task_transfers")?.state, "failed");
+  const blocked = await s.monitor.check();
+  assert.equal(blocked.checks.find(check => check.name === "task_transfers")?.state, "failed");
+  assert.equal(blocked.checks.find(check => check.name === "transfer:operation")?.state, "failed");
   s.store.updateTransfer(s.store.transfer(binding.id)!, { phase: "complete" });
   assert.equal((await s.monitor.check()).checks.find(check => check.name === "task_transfers")?.state, "ok");
+});
+
+test("health names a transfer whose source changed without exposing task history", async t => {
+  const s = setup(t);
+  const task = (await s.desktop.listTasks())[0]!;
+  const binding = s.store.ensureBinding(task);
+  s.store.markTransfer({ id: "changed-source", bindingId: binding.id, source: task, startedAt: 90_000,
+    targetSourceId: "work", targetProjectId: null, phase: "switched", version: 2,
+    step: "archive", blocked: true, blockedReason: "sourceChanged", detail: "private history content" });
+  const report = await s.monitor.check(true);
+  const check = report.checks.find(item => item.name === "transfer:changed-source")!;
+  assert.equal(check.state, "failed");
+  assert.match(check.detail, /изменились история или цель/u);
+  assert.doesNotMatch(check.detail, /private history content/u);
 });
 
 test("health monitor degrades when an attached task points to a missing workspace", async t => {
@@ -107,6 +204,22 @@ test("health monitor degrades when an attached task points to a missing workspac
   const catalog = report.checks.find(check => check.name === "codex_catalog")!;
   assert.equal(catalog.state, "degraded");
   assert.match(catalog.detail, /рабочая папка недоступна/u);
+});
+
+test("health fails for a VK binding left on an archived task", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const desktop = new HealthDesktop(); desktop.listTasks = async () => [];
+  desktop.isTaskArchived = async task => task.threadId === "archived-task";
+  const binding = store.ensureBinding({ hostId: "local", threadId: "archived-task", title: "Archived task", workspace: "/fixture", updatedAt: 1 });
+  store.setChat(binding.id, 2_000_000_001, 1);
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, desktop, new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  assert.equal(report.state, "failed");
+  assert.match(report.checks.find(check => check.name === `archived_binding:${binding.id}`)!.detail, /Archived task.*архивной задаче/u);
 });
 
 test("failed checks alert after two runs and recovery waits for three healthy runs", async t => {
@@ -127,6 +240,28 @@ test("failed checks alert after two runs and recovery waits for three healthy ru
   }
   pending = s.store.pendingDeliveries();
   assert.equal(pending.length, 1); assert.match(pending[0]!.view.text, /снова OK/u);
+});
+
+test("a new failed check alerts even while another failure keeps overall health FAILED", async t => {
+  const s = setup(t);
+  s.chat.checks = [{ name: "vk_api", state: "failed", detail: "API unavailable" }];
+  await s.monitor.check(true);
+  s.advance(60_000); await s.monitor.check(true);
+  const first = s.store.pendingDeliveries()[0]!;
+  s.store.delivered(first, { peerId: access.ownerId, conversationMessageId: 1 });
+  s.chat.checks = [
+    { name: "vk_api", state: "failed", detail: "API unavailable" },
+    { name: "vk_long_poll", state: "failed", detail: "No incoming messages" },
+  ];
+  s.advance(60_000); assert.equal((await s.monitor.check(true)).state, "failed");
+  assert.equal(s.store.pendingDeliveries().length, 0);
+  s.advance(60_000); assert.equal((await s.monitor.check(true)).state, "failed");
+  const second = s.store.pendingDeliveries();
+  assert.equal(second.length, 1);
+  assert.match(second[0]!.view.text, /vk_long_poll: No incoming messages/u);
+  s.store.delivered(second[0]!, { peerId: access.ownerId, conversationMessageId: 2 });
+  s.advance(60_000); await s.monitor.check(true);
+  assert.equal(s.store.pendingDeliveries().length, 0);
 });
 
 test("a delivery backlog becomes degraded and then failed instead of looking healthy forever", async t => {

@@ -6,7 +6,7 @@ const object = (value: unknown): value is Message => !!value && typeof value ===
 const owns = (value: Message, key: string) => Object.prototype.hasOwnProperty.call(value, key);
 
 export class OwnerTransportError extends Error {
-  constructor(readonly outcome: "unavailable" | "rejected" | "unknown", message: string) { super(message); }
+  constructor(readonly outcome: "unavailable" | "outdated" | "rejected" | "unknown", message: string) { super(message); }
 }
 
 /** Experimental transport, not installed into production clients automatically.
@@ -133,6 +133,18 @@ export class OwnerTransport {
     const loaded = await this.request("thread/loaded/list", {});
     if (!Array.isArray(loaded.data)) throw new OwnerTransportError("unavailable", "Invalid loaded task response.");
     return loaded.data.includes(threadId);
+  }
+
+  /** Read the native owner's state without resuming a task or opening its UI. */
+  async inspectTask(threadId: string): Promise<"idle" | "active" | "systemError"> {
+    if (!await this.ownsTask(threadId)) throw new OwnerTransportError("rejected", "This native process does not own the task.");
+    const result = await this.request("thread/read", { threadId, includeTurns: false });
+    const thread = result.thread;
+    if (!object(thread) || thread.id !== threadId || !object(thread.status)
+      || !["idle", "active", "systemError"].includes(String(thread.status.type))) {
+      throw new OwnerTransportError("unavailable", "Owner returned an invalid task state.");
+    }
+    return thread.status.type as "idle" | "active" | "systemError";
   }
 
   async archiveIdle(threadId: string): Promise<void> {

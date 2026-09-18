@@ -8,6 +8,7 @@ import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sam
 import { nativeCodexPath } from "./metadata.js";
 import type { MultiDesktopCatalog, ResolvedDesktopProject } from "./multi-catalog.js";
 import { createTaskWorktree } from "./task-workspaces.js";
+import { withVkResponseFormat } from "./vk-response-format.js";
 
 const efforts = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
@@ -49,7 +50,7 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
   private readonly listeners = new Set<(update: TaskCreationUpdate) => void>();
 
   constructor(
-    private readonly catalog: Pick<MultiDesktopCatalog, "resolveProject" | "sourceHome" | "listTasks">,
+    private readonly catalog: Pick<MultiDesktopCatalog, "resolveProject" | "sourceHome" | "listTasks"> & Partial<Pick<MultiDesktopCatalog, "listModels">>,
     private readonly metadata: DesktopMetadata,
     private readonly createCodex: (home: string) => Codex = home => new Codex({
       codexPathOverride: nativeCodexPath(),
@@ -76,6 +77,13 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
     const model = request.model?.trim(); const effort = request.effort?.trim();
     if (effort && !efforts.has(effort)) throw new ActionRejectedError("Выбранный уровень рассуждения не поддерживается Codex.");
     const resolved = await this.resolveWorkspace(request);
+    if (model && this.catalog.listModels) {
+      const models = await this.catalog.listModels({ hostId: "local", threadId: "", sourceId: resolved.sourceId ?? "" });
+      const available = models.find(item => item.id === model);
+      if (!available || (effort && !available.efforts.includes(effort))) {
+        throw new ActionRejectedError("Версия Codex CLI, установленная с VKodex, не поддерживает выбранную модель или уровень рассуждения. Обнови VKodex или выбери доступную модель; задача не создана.");
+      }
+    }
     const controller = new AbortController();
     const thread = this.createCodex(resolved.sourceHome).startThread({
       workingDirectory: resolved.workspace,
@@ -85,7 +93,7 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
       ...(effort ? { modelReasoningEffort: effort as ModelReasoningEffort } : {}),
     });
     let stream;
-    try { stream = await thread.runStreamed(request.prompt, { signal: controller.signal }); }
+    try { stream = await thread.runStreamed(withVkResponseFormat(request.prompt), { signal: controller.signal }); }
     catch (error) {
       if (error instanceof ActionRejectedError || error instanceof DesktopUnavailableError) throw error;
       throw new UncertainActionError();

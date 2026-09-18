@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { TaskEvent } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { comparablePath } from "./paths.js";
+import { parseAsyncQuestionReply } from "./questions.js";
 
 export interface ProjectionCheckpoint {
   readonly since: number;
@@ -171,9 +172,11 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
       const id = item.id;
       if (item.type === "userMessage") {
         const operationId = origins.get(id) ?? (typeof item.clientId === "string" ? item.clientId : undefined);
-        const text = userText(item.content);
+        const answers = parseAsyncQuestionReply(item.content);
+        const text = answers.length ? answers.map(a => `Ответ на вопрос Codex «${a.question}»: ${a.answer}`).join("\n") : userText(item.content);
         if (text) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) });
       } else if (item.type === "agentMessage" && typeof item.text === "string") {
+        if (item.delivery === "async") continue; // Rendered as an actionable question card.
         // The first snapshot is a baseline even when the turn is already active.
         // Replaying its accumulated commentary would flood a newly linked VK chat
         // with progress that happened before the user connected it. A later edit

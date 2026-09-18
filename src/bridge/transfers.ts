@@ -25,7 +25,9 @@ export function transferStatus(record: TaskTransferRecord): string {
     `Этап: ${stages[record.step ?? "snapshot"]}. Попытка: ${record.attempt ?? 0}.`,
     record.detail,
     record.goal?.status === "active" && record.checkpoint ? "Исходная цель приостановлена на время переноса; автоматический запуск второй копии запрещён." : "",
-    record.blockedReason === "archiveOwner" ? "Ожидаю архивации в исходном клиенте. Проверка архива выполняется автоматически раз в минуту; повторные команды записи не отправляются."
+    record.blockedReason === "archiveUnknown" ? "Результат архивации неизвестен. Раз в минуту проверяю архив исходной задачи; повторная команда записи запрещена."
+      : record.blockedReason === "archiveOwner" ? "Ожидаю безопасной архивации источника. Раз в минуту проверяю архив и готовность владельца либо незагруженной задачи; попытка записи проходит только после повторной проверки истории и цели."
+      : record.blockedReason === "sourceChanged" ? "После копирования изменилась история или цель источника. Автоматическая архивация остановлена, чтобы не потерять новый ход; нужна сверка обеих копий."
       : record.blocked || record.version !== 2 ? "Нужна проверка. /menu → «Продолжить перенос» проверит ту же операцию; новая копия не создаётся."
       : record.retryAt ? `Автоматическая проверка: ${new Date(record.retryAt).toLocaleTimeString("ru-RU")}.` : "Операция выполняется в фоне. Остальные беседы доступны.",
   ].filter(Boolean).join("\n");
@@ -59,6 +61,8 @@ export class TaskTransfers {
     if (!current || ["complete", "cancelled"].includes(current.phase)) throw new ActionRejectedError("Незавершённого переноса нет.");
     if (this.running.has(current.id)) { this.publish(current); return; }
     if (current.lease && processAlive(current.lease.pid)) throw new ActionRejectedError("Операция уже выполняется другим процессом VKodex. Повторный запуск запрещён.");
+    if (current.blockedReason === "archiveUnknown") throw new ActionRejectedError("Результат архивации неизвестен. VKodex проверяет состояние источника и не повторит команду записи вслепую.");
+    if (current.blockedReason === "sourceChanged") throw new ActionRejectedError("После копирования изменились история или цель источника. Сначала сверяй обе копии; автоматическая архивация запрещена.");
     // Legacy operations have no saved boundary. Never invent one and archive a
     // source that might have advanced since that historical transfer.
     const next = this.store.updateTransfer(current, { version: 2, blocked: false, retryAt: 0, attempt: 0,
@@ -81,7 +85,10 @@ export class TaskTransfers {
     if (this.stopped) return;
     for (const record of this.store.transfers()) {
       if (this.running.size >= 2) break;
-      const archiveCheck = record.phase === "switched" && record.blockedReason === "archiveOwner";
+      // Every blocked switched transfer gets read-only reconciliation. This
+      // also repairs older records which did not persist a typed block reason.
+      // Only an explicit known owner rejection may authorize another write.
+      const archiveCheck = record.phase === "switched" && !!record.blocked && !!record.target && !!record.checkpoint;
       if (record.version !== 2 || ["complete", "cancelled"].includes(record.phase) || (record.blocked && !archiveCheck)
         || (record.retryAt ?? 0) > this.now() || this.running.has(record.id)
         || (archiveCheck && this.now() - (this.archiveChecks.get(record.id) ?? -Infinity) < 60_000)) continue;
@@ -108,18 +115,46 @@ export class TaskTransfers {
   private async checkArchivedSource(record: TaskTransferRecord): Promise<void> {
     try {
       if (!this.desktop.isTaskArchived || !record.target || !record.checkpoint) return;
-      if (!await this.desktop.isTaskArchived(record.source, record.checkpoint)) return;
+      if (!await this.confirmArchivedSource(record)) {
+        if (record.blockedReason === null && this.desktop.verifyTransferSource) {
+          // Older blocked records did not preserve a typed failure. Read the
+          // immutable boundary before even considering an operator retry.
+          await this.desktop.verifyTransferSource(record.source, record.checkpoint);
+          await this.verifySourceGoal(record);
+        }
+        // The previous external archive was explicitly rejected by a writer.
+        // A newly connected idle native owner can now accept it. Re-enter the
+        // saved archive stage, which rechecks the source boundary and goal
+        // before writing; never infer ownership from a timeout alone.
+        if (record.blockedReason === "archiveOwner" && this.desktop.archiveRetryReady
+          && await this.desktop.archiveRetryReady(record.source)) await this.run(record);
+        return;
+      }
       await this.verifySourceGoal(record);
       const next = this.store.completeTransfer(record, this.now());
       this.publish(next);
     } catch (error) {
       if (error instanceof TransferConflictError) {
         try {
-          const next = this.store.updateTransfer(record, { blockedReason: null, detail: error.message }, this.now());
+          const next = this.store.updateTransfer(record, { blockedReason: "sourceChanged", detail: error.message }, this.now());
           this.publish(next);
         } catch { /* Another worker or a changed binding wins over this read. */ }
       }
       // An unavailable read leaves the original failure visible to health.
+    }
+  }
+
+  private async confirmArchivedSource(record: TaskTransferRecord): Promise<boolean> {
+    if (!this.desktop.isTaskArchived) return false;
+    try { return await this.desktop.isTaskArchived(record.source, record.checkpoint); }
+    catch (error) {
+      // Old transfers stored file size/mtime but not a semantic digest. Once
+      // archived, Codex may relocate or rewrite that file. Reconcile only a
+      // genuinely archived source against the target's exact copied prefix.
+      if (!record.checkpoint || record.checkpoint.semanticDigest || !record.target
+        || !this.desktop.verifyLegacyArchivedPair) throw error;
+      await this.desktop.verifyLegacyArchivedPair(record.source, record.target, record.checkpoint);
+      return true;
     }
   }
 
@@ -216,24 +251,25 @@ export class TaskTransfers {
         this.store.markDesktopHandoff(record.bindingId, record.target!, "live");
       }
       step("archive");
-      if (!await this.desktop.isTaskArchived(record.source, record.checkpoint)) {
+      if (!await this.confirmArchivedSource(record)) {
         if (!record.checkpoint) throw new TransferConflictError("Граница старого переноса неизвестна. Источник не архивирован автоматически.");
         await this.desktop.verifyTransferSource(record.source, record.checkpoint);
         await this.verifySourceGoal(record);
         if (!this.desktop.archiveTransferredSource) throw new TransferConflictError("Архивация источника недоступна.");
         await this.desktop.archiveTransferredSource(record.source);
-        if (!await this.desktop.isTaskArchived(record.source, record.checkpoint)) throw new DesktopUnavailableError("Архивация не подтверждена исходным каталогом.");
+        if (!await this.confirmArchivedSource(record)) throw new DesktopUnavailableError("Архивация не подтверждена исходным каталогом.");
       }
       // A legacy operation can only reach here if its source was ALREADY
       // archived. Do not imply that its missing checkpoint was verified.
       if (!record.checkpoint && record.target) await this.desktop.isTaskArchived(record.target);
       record = this.store.completeTransfer(record, this.now()); this.publish(record);
     } catch (error) {
-      const blocked = error instanceof TransferConflictError || (record.attempt ?? 0) >= 8;
+      const unknownArchive = record.phase === "switched" && record.step === "archive" && error instanceof UncertainActionError;
+      const blocked = error instanceof TransferConflictError || unknownArchive || (record.attempt ?? 0) >= 8;
       const detail = error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError
         ? error.message : "Сбой этапа переноса. Состояние сохранено; новая копия не создаётся.";
       try {
-        save({ blocked, detail, blockedReason: error instanceof ArchiveOwnerRequiredError ? "archiveOwner" : null,
+        save({ blocked, detail, blockedReason: error instanceof ArchiveOwnerRequiredError ? "archiveOwner" : unknownArchive ? "archiveUnknown" : null,
           retryAt: blocked ? 0 : this.now() + Math.min(10 * 60_000, 10_000 * 2 ** Math.min(record.attempt ?? 1, 6)) });
         this.publish(record);
       } catch { /* A stale callback must not overwrite a different operation. */ }

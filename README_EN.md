@@ -8,6 +8,7 @@
 
 # VKodex
 
+
 **VKodex is an open-source VK bot for remotely controlling OpenAI Codex through VK messages and conversations.**
 
 Continue existing Codex tasks or create new ones from your phone: choose a project in the manager chat, open a linked VK conversation, and send follow-up requests and attachments into the same context.
@@ -348,6 +349,8 @@ Status: owner-side archival has been verified in a separate VS Code instance. In
 
 ## 6. Manager and linked conversations
 
+**Long incoming messages:** in a linked conversation, text of at least 3,000 characters starts a collection window. Subsequent text parts from the same author are joined with newlines after 1.5 seconds of silence, up to 64,000 characters per request. Short trailing parts are included; commands, attachments and a different author end the batch and are processed separately. VK provides no split-message identifier, so this is a heuristic: a gap longer than 1.5 seconds produces a separate request. Editing an individual part after merging changes VK only. The pre-dispatch buffer is in memory; forcibly terminating the process during this short window can lose it.
+
 ### Manager
 
 The manager is the **private chat with the community**, not another group conversation.
@@ -440,7 +443,7 @@ By default, a message may contain up to **10 files**, one inbound file may be up
 
 Inbound files are stored in `BOT_DATA_DIR/files/<request-identifier>/inbox/`; outbound files go to the adjacent `outbox/`. The bridge creates the identifier and gives the exact path to the agent. This is not a project directory. Codex task permissions are not widened: grant access through the regular desktop flow if the task cannot access that folder. Prompts sent directly from the desktop do not receive a new folder automatically.
 
-Each outbox has separate limits: up to 10 files, 20 MiB per file, and 50 MiB total. The bridge sends only regular files directly inside `outbox/`: hidden files are skipped, and links or files still being written are rejected. Paths mentioned in answer text and other project directories are never scanned. Archives are not extracted automatically. Document contents remain user data, not bridge commands.
+Each outbox supports up to 10 files, 200 MiB per file, and 200 MiB total. The bridge sends only regular files directly inside `outbox/`: hidden files are skipped, and links or files still being written are rejected. Paths mentioned in answer text and other project directories are never scanned. Archives are not extracted automatically. Document contents remain user data, not bridge commands.
 
 Rescanning and restarting do not resend an unchanged file. Binding activity is checked before download, upload, and delivery, but the participant list is not. Old folders are not sent automatically after a disabled binding is reconnected. Local files remain on disk; move unwanted data to the Recycle Bin manually and never add `BOT_DATA_DIR` to Git.
 
@@ -492,9 +495,9 @@ Goals are preserved separately from history. An active source goal is paused, an
 
 An acknowledged fork ID is saved before follow-up metadata writes, so retries prepare the same copy. If Codex never acknowledges the result ID, VKodex does not submit another fork or adopt an unrelated descendant as the result. Changes to source history or its goal also stop the switch and preserve both copies for inspection. During preparation, new prompts and modifying commands are rejected with an explanation rather than sent to the old task. **Cancel transfer** releases that restriction once the current stage has settled and before the binding has switched. Cancellation never deletes a created copy or automatically resumes a goal.
 
-After the atomic binding switch, VKodex archives the source. It verifies the exact persisted source record and saved rollout, not merely absence from the active task list. Transient archival errors are retried in the background while the VK conversation stays on the verified target. **Retry archival** checks the same stage. If the source client holds a writer lock (`already has an active writer`), write attempts stop immediately. The installed Desktop/VS Code client exposes no archival command in its external follower IPC, so the source must be archived in that client. VKodex then detects the confirmed archive with a read-only check once a minute and completes the saved stage. It does not terminate Codex or forcibly remove locks. **Fully autonomous archival of an open source task is not yet supported**; this limitation remains visible in the menu and health check, rather than being reported as a completed transfer.
+After the atomic binding switch, VKodex archives the source. It verifies the persisted source record and saved history boundary, not merely absence from the active task list. The owner adapter sends archival through the client that holds the task; this path has passed a live test in VS Code `.codex-work`. The Codex Desktop path is prepared but has not yet been verified on working tasks. Without the adapter, a separate App Server may archive only after confirming that the task is unloaded and its latest turn is terminal. An unknown write result is never retried blindly: VKodex polls the archive state read-only. If source history or goal changes after copying, archival stops and both copies remain available for review. VKodex neither terminates Codex nor forcibly removes locks. Full autonomy across all configurations remains unverified until Desktop and a live round trip are tested.
 
-`/health` reports pending transfers, stages without progress, and operations requiring user attention. Legacy records without a saved history boundary are never automatically replayed and do not block ordinary messages in existing conversations. They can be inspected or cancelled from the menu; missing history boundaries are not guessed. When the source is already archived and the exact VK binding is confirmed, an old record can be closed with a distinct reconciliation note. This does not claim to reverify its entire historical transfer.
+`/health` reports pending transfers, stages without progress, and archived tasks that still have active VK bindings. Legacy records without a saved history boundary are never automatically replayed: missing evidence is not guessed. If a legacy record has a boundary, its source is already archived, and the source's semantic history matches the target's history prefix, VKodex can finish the same stage without a new fork or database edit. If the source acquired another turn, archival retry is blocked even after the VK conversation switched.
 
 Recovery checks use dedicated test tasks: process termination after the fork ID is saved and after the binding switch, a lost response after opening the client, transfer of a paused goal with its remaining budget, and large JSONL processing. Native process exit is tracked separately from stdio closure so delayed Windows pipe closure does not turn an acknowledged fork into an error.
 
@@ -731,3 +734,17 @@ Run all three with `npm run check`. Automated tests use VK and Codex test double
 - [MIT License](LICENSE).
 
 VKodex is an independent project and is not an official VK or OpenAI product.
+
+### Deferred prompts: `/queue`
+
+Send `/queue <prompt>` in a task conversation (newlines and attachments are supported). VKodex calls `thread/queue/add` to append to the **native Codex queue**, without steering the current turn. Codex may start it immediately when idle. Codex owns persistence and execution; VKodex has no separate queue scheduler. The task client must be connected. An uncertain insertion is never retried automatically. Edit an already queued prompt in Codex.
+
+### Codex questions in VK: `/questions`
+
+An open Codex question appears in the task conversation with option buttons and **“Свой ответ”** (custom answer). You can also use VK's **Reply** on the question card and type your answer. Multiple questions are collected in order and submitted together. `/questions` checks current questions and refreshes buttons, which expire after 30 minutes.
+
+Both blocking `item/tool/requestUserInput` requests and asynchronous `request_user_input_async` questions are supported. Async answers use the same structured reply envelope through `steer` as the Codex client. An async question does not imply that the agent has stopped working; it is no longer answerable once its turn ends.
+
+Only the VKodex owner can answer, including in shared conversations. Secret fields (`isSecret`) must be answered in Codex. Command/file permission approvals and MCP forms are not handled by this feature. Answers never start a new turn or enter `/queue`.
+
+The task-owning client must provide live state; reading the rollout file alone is insufficient. VKodex rechecks the question and selected source before submitting. Answering in the app closes the VK card. Open questions survive bridge restarts without replaying answers. Ambiguous submissions remain blocked pending verification in Codex. Editing an already submitted answer from VK is not supported yet.

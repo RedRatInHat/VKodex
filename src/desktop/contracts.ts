@@ -68,6 +68,8 @@ export interface TransferCheckpoint {
   readonly rolloutPath: string;
   readonly size: number;
   readonly mtimeMs: number;
+  /** Hash of all persisted completed turns. Older in-flight transfers lack it. */
+  readonly semanticDigest?: string;
 }
 
 export interface SubmitTaskRequest {
@@ -174,6 +176,8 @@ export interface AccountUsageProvider {
 }
 
 export interface DesktopMetadata {
+  queue?(request: SubmitTaskRequest, input: readonly Record<string, unknown>[]): Promise<string>;
+  findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
   rename(task: TaskRef, title: string): Promise<void>;
   archive(task: TaskRef): Promise<void>;
   markdown(task: TaskRef): Promise<string>;
@@ -181,6 +185,8 @@ export interface DesktopMetadata {
   /** Native persisted state, not a project inferred by the display catalog. */
   read?(task: TaskRef): Promise<{ readonly title: string | null; readonly projectId: string | null }>;
   isArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
+  /** Read-only check before retrying a previously rejected source archive. */
+  archiveRetryReady?(task: TaskRef): Promise<boolean>;
 }
 
 export interface TaskRenameResult {
@@ -225,6 +231,8 @@ export interface DesktopTaskTransfer {
   checkpoint?(task: TaskRef): Promise<TransferCheckpoint>;
   verifySource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
   verifyTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
+  /** Reconcile a legacy archived source against the exact copied history prefix. */
+  verifyLegacyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
 }
 
 /** Events from the atomic first turn that materializes a new Codex task. */
@@ -244,6 +252,9 @@ export interface DesktopCompatibility {
 }
 
 export interface DesktopTasks {
+  pendingQuestions?(task: TaskRef): Promise<readonly import("./questions.js").CodexQuestions[]>;
+  answerQuestions?(task: TaskRef, question: import("./questions.js").CodexQuestions, answers: Readonly<Record<string, string>>, operationId: string, beforeSend: () => Promise<void>): Promise<void>;
+  queue?(request: SubmitTaskRequest): Promise<string>;
   readonly capabilities: DesktopCapabilities;
   listTasks(): Promise<readonly DesktopTask[]>;
   listSources?(): readonly DesktopSource[];
@@ -252,6 +263,7 @@ export interface DesktopTasks {
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;
   submitWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
+  findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
   interrupt(task: TaskRef): Promise<void>;
   moveTask(task: TaskRef, projectId: string | null): Promise<void>;
@@ -259,7 +271,10 @@ export interface DesktopTasks {
   transferCheckpoint?(task: TaskRef): Promise<TransferCheckpoint>;
   verifyTransferSource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
   verifyTransferTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
+  verifyLegacyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
   isTaskArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
+  /** Read-only check used to resume a previously rejected archive. */
+  archiveRetryReady?(task: TaskRef): Promise<boolean>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;
@@ -305,9 +320,9 @@ export class TaskConnectionLostError extends DesktopUnavailableError {
   }
 }
 
-/** The desktop explicitly rejected a read-only IPC request before any mutation. */
+/** Read rejection, or an explicit protocol-version rejection before dispatch. */
 export class DesktopRequestRejectedError extends DesktopUnavailableError {
-  constructor(readonly reason: "no-client-found" | "request-rejected" = "request-rejected") {
+  constructor(readonly reason: "no-client-found" | "request-rejected" | "request-version-mismatch" = "request-rejected") {
     super("Десктоп отклонил запрос.");
     this.name = "DesktopRequestRejectedError";
   }

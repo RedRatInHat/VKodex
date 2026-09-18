@@ -5,18 +5,21 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
+import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef, type SubmitTaskRequest, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { mirrorLegacyProjectAssignment } from "./projects.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
-import { archiveThroughOwner } from "./owner-channel.js";
+import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
+import { completedHistoryDigest } from "./history-digest.js";
+import { findAcceptedInputTurn } from "./input-reconciliation.js";
 
-export type LocalAppServerMethod = "thread/read" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
-const methods = new Set<LocalAppServerMethod>(["thread/read", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
+export type LocalAppServerMethod = "model/list" | "thread/queue/add" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
+const methods = new Set<LocalAppServerMethod>(["model/list","thread/queue/add","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
 
 function rejectedMetadata(method: LocalAppServerMethod, error: unknown): ActionRejectedError {
+  if (method === "thread/queue/add") return new ActionRejectedError("Codex отклонил добавление в штатную очередь. Проверь версию Codex и состояние задачи. В текущий ход запрос не отправлялся.");
   const message = isObject(error) && typeof error.message === "string" ? error.message : "";
   if (method === "thread/archive" && /invalid filename/iu.test(message)) {
     return new ActionRejectedError("Codex не может архивировать задачу: файл её истории имеет нестандартное имя.");
@@ -62,7 +65,7 @@ export class MetadataRpc {
   async call(method: LocalAppServerMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
-    const mutating = !["thread/read", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
+    const mutating = !["model/list","thread/read", "thread/turns/list", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
       let buffer = ""; let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
@@ -259,6 +262,16 @@ export class NativeDesktopMetadata implements DesktopMetadata {
       }
     }
   }
+  async queue(request: SubmitTaskRequest, input: readonly IpcObject[]): Promise<string> {
+    this.local(request.task);
+    const result = await this.rpc.call("thread/queue/add", {
+      threadId: request.task.threadId, clientUserMessageId: request.operationId, input,
+    });
+    const queued = result.queuedSubmission;
+    if (!isObject(queued) || typeof queued.id !== "string" || !queued.id
+      || queued.clientUserMessageId !== request.operationId) throw new UncertainActionError();
+    return queued.id;
+  }
   async archive(task: TaskRef): Promise<void> {
     this.local(task); await this.rpc.call("thread/archive", { threadId: task.threadId });
   }
@@ -295,13 +308,46 @@ export class NativeDesktopMetadata implements DesktopMetadata {
   }
 }
 
+export function unownedArchiveReady(read: IpcObject, turns: IpcObject, threadId: string): boolean {
+  const thread = isObject(read.thread) && read.thread.id === threadId ? read.thread : null;
+  const turn = Array.isArray(turns.data) && isObject(turns.data[0]) ? turns.data[0] : null;
+  return isObject(thread?.status) && thread.status.type === "notLoaded"
+    && !!turn && typeof turn.id === "string" && !!turn.id
+    && ["completed", "failed", "interrupted"].includes(String(turn.status));
+}
+
 export class ProfileDesktopMetadata implements DesktopMetadata {
   constructor(
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
   ) {}
+  async archiveRetryReady(task: TaskRef): Promise<boolean> {
+    if (task.hostId !== "local") return false;
+    const home = this.sourceHome(task);
+    const owner = await inspectThroughOwner(home, task.threadId);
+    if (owner !== null) return owner === "idle";
+    // No registered client owns this thread. A separate App Server may archive
+    // it, but only after native reads confirm it is unloaded and its latest
+    // turn is terminal. An unregistered writer may still reject the write.
+    const rpc = new MetadataRpc(home, undefined, 10_000);
+    const [read, turns] = await Promise.all([
+      rpc.call("thread/read", { threadId: task.threadId, includeTurns: false }),
+      rpc.call("thread/turns/list", { threadId: task.threadId, limit: 1, sortDirection: "desc", itemsView: "summary" }),
+    ]);
+    return unownedArchiveReady(read, turns, task.threadId);
+  }
   rename(task: TaskRef, title: string): Promise<void> { return this.createMetadata(this.sourceHome(task)).rename(task, title); }
+  findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
+    const rpc = new MetadataRpc(this.sourceHome(task), undefined, 10_000);
+    return findAcceptedInputTurn(task.threadId, operationId, params => rpc.call("thread/turns/list", params));
+  }
+  async queue(request: SubmitTaskRequest, input: readonly IpcObject[]): Promise<string> {
+    const metadata = this.createMetadata(this.sourceHome(request.task));
+    if (!metadata.queue) throw new ActionRejectedError("Штатная очередь недоступна в выбранном каталоге Codex.");
+    return metadata.queue(request, input);
+  }
+
   async archive(task: TaskRef): Promise<void> {
     if (task.hostId !== "local") throw new ActionRejectedError("Архивация доступна только локальным задачам.");
     const home = this.sourceHome(task);
@@ -310,6 +356,7 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
       // Once dispatched to an owner, do not retry through a different connection.
       if (error instanceof OwnerTransportError && error.outcome === "unknown") throw new UncertainActionError();
       if (error instanceof OwnerTransportError && error.outcome === "rejected") throw new ActionRejectedError("Владелец задачи не разрешил безопасную архивацию. Проверь завершение ходов, состояние цели и дочерних задач.");
+      if (error instanceof OwnerTransportError && error.outcome === "outdated") throw new DesktopUnavailableError("Адаптер клиента Codex для исходного каталога устарел. Перезапусти этот клиент с текущим адаптером VKodex; архивация не выполнялась.");
       throw new DesktopUnavailableError("Канал владельца задачи недоступен; архивация не подтверждена.");
     }
     await this.createMetadata(home).archive(task);
@@ -334,9 +381,17 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
         const archived = db.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(task.threadId) as { rollout_path: string } | undefined;
         const relative = archived && path.relative(home, archived.rollout_path);
         if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid archive path");
-        const file = await stat(archived!.rollout_path);
-        if (file.size !== checkpoint.size || file.mtimeMs !== checkpoint.mtimeMs) {
-          throw new TransferConflictError("История источника изменилась перед архивацией. Архив сохранён, но перенос требует проверки новых сообщений.");
+        if (checkpoint.semanticDigest) {
+          const digest = await completedHistoryDigest(task.threadId, checkpoint.lastTurnId,
+            params => new MetadataRpc(home).call("thread/turns/list", params));
+          if (digest !== checkpoint.semanticDigest) {
+            throw new TransferConflictError("Содержимое истории источника изменилось перед архивацией. Архив сохранён, перенос требует проверки.");
+          }
+        } else {
+          const file = await stat(archived!.rollout_path);
+          if (file.size !== checkpoint.size || file.mtimeMs !== checkpoint.mtimeMs) {
+            throw new TransferConflictError("История источника изменилась перед архивацией. Архив сохранён, но перенос требует проверки новых сообщений.");
+          }
         }
       }
       return row.archived === 1;
