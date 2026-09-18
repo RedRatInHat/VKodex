@@ -15,7 +15,7 @@ import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
 import { completedHistoryDigest } from "./history-digest.js";
 
-type TransferMethod = "thread/fork" | "thread/list" | "thread/turns/list";
+type TransferMethod = "thread/fork" | "thread/list" | "thread/read" | "thread/turns/list";
 
 interface StagedRollout {
   readonly path: string;
@@ -231,6 +231,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       || !await this.hasSourceThread(target.rolloutPath, request.task.threadId))) {
       throw new ActionRejectedError("Сохранённая копия не подтверждает исходную историю. Новый fork не создан.");
     }
+    if (target) await this.verifyLineage(request.task, target);
     if (!target) {
       if (request.forkSubmitted) throw new TransferConflictError("Отправка fork зафиксирована, но ID результата не подтверждён. Источник сохранён; новая копия автоматически не создаётся. Нужна проверка операции.");
       const lastTurnId = request.checkpoint?.lastTurnId ?? await this.lastTerminalTurn(sourceHome, request.task.threadId);
@@ -318,17 +319,32 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       || !target.rolloutPath || !inside(this.catalog.sourceHome(target), target.rolloutPath)) {
       throw new TransferConflictError("Назначение не соответствует выбранному каталогу или новой копии.");
     }
+    const targetHome = this.catalog.sourceHome(target);
+    await this.verifyLineage(request.task, target);
     const project = await this.targetProject(request.projectId, request.targetSourceId);
     const current = await this.metadata.read(target);
     if (current.title !== request.task.title || current.projectId !== (project?.rawId ?? null)) {
       throw new DesktopUnavailableError("Название или нативное назначение проекта не подтверждено. VK-беседа ещё не переключена.");
     }
-    if (await this.lastTerminalTurn(this.catalog.sourceHome(target), target.threadId) !== request.checkpoint.lastTurnId) {
+    if (await this.lastTerminalTurn(targetHome, target.threadId) !== request.checkpoint.lastTurnId) {
       throw new TransferConflictError("Последний ход копии не совпадает со снимком исходной задачи.");
     }
     if (request.checkpoint.semanticDigest && await completedHistoryDigest(target.threadId, request.checkpoint.lastTurnId,
-      params => this.createRpc(this.catalog.sourceHome(target)).call("thread/turns/list", params)) !== request.checkpoint.semanticDigest) {
+      params => this.createRpc(targetHome).call("thread/turns/list", params)) !== request.checkpoint.semanticDigest) {
       throw new TransferConflictError("Содержимое истории копии не совпадает с исходной задачей. VK-беседа не переключена.");
+    }
+  }
+
+  private async verifyLineage(source: TaskRef, target: DesktopTask): Promise<void> {
+    const native = await this.createRpc(this.catalog.sourceHome(target)).call("thread/read", { threadId: target.threadId, includeTurns: false });
+    if (!isObject(native.thread) || native.thread.id !== target.threadId) {
+      throw new DesktopUnavailableError("Codex не подтвердил идентичность целевой задачи.");
+    }
+    // Current App Server exposes direct fork lineage. It is stronger than a
+    // matching title or copied prefix. Older builds may omit it, so history
+    // verification remains mandatory for every version.
+    if (typeof native.thread.forkedFromId === "string" && native.thread.forkedFromId !== source.threadId) {
+      throw new TransferConflictError("Целевая задача создана из другого источника. VK-беседа не переключена.");
     }
   }
 
@@ -341,6 +357,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     const sourceHome = this.catalog.sourceHome(source);
     const targetHome = this.catalog.sourceHome(target);
     try {
+      await this.verifyLineage(source, target);
       if (await this.lastTerminalTurn(sourceHome, source.threadId) !== checkpoint.lastTurnId) {
         throw new TransferConflictError("После снимка у источника появились новые ходы.");
       }
@@ -393,6 +410,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     const matches = inspected.filter(candidate => candidate.matches).map(candidate => candidate.task);
     if (matches.length > 1) throw new ActionRejectedError("В целевом каталоге найдено несколько возможных копий. Автоматический повтор остановлен; выбери нужную задачу вручную.");
     const match = matches[0];
+    if (match) await this.verifyLineage(request.task, match);
     if (match && request.checkpoint) {
       // Ancestry alone is not enough: a fork of an older fork also contains the
       // source ID. Check the exact copied boundary before accepting recovery.

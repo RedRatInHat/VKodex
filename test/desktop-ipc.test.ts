@@ -943,15 +943,20 @@ test("legacy archived transfer verifies the source and target history prefix", a
   const source = { hostId: "local", threadId: "source", sourceId: "work" };
   const target = { hostId: "local", threadId: "target", title: "Copied", workspace: "/target", updatedAt: 1 };
   const checkpoint = { lastTurnId: "boundary", rolloutPath: "/old/source.jsonl", size: 1, mtimeMs: 1 };
-  let archived = true; let targetText = "Original"; let sourceNewTurn = false;
+  let archived = true; let targetText = "Original"; let sourceNewTurn = false; let ancestor = "source";
   const transfer = new AppServerTaskTransfer({ sourceHome: (task: typeof source) => task.sourceId ? "/work" : "/base" } as never,
     { isArchived: async () => archived } as never,
-    (_home: string) => ({ call: async (_method: string, params: IpcObject) => ({ data: params.itemsView === "summary"
+    (_home: string) => ({ call: async (method: string, params: IpcObject) => method === "thread/read"
+      ? { thread: { id: "target", forkedFromId: ancestor } }
+      : { data: params.itemsView === "summary"
       ? [{ id: params.threadId === "source" && !sourceNewTurn ? "boundary" : "later", status: "completed", items: [] }]
       : [{ id: "boundary", status: "completed", items: [{ id: params.threadId === "source" ? "source-item" : "target-item",
         type: "userMessage", text: params.threadId === "source" ? "Original" : targetText }] },
-        ...(params.threadId === "target" ? [{ id: "later", status: "inProgress", items: [] }] : [])], nextCursor: null }) }) as never);
+        ...(params.threadId === "target" ? [{ id: "later", status: "inProgress", items: [] }] : [])], nextCursor: null } }) as never);
   await transfer.verifyLegacyArchivedPair(source, target, checkpoint);
+  ancestor = "unrelated";
+  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  ancestor = "source";
   targetText = "Changed";
   await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
   targetText = "Original"; sourceNewTurn = true;
@@ -1058,8 +1063,9 @@ test("App Server transfer reconciles a lost fork response without creating a dup
     sourceHome: () => targetHome, listSources: () => [{ id: "work", label: ".codex-work" }], listTasks: async () => [target],
     resolveProject: async () => assert.fail("No project expected"),
   } as never, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} }, () => ({
-    call: async (method: "thread/fork" | "thread/list") => {
+    call: async (method: "thread/fork" | "thread/list" | "thread/read") => {
       if (method === "thread/fork") { forks++; throw new Error("must not fork"); }
+      if (method === "thread/read") return { thread: { id: target.threadId, forkedFromId: "source-thread" } };
       return { data: [{ id: target.threadId, cwd: target.workspace, path: rollout, name: target.title,
         createdAt: 100, updatedAt: 101, forkedFromId: "source-thread" }] };
     },
@@ -1068,6 +1074,25 @@ test("App Server transfer reconciles a lost fork response without creating a dup
     hostId: "local", threadId: "source-thread", title: "Moved task", rolloutPath: path.resolve("source.jsonl"),
   }, targetSourceId: "work", projectId: null });
   assert.equal(result.threadId, target.threadId); assert.equal(forks, 0);
+});
+
+test("fork reconciliation never adopts a different direct ancestor with similar history", async () => {
+  const home = path.resolve("fixture-target-home");
+  const target: DesktopTask = { hostId: "local", threadId: "other-fork", sourceId: "work", title: "Moved task",
+    workspace: path.resolve("fixture-project"), rolloutPath: path.join(home, "sessions", "candidate.jsonl"), updatedAt: 100_001 };
+  let forks = 0;
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => assert.fail("Unrelated fork must not be renamed"), archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  () => ({ call: async method => {
+    if (method === "thread/fork") { forks++; throw new Error("Unexpected duplicate fork"); }
+    assert.equal(method, "thread/read");
+    return { thread: { id: target.threadId, forkedFromId: "different-source" } };
+  } }), undefined, async () => true);
+  await assert.rejects(transfer.fork({ operationId: "lost-fork", startedAt: 100_000,
+    task: { hostId: "local", threadId: "source-thread", title: target.title, rolloutPath: path.resolve("source.jsonl") },
+    targetSourceId: "work", projectId: null }), /из другого источника/u);
+  assert.equal(forks, 0);
 });
 
 test("a v2 transfer with an unacknowledged fork never adopts an unrelated descendant or submits another fork", async () => {
@@ -1089,9 +1114,47 @@ test("transfer verification rejects inferred project success when native metadat
     listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
   { rename: async () => assert.fail("Verification is read-only"), archive: async () => {}, markdown: async () => "", assignProject: async () => {},
     read: async () => ({ title: "Fixture", projectId: "unexpected-native-project" }) },
-  () => ({ call: async () => ({ data: [{ id: "boundary", status: "completed" }] }) }));
+  () => ({ call: async method => method === "thread/read"
+    ? { thread: { id: target.threadId, forkedFromId: ref.threadId } }
+    : { data: [{ id: "boundary", status: "completed" }] } }));
   await assert.rejects(transfer.verifyTarget({ operationId: "verify", startedAt: 1, task: { ...ref, title: "Fixture" }, targetSourceId: "work", projectId: null,
     checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }, target), DesktopUnavailableError);
+});
+
+test("transfer verification rejects a native fork of another source before switching VK", async () => {
+  const home = path.resolve("fixture-target");
+  const target: DesktopTask = { ...ref, threadId: "new-thread", sourceId: "work", title: "Fixture", workspace: home,
+    rolloutPath: path.join(home, "sessions", "target.jsonl"), updatedAt: 1 };
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => assert.fail("Verification is read-only"), archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    read: async () => assert.fail("Wrong fork must fail before metadata inspection") },
+  () => ({ call: async method => {
+    assert.equal(method, "thread/read");
+    return { thread: { id: target.threadId, forkedFromId: "unrelated-source" } };
+  } }));
+  await assert.rejects(transfer.verifyTarget({ operationId: "wrong-fork", startedAt: 1,
+    task: { ...ref, title: "Fixture" }, targetSourceId: "work", projectId: null,
+    checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }, target),
+  /из другого источника/u);
+});
+
+test("transfer verification accepts matching lineage and older clients without lineage", async () => {
+  const home = path.resolve("fixture-target");
+  const target: DesktopTask = { ...ref, threadId: "new-thread", sourceId: "work", title: "Fixture", workspace: home,
+    rolloutPath: path.join(home, "sessions", "target.jsonl"), updatedAt: 1 };
+  for (const lineage of [ref.threadId, undefined]) {
+    const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+      listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+    { rename: async () => assert.fail("Verification is read-only"), archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+      read: async () => ({ title: target.title, projectId: null }) },
+    () => ({ call: async method => method === "thread/read"
+      ? { thread: { id: target.threadId, ...(lineage ? { forkedFromId: lineage } : {}) } }
+      : { data: [{ id: "boundary", status: "completed" }] } }));
+    await transfer.verifyTarget({ operationId: "confirmed-fork", startedAt: 1,
+      task: { ...ref, title: target.title }, targetSourceId: "work", projectId: null,
+      checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }, target);
+  }
 });
 
 test("a projectless transfer accepts catalog project inference from its workspace", async () => {
@@ -1104,12 +1167,31 @@ test("a projectless transfer accepts catalog project inference from its workspac
     resolveProject: async () => assert.fail("No explicit project expected"),
   } as never, {
     rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => { projectWrites++; },
-  }, () => ({ call: async () => assert.fail("Existing copy must not be forked again") }), undefined, async () => true);
+  }, () => ({ call: async method => method === "thread/read"
+    ? { thread: { id: target.threadId, forkedFromId: "source-thread" } }
+    : assert.fail("Existing copy must not be forked again") }), undefined, async () => true);
   const result = await transfer.fork({ operationId: "projectless-inferred", startedAt: 100_000, existingTarget: target,
     task: { hostId: "local", threadId: "source-thread", title: target.title, rolloutPath: path.resolve("source.jsonl") },
     targetSourceId: "work", projectId: null });
   assert.equal(result.projectId, "inferred-project");
   assert.equal(projectWrites, 0);
+});
+
+test("a saved target with wrong native ancestor is rejected before metadata writes", async () => {
+  const home = path.resolve("fixture-target-home");
+  const target: DesktopTask = { hostId: "local", threadId: "saved-copy", sourceId: "work", title: "Wrong name",
+    workspace: home, rolloutPath: path.join(home, "sessions", "target.jsonl"), updatedAt: 1 };
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: ".codex-work" }], listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => assert.fail("Wrong fork must not be renamed"), archive: async () => {}, markdown: async () => "",
+    assignProject: async () => assert.fail("Wrong fork must not be assigned") },
+  () => ({ call: async method => {
+    assert.equal(method, "thread/read");
+    return { thread: { id: target.threadId, forkedFromId: "unrelated" } };
+  } }), undefined, async () => true);
+  await assert.rejects(transfer.fork({ operationId: "saved-wrong-fork", startedAt: 1, existingTarget: target,
+    task: { hostId: "local", threadId: "source", title: "Correct name", rolloutPath: path.resolve("source.jsonl") },
+    targetSourceId: "work", projectId: null }), /из другого источника/u);
 });
 
 test("a fork identity survives rejected project metadata and retry prepares that same target", async () => {
@@ -1131,6 +1213,7 @@ test("a fork identity survives rejected project metadata and retry prepares that
     },
   }, () => ({ call: async method => {
     if (method === "thread/turns/list") return { data: [{ id: "terminal", status: "failed" }] };
+    if (method === "thread/read") return { thread: { id: "one-fork", forkedFromId: ref.threadId } };
     assert.equal(method, "thread/fork"); forks++;
     target = { hostId: "local", threadId: "one-fork", sourceId: "work", title: "Initial", workspace: home, rolloutPath: path.join(home, "sessions", "target.jsonl"), projectId: null, updatedAt: 100_000 };
     return { thread: { id: target.threadId, cwd: home, path: target.rolloutPath } };
@@ -1157,7 +1240,9 @@ test("transfer does not confirm a project from an acknowledged database write al
   }, {
     rename: async () => {}, archive: async () => assert.fail("Unconfirmed project must not archive the source"), markdown: async () => "",
     assignProject: async () => { writes++; },
-  }, () => ({ call: async () => assert.fail("Existing copy must not be forked again") }),
+  }, () => ({ call: async method => method === "thread/read"
+    ? { thread: { id: target.threadId, forkedFromId: ref.threadId } }
+    : assert.fail("Existing copy must not be forked again") }),
   async () => assert.fail("Existing copy must not be staged again"), async () => true);
   await assert.rejects(transfer.fork({ operationId: "same-operation", startedAt: 1, existingTarget: target,
     task: { ...ref, title: target.title, rolloutPath: path.resolve("source.jsonl") }, targetSourceId: "work", projectId: "target-project",
