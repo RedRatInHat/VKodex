@@ -75,21 +75,23 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
 
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
     const model = request.model?.trim(); const effort = request.effort?.trim();
+    // The configured Desktop default may be newer than VKodex's bundled CLI.
+    // Inheriting it can create a thread whose first turn fails after creation.
+    if (!model) throw new ActionRejectedError("Выбери модель из списка VKodex перед созданием задачи. Настройка Codex по умолчанию может не поддерживаться установленным CLI.");
     if (effort && !efforts.has(effort)) throw new ActionRejectedError("Выбранный уровень рассуждения не поддерживается Codex.");
-    const resolved = await this.resolveWorkspace(request);
-    if (model && this.catalog.listModels) {
-      const models = await this.catalog.listModels({ hostId: "local", threadId: "", sourceId: resolved.sourceId ?? "" });
-      const available = models.find(item => item.id === model);
-      if (!available || (effort && !available.efforts.includes(effort))) {
-        throw new ActionRejectedError("Версия Codex CLI, установленная с VKodex, не поддерживает выбранную модель или уровень рассуждения. Обнови VKodex или выбери доступную модель; задача не создана.");
-      }
+    if (!this.catalog.listModels) throw new DesktopUnavailableError("Список моделей выбранного каталога недоступен; задача не создана.");
+    const models = await this.catalog.listModels({ hostId: "local", threadId: "", sourceId: request.sourceId ?? "" });
+    const available = models.find(item => item.id === model);
+    if (!available || (effort && !available.efforts.includes(effort))) {
+      throw new ActionRejectedError("Версия Codex CLI, установленная с VKodex, не поддерживает выбранную модель или уровень рассуждения. Обнови VKodex или выбери доступную модель; задача не создана.");
     }
+    const resolved = await this.resolveWorkspace(request);
     const controller = new AbortController();
     const thread = this.createCodex(resolved.sourceHome).startThread({
       workingDirectory: resolved.workspace,
       threadSource: "user",
       skipGitRepoCheck: request.projectId === null,
-      ...(model ? { model } : {}),
+      model,
       ...(effort ? { modelReasoningEffort: effort as ModelReasoningEffort } : {}),
     });
     let stream;

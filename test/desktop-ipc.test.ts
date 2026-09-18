@@ -875,6 +875,7 @@ test("App Server creator materializes a new task with its atomic first turn", as
   const creator = new AppServerTaskCreator({
     resolveProject: async () => ({ project: { id: "visible", title: "Project", workspace }, rawProjectId: "raw", sourceHome: profileRoot, sourceId: "work", sourceLabel: ".codex-work" }),
     sourceHome: () => profileRoot, listTasks: async () => [catalogTask],
+    listModels: async () => [{ id: "model-a", title: "Model A", efforts: ["high"], defaultEffort: "high" }],
   }, {
     rename: async (_task, title) => { metadata.push(`name:${title}`); }, archive: async () => {}, markdown: async () => "",
     assignProject: async (_task, projectId) => { metadata.push(`project:${projectId}`); },
@@ -899,9 +900,8 @@ test("App Server creator materializes a new task with its atomic first turn", as
 test("App Server creator rejects a model absent from its own CLI before creating a task", async () => {
   let started = 0;
   const profileRoot = path.resolve("fixture-app-server-home");
-  const workspace = path.resolve("fixture-project");
   const creator = new AppServerTaskCreator({
-    resolveProject: async () => ({ project: { id: "visible", title: "Project", workspace }, rawProjectId: "raw", sourceHome: profileRoot, sourceId: "work", sourceLabel: ".codex-work" }),
+    resolveProject: async () => assert.fail("Unsupported model must be rejected before workspace preparation"),
     sourceHome: () => profileRoot, listTasks: async () => [],
     listModels: async task => {
       assert.equal(task?.sourceId, "work");
@@ -913,6 +913,34 @@ test("App Server creator rejects a model absent from its own CLI before creating
   await assert.rejects(creator.createTask({ operationId: "unsupported-model", projectId: "visible", sourceId: "work",
     title: "Test", prompt: "Test", model: "gpt-6-astra", effort: "high", environment: "local" }),
   /не поддерживает выбранную модель/u);
+  assert.equal(started, 0);
+});
+
+test("App Server creator never inherits an unsupported Desktop default model", async () => {
+  let started = 0;
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => assert.fail("No workspace or project should be prepared"),
+    sourceHome: () => assert.fail("No profile should be opened"),
+    listTasks: async () => assert.fail("No task should exist"),
+  } as never, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  (() => { started++; throw new Error("No App Server should start"); }) as never);
+  await assert.rejects(creator.createTask({ operationId: "missing-model", projectId: null,
+    workspace: path.resolve("fixture-workspace"), title: "Test", prompt: "Test", environment: "local" }),
+  /Выбери модель/u);
+  assert.equal(started, 0);
+});
+
+test("App Server creator requires a profile model inventory before creating a task", async () => {
+  let started = 0;
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => assert.fail("No project should be prepared"),
+    sourceHome: () => assert.fail("No profile should be opened"),
+    listTasks: async () => assert.fail("No task should exist"),
+  } as never, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  (() => { started++; throw new Error("No App Server should start"); }) as never);
+  await assert.rejects(creator.createTask({ operationId: "missing-inventory", projectId: null,
+    workspace: path.resolve("fixture-workspace"), title: "Test", prompt: "Test", model: "gpt-5.6-sol", environment: "local" }),
+  /Список моделей/u);
   assert.equal(started, 0);
 });
 
