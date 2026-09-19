@@ -187,13 +187,18 @@ export class BridgeHealthMonitor {
           detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${queued.length} VK-запрос(а) остаются в штатной очереди Codex ${Math.round(queuedAge / 1_000)} с при состоянии «${binding.status}». VKodex не запускает и не повторяет их самостоятельно.` });
       }
       if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
-      const problem = binding.failure === "usageLimit" ? "исчерпан лимит аккаунта"
-        : binding.failure === "systemError" ? "Codex сообщил системную ошибку"
+      const problem = binding.failure === "usageLimit" ? "последний ход завершился из-за лимита аккаунта"
+        : binding.failure === "systemError" ? "последний ход завершился системной ошибкой Codex"
           : "нет подтверждённой связи с владельцем выполняющейся задачи";
       const lastSeen = binding.lastConfirmedAt === null ? "подтверждения ещё не было"
         : `последнее подтверждение ${new Date(binding.lastConfirmedAt).toISOString()}`;
+      const next = binding.connected
+        ? binding.failure === "usageLimit"
+          ? "Связь с задачей подтверждена; проверь текущие лимиты через /limits и повтори запрос, если лимит уже восстановился."
+          : "Связь с задачей подтверждена; проверь /menu задачи перед повтором запроса."
+        : "Связь не подтверждена; мост повторяет подключение, проверь /menu задачи.";
       checks.push({ name: `codex_task:${binding.id}`, state: binding.failure === "systemError" ? "failed" : "degraded",
-        detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${problem}; ${lastSeen}. Мост повторяет подключение; проверь /menu задачи.` });
+        detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${problem}; ${lastSeen}. ${next}` });
     }
 
     const transfers = this.store.transfers().filter(record => !["complete", "cancelled"].includes(record.phase));

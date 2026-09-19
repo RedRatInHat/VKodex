@@ -79,6 +79,21 @@ test("Codex task failures degrade health even with a connected stream", async t 
   assert.equal(report.checks.find(check => check.name === "codex_tasks")!.state, "degraded");
 });
 
+test("health describes a connected historical usage limit without claiming the account is still exhausted", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 1,
+    requiredBindings: 0, connectedRequiredBindings: 0, failedBindings: 1,
+    bindings: [{ id: "limited", title: "Limited task", source: ".codex", status: "failed", connected: true,
+      lastConfirmedAt: 90_000, failure: "usageLimit" as const }],
+  }), undefined, () => now);
+  const check = (await monitor.check(true)).checks.find(item => item.name === "codex_task:limited")!;
+  assert.equal(check.state, "degraded");
+  assert.match(check.detail, /последний ход завершился.*лимита.*Связь с задачей подтверждена.*\/limits/u);
+  assert.doesNotMatch(check.detail, /исчерпан лимит|повторяет подключение/u);
+});
+
 test("health distinguishes a live task stream from a missing native owner adapter", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const task = (await new HealthDesktop().listTasks())[0]!;
