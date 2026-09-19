@@ -127,3 +127,15 @@ test("a timed-out mutation is never replayed when the profile connection recover
     assert.equal(second.messages.some(message => message.method === "turn/start"), false);
   } finally { await connection.close(); }
 });
+
+test("a timed-out read does not disconnect unrelated profile work", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
+    : message.method === "thread/read" ? null : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 20);
+  try {
+    await assert.rejects(connection.request("thread/read", { threadId: "slow" }), AppServerUnavailableError);
+    assert.deepEqual(await connection.request("model/list"), { ok: true });
+    assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
+  } finally { await connection.close(); }
+});

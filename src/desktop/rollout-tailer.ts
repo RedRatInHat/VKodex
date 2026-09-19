@@ -1,6 +1,7 @@
 import { open, stat } from "node:fs/promises";
 import { normalize } from "node:path";
 import type { TaskEvent, TaskRef } from "./contracts.js";
+import { visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
 
 interface Cursor { readonly offset: number; readonly pending: Buffer; readonly anchor: Buffer; }
 
@@ -141,7 +142,10 @@ function parseRecord(line: string): RolloutRecord | null {
     const turnId = turnIdFrom(item);
     if (!text || !turnId) return null;
     if (phase === "commentary") return { timestamp, event: { type: "progress", id: item.id, turnId, text } };
-    if (phase === "final" || phase === "final_answer") return { timestamp, event: { type: "final", id: item.id, turnId, text } };
+    if (phase === "final" || phase === "final_answer") {
+      const visible = visibleAutomationHeartbeatOutput(text);
+      return visible ? { timestamp, event: { type: "final", id: item.id, turnId, text: visible } } : null;
+    }
     return null;
   }
   if (record.type === "event_msg") {

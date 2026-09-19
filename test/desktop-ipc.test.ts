@@ -1989,6 +1989,18 @@ test("a reconnect recovers only the undelivered final of a turn accepted from VK
   }).events.length, 0);
 });
 
+test("snapshot projection does not mirror quiet scheduler heartbeats", () => {
+  const initial = projectSnapshot(state([], "completed"), null, 100);
+  const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
+  const completed = state([
+    { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
+    { type: "agentMessage", id: "progress", phase: "commentary", text: "Internal progress" },
+    { type: "agentMessage", id: "answer", phase: "final_answer", text: "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>" },
+  ], "completed");
+  const next = projectSnapshot(completed, initial.checkpoint, 200);
+  assert.deepEqual(next.events.filter(event => event.type !== "status"), []);
+});
+
 test("a reconnect recovers the terminal status of an accepted interrupted turn", () => {
   const attached = projectSnapshot(state([], "completed"), null, 100);
   const interrupted = state([

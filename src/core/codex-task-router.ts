@@ -177,6 +177,11 @@ export class RoutedCodexTasks implements CodexTasks {
   getGoal(task: TaskRef): Promise<TaskGoal | null> {
     const owner = this.owner(task); return owner?.getGoal(task) ?? this.base.getGoal?.(task) ?? Promise.resolve(null);
   }
+  healthGoal(task: TaskRef): Promise<TaskGoal | null> {
+    // Health probes run in the base adapter's short-lived read-only process.
+    // They must never stall or reset the long-lived profile writer used by VK.
+    return this.base.healthGoal?.(task) ?? this.base.getGoal?.(task) ?? Promise.resolve(null);
+  }
   setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
     const owner = this.owner(task);
     if (owner) return owner.setGoal(task, update);

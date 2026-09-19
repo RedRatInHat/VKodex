@@ -24,6 +24,19 @@ test("rollout tailer ignores old history and incrementally reads new visible ass
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), []);
 });
 
+test("rollout recovery suppresses quiet heartbeats and unwraps notifications", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  const quiet = "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>";
+  const notify = "<heartbeat><automation_id>monitor</automation_id><decision>NOTIFY</decision><message>Needs attention.</message></heartbeat>";
+  await writeFile(rollout,
+    line("2026-09-03T10:00:00.000Z", message("quiet", "quiet-turn", "final_answer", quiet))
+    + line("2026-09-03T10:01:00.000Z", message("notify", "notify-turn", "final_answer", notify)));
+  const tailer = new RolloutTailer(4096, 4096);
+  assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), [
+    { type: "final", id: "notify", turnId: "notify-turn", text: "Needs attention." },
+  ]);
+});
+
 test("rollout tailer expands beyond its initial tail window to recover older missed events", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
   await writeFile(rollout,

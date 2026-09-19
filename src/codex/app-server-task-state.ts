@@ -4,6 +4,7 @@ import { TaskOwnedByClientError, type TaskDetails, type TaskEvent, type TaskRef 
 import type { TaskObservation, TaskObservationCheckpoint, TaskObservationOptions, TaskObservedInput } from "../core/task-observation.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
 import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelope, type AppServerRpc } from "./app-server-connection.js";
+import { isAutomationHeartbeatInput, visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
 
 type JsonObject = Record<string, unknown>;
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -79,20 +80,24 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
+    const automationHeartbeat = turn.items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(textInput(item.content)));
     const lastAgentId = string(agentItems.at(-1)?.id);
     for (const item of turn.items) {
       const id = string(item.id); if (!id) continue;
       if (item.type === "userMessage") {
         const operationId = string(item.clientId); if (operationId) operationIds.push(operationId);
         const text = textInput(item.content);
-        if (eligible && text) emit({ type: "user", id, turnId: turn.id, text, ...(operationId ? { operationId } : {}) });
+        if (eligible && text && !isAutomationHeartbeatInput(text)) emit({ type: "user", id, turnId: turn.id, text, ...(operationId ? { operationId } : {}) });
       } else if (item.type === "agentMessage" && typeof item.text === "string" && item.delivery !== "async" && eligible) {
         if (turn.status === "inProgress" || item.phase === "commentary") {
-          emit({ type: "progress", id, turnId: turn.id, text: item.text });
+          if (!automationHeartbeat) emit({ type: "progress", id, turnId: turn.id, text: item.text });
         } else if (turn.status === "completed" && (item.phase === "final_answer" || item.phase == null) && id === lastAgentId) {
-          const event = { type: "final", id, turnId: turn.id, text: item.text } as const;
-          const missingAcceptedFinal = recoverFinal.has(turn.id) && !(options.finalRecorded?.(id) ?? false);
-          emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id));
+          const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
+          if (text) {
+            const event = { type: "final", id, turnId: turn.id, text } as const;
+            const missingAcceptedFinal = recoverFinal.has(turn.id) && !(options.finalRecorded?.(id) ?? false);
+            emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id));
+          }
         }
       }
     }

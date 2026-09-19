@@ -4,6 +4,7 @@ import type { TaskObservationCheckpoint as ProjectionCheckpoint, TaskObservation
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { comparablePath } from "./paths.js";
 import { parseAsyncQuestionReply } from "./questions.js";
+import { isAutomationHeartbeatInput, visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
 
 export type { ProjectionCheckpoint, ProjectionOptions };
 
@@ -134,6 +135,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
     const startedWhileDisconnected = rebaseline && lastObservedAt !== undefined
       && Number(turn.turnStartedAtMs) > lastObservedAt;
     const items = (turn.items as unknown[]).filter(isObject);
+    const automationHeartbeat = items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(userText(item.content)));
     const origins = new Map<string, string>();
     for (const item of items) {
       if (item.type === "steeringUserMessage" && item.status === "accepted" && typeof item.serverUserMessageId === "string" && typeof item.clientUserMessageId === "string") {
@@ -147,16 +149,19 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         const operationId = origins.get(id) ?? (typeof item.clientId === "string" ? item.clientId : undefined);
         const answers = parseAsyncQuestionReply(item.content);
         const text = answers.length ? answers.map(a => `Ответ на вопрос Codex «${a.question}»: ${a.answer}`).join("\n") : userText(item.content);
-        if (text) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) }, startedWhileDisconnected);
+        if (text && !isAutomationHeartbeatInput(text)) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) }, startedWhileDisconnected);
       } else if (item.type === "agentMessage" && typeof item.text === "string") {
         if (item.delivery === "async") continue; // Rendered as an actionable question card.
         // The first snapshot is a baseline even when the turn is already active.
         // Replaying its accumulated commentary would flood a newly linked VK chat
         // with progress that happened before the user connected it. A later edit
         // to the same item (or genuinely new content) is emitted.
-        if (item.phase === "commentary") emitSemantic({ type: "progress", id, turnId, text: item.text });
+        if (item.phase === "commentary") {
+          if (!automationHeartbeat) emitSemantic({ type: "progress", id, turnId, text: item.text });
+        }
         else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") {
-          emitSemantic({ type: "final", id, turnId, text: item.text }, previouslyActive.has(turnId) || startedWhileDisconnected);
+          const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
+          if (text) emitSemantic({ type: "final", id, turnId, text }, previouslyActive.has(turnId) || startedWhileDisconnected);
         }
       }
     }

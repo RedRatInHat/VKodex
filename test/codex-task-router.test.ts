@@ -19,6 +19,7 @@ function fixture() {
     inspectTask: async () => ({ status: "idle" as const, workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
     listModels: async () => [], selectModel: async () => { calls.push("base:model"); },
     renameTask: async () => ({ liveTitleUpdated: false }), archiveTask: async () => {}, archiveTransferredSource: async () => {}, exportMarkdown: async () => "",
+    healthGoal: async () => null,
     ensureOpen: async () => { calls.push("base:open"); },
   } satisfies CodexTasks;
   const owner: CodexTaskOwner = {
@@ -55,6 +56,15 @@ test("metadata and goals use the selected profile owner", async () => {
   assert.equal(await f.routed.clearGoal!(work), true);
   await f.routed.continueGoal!(work);
   assert.deepEqual(f.calls, ["owner:rename", "owner:move", "owner:clear-goal"]);
+});
+
+test("health goal reads are isolated from the long-lived task owner", async () => {
+  const f = fixture(); let ownerReads = 0; let healthReads = 0;
+  f.owner.getGoal = async () => { ownerReads++; return null; };
+  f.base.healthGoal = async () => { healthReads++; return null; };
+  assert.equal(await f.routed.getGoal!(work), null);
+  assert.equal(await f.routed.healthGoal!(work), null);
+  assert.deepEqual({ ownerReads, healthReads }, { ownerReads: 1, healthReads: 1 });
 });
 
 test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {

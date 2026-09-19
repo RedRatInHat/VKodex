@@ -298,6 +298,8 @@ export interface CodexTasks {
   accountUsage?(task?: TaskRef): Promise<readonly AccountUsage[]>;
   consumeUsageReset?(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome>;
   getGoal?(task: TaskRef): Promise<TaskGoal | null>;
+  /** Isolated read used by health checks; it must not share a task writer. */
+  healthGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
   continueGoal?(task: TaskRef): Promise<void>;

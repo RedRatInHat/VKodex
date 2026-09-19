@@ -133,6 +133,44 @@ test("native observer baselines old history and emits live progress and final on
   assert.deepEqual(repeated.events, []);
 });
 
+test("native observer hides scheduler input and quiet heartbeat output", () => {
+  const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
+  const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "idle", context: null, turns: [] };
+  const first = observeAppServerTaskState(empty, null, 10_000);
+  const running = structuredClone(empty); running.runtimeStatus = "active";
+  running.turns = [turn("heartbeat", "inProgress", [
+    { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
+    item("progress", "Internal automation progress", "commentary"),
+  ], 11_000)];
+  const live = observeAppServerTaskState(running, first.checkpoint, 12_000);
+  assert.deepEqual(live.events.map(event => event.type), ["status"]);
+
+  const completed = structuredClone(running); completed.runtimeStatus = "idle";
+  (completed.turns as JsonObject[])[0] = turn("heartbeat", "completed", [
+    { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
+    item("final", "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>"),
+  ], 11_000);
+  const done = observeAppServerTaskState(completed, live.checkpoint, 13_000);
+  assert.deepEqual(done.events, [{ type: "status", id: "status:heartbeat", turnId: "heartbeat", status: "completed" }]);
+});
+
+test("native observer unwraps a notifying heartbeat", () => {
+  const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
+  const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "idle", context: null, turns: [] };
+  const first = observeAppServerTaskState(empty, null, 10_000);
+  const completed = structuredClone(empty);
+  completed.turns = [turn("heartbeat", "completed", [
+    { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
+    item("final", "<heartbeat><automation_id>monitor</automation_id><decision>NOTIFY</decision><message>Needs attention.</message></heartbeat>"),
+  ], 11_000)];
+  const done = observeAppServerTaskState(completed, first.checkpoint, 12_000);
+  assert.deepEqual(done.events.filter(event => event.type === "final"), [
+    { type: "final", id: "final", turnId: "heartbeat", text: "Needs attention." },
+  ]);
+});
+
 test("a streamed final-answer item remains progress until the turn completes", () => {
   const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
     runtimeStatus: "idle", context: null, turns: [] };

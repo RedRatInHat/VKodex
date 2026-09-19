@@ -315,7 +315,8 @@ export class BridgeHealthMonitor {
       const bound = this.store.bindings().find(binding => binding.attached);
       const task = bound ?? (await withTimeout(this.desktop.listTasks(), 15_000))[0];
       if (!task) return { name: "codex_goals", state: "ok", detail: "API целей подключён; задач для безопасного чтения пока нет." };
-      const goal = await withTimeout(this.desktop.getGoal(task), 15_000);
+      const readGoal = this.desktop.healthGoal ?? this.desktop.getGoal;
+      const goal = await withTimeout(readGoal.call(this.desktop, task), 15_000);
       return { name: "codex_goals", state: "ok", detail: goal ? `API целей отвечает; прочитан статус ${goal.status}.` : "API целей отвечает; у проверенной задачи цели нет." };
     } catch { return { name: "codex_goals", state: "failed", detail: "Локальный API целей Codex не ответил за 15 секунд." }; }
   }
