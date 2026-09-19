@@ -144,7 +144,8 @@ function parseRecord(line: string): RolloutRecord | null {
     if (phase === "commentary") return { timestamp, event: { type: "progress", id: item.id, turnId, text } };
     if (phase === "final" || phase === "final_answer") {
       const visible = visibleAutomationHeartbeatOutput(text);
-      return visible ? { timestamp, event: { type: "final", id: item.id, turnId, text: visible } } : null;
+      return visible ? { timestamp, event: { type: "final", id: item.id, turnId, text: visible,
+        ...(visible !== text ? { showMenu: false as const } : {}) } } : null;
     }
     return null;
   }

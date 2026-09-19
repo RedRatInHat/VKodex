@@ -33,7 +33,7 @@ test("rollout recovery suppresses quiet heartbeats and unwraps notifications", a
     + line("2026-09-03T10:01:00.000Z", message("notify", "notify-turn", "final_answer", notify)));
   const tailer = new RolloutTailer(4096, 4096);
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), [
-    { type: "final", id: "notify", turnId: "notify-turn", text: "Needs attention." },
+    { type: "final", id: "notify", turnId: "notify-turn", text: "Needs attention.", showMenu: false },
   ]);
 });
 

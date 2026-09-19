@@ -45,14 +45,15 @@ export class TaskMirror {
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
       if (event.type === "user" && this.store.consumeExpectedEditedUser(binding.id, event.text)) return;
       const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";
-      const footer = event.type === "final" ? MENU_FOOTER : "";
+      const showMenu = event.type === "final" && event.showMenu !== false;
+      const footer = showMenu ? MENU_FOOTER : "";
       // Reserve room for the footer so it cannot become a separate VK message.
       const chunks = chunkText(event.text, this.chunkSize - prefix.length - footer.length);
       chunks.forEach((chunk, index) => {
         this.store.enqueue(`event:${binding.id}:${event.id}:${index}`, peerId, {
           text: `${prefix}${chunk}${index === chunks.length - 1 ? footer : ""}`,
           ...(event.type === "user" ? { silent: true } : {}),
-          ...(event.type === "final" && index === chunks.length - 1 ? { buttons: [MENU_BUTTON] } : {}),
+          ...(showMenu && index === chunks.length - 1 ? { buttons: [MENU_BUTTON] } : {}),
         }, binding.id, false, event.turnId);
       });
     });

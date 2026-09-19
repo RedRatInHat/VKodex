@@ -167,7 +167,7 @@ test("native observer unwraps a notifying heartbeat", () => {
   ], 11_000)];
   const done = observeAppServerTaskState(completed, first.checkpoint, 12_000);
   assert.deepEqual(done.events.filter(event => event.type === "final"), [
-    { type: "final", id: "final", turnId: "heartbeat", text: "Needs attention." },
+    { type: "final", id: "final", turnId: "heartbeat", text: "Needs attention.", showMenu: false },
   ]);
 });
 

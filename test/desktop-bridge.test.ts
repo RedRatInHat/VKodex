@@ -827,6 +827,14 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   assert.equal(s.store.streamGeneration(original.id), 2);
 });
 
+test("automation notifications do not append a task menu", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.mirror.accept(binding.id, { type: "final", id: "automation-final", turnId: "automation-turn",
+    text: "Needs attention.", showMenu: false });
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view), [{ text: "Needs attention." }]);
+});
+
 test("catalog transfer reapplies the target project after opening its Codex client", async t => {
   const s = setup(t); const original = s.attach();
   s.desktop.capabilities.transferTask = true;

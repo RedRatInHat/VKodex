@@ -205,7 +205,7 @@ export interface TaskRenameResult {
 export type TaskEvent =
   // Only visible agent commentary; commands, tool output and file changes are excluded.
   | { readonly type: "progress"; readonly id: string; readonly turnId: string; readonly text: string }
-  | { readonly type: "final"; readonly id: string; readonly turnId: string; readonly text: string }
+  | { readonly type: "final"; readonly id: string; readonly turnId: string; readonly text: string; readonly showMenu?: false }
   | { readonly type: "user"; readonly id: string; readonly turnId: string; readonly text: string; readonly operationId?: string }
   | { readonly type: "status"; readonly id: string; readonly turnId: string; readonly status: "running" | "completed" | "failed" | "interrupted" | "approval" };
 

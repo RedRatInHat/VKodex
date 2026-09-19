@@ -94,7 +94,8 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
         } else if (turn.status === "completed" && (item.phase === "final_answer" || item.phase == null) && id === lastAgentId) {
           const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
           if (text) {
-            const event = { type: "final", id, turnId: turn.id, text } as const;
+            const event = { type: "final", id, turnId: turn.id, text,
+              ...(automationHeartbeat ? { showMenu: false as const } : {}) } as const;
             const missingAcceptedFinal = recoverFinal.has(turn.id) && !(options.finalRecorded?.(id) ?? false);
             emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id));
           }

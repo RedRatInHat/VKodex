@@ -161,7 +161,8 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         }
         else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") {
           const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
-          if (text) emitSemantic({ type: "final", id, turnId, text }, previouslyActive.has(turnId) || startedWhileDisconnected);
+          if (text) emitSemantic({ type: "final", id, turnId, text, ...(automationHeartbeat ? { showMenu: false as const } : {}) },
+            previouslyActive.has(turnId) || startedWhileDisconnected);
         }
       }
     }
