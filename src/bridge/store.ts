@@ -598,6 +598,14 @@ export class BridgeStore {
       WHERE op.state = 'uncertain'`).get() as { count: number; oldestAt: number | null };
     return row;
   }
+  unresolvedPromptOperations(bindingId: string): readonly { id: string; state: "sending" | "uncertain"; createdAt: number }[] {
+    const current = this.getBinding(bindingId);
+    if (!current) return [];
+    return this.db.prepare(`SELECT op.id AS id, op.state AS state, input.created_at AS createdAt
+      FROM bridge_operations AS op JOIN bridge_operation_inputs AS input ON input.operation_id = op.id
+      WHERE input.binding_id = ? AND op.task_key = ? AND op.state IN ('sending', 'uncertain')
+      ORDER BY input.created_at`).all(bindingId, taskKey(current)) as { id: string; state: "sending" | "uncertain"; createdAt: number }[];
+  }
   markOperationChecked(id: string, now = Date.now()): void {
     this.db.prepare("UPDATE bridge_operation_inputs SET last_checked_at = ? WHERE operation_id = ?").run(now, id);
   }
@@ -636,7 +644,7 @@ export class BridgeStore {
   }
   rememberQueuedInput(bindingId: string, operationId: string, queuedId: string, now = Date.now()): void {
     const queued = this.queuedInputs(bindingId).filter(item => item.operationId !== operationId);
-    this.setValue(`queued-inputs:${bindingId}`, [...queued, { operationId, queuedId, acceptedAt: now }].slice(-32));
+    this.setValue(`queued-inputs:${bindingId}`, [...queued, { operationId, queuedId, acceptedAt: now }]);
   }
   queuedInputs(bindingId: string): readonly QueuedTaskInput[] {
     const value = this.getValue<unknown>(`queued-inputs:${bindingId}`);

@@ -797,6 +797,8 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   s.store.recordOperation("queued-source-operation", { ...original, threadId: "older-source" });
   s.store.finishOperation("queued-source-operation", "accepted");
   s.store.rememberQueuedInput(original.id, "queued-source-operation", "old-native-queue");
+  s.store.recordOperation("uncertain-source-operation", { ...original, threadId: "older-source" }, "old-inbox", original.id);
+  s.store.finishOperation("uncertain-source-operation", "uncertain");
   s.store.setValue(`health:legacy-accepted:${original.id}`, { signature: "old", firstSeenAt: 1 });
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
@@ -1234,6 +1236,20 @@ test("transfer cannot discard an accepted VK turn whose completion is still unkn
   assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
 });
 
+test("transfer waits for an unresolved VK prompt instead of racing its Codex acceptance", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.recordOperation("uncertain-operation", record.source, "vk-inbox", record.bindingId, s.now());
+  s.store.finishOperation("uncertain-operation", "uncertain");
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const saved = s.store.transfer(record.bindingId)!;
+  assert.equal(saved.blocked, true);
+  assert.match(saved.detail ?? "", /неподтверждённым результатом отправки/u);
+  assert.equal(saved.checkpoint, undefined);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+});
+
 test("transfer waits for the native Codex queue instead of losing queued VK input", async t => {
   const s = setup(t); const record = transferFixture(s);
   s.store.recordOperation("queued-operation", record.source, "vk-inbox", record.bindingId, s.now());
@@ -1247,6 +1263,17 @@ test("transfer waits for the native Codex queue instead of losing queued VK inpu
   assert.equal(saved.checkpoint, undefined);
   assert.equal(s.desktop.transfers.length, 0);
   assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+});
+
+test("native queue recovery retains every accepted item until Codex starts it", t => {
+  const s = setup(t); const binding = s.attach();
+  for (let index = 0; index < 40; index++) {
+    const operationId = `queued-operation-${index}`;
+    s.store.recordOperation(operationId, binding, `vk-inbox-${index}`, binding.id, s.now() + index);
+    s.store.finishOperation(operationId, "accepted");
+    s.store.rememberQueuedInput(binding.id, operationId, `native-queue-${index}`, s.now() + index);
+  }
+  assert.equal(s.store.queuedInputs(binding.id).length, 40);
 });
 
 test("an uncertain archive is read-only until native state confirms it", async t => {
