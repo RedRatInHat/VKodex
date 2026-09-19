@@ -696,7 +696,7 @@ export class TaskManager {
         this.files?.markQueued(binding.id, operationId);
         const queuedId = await this.desktop.queue(request);
         this.store.rememberQueuedInput(binding.id, operationId, queuedId);
-        this.store.finishOperation(operationId, "accepted");
+        this.store.settlePromptDispatch(operationId, "accepted");
         this.files?.finish(binding.id, operationId, "accepted");
         this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
         return;
@@ -705,7 +705,7 @@ export class TaskManager {
         ? await this.desktop.submitWithReceipt(request)
         : (await this.desktop.submit(request), null);
       if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
-      this.store.finishOperation(operationId, "accepted");
+      this.store.settlePromptDispatch(operationId, "accepted");
       this.files?.finish(binding.id, operationId, "accepted", receipt?.turnId ?? undefined);
       const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
       if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
@@ -720,7 +720,7 @@ export class TaskManager {
         const acceptedTurn = await this.desktop.findAcceptedInput(binding, operationId).catch(() => null);
         if (acceptedTurn) {
           this.store.rememberAcceptedTurn(binding.id, acceptedTurn, operationId);
-          this.store.finishOperation(operationId, "accepted");
+          this.store.settlePromptDispatch(operationId, "accepted");
           this.files?.finish(binding.id, operationId, "accepted", acceptedTurn);
           this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
             { text: "Codex принял запрос; подтверждение ответа задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
@@ -728,7 +728,7 @@ export class TaskManager {
         }
       }
       const state = error instanceof ActionRejectedError ? "rejected" : "uncertain";
-      this.store.finishOperation(operationId, state);
+      this.store.settlePromptDispatch(operationId, state);
       this.files?.finish(binding.id, operationId, state);
       throw error;
     }

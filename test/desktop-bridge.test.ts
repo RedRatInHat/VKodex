@@ -2993,6 +2993,21 @@ test("prompt journal and inbox leave the replayable state in one transaction", t
   assert.equal(s.store.operationState("one-operation"), "uncertain");
 });
 
+test("prompt result settles every merged VK fragment in the same durable commit", t => {
+  const s = setup(t); const binding = s.attach();
+  const keys = [JSON.stringify([peerId, "merged:message:41,message:42"]),
+    JSON.stringify([peerId, "message:41"]), JSON.stringify([peerId, "message:42"])];
+  for (const key of keys) assert.equal(s.store.claimInput(key), true);
+  s.store.markInputPreparing(keys);
+  s.store.beginPromptDispatch("merged-operation", binding, keys, binding.id);
+  s.store.settlePromptDispatch("merged-operation", "accepted");
+  assert.equal(s.store.operationState("merged-operation"), "accepted");
+  assert.deepEqual(keys.map(key => s.store.inputState(key)), ["done", "done", "done"]);
+  s.store.recover();
+  assert.equal(s.store.operationState("merged-operation"), "accepted");
+  assert.deepEqual(keys.map(key => s.store.inputState(key)), ["done", "done", "done"]);
+});
+
 test("a detached chat settles every merged VK fragment atomically", async t => {
   const s = setup(t); const binding = s.attach(); s.store.setAttached(binding.id, false);
   await s.manager.handle({ ...s.input("part one\npart two", peerId), eventId: "merged:message:20,message:21",

@@ -138,7 +138,7 @@ export class DesktopBridgeRuntime {
       if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== operation.taskKey
         || this.store.operationState(operation.id) !== "uncertain") return;
       this.store.atomic(() => {
-        this.store.finishOperation(operation.id, "accepted");
+        this.store.settlePromptDispatch(operation.id, "accepted");
         this.store.rememberAcceptedTurn(binding.id, turnId, operation.id);
         this.files?.finish(binding.id, operation.id, "accepted", turnId);
         this.store.enqueue(`reconciled-operation:${operation.id}`, current.peerId!, {

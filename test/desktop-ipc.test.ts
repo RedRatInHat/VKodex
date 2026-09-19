@@ -280,6 +280,7 @@ test("runtime reconciles an uncertain prompt from Codex history after restart", 
   (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
   for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(s.store.operationState(operationId), "accepted");
+  assert.equal(s.store.inputState(inboxKey), "done");
   assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "native-turn", operationId }]);
   assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
 });

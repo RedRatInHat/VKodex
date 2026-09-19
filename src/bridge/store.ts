@@ -117,7 +117,7 @@ export class BridgeStore {
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
         operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id),
-        binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), inbox_key TEXT NOT NULL,
+        binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), inbox_key TEXT NOT NULL, inbox_keys TEXT,
         created_at INTEGER NOT NULL, last_checked_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS bridge_events (binding_id TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(binding_id, event_id));
@@ -134,6 +134,8 @@ export class BridgeStore {
     `);
     migrateBindingSources(this.db);
     migrateInboxJournal(this.db);
+    const operationInputColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_operation_inputs)").all() as { name: string }[]).map(column => column.name));
+    if (!operationInputColumns.has("inbox_keys")) this.db.exec("ALTER TABLE bridge_operation_inputs ADD COLUMN inbox_keys TEXT");
     const actionColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_actions)").all() as { name: string }[]).map(column => column.name));
     if (!actionColumns.has("peer_id")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN peer_id INTEGER");
     if (!actionColumns.has("consumed")) this.db.exec("ALTER TABLE bridge_actions ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
@@ -570,8 +572,8 @@ export class BridgeStore {
   recordOperation(id: string, task: TaskRef, inboxKey?: string, bindingId?: string, now = Date.now()): void {
     this.atomic(() => {
       this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
-      if (inboxKey && bindingId) this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, created_at) VALUES (?, ?, ?, ?)")
-        .run(id, bindingId, inboxKey, now);
+      if (inboxKey && bindingId) this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, inbox_keys, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(id, bindingId, inboxKey, JSON.stringify([inboxKey]), now);
     });
   }
   beginPromptDispatch(id: string, task: TaskRef, inboxKeys: readonly string[], bindingId: string, now = Date.now()): void {
@@ -581,8 +583,8 @@ export class BridgeStore {
         if (this.inputState(key) !== "preparing") throw new Error("VK input is not prepared for Codex dispatch");
       }
       this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
-      this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, created_at) VALUES (?, ?, ?, ?)")
-        .run(id, bindingId, inboxKeys[0], now);
+      this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, inbox_keys, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(id, bindingId, inboxKeys[0], JSON.stringify(inboxKeys), now);
       for (const key of inboxKeys) this.db.prepare("UPDATE bridge_inbox SET state = 'sending' WHERE id = ?").run(key);
     });
   }
@@ -611,6 +613,25 @@ export class BridgeStore {
   }
   finishOperation(id: string, state: "accepted" | "rejected" | "uncertain"): void {
     this.db.prepare("UPDATE bridge_operations SET state = ? WHERE id = ?").run(state, id);
+  }
+  /** Commit a prompt result together with every VK fragment that formed it.
+   * This closes the crash window where Codex had accepted the request but the
+   * durable inbox still looked in-flight after restart. */
+  settlePromptDispatch(id: string, state: "accepted" | "rejected" | "uncertain"): void {
+    this.atomic(() => {
+      this.finishOperation(id, state);
+      const row = this.db.prepare("SELECT inbox_key, inbox_keys FROM bridge_operation_inputs WHERE operation_id = ?")
+        .get(id) as { inbox_key: string; inbox_keys: string | null } | undefined;
+      if (!row) return;
+      let keys: readonly string[] = [row.inbox_key];
+      if (row.inbox_keys) {
+        try {
+          const saved: unknown = JSON.parse(row.inbox_keys);
+          if (Array.isArray(saved) && saved.length && saved.every(key => typeof key === "string")) keys = saved;
+        } catch { /* A legacy or damaged list still retains its primary key. */ }
+      }
+      this.finishInputs(keys, state === "uncertain");
+    });
   }
   operationState(id: string): "sending" | "accepted" | "rejected" | "uncertain" | null {
     const row = this.db.prepare("SELECT state FROM bridge_operations WHERE id = ?").get(id) as { state: string } | undefined;
