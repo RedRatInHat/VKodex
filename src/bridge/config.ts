@@ -23,6 +23,8 @@ export type CodexLauncherConfig =
 
 export interface CodexSourceConfig {
   readonly home: string;
+  /** Explicit execution owner. Omitted keeps the existing UI-client contract. */
+  readonly owner?: "client" | "app-server";
   readonly launcher?: CodexLauncherConfig;
 }
 
@@ -79,8 +81,10 @@ export function configuredCodexSources(env: NodeJS.ProcessEnv = process.env): Co
     const key = comparablePath(home);
     if (seen.has(key)) throw new Error("CODEX_SOURCES contains duplicate homes");
     seen.add(key);
+    const owner = item.owner === undefined ? undefined : item.owner;
+    if (owner !== undefined && owner !== "client" && owner !== "app-server") throw new Error(`CODEX_SOURCES[${index}].owner is not supported`);
     const configuredLauncher = launcher(item.launcher, index);
-    result.push({ home, ...(configuredLauncher ? { launcher: configuredLauncher } : {}) });
+    result.push({ home, ...(owner ? { owner } : {}), ...(configuredLauncher ? { launcher: configuredLauncher } : {}) });
   }
   return result;
 }

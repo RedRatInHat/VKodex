@@ -16,6 +16,23 @@ export interface TaskStateTransport {
   close(): void;
 }
 
+export interface TaskStateOwnerRoute {
+  owns(task: TaskRef): boolean;
+  readonly states: TaskStateTransport;
+}
+
+/** Selects the configured source owner before opening a task stream. */
+export class RoutedTaskStateTransport implements TaskStateTransport {
+  constructor(private readonly fallback: TaskStateTransport, private readonly owners: readonly TaskStateOwnerRoute[]) {}
+  subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
+    return (this.owners.find(owner => owner.owns(task))?.states ?? this.fallback).subscribe(task, onState, onError);
+  }
+  close(): void {
+    this.fallback.close();
+    for (const owner of this.owners) owner.states.close();
+  }
+}
+
 export interface TaskStateConnectionFailure {
   readonly task: TaskRef;
   readonly error: Error;

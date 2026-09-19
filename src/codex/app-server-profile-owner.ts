@@ -1,7 +1,10 @@
-import { ActionRejectedError, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef } from "../core/codex-tasks.js";
+import { spawn } from "node:child_process";
+import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
+import { ActionRejectedError, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
 import type { CodexQuestions } from "../core/codex-questions.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
-import type { AppServerRpc } from "./app-server-connection.js";
+import { AppServerConnection, type AppServerRpc } from "./app-server-connection.js";
+import { nativeCodexPath } from "./native-cli.js";
 import { AppServerTaskExecutor } from "./app-server-task-executor.js";
 import { AppServerTaskStateTransport, observeAppServerTaskState } from "./app-server-task-state.js";
 
@@ -70,6 +73,17 @@ export class AppServerProfileOwner {
     } while (cursor);
     return null;
   }
+
+  async inspectTask(task: TaskRef): Promise<TaskDetails> {
+    this.assertOwner(task);
+    let state: TaskState | null = null;
+    const stream = this.nativeStates.subscribe(task, value => { state = value; }, () => {});
+    try {
+      await stream.start();
+      if (!state) throw new ActionRejectedError("Codex не вернул состояние задачи.");
+      return this.observe(state, null).details;
+    } finally { stream.close(); }
+  }
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void> {
     this.assertOwner(task); return this.executor.answerQuestions(task, question, answers, operationId, beforeSend);
@@ -78,6 +92,14 @@ export class AppServerProfileOwner {
   async close(): Promise<void> {
     this.unsubscribeQuestions(); this.nativeStates.close(); this.executor.close(); await this.rpc.close();
   }
+}
+
+export function createAppServerProfileOwner(sourceId: string, codexHome: string): AppServerProfileOwner {
+  const rpc = new AppServerConnection(() => spawn(nativeCodexPath(), ["app-server", "--stdio"], {
+    windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    env: { ...buildCodexEnvironment(process.env), CODEX_HOME: codexHome },
+  }));
+  return new AppServerProfileOwner(sourceId, rpc);
 }
 
 /** Routes state subscriptions to an explicit profile owner without fallback. */

@@ -35,17 +35,18 @@ test("invalid source configuration fails without exposing its value", () => {
 test("structured sources bind each Codex home to a launcher and legacy homes remain compatible", () => {
   const executable = path.resolve("fixture-code.exe"); const userDataDir = path.resolve("fixture-vscode-profile");
   const sources = configuredCodexSources({ CODEX_SOURCES: JSON.stringify([
-    { home: primary, launcher: { type: "desktop" } },
-    { home: extra, launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
+    { home: primary, owner: "app-server", launcher: { type: "desktop" } },
+    { home: extra, owner: "client", launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
   ]) });
   assert.deepEqual(sources, [
-    { home: primary, launcher: { type: "desktop" } },
-    { home: extra, launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
+    { home: primary, owner: "app-server", launcher: { type: "desktop" } },
+    { home: extra, owner: "client", launcher: { type: "vscode", executable, userDataDir, arguments: ["--reuse-window"] } },
   ]);
   assert.deepEqual(configuredCodexSources({ CODEX_HOME: primary, CODEX_EXTRA_HOMES: JSON.stringify([extra]) }), [
     { home: primary, launcher: { type: "desktop" } }, { home: extra },
   ]);
-  for (const value of ["PRIVATE", "[]", '[{"home":"PRIVATE","launcher":{"type":"unknown"}}]', '[{"home":"a"},{"home":"a"}]']) {
+  for (const value of ["PRIVATE", "[]", '[{"home":"PRIVATE","launcher":{"type":"unknown"}}]',
+    '[{"home":"PRIVATE","owner":"unknown"}]', '[{"home":"a"},{"home":"a"}]']) {
     assert.throws(() => configuredCodexSources({ CODEX_SOURCES: value }), error => error instanceof Error && !error.message.includes("PRIVATE"));
   }
 });

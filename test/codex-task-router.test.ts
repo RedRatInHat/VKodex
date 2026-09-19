@@ -1,0 +1,60 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
+import { ActionRejectedError, type CodexTasks, type TaskRef } from "../src/core/codex-tasks.js";
+import { RoutedTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
+
+const primary = { hostId: "local", threadId: "primary" };
+const work = { hostId: "local", threadId: "work", sourceId: "work" };
+
+function fixture() {
+  const calls: string[] = [];
+  const base = {
+    capabilities: { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true },
+    listTasks: async () => [], listProjects: async () => [], createTask: async () => { throw new Error("unused"); },
+    submit: async () => { calls.push("base:submit"); },
+    submitWithReceipt: async () => { calls.push("base:submitWithReceipt"); return { mode: "start" as const, turnId: "base-turn" }; },
+    interrupt: async () => { calls.push("base:interrupt"); }, moveTask: async () => { calls.push("base:move"); },
+    inspectTask: async () => ({ status: "idle" as const, workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
+    listModels: async () => [], selectModel: async () => { calls.push("base:model"); },
+    renameTask: async () => ({ liveTitleUpdated: false }), archiveTask: async () => {}, exportMarkdown: async () => "",
+    ensureOpen: async () => { calls.push("base:open"); },
+  } satisfies CodexTasks;
+  const owner: CodexTaskOwner = {
+    owns: task => (task.sourceId ?? "") === "work",
+    submitWithReceipt: async () => { calls.push("owner:submit"); return { mode: "start", turnId: "owner-turn" }; },
+    interrupt: async () => { calls.push("owner:interrupt"); }, queue: async () => "queued",
+    selectModel: async () => { calls.push("owner:model"); }, pendingQuestions: async () => [], answerQuestions: async () => {},
+    findAcceptedInput: async () => "accepted", inspectTask: async () => ({ status: "idle", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
+  };
+  return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
+}
+
+test("command router uses exactly the configured source owner", async () => {
+  const f = fixture();
+  assert.equal((await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" })).turnId, "owner-turn");
+  assert.equal((await f.routed.submitWithReceipt!({ operationId: "two", task: primary, text: "x" })).turnId, "base-turn");
+  await f.routed.interrupt(work); await f.routed.interrupt(primary);
+  await f.routed.selectModel(work, "model", "high"); await f.routed.selectModel(primary, "model", "high");
+  assert.deepEqual(f.calls, ["owner:submit", "base:submitWithReceipt", "owner:interrupt", "base:interrupt", "owner:model", "base:model"]);
+});
+
+test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {
+  const f = fixture(); await f.routed.ensureOpen!(work); assert.deepEqual(f.calls, []);
+  assert.throws(() => f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);
+  assert.deepEqual(f.calls, []);
+  await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["base:open"]);
+});
+
+test("state router sends each task only to its selected owner", () => {
+  const used: string[] = [];
+  const transport = (label: string): TaskStateTransport => ({
+    subscribe: (task: TaskRef): TaskStateStream => { used.push(`${label}:${task.threadId}`); return { task, start: async () => {}, verifyOwner: async () => {}, close: () => {} }; },
+    close: () => { used.push(`${label}:close`); },
+  });
+  const fallback = transport("client"); const native = transport("native");
+  const owner = { owns: (task: TaskRef) => task.sourceId === "work", states: native };
+  const routed = new RoutedTaskStateTransport(fallback, [owner]);
+  routed.subscribe(primary, () => {}, () => {}); routed.subscribe(work, () => {}, () => {}); routed.close();
+  assert.deepEqual(used, ["client:primary", "native:work", "client:close", "native:close"]);
+});

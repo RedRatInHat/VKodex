@@ -1,7 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
@@ -14,6 +12,8 @@ import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
 import { findAcceptedInputTurn } from "./input-reconciliation.js";
+export { nativeCodexPath } from "../codex/native-cli.js";
+import { nativeCodexPath } from "../codex/native-cli.js";
 
 export type LocalAppServerMethod = "model/list" | "thread/queue/add" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
 const methods = new Set<LocalAppServerMethod>(["model/list","thread/queue/add","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
@@ -31,23 +31,6 @@ function rejectedMetadata(method: LocalAppServerMethod, error: unknown): ActionR
     return new ActionRejectedError("Codex отклонил сброс лимита. Обнови /limits и проверь доступные кредиты выбранного аккаунта.");
   }
   return new ActionRejectedError("Codex отклонил операцию с метаданными. Проверь состояние задачи в десктопе.");
-}
-
-export function nativeCodexPath(): string {
-  const cpu = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : null;
-  const suffix = ({ win32: "pc-windows-msvc", linux: "unknown-linux-musl", darwin: "apple-darwin" } as Record<string, string>)[process.platform];
-  if (!cpu || !suffix) throw new DesktopUnavailableError("Эта платформа не поддерживает операции с метаданными Codex.");
-  try {
-    const require = createRequire(import.meta.url);
-    const cliRequire = createRequire(require.resolve("@openai/codex/package.json"));
-    const packageFile = cliRequire.resolve(`@openai/codex-${process.platform}-${process.arch}/package.json`);
-    const root = path.join(path.dirname(packageFile), "vendor", `${cpu}-${suffix}`);
-    const name = process.platform === "win32" ? "codex.exe" : "codex";
-    const candidates = [path.join(root, "bin", name), path.join(root, "codex", name)];
-    const binary = candidates.find(existsSync);
-    if (binary) return binary;
-  } catch { /* Present a static error, not local paths or subprocess output. */ }
-  throw new DesktopUnavailableError("Не найден локальный Codex CLI из зависимостей VKodex.");
 }
 
 // This short-lived process exposes a fixed allowlist for metadata, account and
