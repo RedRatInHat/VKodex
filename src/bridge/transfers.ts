@@ -16,6 +16,7 @@ const stages: Record<NonNullable<TaskTransferRecord["step"]>, string> = {
 };
 
 export function transferStatus(record: TaskTransferRecord): string {
+  if (record.phase === "cancelled" && record.conflictResolution === "keptBoth") return "Конфликт переноса закрыт без удаления данных. VK-беседа продолжает целевую задачу; изменившийся источник сохранён в прежнем каталоге и не архивирован.";
   if (record.phase === "cancelled") return "Перенос отменён. VK-беседа осталась в исходном каталоге. Если копия уже создана, она сохранена для проверки и не удалена. Цель не запускается автоматически; /goal — проверить её состояние.";
   if (record.phase === "complete" && record.legacyReconciled) return "Старая запись переноса закрыта: исходная задача уже архивирована, VK-привязка указывает на сохранённую копию. Граница старой истории не была записана; повторный перенос и изменение задач не выполнялись.";
   if (record.phase === "complete") return "Перенос завершён. VK-беседа подключена к проверенной копии; исходная задача архивирована."
@@ -78,6 +79,20 @@ export class TaskTransfers {
     const binding = this.store.getBinding(bindingId);
     if (!binding || !sameTask(binding, record.source)) throw new TransferConflictError("Привязка беседы изменилась. Отмена старой операции не выполнена.");
     const next = this.store.updateTransfer(record, { phase: "cancelled", blocked: false, retryAt: 0 }, this.now());
+    this.publish(next);
+  }
+
+  keepBoth(bindingId: string): void {
+    const record = this.store.transfer(bindingId);
+    if (!record?.target || record.phase !== "switched" || record.blockedReason !== "sourceChanged") {
+      throw new ActionRejectedError("Расхождения двух копий для этой задачи больше нет.");
+    }
+    if (this.running.has(record.id)) throw new ActionRejectedError("Проверка переноса ещё выполняется. Обнови /menu после её завершения.");
+    if (record.lease && processAlive(record.lease.pid)) throw new ActionRejectedError("Проверка переноса выполняется другим процессом VKodex. Обнови /menu позже.");
+    const binding = this.store.getBinding(bindingId);
+    if (!binding || !sameTask(binding, record.target)) throw new TransferConflictError("VK-беседа больше не указывает на проверенную целевую копию.");
+    const next = this.store.updateTransfer(record, { phase: "cancelled", blocked: false, blockedReason: null, retryAt: 0,
+      conflictResolution: "keptBoth", detail: "" }, this.now());
     this.publish(next);
   }
 

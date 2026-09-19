@@ -12,7 +12,7 @@ interface PanelState {
   id: string;
   messageKey: string;
   bindingId: string | null;
-  view: "home" | "projects" | "limitsReset" | "move" | "moveProject" | "moveSource" | "moveSourceProject" | "moveSourceConfirm" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
+  view: "home" | "projects" | "limitsReset" | "move" | "moveProject" | "moveSource" | "moveSourceProject" | "moveSourceConfirm" | "moveSourceConflict" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
   page: number;
   model?: string;
   title?: string;
@@ -425,6 +425,22 @@ export class TaskPanels {
         await this.home(input.peerId, "Перенос отменён. Исходная задача снова принимает запросы. Скопированная история, если есть, сохранена; цель автоматически не запускается.");
         break;
       }
+      case "moveSourceConflict": {
+        const record = this.store.transfer(binding.id);
+        if (!record?.target || record.phase !== "switched" || record.blockedReason !== "sourceChanged" || !sameTask(binding, record.target)) {
+          throw new ActionRejectedError("Конфликт переноса уже изменился. Обнови /menu.");
+        }
+        const next = this.newState(input.peerId, binding.id, "moveSourceConflict");
+        this.show(input.peerId, next, { text: "После копирования и исходная, и целевая задачи получили собственные изменения. Автоматически объединить две истории Codex нельзя.\n\nОставить обе копии? VK-беседа продолжит целевую задачу. Исходная задача останется неархивированной и доступной в прежнем каталоге; её цель не возобновится автоматически. Операция переноса будет закрыта без удаления данных.",
+          buttons: [this.button(input.peerId, next, "Оставить обе копии", "moveSourceConflictApply"), this.button(input.peerId, next, "Назад", "home")] });
+        break;
+      }
+      case "moveSourceConflictApply": {
+        if (state.view !== "moveSourceConflict") throw new ActionRejectedError("Подтверждение разрешения конфликта устарело.");
+        this.consume(input); this.transfers.keepBoth(binding.id);
+        await this.home(input.peerId, "Конфликт закрыт без удаления данных. VK продолжает целевую задачу; исходная копия сохранена в прежнем каталоге и не архивирована.");
+        break;
+      }
       case "models": await this.models(binding, action.page ?? 0); break;
       case "efforts": {
         const model = (await this.desktop.listModels(binding)).find(model => model.id === action.model);
@@ -788,7 +804,11 @@ export class TaskPanels {
         const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться"].includes(item.label));
         if (index >= 0) buttons.splice(index, 1);
       }
-      buttons.push(button(transfer.phase === "switched" ? "Повторить архивацию" : "Продолжить перенос", "moveSourceResume"));
+      if (transfer.phase === "switched" && transfer.blockedReason === "sourceChanged") {
+        buttons.push(button("Разрешить конфликт", "moveSourceConflict"));
+      } else {
+        buttons.push(button(transfer.phase === "switched" ? "Повторить архивацию" : "Продолжить перенос", "moveSourceResume"));
+      }
       if (transfer.phase !== "switched") {
         if (buttons.length >= 10) {
           const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться", "Markdown-файл"].includes(item.label));

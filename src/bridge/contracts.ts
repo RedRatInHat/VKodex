@@ -90,6 +90,8 @@ export interface TaskTransferRecord {
   readonly retryAt?: number;
   readonly blocked?: boolean;
   readonly blockedReason?: "archiveOwner" | "archiveUnknown" | "sourceChanged" | null;
+  /** Explicit owner decision after both source and target acquired unique work. */
+  readonly conflictResolution?: "keptBoth";
   /** A historical record closed from native archive + exact binding evidence,
    * not a claim that a missing legacy history checkpoint was reconstructed. */
   readonly legacyReconciled?: boolean;
@@ -141,7 +143,7 @@ export interface PanelAction {
   readonly type: "panel";
   readonly screenId: string;
   readonly bindingId?: string;
-  readonly command: "home" | "health" | "limits" | "limitsReset" | "limitsResetApply" | "projects" | "openDesktop" | "move" | "moveProject" | "moveProjectApply" | "moveSource" | "moveSourceSelect" | "moveSourceProject" | "moveSourceConfirm" | "moveSourceApply" | "moveSourceResume" | "moveSourceCancel" | "models" | "efforts" | "select" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalApply" | "goalPause" | "goalResume" | "goalClear" | "goalClearApply" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
+  readonly command: "home" | "health" | "limits" | "limitsReset" | "limitsResetApply" | "projects" | "openDesktop" | "move" | "moveProject" | "moveProjectApply" | "moveSource" | "moveSourceSelect" | "moveSourceProject" | "moveSourceConfirm" | "moveSourceApply" | "moveSourceResume" | "moveSourceCancel" | "moveSourceConflict" | "moveSourceConflictApply" | "models" | "efforts" | "select" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalApply" | "goalPause" | "goalResume" | "goalClear" | "goalClearApply" | "rename" | "renameApply" | "renameVk" | "archive" | "archiveApply" | "share" | "path" | "link" | "export";
   readonly page?: number;
   readonly model?: string;
   readonly effort?: string;

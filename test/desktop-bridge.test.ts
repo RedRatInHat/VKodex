@@ -1346,6 +1346,18 @@ test("an older blocked transfer reports a changed source instead of retrying its
   assert.match(s.store.transfer(record.bindingId)?.detail ?? "", /another completed turn/u);
   assert.equal(writes, 1);
   assert.throws(() => transfers.resume(record.bindingId), /автоматическая архивация запрещена/u);
+  const target = s.store.byPeer(peerId)!;
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Разрешить конфликт");
+  assert.match(panelView(s).text, /Оставить обе копии/u);
+  await clickPanel(s, "Оставить обе копии");
+  const resolved = s.store.transfer(record.bindingId)!;
+  assert.equal(resolved.phase, "cancelled");
+  assert.equal(resolved.conflictResolution, "keptBoth");
+  assert.equal(resolved.blockedReason, null);
+  assert.equal(s.store.byPeer(peerId)!.threadId, target.threadId);
+  assert.equal(writes, 1);
+  assert.match(transferStatus(resolved), /источник сохранён.*не архивирован/u);
 });
 
 test("archive confirmation does not close a transfer after its goal or binding changes", async t => {
