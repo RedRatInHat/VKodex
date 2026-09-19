@@ -38,10 +38,11 @@ const resume = (turns: JsonObject[], nextCursor: string | null = null) => ({
   initialTurnsPage: { data: turns, nextCursor },
 });
 
-test("native state stream pages history, buffers races and filters other tasks", async () => {
+test("native state stream bounds history, drops tool output, buffers races and filters other tasks", async () => {
   const rpc = new FakeRpc();
-  rpc.responses.set("thread/resume", [resume([turn("two", "completed", [item("old", "old")], 2)], "older")]);
-  rpc.responses.set("thread/turns/list", [{ data: [turn("one", "completed", [], 1)], nextCursor: null }]);
+  rpc.responses.set("thread/resume", [resume([turn("two", "completed", [
+    { type: "commandExecution", id: "large-tool-output", aggregatedOutput: "discard me" }, item("old", "old"),
+  ], 2)], "older")]);
   const states: { state: TaskState; initial: boolean }[] = []; const errors: Error[] = [];
   const transport = new AppServerTaskStateTransport(rpc);
   const stream = transport.subscribe({ hostId: "h", threadId: "task" }, (state, initial) => states.push({ state, initial }), error => errors.push(error));
@@ -53,7 +54,10 @@ test("native state stream pages history, buffers races and filters other tasks",
   };
   await stream.start();
   assert.equal(states.length, 1); assert.equal(states[0]?.initial, true);
-  assert.deepEqual((states[0]?.state.turns as JsonObject[]).map(value => value.id), ["one", "two", "three"]);
+  assert.deepEqual((states[0]?.state.turns as JsonObject[]).map(value => value.id), ["two", "three"]);
+  assert.deepEqual(rpc.calls.map(call => call.method), ["thread/resume"]);
+  assert.equal(((rpc.calls[0]?.params.initialTurnsPage as JsonObject).limit), 20);
+  assert.deepEqual(((states[0]?.state.turns as JsonObject[])[0]?.items as JsonObject[]).map(value => value.id), ["old"]);
   rpc.notify("item/agentMessage/delta", { threadId: "task", turnId: "three", itemId: "live", delta: "b" });
   assert.equal(states.length, 2);
   const latestTurns = states.at(-1)?.state.turns as JsonObject[];
@@ -62,6 +66,27 @@ test("native state stream pages history, buffers races and filters other tasks",
   rpc.responses.set("thread/read", [{ thread: { id: "task" } }]); await stream.verifyOwner();
   rpc.disconnect(); assert.equal(errors.length, 1);
   transport.close();
+});
+
+test("native state stream starts at most two profile reads concurrently", async () => {
+  const rpc = new FakeRpc(); let active = 0; let maximum = 0;
+  const releases: Array<() => void> = [];
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    assert.equal(method, "thread/resume"); active++; maximum = Math.max(maximum, active);
+    await new Promise<void>(resolve => releases.push(resolve)); active--;
+    const id = String(params.threadId);
+    return { thread: { id, name: id, status: { type: "idle" } }, initialTurnsPage: { data: [], nextCursor: null } };
+  };
+  const transport = new AppServerTaskStateTransport(rpc);
+  const starts = ["one", "two", "three"].map(threadId => transport
+    .subscribe({ hostId: "h", threadId }, () => {}, () => {}).start());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(maximum, 2); assert.equal(releases.length, 2);
+  releases.shift()!(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(maximum, 2); assert.equal(releases.length, 2);
+  while (releases.length) { releases.shift()!(); await new Promise(resolve => setImmediate(resolve)); }
+  await Promise.all(starts); transport.close();
 });
 
 test("native state stream keeps a live turn eligible when notifications omit timestamps", async () => {

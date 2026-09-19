@@ -35,7 +35,11 @@ function parseTurn(value: unknown): NativeTurn | null {
   return {
     id: String(value.id), status: String(value.status ?? ""),
     startedAt: typeof value.startedAt === "number" ? value.startedAt * 1000 : 0,
-    items: value.items.filter(isObject), error: isObject(value.error) ? value.error : null,
+    // Runtime mirroring needs only visible conversation items. Keeping tool
+    // output for every attached task made a cold bridge start retain hundreds
+    // of megabytes and could time out the shared profile connection.
+    items: value.items.filter(isObject).filter(item => item.type === "userMessage" || item.type === "agentMessage"),
+    error: isObject(value.error) ? value.error : null,
   };
 }
 
@@ -127,31 +131,28 @@ class AppServerTaskStream implements TaskStateStream {
   constructor(private readonly rpc: AppServerRpc, readonly task: TaskRef,
     private readonly onState: (state: TaskState, initial: boolean) => void,
     private readonly onError: (error: Error) => void,
-    private readonly questions: (threadId: string) => readonly CodexQuestions[]) {}
+    private readonly questions: (threadId: string) => readonly CodexQuestions[],
+    private readonly startGate: <T>(work: () => Promise<T>) => Promise<T>,
+    private readonly onClose: (stream: AppServerTaskStream) => void) {}
 
   async start(): Promise<void> {
     this.unsubscribeNotification = this.rpc.onNotification(notification => this.receive(notification));
     this.unsubscribeDisconnect = this.rpc.onDisconnect?.(error => { if (!this.closed) this.onError(error); }) ?? null;
     try {
-      const result = await this.rpc.request("thread/resume", {
-        threadId: this.task.threadId, excludeTurns: true,
-        initialTurnsPage: { limit: 100, sortDirection: "desc", itemsView: "full" },
+      const result = await this.startGate(async () => {
+        if (this.closed) throw new AppServerUnavailableError("Подключение к задаче уже закрыто.");
+        return this.rpc.request("thread/resume", {
+          threadId: this.task.threadId, excludeTurns: true,
+          // The stream is an operational tail, not a transfer verifier. Twenty
+          // recent turns cover reconnect recovery while full paged history
+          // remains in the dedicated transfer and reconciliation paths.
+          initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "full" },
+        }, { timeoutMs: 120_000 });
       });
       const thread = isObject(result.thread) ? result.thread : null;
       if (!thread || thread.id !== this.task.threadId) throw new AppServerUnavailableError("Codex открыл другую задачу.");
       const initial = isObject(result.initialTurnsPage) ? result.initialTurnsPage : {};
       const turns = Array.isArray(initial.data) ? initial.data.map(parseTurn).filter((turn): turn is NativeTurn => !!turn) : [];
-      let cursor = string(initial.nextCursor); const cursors = new Set<string>();
-      while (cursor) {
-        if (cursors.has(cursor)) throw new AppServerUnavailableError("Codex повторил страницу истории.");
-        cursors.add(cursor);
-        const page = await this.rpc.request("thread/turns/list", {
-          threadId: this.task.threadId, cursor, limit: 100, sortDirection: "desc", itemsView: "full",
-        });
-        if (!Array.isArray(page.data)) throw new AppServerUnavailableError("Codex вернул неполную историю.");
-        turns.push(...page.data.map(parseTurn).filter((turn): turn is NativeTurn => !!turn));
-        cursor = string(page.nextCursor);
-      }
       this.snapshot = this.makeSnapshot(thread, result, turns);
       for (const notification of this.queued.splice(0)) this.apply(notification);
       if (!this.closed) this.onState(this.snapshot, true);
@@ -199,7 +200,7 @@ class AppServerTaskStream implements TaskStateStream {
     if (notification.method === "turn/started" || notification.method === "turn/completed") upsert(notification.params.turn);
     else if (notification.method === "item/started" || notification.method === "item/completed") {
       const turnId = string(notification.params.turnId); const item = isObject(notification.params.item) ? notification.params.item : null;
-      if (turnId && item) turns = turns.map(turn => turn.id !== turnId ? turn : { ...turn,
+      if (turnId && item && (item.type === "userMessage" || item.type === "agentMessage")) turns = turns.map(turn => turn.id !== turnId ? turn : { ...turn,
         items: [...turn.items.filter(existing => existing.id !== item.id), item] });
     } else if (notification.method === "item/agentMessage/delta") {
       const turnId = string(notification.params.turnId); const itemId = string(notification.params.itemId);
@@ -229,18 +230,32 @@ class AppServerTaskStream implements TaskStateStream {
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true; this.unsubscribeNotification?.(); this.unsubscribeDisconnect?.();
     this.unsubscribeNotification = null; this.unsubscribeDisconnect = null; this.queued.length = 0;
+    this.onClose(this);
   }
 }
 
 /** Native task streams for one profile-scoped App Server connection. */
 export class AppServerTaskStateTransport implements TaskStateTransport {
   private readonly streams = new Set<AppServerTaskStream>();
+  private readonly startWaiters: Array<() => void> = [];
+  private activeStarts = 0;
   constructor(private readonly rpc: AppServerRpc,
     private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => []) {}
+  private async gate<T>(work: () => Promise<T>): Promise<T> {
+    if (this.activeStarts >= 2) await new Promise<void>(resolve => this.startWaiters.push(resolve));
+    this.activeStarts++;
+    try { return await work(); }
+    finally {
+      this.activeStarts--;
+      this.startWaiters.shift()?.();
+    }
+  }
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
-    const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions);
+    const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions,
+      work => this.gate(work), closed => this.streams.delete(closed));
     this.streams.add(stream); return stream;
   }
   refresh(threadId: string): void {
