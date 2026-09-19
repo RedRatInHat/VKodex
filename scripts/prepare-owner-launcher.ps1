@@ -33,14 +33,6 @@ foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $repo "dist\src\de
 $utf8 = New-Object Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $target 'package.json'), '{"private":true,"type":"module"}', $utf8)
 $config = @{version=1;codexHome=$homePath;nativeExecutable=$nativePath;runtimeExecutable=$runtimePath;adapterEntry=(Join-Path $target 'owner-launcher.js')}
-$nativeDirectory = Split-Path $nativePath -Parent
-$nativeVersion = Split-Path $nativeDirectory -Leaf
-$nativeRoot = Split-Path $nativeDirectory -Parent
-if ((Split-Path $nativePath -Leaf) -ieq 'codex.exe' -and $nativeVersion -match '^[a-f0-9]{16}$' -and (Split-Path $nativeRoot -Leaf) -ieq 'bin') {
-  # Codex Desktop replaces the hashed native directory during an AppX update.
-  # Resolve the newest signed app payload at launch instead of pinning a deleted file.
-  $config.nativeSearchRoot = $nativeRoot
-}
 $extensionDirectory = Split-Path (Split-Path (Split-Path $nativePath -Parent) -Parent) -Parent
 $extensionRegistry = Join-Path (Split-Path $extensionDirectory -Parent) 'extensions.json'
 if ((Split-Path $extensionDirectory -Leaf) -like 'openai.chatgpt-*' -and (Test-Path -LiteralPath $extensionRegistry -PathType Leaf)) {

@@ -341,8 +341,7 @@ Prepare on Windows after `npm run build`:
 Select the client's actual native CLI, not another adapter executable. The installer creates a separate package and private local channel; it does not change client settings or running processes. For standard VS Code extension installations, the package follows `extensions.json` across extension updates. Ambiguous entries or a mismatching manifest prevent startup.
 
 - **VS Code:** set `chatgpt.cliExecutable` in the selected profile to the generated `VKodexOwnerLauncher.exe`. This is an experimental extension setting.
-- **Codex Desktop:** launch the application with `CODEX_CLI_PATH` pointing to that executable. `CODEX_SOURCES` supports this through `launcher.type: "command"`, `launcher.environment`, and `scripts/start-codex-desktop.ps1`. The script resolves the current AppX version on every launch, so a Desktop update cannot leave the launcher pinned to a deleted versioned path. Opening a system URI does not guarantee environment propagation.
-- A Desktop adapter prepared from `%LOCALAPPDATA%\OpenAI\Codex\bin\<version>\codex.exe` stores the stable `bin` root and selects the current `codex.exe` at every start. Updating the app no longer requires rebuilding the package solely because the versioned directory changed.
+- **Codex Desktop:** launch the application with `CODEX_CLI_PATH` pointing to that executable. `CODEX_SOURCES` supports this through `launcher.type: "command"` and `launcher.environment`. Opening a system URI does not guarantee environment propagation.
 - **An existing client:** new environment variables cannot attach the adapter to an existing App Server. Initial activation requires a safe client restart; do not restart during tasks or while a browser session must be preserved.
 - **Rollback:** restore the previous CLI setting or remove `CODEX_CLI_PATH`, then restart the client when safe. The adapter does not rewrite task history.
 
