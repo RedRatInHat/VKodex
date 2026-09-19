@@ -291,7 +291,7 @@ export class BridgeHealthMonitor {
         try {
           if (!await withTimeout(this.desktop.isTaskArchived!(binding), 5_000)) return null;
           return { name: `archived_binding:${binding.id}`, state: "failed", detail:
-            `VK-беседа «${binding.title.slice(0, 120)}» привязана к архивной задаче (${binding.sourceLabel || binding.sourceId || ".codex"}). Выбери актуальную копию в менеджере; /open архив не восстановит.` } satisfies HealthCheckResult;
+            `VK-беседа «${binding.title.slice(0, 120)}» привязана к архивной задаче (${binding.sourceLabel || binding.sourceId || ".codex"}). Выбери актуальную копию в менеджере либо отправь /detach в старой беседе; /open архив не восстановит.` } satisfies HealthCheckResult;
         } catch {
           return { name: `archive_lookup:${binding.id}`, state: "degraded", detail:
             `Не удалось проверить архивный статус отсутствующей в каталоге задачи «${binding.title.slice(0, 120)}».` } satisfies HealthCheckResult;

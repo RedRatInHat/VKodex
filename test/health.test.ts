@@ -335,6 +335,7 @@ test("health fails for a VK binding left on an archived task", async t => {
   const report = await monitor.check(true);
   assert.equal(report.state, "failed");
   assert.match(report.checks.find(check => check.name === `archived_binding:${binding.id}`)!.detail, /Archived task.*архивной задаче/u);
+  assert.match(report.checks.find(check => check.name === `archived_binding:${binding.id}`)!.detail, /\/detach/u);
 });
 
 test("failed checks alert after two runs and recovery waits for three healthy runs", async t => {

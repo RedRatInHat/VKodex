@@ -187,6 +187,9 @@ export class TaskPanels {
     if (input.senderId === this.access.ownerId && text === "/open") {
       const binding = this.store.byPeer(input.peerId);
       if (!binding) return false;
+      if (this.desktop.isTaskArchived && await this.desktop.isTaskArchived(binding).catch(() => false)) {
+        throw new ActionRejectedError("Эта VK-беседа привязана к архивной задаче Codex. /open архив не восстановит. Отправь /detach либо выбери актуальную копию задачи в менеджере.");
+      }
       if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
       await (this.desktop.revealTask?.(binding) ?? this.desktop.ensureOpen!(binding));
       this.store.markDesktopHandoff(binding.id, binding, "launched");

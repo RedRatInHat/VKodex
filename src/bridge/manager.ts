@@ -714,9 +714,17 @@ export class TaskManager {
         ...(request.author ? { author: request.author } : {}), ...prepared,
       });
     } catch (error) {
+      let reported = error;
+      if ((error instanceof ActionRejectedError || error instanceof TaskNotOpenError) && this.desktop.isTaskArchived) {
+        const archived = await this.desktop.isTaskArchived(binding).catch(() => false);
+        if (archived) reported = new ActionRejectedError(
+          "Сообщение не отправлено: эта VK-беседа привязана к архивной задаче Codex. "
+          + "/open архив не восстановит. Отправь /detach, если старая беседа больше не нужна, либо выбери актуальную копию задачи в менеджере.",
+        );
+      }
       // A lost RPC acknowledgment is not necessarily a lost prompt. The native
       // userMessage clientId is the immutable operation ID sent to Codex.
-      if (!(error instanceof ActionRejectedError) && this.desktop.findAcceptedInput) {
+      if (!(reported instanceof ActionRejectedError) && this.desktop.findAcceptedInput) {
         const acceptedTurn = await this.desktop.findAcceptedInput(binding, operationId).catch(() => null);
         if (acceptedTurn) {
           this.store.rememberAcceptedTurn(binding.id, acceptedTurn, operationId);
@@ -727,10 +735,10 @@ export class TaskManager {
           return;
         }
       }
-      const state = error instanceof ActionRejectedError ? "rejected" : "uncertain";
+      const state = reported instanceof ActionRejectedError ? "rejected" : "uncertain";
       this.store.settlePromptDispatch(operationId, state);
       this.files?.finish(binding.id, operationId, state);
-      throw error;
+      throw reported;
     }
   }
 

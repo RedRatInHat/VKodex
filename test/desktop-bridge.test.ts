@@ -2880,6 +2880,20 @@ test("manager restores a persisted VK burst into one task turn after restart", a
   assert.equal(s.desktop.submissions.length, 1);
 });
 
+test("an archived binding explains detach or rebind instead of offering a useless open", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.archives.push(binding);
+  s.desktop.submitError = new TaskNotOpenError();
+  await s.handle("continue old task", peerId);
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.operationState(s.desktop.submissions[0]!.operationId), "rejected");
+  assert.match(s.chat.sent.at(-1)!.view.text, /архивной задаче.*\/detach.*менеджере/u);
+  s.desktop.opened.length = 0;
+  await s.handle("/open", peerId);
+  assert.equal(s.desktop.opened.length, 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /архивной задаче.*\/open архив не восстановит.*\/detach/u);
+});
+
 test("an incoming VK event saved before dispatch recovers without duplicate submission", async t => {
   const s = setup(t); s.attach();
   const input = { ...s.input("Recovered prompt", peerId), eventId: "message:1250" };
