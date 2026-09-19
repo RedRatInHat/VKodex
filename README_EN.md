@@ -468,7 +468,7 @@ CODEX_SOURCES='[{"home":"~/.codex","owner":"app-server","launcher":{"type":"desk
 
 Three launcher types are supported:
 
-- `desktop` opens `codex://threads/<id>` through the registered Codex Desktop application;
+- `desktop` passes `codex://threads/<id>` to the registered Windows protocol handler for Codex Desktop. VKodex does not start `ChatGPT.exe` from `WindowsApps` directly: that path changes across updates and can create separate processes without handing the task to the running application;
 - `vscode` starts the configured `Code.exe` with the source `CODEX_HOME`, `userDataDir`, and the official extension's task URI;
 - `command` starts a custom executable with an `arguments` array and optional `environment`. Values may use the `{threadId}` and `{codexHome}` placeholders.
 
