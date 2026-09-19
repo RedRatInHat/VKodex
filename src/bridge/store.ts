@@ -3,7 +3,7 @@ import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
-import { comparablePath } from "../desktop/paths.js";
+import { comparablePath } from "../core/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
 
 const bindingColumns = `id TEXT PRIMARY KEY, host_id TEXT NOT NULL, thread_id TEXT NOT NULL, title TEXT NOT NULL,

@@ -1,42 +1,11 @@
 import { createHash } from "node:crypto";
 import type { TaskEvent } from "./contracts.js";
+import type { TaskObservationCheckpoint as ProjectionCheckpoint, TaskObservationOptions as ProjectionOptions } from "../core/task-observation.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { comparablePath } from "./paths.js";
 import { parseAsyncQuestionReply } from "./questions.js";
 
-export interface ProjectionCheckpoint {
-  readonly since: number;
-  /** Time of the last owner snapshot, used to identify whole turns completed while disconnected. */
-  readonly lastObservedAt?: number;
-  readonly activeAtAttach: readonly string[];
-  /** Turns that were running in the last accepted live snapshot. */
-  readonly active?: readonly string[];
-  readonly seen: Readonly<Record<string, string>>;
-  /**
-   * Last accepted semantic content by desktop event identity. Codex can rebuild
-   * an edited branch while replacing live msg IDs with canonical item IDs.
-   * Hashes keep that rewrite from looking like new user-visible history without
-   * storing message text.
-   */
-  readonly semanticByIdentity?: Readonly<Record<string, string>>;
-  /** Exact rollout used for the last snapshot, normalized without exposing it to VK. */
-  readonly rolloutPath?: string;
-}
-
-export interface ProjectionOptions {
-  /**
-   * The snapshot is the first one from a new subscription. Suppress accumulated
-   * progress, but recover new complete turns since the last owner snapshot.
-   */
-  readonly rebaseline?: boolean;
-  /**
-   * Turns accepted from VK whose terminal result still has no durable delivery.
-   * Only their final answer may cross a reconnect baseline; accumulated progress
-   * and unrelated desktop history remain suppressed.
-   */
-  readonly recoverFinalTurnIds?: readonly string[];
-  readonly finalRecorded?: (eventId: string) => boolean;
-}
+export type { ProjectionCheckpoint, ProjectionOptions };
 
 export function turnsFromState(state: IpcObject): IpcObject[] {
   const turns = new Map<string, IpcObject>();

@@ -3093,7 +3093,7 @@ const questionState = (count = 1) => ({ requests: [{ id: "question-request", met
 test("VK question buttons and quoted free text produce one complete native response", async t => {
   const s = setup(t); const binding = s.attach();
   const state = questionState(2); s.desktop.questions = pendingCodexQuestions(state);
-  s.manager.questions.observe(binding, state); await s.worker.flush();
+  s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const card = s.chat.sent.find(m => m.view.buttons?.some(b => b.label.startsWith("1. Alpha")))!;
   assert.ok(card);
   const first = card.view.buttons![0]!.action;
@@ -3116,16 +3116,16 @@ test("VK question buttons and quoted free text produce one complete native respo
 test("questions recover without duplicate cards, close when answered elsewhere, and stay owner scoped", async t => {
   const s = setup(t); const binding = s.attach(); const state = questionState();
   s.desktop.questions = pendingCodexQuestions(state);
-  s.manager.questions.observe(binding, state); await s.worker.flush();
+  s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const card = s.chat.sent[0]!;
   const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
-  restarted.questions.observe(binding, state); await s.worker.flush();
+  restarted.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   assert.equal(s.chat.sent.length, 1);
   await restarted.handle({ ...s.input("No", peerId), senderId: 999, replyToMessageId: card.handle.conversationMessageId });
   await restarted.handle({ ...s.input("", peerId, card.view.buttons![0]!.action), senderId: 999 });
   assert.equal(s.desktop.questionAnswers.length, 0);
   s.desktop.questions = [];
-  restarted.questions.observe(binding, { requests: [] });
+  restarted.questions.observeQuestions(binding, []);
   await restarted.handle(s.input("", peerId, card.view.buttons![0]!.action));
   await s.worker.flush();
   assert.equal(s.desktop.questionAnswers.length, 0);
@@ -3136,11 +3136,11 @@ test("questions recover without duplicate cards, close when answered elsewhere, 
 test("uncertain question answer is never replayed by another button or after restart", async t => {
   const s = setup(t); const binding = s.attach(); const state = questionState();
   s.desktop.questions = pendingCodexQuestions(state); s.desktop.questionError = new UncertainActionError();
-  s.manager.questions.observe(binding, state); await s.worker.flush();
+  s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const action = s.chat.sent[0]!.view.buttons![0]!.action;
   await s.handle("", peerId, action);
   const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
-  restarted.questions.observe(binding, state);
+  restarted.questions.observeQuestions(binding, pendingCodexQuestions(state));
   await restarted.handle(s.input("", peerId, action));
   assert.equal(s.desktop.questionAnswers.length, 1);
   assert.equal(s.desktop.submissions.length, 0);
@@ -3162,7 +3162,7 @@ test("secret questions expose no answer buttons and refresh does not start a tur
 test("VK Long Poll replies and callback buttons use the native question handler", async t => {
   const s = setup(t); const binding = s.attach(); const state = questionState(2);
   s.desktop.questions = pendingCodexQuestions(state);
-  s.manager.questions.observe(binding, state); await s.worker.flush();
+  s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const first = s.chat.sent[0]!;
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
   t.mock.method(vk.api, "call", async () => 1);
@@ -3185,15 +3185,16 @@ test("VK Long Poll replies and callback buttons use the native question handler"
 test("a process crash during question submission preserves the uncertain state", async t => {
   const s = setup(t); const binding = s.attach(); const state = questionState();
   s.desktop.questions = pendingCodexQuestions(state);
-  s.manager.questions.observe(binding, state); await s.worker.flush();
+  s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const action = s.chat.sent[0]!.view.buttons![0]!.action;
   const key = `questions:${binding.id}`;
   const cards = s.store.getValue<Record<string, unknown>[]>(key)!;
   s.store.setValue(key, cards.map(c => ({ ...c, status: "sending", operationId: "lost-operation" })));
   const restarted = new TaskManager(access, s.desktop, s.chat, s.store, s.gate);
-  restarted.questions.observe(binding, state);
+  restarted.questions.observeQuestions(binding, pendingCodexQuestions(state));
   assert.equal(s.store.getValue<Record<string, unknown>[]>(key)![0]!.status, "uncertain");
   await restarted.handle(s.input("", peerId, action));
   assert.equal(s.desktop.questionAnswers.length, 0);
   assert.equal(s.desktop.submissions.length, 0);
 });
+

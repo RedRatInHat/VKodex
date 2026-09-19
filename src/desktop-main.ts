@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { inspect } from "node:util";
 import { loadDesktopBridgeConfig, type DesktopBridgeConfig } from "./bridge/config.js";
-import { DesktopBridgeRuntime } from "./bridge/runtime.js";
+import { BridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
@@ -13,6 +13,9 @@ import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from
 import { createDesktopLogger } from "./desktop/logging.js";
 import { writeRuntimeProcessState } from "./desktop/process-state.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
+import { DesktopTaskStateTransport } from "./desktop/state-transport.js";
+import { observeTaskState } from "./desktop/task-observation.js";
+import { RolloutTaskHistoryRecovery } from "./desktop/history-recovery.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -38,7 +41,8 @@ const transfer = new AppServerTaskTransfer(catalog, metadata);
 const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task), undefined, () => catalog.listSources()), new ProfileDesktopGoals(task => catalog.sourceHome(task)),
   { launcher, creator, transfer });
-const runtime = new DesktopBridgeRuntime(config.access, desktop, gateway, store, undefined, undefined,
+const runtime = new BridgeRuntime(config.access, desktop, gateway, store,
+  { states: new DesktopTaskStateTransport(), observe: observeTaskState, history: new RolloutTaskHistoryRecovery() }, undefined,
   path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits);
 const startedAt = Date.now();
 let exitReason = "process_exit";

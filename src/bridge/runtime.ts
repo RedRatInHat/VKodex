@@ -1,6 +1,6 @@
-import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../desktop/state-transport.js";
-import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../desktop/history-recovery.js";
-import { observeTaskState, type TaskObservationCheckpoint } from "../desktop/task-observation.js";
+import { TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../core/task-state.js";
+import type { TaskHistoryRecovery } from "../core/task-history.js";
+import type { TaskObservationCheckpoint, TaskStateObserver } from "../core/task-observation.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
@@ -15,7 +15,13 @@ import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 
-export class DesktopBridgeRuntime {
+export interface BridgeRuntimeAdapters {
+  readonly states: TaskStateTransport;
+  readonly observe: TaskStateObserver;
+  readonly history: TaskHistoryRecovery;
+}
+
+export class BridgeRuntime {
   private readonly gate: AccessGate;
   private readonly delivery: DeliveryWorker;
   private readonly manager: TaskManager;
@@ -35,14 +41,19 @@ export class DesktopBridgeRuntime {
   private operationReconciliation: Promise<void> | null = null;
   private lastOperationReconciliationAt = 0;
 
+  private readonly observeTaskState: TaskStateObserver;
+  private readonly historyRecovery: TaskHistoryRecovery;
+
   constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, chat: BridgeChat, private readonly store: BridgeStore,
-    streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
+    adapters: BridgeRuntimeAdapters, private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
-    inboundFileLimits?: InboundFileLimits, private historyRecovery: TaskHistoryRecovery = new RolloutTaskHistoryRecovery()) {
+    inboundFileLimits?: InboundFileLimits) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
-    this.connections = new TaskStateConnections(streams, now);
+    this.connections = new TaskStateConnections(adapters.states, now);
+    this.observeTaskState = adapters.observe;
+    this.historyRecovery = adapters.history;
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
@@ -312,7 +323,7 @@ export class DesktopBridgeRuntime {
               if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
               const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
               if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
-              const observation = observeTaskState(state, this.store.getValue<TaskObservationCheckpoint>(checkpointKey), this.now(), {
+              const observation = this.observeTaskState(state, this.store.getValue<TaskObservationCheckpoint>(checkpointKey), this.now(), {
                 rebaseline: initial,
                 recoverFinalTurnIds: [...recoverFinalTurnIds],
                 finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
@@ -404,3 +415,6 @@ export class DesktopBridgeRuntime {
     await this.delivery.idle();
   }
 }
+
+/** @deprecated Use the transport-neutral BridgeRuntime name. */
+export { BridgeRuntime as DesktopBridgeRuntime };

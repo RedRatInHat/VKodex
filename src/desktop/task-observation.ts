@@ -1,29 +1,11 @@
-import type { TaskDetails, TaskEvent } from "./contracts.js";
+import type { TaskObservation, TaskObservationCheckpoint, TaskObservationOptions } from "../core/task-observation.js";
 import { taskDetails } from "./details.js";
 import type { IpcObject } from "./ipc-client.js";
 import { isObject } from "./ipc-client.js";
-import { activeTurnsFromState, projectSnapshot, turnsFromState,
-  type ProjectionCheckpoint, type ProjectionOptions } from "./projector.js";
-import { pendingCodexQuestions, type CodexQuestions } from "./questions.js";
+import { activeTurnsFromState, projectSnapshot, turnsFromState } from "./projector.js";
+import { pendingCodexQuestions } from "./questions.js";
 
-export type TaskObservationCheckpoint = ProjectionCheckpoint;
-export type TaskObservationOptions = ProjectionOptions;
-
-export interface TaskObservedInput {
-  readonly turnId: string;
-  readonly status: string;
-  readonly operationIds: readonly string[];
-}
-
-export interface TaskObservation {
-  readonly checkpoint: TaskObservationCheckpoint;
-  readonly events: readonly TaskEvent[];
-  readonly details: TaskDetails;
-  readonly questions: readonly CodexQuestions[];
-  readonly inputs: readonly TaskObservedInput[];
-  readonly latestTurnId: string;
-  readonly activeTurnId: string | null;
-}
+export type { TaskObservation, TaskObservationCheckpoint, TaskObservationOptions, TaskObservedInput } from "../core/task-observation.js";
 
 /** Converts one client-specific stream snapshot into the bridge domain. */
 export function observeTaskState(state: IpcObject, previous: TaskObservationCheckpoint | null,

@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
-import { comparablePath } from "../desktop/paths.js";
+import { comparablePath } from "../core/paths.js";
 import type { OwnerAccess } from "./contracts.js";
 
 export interface DesktopBridgeConfig {

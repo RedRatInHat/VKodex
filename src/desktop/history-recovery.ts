@@ -1,20 +1,10 @@
-import type { TaskEvent, TaskRef } from "./contracts.js";
+import type { TaskRef } from "./contracts.js";
+import type { TaskHistoryRecovery, TaskHistoryRecoveryResult } from "../core/task-history.js";
+import type { TaskObservationCheckpoint } from "../core/task-observation.js";
 import { comparablePath } from "./paths.js";
-import type { ProjectionCheckpoint } from "./projector.js";
 import { RolloutRecordTooLargeError, RolloutTailer } from "./rollout-tailer.js";
 
-export interface TaskHistoryRecoveryResult {
-  readonly events: readonly TaskEvent[];
-  readonly historyRebuilt: boolean;
-  readonly failure: "recordTooLarge" | "readFailed" | null;
-}
-
-export interface TaskHistoryRecovery {
-  enable(id: string, since: number): void;
-  disable(id: string, task: TaskRef): void;
-  poll(id: string, task: TaskRef, checkpoint: ProjectionCheckpoint | null, oldestAcceptedAt: number | null,
-    acceptedTurnIds: ReadonlySet<string>, now: number): Promise<TaskHistoryRecoveryResult | null>;
-}
+export type { TaskHistoryRecovery, TaskHistoryRecoveryResult } from "../core/task-history.js";
 
 /** Recovery-only transport for visible events missed by the live task owner. */
 export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
@@ -34,7 +24,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
     this.tailer.clear(task);
   }
 
-  async poll(id: string, task: TaskRef, checkpoint: ProjectionCheckpoint | null, oldestAcceptedAt: number | null,
+  async poll(id: string, task: TaskRef, checkpoint: TaskObservationCheckpoint | null, oldestAcceptedAt: number | null,
     acceptedTurnIds: ReadonlySet<string>, now: number): Promise<TaskHistoryRecoveryResult | null> {
     const enabledSince = this.enabled.get(id);
     if (enabledSince === undefined || now < (this.pollAfter.get(id) ?? 0)) return null;

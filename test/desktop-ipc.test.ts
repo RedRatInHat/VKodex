@@ -145,6 +145,12 @@ class FakeStateTransport implements TaskStateTransport {
   close(): void { this.closed = true; }
 }
 
+const runtimeAdapters = (states: TaskStateTransport) => ({
+  states,
+  observe: observeTaskState,
+  history: new RolloutTaskHistoryRecovery(),
+});
+
 function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => Promise<import("../src/bridge/contracts.js").BridgeHealthSnapshot>,
   streamTransport?: TaskStateTransport) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
@@ -165,7 +171,8 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   };
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client);
   let now = 100_000;
-  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, streamTransport ?? new DesktopTaskStateTransport(client), () => now, undefined, undefined, 60_000, healthCheckOverride);
+  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store,
+    runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), () => now, undefined, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
@@ -641,7 +648,8 @@ test("first-turn creation output survives a runtime restart before its VK bindin
     inviteLink: async () => { throw new Error("Unexpected invitation"); },
     uploadDocument: async () => { throw new Error("Unexpected upload"); },
   };
-  const runtime1 = new DesktopBridgeRuntime(access, desktop, chat, store, new DesktopTaskStateTransport(new DesktopIpcClient(() => new Server(), 100)));
+  const runtime1 = new DesktopBridgeRuntime(access, desktop, chat, store,
+    runtimeAdapters(new DesktopTaskStateTransport(new DesktopIpcClient(() => new Server(), 100))));
   const update = { task, event: { type: "final" as const, id: "creation-final", turnId: "creation-turn", text: "Durable first answer" },
     details: { status: "idle" as const, workspace: "/fixture", model: "model-a", effort: "high", nextModel: null, nextEffort: null, context: null } };
   for (const listener of listeners) listener(update);
@@ -650,7 +658,8 @@ test("first-turn creation output survives a runtime restart before its VK bindin
 
   const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17);
   const server = new Server(); server.dataState = { ...state([], "completed"), threadRuntimeStatus: { type: "idle" } };
-  const runtime2 = new DesktopBridgeRuntime(access, desktop, chat, store, new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 100)));
+  const runtime2 = new DesktopBridgeRuntime(access, desktop, chat, store,
+    runtimeAdapters(new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 100))));
   try {
     await runtime2.tick();
     assert.ok(sent.some(view => view.text.includes("Durable first answer")));

@@ -11,7 +11,7 @@ import { systemLoadText } from "./system-load.js";
 import { taskInput } from "../core/task-input.js";
 import path from "node:path";
 import os from "node:os";
-import { comparablePath } from "../desktop/paths.js";
+import { comparablePath } from "../core/paths.js";
 import { TaskQuestions } from "./questions.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
