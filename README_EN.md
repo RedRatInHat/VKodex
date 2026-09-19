@@ -19,7 +19,7 @@ Continue existing Codex tasks or create new ones from your phone: choose a proje
 
 The private chat with the community is the manager. Each separate VK conversation represents one Codex task. Agent progress arrives without notifications; final answers arrive as regular messages.
 
-**Status: experimental Windows desktop integration.** VKodex uses the application's internal IPC for live events. That protocol can change after a Codex update, so compatibility is checked automatically at startup and while the bridge is running. App Server atomically materializes a new task with its first turn in the selected profile, then the configured launcher opens it in Codex Desktop or VS Code; every later request goes through the confirmed live owner. Start by testing with a non-critical task.
+**Status: experimental Codex integration on Windows.** For every profile configured with `owner: "app-server"`, VKodex keeps one long-lived App Server for commands and events. If Codex Desktop or VS Code already holds a task's active writer, routing switches to that confirmed client owner before dispatch; there is no automatic fallback after a mutation starts. The launcher is used only by explicit `/open`, so an ordinary prompt does not focus the application window. Codex's internal protocols may change after an update, so compatibility is checked at startup and while the bridge is running. Start by testing with a non-critical task.
 
 ## Contents
 
@@ -226,7 +226,7 @@ HEALTH_CHECK_INTERVAL_MS=60000
 | `BOT_DATA_DIR` | No | Private database, queue, files, and bindings. The desktop adapter uses `./data/desktop` by default. |
 | `CODEX_HOME` | No | Primary Codex data directory. An empty value means `~/.codex`. This is not a source-code project directory. |
 | `CODEX_EXTRA_HOMES` | No | Backward-compatible JSON array of additional Codex data directories, up to 16. |
-| `CODEX_SOURCES` | No | Preferred JSON array of sources with a `home` and launcher. When set, it replaces `CODEX_HOME` and `CODEX_EXTRA_HOMES`. |
+| `CODEX_SOURCES` | No | Preferred JSON array of sources with `home`, `owner`, and a launcher. `owner: "app-server"` enables autonomous profile ownership; the launcher is used by `/open`. When set, it replaces `CODEX_HOME` and `CODEX_EXTRA_HOMES`. |
 | `VKODEX_PROJECTLESS_ROOT` | No | Root for automatically created empty workspaces used by **No project** tasks. The default is the user's local application-data directory; on Windows, `%LOCALAPPDATA%/VKodex/workspaces`. |
 | `HEALTH_CHECK_INTERVAL_MS` | No | Full operational-check interval. Default: 60 seconds; allowed range: 30 seconds to one hour. |
 
@@ -325,9 +325,9 @@ Use a non-critical task first. The internal application protocol is not a stable
 
 <a id="usage"></a>
 
-### Experimental task-owner adapter
+### Optional client-owner adapter
 
-When a native client holds a transfer source, a separate App Server may be unable to archive it. `VKodexOwnerLauncher.exe` sends archival through the client's own App Server connection. It does not run extra turns: normal requests, notifications and approvals remain on the original connection.
+Tasks owned by VKodex's profile App Server do not need this adapter. It is only needed for safe source archival when VS Code already holds the task writer: `VKodexOwnerLauncher.exe` forwards the request through that client's App Server. It is not a second turn executor or a timeout fallback.
 
 Prepare on Windows after `npm run build`:
 
@@ -341,11 +341,10 @@ Prepare on Windows after `npm run build`:
 Select the client's actual native CLI, not another adapter executable. The installer creates a separate package and private local channel; it does not change client settings or running processes. For standard VS Code extension installations, the package follows `extensions.json` across extension updates. Ambiguous entries or a mismatching manifest prevent startup.
 
 - **VS Code:** set `chatgpt.cliExecutable` in the selected profile to the generated `VKodexOwnerLauncher.exe`. This is an experimental extension setting.
-- **Codex Desktop:** launch the application with `CODEX_CLI_PATH` pointing to that executable. `CODEX_SOURCES` supports this through `launcher.type: "command"` and `launcher.environment`. Opening a system URI does not guarantee environment propagation.
 - **An existing client:** new environment variables cannot attach the adapter to an existing App Server. Initial activation requires a safe client restart; do not restart during tasks or while a browser session must be preserved.
 - **Rollback:** restore the previous CLI setting or remove `CODEX_CLI_PATH`, then restart the client when safe. The adapter does not rewrite task history.
 
-Status: owner-side archival has been verified in a separate VS Code instance. Integration into both working clients and a fully autonomous round trip remain unverified. The source and all unarchived descendants must have confirmed idle status and inactive goals. Unknown, unloaded or running descendants block archival; the adapter does not automatically load or stop them. Uncertain archival is never retried automatically. The `owner-transports` directory contains local access tokens: never publish it or send it to VK.
+Do not inject the adapter into Codex Desktop and do not set a global `CODEX_CLI_PATH`; VKodex does not support that setup and it can prevent the application from starting. Owner-mediated archival has been verified in a separate VS Code profile. The source and all unarchived descendants must have confirmed idle status and inactive goals. Unknown, unloaded or running descendants block archival; the adapter does not automatically load or stop them. Uncertain archival is never retried automatically. The `owner-transports` directory contains local access tokens: never publish it or send it to VK.
 
 ## 6. Manager and linked conversations
 
@@ -378,7 +377,7 @@ Manager service responses contain a **Menu** button. The menu shows the bridge p
 
 Inbound events are serialized independently per VK conversation. A stalled task connection cannot block the manager or other tasks. After 45 seconds, a watchdog reports the delay but preserves that conversation's ordering until the call settles; state-changing operations are not retried automatically. Other conversations continue through their own queues.
 
-Codex's live follower protocol accepts turns only for a materialized task: `thread/start` alone returns a transient ID that a client cannot open yet. VKodex therefore creates a task atomically through the official App Server for the selected `CODEX_HOME`. This short creation session creates the task, runs only its first turn, streams progress to VK, and supports `/stop`. First-turn events emitted before the VK conversation is ready are stored in SQLite, so restarting the bridge between task creation and binding does not lose the final answer. Once a persistent ID exists, VKodex opens the Codex Desktop or VS Code client configured for that source; the second and every later turn use only the confirmed live owner. The creation session cannot continue existing tasks and is never used as a fallback. For a project task, **Local** mode uses the project's saved working directory. **No project** does not require typing a computer path from a phone: VKodex creates a separate empty directory under `VKODEX_PROJECTLESS_ROOT`, selects local mode, and stores the task without a project assignment. **Choose folder** opens a paginated button list of known workspaces collected from projects and existing tasks in the selected catalog; choosing one does not assign the new task to that project. The same screen retains an empty-folder option and manual path entry as a fallback. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; the source directory must be a Git repository, and worktrees are not deleted automatically. If the first turn starts but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
+A new task is created atomically through the App Server for the selected `CODEX_HOME`: the operation materializes a permanent thread ID and accepts its first turn before returning. First-turn events emitted before the VK conversation is ready are stored in SQLite, so restarting the bridge between task creation and binding does not lose the final answer. After the short creation session finishes, every later turn uses the long-lived profile owner; if a UI client already holds the writer, routing switches to that client before dispatch. This path does not need a launcher. The creation session cannot continue existing tasks and is never used as a fallback. For a project task, **Local** mode uses the project's saved working directory. **No project** does not require typing a computer path from a phone: VKodex creates a separate empty directory under `VKODEX_PROJECTLESS_ROOT`, selects local mode, and stores the task without a project assignment. **Choose folder** opens a paginated button list of known workspaces collected from projects and existing tasks in the selected catalog; choosing one does not assign the new task to that project. The same screen retains an empty-folder option and manual path entry as a fallback. **Separate worktree** mode calls `git worktree add --detach` and creates a neighboring directory named like `<repository>_VKodex_<identifier>_worktree`; the source directory must be a Git repository, and worktrees are not deleted automatically. If the first turn starts but the following VK response is lost, the wizard marks the result as uncertain and does not create a duplicate.
 
 ### Task conversation
 
@@ -394,7 +393,7 @@ The **Task menu:** line and **Menu** button are appended to the final Codex answ
 | --- | --- |
 | `/menu`, `/status` | Open the task's technical card. |
 | `/help` | Show commands supported in this conversation. |
-| `/open`, **Share** → **Open in Codex** | Explicitly bring the configured Codex client to the foreground and open this task. An ordinary prompt opens it only when recovering a missing live connection. |
+| `/open`, **Share** → **Open in Codex** | Explicitly bring the configured Codex client to the foreground and open this task. An ordinary prompt never invokes the launcher or focuses a window. |
 | `/files` | Scan this binding's outbox and send new completed files to VK. |
 | `/goal`, **Goal** | Show the Codex goal, status, budget, token use, and elapsed time. The menu can set or edit the objective and budget, pause, resume, or clear it. The agent marks a goal complete after verifying the result. |
 | **Model / reasoning** | Select a model and reasoning effort for the next turn from the available Codex cache. The current turn is not interrupted. |
@@ -459,12 +458,12 @@ Deleting a conversation **only for yourself** does not produce a dedicated event
 
 ## 7. Additional Codex data directories
 
-VKodex searches `~/.codex` by default and opens its tasks through the registered Codex Desktop protocol. For multiple accounts, use `CODEX_SOURCES`: each Codex data directory is bound to the application authenticated for that profile.
+VKodex reads tasks from `~/.codex` by default. For multiple accounts, use `CODEX_SOURCES`: each data directory gets a command owner and an optional launcher for explicit `/open`.
 
 Codex Desktop for the primary account and a dedicated VS Code profile for a work account:
 
 ```dotenv
-CODEX_SOURCES='[{"home":"~/.codex","launcher":{"type":"desktop"}},{"home":"~/.codex-work","launcher":{"type":"vscode","executable":"C:/Path/To/Code.exe","userDataDir":"C:/Path/To/Code-Codex-Work"}}]'
+CODEX_SOURCES='[{"home":"~/.codex","owner":"app-server","launcher":{"type":"desktop"}},{"home":"~/.codex-work","owner":"app-server","launcher":{"type":"vscode","executable":"C:/Path/To/Code.exe","userDataDir":"C:/Path/To/Code-Codex-Work"}}]'
 ```
 
 Three launcher types are supported:
@@ -472,6 +471,8 @@ Three launcher types are supported:
 - `desktop` opens `codex://threads/<id>` through the registered Codex Desktop application;
 - `vscode` starts the configured `Code.exe` with the source `CODEX_HOME`, `userDataDir`, and the official extension's task URI;
 - `command` starts a custom executable with an `arguments` array and optional `environment`. Values may use the `{threadId}` and `{codexHome}` placeholders.
+
+`owner: "app-server"` enables a long-lived owner for the selected `CODEX_HOME`. It can continue unloaded tasks without opening a window. If Desktop or VS Code already holds a task's active writer, VKodex recognizes that before mutation and uses the connected client owner. Once dispatch begins, a command is never retried through another owner.
 
 Legacy `CODEX_HOME` and `CODEX_EXTRA_HOMES` remain supported for listing tasks. Without `CODEX_SOURCES`, the primary directory automatically receives the `desktop` launcher; migrate additional directories to the structured format so VKodex can open the correct client explicitly.
 
@@ -485,7 +486,7 @@ When an account has an available limit-reset credit, `/limits` shows a **Reset l
 
 If an additional CLI or work profile contains tasks but has no desktop project file of its own, VKodex matches tasks to shared local projects by working directory. A project is assigned only when there is one uniquely best root match; other tasks remain under **No project**. Copies with the same ID in different directories stay separate, with independent VK bindings, history sources, and model caches.
 
-For live reads of an existing task and every turn after creation, the bridge uses the task owner in the configured client and verifies that the history path belongs to the selected profile. The first launch during binding is recorded in the database: restarting VKodex alone does not reopen all linked tasks. On a new prompt, the bridge first checks the live connection. If Codex explicitly reports no owner for the task, for example after the application restarts, VKodex invokes the selected source launcher once, waits up to 30 seconds, verifies the history source, and forwards that prompt. Recovery can bring up the Codex window; an already connected task is not reopened. Background reads and health checks never invoke a launcher. A history mismatch, wrong account, general IPC error, or incompatible live protocol blocks the command; no fallback SDK turn is started. A sent command with an unknown result is never retried automatically.
+For commands and live events on an existing task, the bridge uses its profile owner and verifies `sourceId` before any mutation. The profile App Server attaches an unloaded task itself; an active-writer rejection from a UI client is positive evidence that the task is already open, not a reason to launch a window and wait for 30 seconds. Only `/open` invokes a launcher. A profile or account mismatch, owner loss after dispatch, or incompatible protocol blocks the command; no substitute executor is started. A command with an unknown result is reconciled by immutable operation ID and is never retried automatically.
 
 Start a cross-profile transfer from **Move → Another profile** in the task menu. Transfers run in a background worker with durable SQLite stages, outside the VK button handler. After a VKodex restart, the worker resumes the saved stage with bounded retries and increasing backoff. A UI timeout cannot release a live worker's lease or start a second executor for the same operation.
 
@@ -495,11 +496,11 @@ Goals are preserved separately from history. An active source goal is paused, an
 
 An acknowledged fork ID is saved before follow-up metadata writes, so retries prepare the same copy. If Codex never acknowledges the result ID, VKodex does not submit another fork or adopt an unrelated descendant as the result. Changes to source history or its goal also stop the switch and preserve both copies for inspection. During preparation, new prompts and modifying commands are rejected with an explanation rather than sent to the old task. **Cancel transfer** releases that restriction once the current stage has settled and before the binding has switched. Cancellation never deletes a created copy or automatically resumes a goal.
 
-After the atomic binding switch, VKodex archives the source. It verifies the persisted source record and saved history boundary, not merely absence from the active task list. The owner adapter sends archival through the client that holds the task; this path has passed a live test in VS Code `.codex-work`. The Codex Desktop path is prepared but has not yet been verified on working tasks. Without the adapter, a separate App Server may archive only after confirming that the task is unloaded and its latest turn is terminal. An unknown write result is never retried blindly: VKodex polls the archive state read-only. If source history or goal changes after copying, archival stops and both copies remain available for review. VKodex neither terminates Codex nor forcibly removes locks. Full autonomy across all configurations remains unverified until Desktop and a live round trip are tested.
+After the atomic binding switch, VKodex archives the source through its profile owner. It verifies the persisted source record and saved history boundary, not merely absence from the active task list. Two consecutive live `.codex → .codex-work → .codex` cycles completed without database edits while preserving history, title, an explicit target project, working directory, model/effort, and a paused goal with its budget; both sources were archived. A short turn after returning to `.codex` was confirmed. A `.codex-work` turn was not started because that account had exhausted its usage allowance and remains a separate live check after the limit recovers. A separate crash run intentionally terminated after the binding switch and before archival: a new process resumed the same dead lease, produced exactly one fork, and confirmed archival. An unknown write result is never retried blindly; VKodex first polls native archive state. If source history or goal changes after copying, archival stops and both copies remain available for review. A source held by a UI client without a supported archive channel remains a visible block; VKodex never closes Codex or forcibly removes its writer.
 
 `/health` reports pending transfers, stages without progress, and archived tasks that still have active VK bindings. Legacy records without a saved history boundary are never automatically replayed: missing evidence is not guessed. If a legacy record has a boundary, its source is already archived, and the source's semantic history matches the target's history prefix, VKodex can finish the same stage without a new fork or database edit. If the source acquired another turn, archival retry is blocked even after the VK conversation switched.
 
-Recovery checks use dedicated test tasks: process termination after the fork ID is saved and after the binding switch, a lost response after opening the client, transfer of a paused goal with its remaining budget, and large JSONL processing. Native process exit is tracked separately from stdio closure so delayed Windows pipe closure does not turn an acknowledged fork into an error.
+Recovery checks use dedicated test tasks: process termination after the fork ID is saved and after the binding switch, a lost response after opening the client, transfer of a paused goal with its remaining budget, and large JSONL processing. The live post-switch crash check used two separate processes and confirmed stage recovery without another fork. Native process exit is tracked separately from stdio closure so delayed Windows pipe closure does not turn an acknowledged fork into an error.
 
 Names, projects and goals are read back after writes. A completed goal stays complete; an active goal is paused. For an exhausted budget, the native API requires a positive number, so the target receives a technical minimum of 1 token and a non-running `budgetLimited` status (or `complete` for an achieved goal). No goal is started automatically.
 
@@ -588,7 +589,7 @@ At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete
 - Codex task system errors, including account usage limits: these result in `DEGRADED` even when VK and IPC work;
 - the Codex named pipe and stream protocol v11 compatibility. A full protocol canary runs at startup, manually through `/health`, and at least once every ten minutes.
 
-Each live task owner is also checked in the background every 30 seconds. If an app restart replaces it, the bridge reconnects the subscription without opening a window or resubmitting a prompt. If the owner is missing, the thinking indicator stops. `/menu` remains available offline; its “Open in Codex” button or `/open` explicitly opens the task through the selected source launcher. A `systemError` is not treated as an active turn even if restored history contains an old `inProgress` entry. When an account hits its usage limit, the bot points to `/limits` instead of continuing the animation.
+Each live task connection is also checked in the background every 30 seconds. If the profile App Server restarts, the bridge reconnects without opening a window or resubmitting a prompt, and events from an obsolete generation are ignored. If the owner is missing, the thinking indicator stops. `/menu` remains available offline; its “Open in Codex” button or `/open` explicitly opens the task through the selected source launcher. A `systemError` is not treated as an active turn even if restored history contains an old `inProgress` entry. When an account hits its usage limit, the bot points to `/limits` instead of continuing the animation.
 
 The latest report is stored without tokens or message content in `BOT_DATA_DIR/health.json`. Current process state and the reason for a handled exit are stored without configuration or error text in `BOT_DATA_DIR/runtime-process.json`. The following command checks health report freshness and exits nonzero if the bridge stopped, the report is stale, or its state is not `OK`:
 
@@ -598,7 +599,7 @@ npm run health:check
 
 An in-process check cannot send a warning after its own process has died, so a persistent installation needs `service:install` or another external supervisor. `FAILED` is sent to the manager after two consecutive checks; `DEGRADED` is sent only after ten consecutive checks. `health check is OK again` is sent after three successful checks, so a brief VK pause does not create a cascade of alerts. If VK itself is unavailable, the warning remains in the durable queue and is delivered after recovery.
 
-`DEGRADED` means core work may continue but part of the chain is unconfirmed: for example, no open task is available for the protocol canary, an active task lost its live connection, VK imposed a temporary pause, the last delivery failed, or an important queue item has not cleared for more than 30 seconds. A pending background comment edit or `thinking` update without a delivery error does not degrade health or raise it to `FAILED`. Closed and idle tasks do not need a live subscription and do not degrade health by themselves. If the configured client unloads a linked task, the next prompt does not focus the application automatically: open the task manually and repeat the message. `FAILED` means a mandatory check failed or the same important answer or panel has been delayed for more than five minutes. After a Codex update, also run `desktop:probe`, `/health`, and a test turn in a separate task. Never edit the IPC version manually to bypass adapter rejection.
+`DEGRADED` means core work may continue but part of the chain is unconfirmed: for example, no task is available for the protocol canary, an active task lost its owner, VK imposed a temporary pause, the last delivery failed, or an important queue item has not cleared for more than 30 seconds. A pending background comment edit or `thinking` update without a delivery error does not degrade health or raise it to `FAILED`. Closed and idle tasks do not need a live subscription and do not degrade health by themselves. The profile App Server reconnects an unloaded task without focusing a window; `/open` is only for explicitly showing it. `FAILED` means a mandatory check failed or the same important answer or panel has been delayed for more than five minutes. After a Codex update, also run `desktop:probe`, `/health`, and a test turn in a separate task. Never edit a protocol version manually to bypass adapter rejection.
 
 ### What to back up
 
@@ -633,7 +634,7 @@ Startup is blocked if native modules have a mismatched architecture or ABI. Do n
 | Text works but buttons do not | Enable the `message_event` event and set Long Poll API version to `5.199`. |
 | A VK edit does not reach Codex | Enable `message_edit`, and verify that this is the same author's latest message and that it started a standalone live turn. A steer sent while the agent was already working cannot be rewritten safely. |
 | The catalog contains no tasks | Make sure Codex runs under the same user, check `CODEX_HOME` and extra directories, and inspect `desktop:probe`. Archived and internal tasks are excluded. |
-| A task is listed but cannot be linked | Codex and VKodex must run as the same OS user. `notLoaded` means the task was unloaded from memory, not deleted. Check the selected source launcher in `CODEX_SOURCES`: it must open a client with the same `CODEX_HOME` and account. VKodex waits up to 30 seconds for a live owner and never starts a separate SDK turn. For duplicate IDs, also check the selected source and history path. |
+| A task is listed but cannot be linked | Codex and VKodex must run as the same OS user. Check `owner: "app-server"`, the source `home`, account, and source selection in `CODEX_SOURCES`. `notLoaded` means the UI unloaded the task; the profile owner should reconnect it without a launcher. If Desktop/VS Code already holds it, that client's active-writer channel must be available. For duplicate IDs, also check `sourceId` and the history path. |
 | No conversation invite arrived | Open the manager. After creating a conversation, the bot sends a link whether or not VK added the owner automatically. Join through it; there is no confirmation button. Check that the bot may participate in conversations. |
 | It is unclear whether a conversation or command was created | Inspect VK and Codex manually. The bridge intentionally avoids repeating actions after ambiguous responses. Do not clear the database just to retry. |
 | An old participant-check pause remains after updating | Restart the bridge. A stale pause created by the former participant check is cleared automatically. If the binding was explicitly disabled before, select the task in the manager again. |
@@ -671,7 +672,7 @@ Forwarded text is stored in VK and the bridge's private database; attachments ar
 | Public **Share** URL | Create it directly in Codex. |
 | Remote or cloud Codex control | This guide and adapter target a local desktop installation. |
 
-VKodex never edits Codex data directories directly. Goals, rename, archive, project assignment, export, and account limits use a constrained set of `codex app-server --stdio` methods. Goal state is selected through the task's own `CODEX_HOME`, so equal IDs in separate profiles are not mixed. Creation is a separate constrained boundary: App Server materializes the task and runs only its first turn because the live follower protocol does not accept a transient `client-new-thread` ID. That turn emits into the same VK stream, `/stop` can cancel it, and the launcher opens the selected client immediately. The creation session is destroyed after completion; continuation, interruption, and events for an existing task use only live IPC. An incompatible protocol blocks mutation instead of starting a substitute executor.
+VKodex never edits Codex data directories directly. Each `CODEX_HOME` with `owner: "app-server"` uses a separate long-lived `codex app-server --stdio` connection, so equal thread IDs in separate profiles are not mixed. Creation remains an atomic first-turn boundary; afterward the profile owner handles continuation, interruption, the native queue, questions, model settings, goals, and events. If Desktop or VS Code already holds the task, active-writer ownership is classified before mutation and the command routes to that connected client. An incompatible protocol or uncertain result blocks mutation instead of starting a substitute executor.
 
 <a id="legacy-sdk"></a>
 
