@@ -1,14 +1,39 @@
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { serveOwnerChannel } from "./owner-channel.js";
 import { OwnerTransport } from "./owner-transport.js";
 
-interface LauncherConfig { version: 1; codexHome: string; nativeExecutable: string; extensionRegistry?: string }
+interface LauncherConfig {
+  version: 1;
+  codexHome: string;
+  nativeExecutable: string;
+  extensionRegistry?: string;
+  /** Stable Desktop bin root. The versioned native directory is replaced on app update. */
+  nativeSearchRoot?: string;
+}
 
 /** Resolve the installed extension, not whichever stale version sorts last on disk. */
-export async function resolveOwnerExecutable(config: Pick<LauncherConfig, "nativeExecutable" | "extensionRegistry">): Promise<string> {
+export async function resolveOwnerExecutable(config: Pick<LauncherConfig, "nativeExecutable" | "extensionRegistry" | "nativeSearchRoot">): Promise<string> {
+  if (config.nativeSearchRoot) {
+    if (!path.isAbsolute(config.nativeSearchRoot) || path.basename(config.nativeExecutable).toLowerCase() !== "codex.exe") {
+      throw new Error("Invalid native executable search configuration.");
+    }
+    const candidates: { executable: string; modified: number }[] = [];
+    for (const entry of await readdir(config.nativeSearchRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{16}$/iu.test(entry.name)) continue;
+      const executable = path.join(config.nativeSearchRoot, entry.name, "codex.exe");
+      try {
+        const details = await stat(executable);
+        if (details.isFile()) candidates.push({ executable, modified: details.mtimeMs });
+      } catch { /* An unrelated runtime directory need not contain codex.exe. */ }
+    }
+    candidates.sort((left, right) => right.modified - left.modified || left.executable.localeCompare(right.executable));
+    if (!candidates.length) throw new Error("Current Codex Desktop executable was not found.");
+    if (candidates[1]?.modified === candidates[0]!.modified) throw new Error("Current Codex Desktop executable is ambiguous.");
+    return candidates[0]!.executable;
+  }
   if (!config.extensionRegistry) return config.nativeExecutable;
   if (!path.isAbsolute(config.extensionRegistry)) throw new Error("Invalid extension registry path.");
   const entries: unknown = JSON.parse(await readFile(config.extensionRegistry, "utf8"));
@@ -37,7 +62,10 @@ export async function runOwnerLauncher(configFile: string, args: readonly string
   const value: unknown = JSON.parse(await readFile(configFile, "utf8"));
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid launcher configuration.");
   const config = value as LauncherConfig;
-  if (config.version !== 1 || ![config.codexHome, config.nativeExecutable].every(p => typeof p === "string" && path.isAbsolute(p) && !/[\x00-\x1f]/u.test(p))) throw new Error("Invalid launcher paths.");
+  if (config.version !== 1 || ![config.codexHome, config.nativeExecutable].every(p => typeof p === "string" && path.isAbsolute(p) && !/[\x00-\x1f]/u.test(p))
+    || (config.nativeSearchRoot !== undefined && (typeof config.nativeSearchRoot !== "string" || !path.isAbsolute(config.nativeSearchRoot) || /[\x00-\x1f]/u.test(config.nativeSearchRoot)))) {
+    throw new Error("Invalid launcher paths.");
+  }
   const serverIndex = args.indexOf("app-server");
   const hasSubcommand = args.slice(serverIndex + 1).some(arg => ["daemon", "proxy", "generate-ts", "generate-json-schema", "help"].includes(arg));
   const adapt = serverIndex >= 0 && !hasSubcommand && !args.some(arg => ["--help", "-h", "--version", "--listen"].includes(arg) || arg.startsWith("--listen="));

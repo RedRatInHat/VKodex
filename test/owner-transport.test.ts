@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -42,6 +42,21 @@ test("owner launcher follows the installed extension registry and rejects ambigu
   await assert.rejects(resolveOwnerExecutable(config));
   await writeFile(extensionRegistry, JSON.stringify([{ ...entry, version: "3.0.0" }]));
   await assert.rejects(resolveOwnerExecutable(config));
+});
+
+test("owner launcher follows Codex Desktop native replacement after an app update", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-desktop-version-"));
+  const oldExecutable = path.join(root, "1111111111111111", "codex.exe");
+  const currentExecutable = path.join(root, "2222222222222222", "codex.exe");
+  await mkdir(path.dirname(oldExecutable), { recursive: true });
+  await mkdir(path.dirname(currentExecutable), { recursive: true });
+  await writeFile(oldExecutable, "old"); await writeFile(currentExecutable, "current");
+  const oldTime = new Date("2025-01-01T00:00:00Z"), currentTime = new Date("2026-01-01T00:00:00Z");
+  await utimes(oldExecutable, oldTime, oldTime); await utimes(currentExecutable, currentTime, currentTime);
+  assert.equal(await resolveOwnerExecutable({ nativeExecutable: oldExecutable, nativeSearchRoot: root }), currentExecutable);
+  await mkdir(path.join(root, "not-a-runtime"), { recursive: true });
+  await writeFile(path.join(root, "not-a-runtime", "codex.exe"), "ignored");
+  assert.equal(await resolveOwnerExecutable({ nativeExecutable: oldExecutable, nativeSearchRoot: root }), currentExecutable);
 });
 
 const threadId = "11111111-1111-4111-8111-111111111111";
