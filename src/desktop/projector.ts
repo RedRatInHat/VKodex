@@ -100,10 +100,10 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const historyRebuilt = previous?.rolloutPath !== undefined && rolloutPath !== undefined && previous.rolloutPath !== rolloutPath;
   const events: TaskEvent[] = [];
   const eligible = (turn: IpcObject): boolean => activeAtAttach.includes(String(turn.turnId)) || Number(turn.turnStartedAtMs ?? 0) >= since;
-  const emitStatus = (event: Extract<TaskEvent, { readonly type: "status" }>, allowInitial = false): void => {
+  const emitStatus = (event: Extract<TaskEvent, { readonly type: "status" }>, allowInitial = false, recover = false): void => {
     const key = identityKey(event);
     const digest = hash(JSON.stringify(event));
-    if (seen[key] !== digest && (previous !== null || allowInitial) && !rebaseline) events.push(event);
+    if (recover || seen[key] !== digest && (previous !== null || allowInitial) && !rebaseline) events.push(event);
     seen[key] = digest;
   };
   const emitSemantic = (event: SemanticEvent, allowRebaseline = false): void => {
@@ -129,7 +129,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   };
   for (const turn of turns) {
     const turnId = String(turn.turnId);
-    const turnEligible = eligible(turn);
+    const turnEligible = eligible(turn) || recoverFinalTurnIds.has(turnId);
     if (!turnEligible) continue;
     const startedWhileDisconnected = rebaseline && lastObservedAt !== undefined
       && Number(turn.turnStartedAtMs) > lastObservedAt;
@@ -161,7 +161,8 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
       }
     }
     const status = turn.status === "inProgress" ? activeTurnIds.has(turnId) ? "running" : null : turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "interrupted" : turn.status === "failed" ? "failed" : null;
-    if (status && turnEligible) emitStatus({ type: "status", id: `status:${turnId}`, turnId, status }, turn.status === "inProgress");
+    if (status && turnEligible) emitStatus({ type: "status", id: `status:${turnId}`, turnId, status }, turn.status === "inProgress",
+      status !== "running" && status !== "completed" && recoverFinalTurnIds.has(turnId));
   }
   const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];

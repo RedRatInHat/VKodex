@@ -1969,6 +1969,23 @@ test("a reconnect recovers only the undelivered final of a turn accepted from VK
   }).events.length, 0);
 });
 
+test("a reconnect recovers the terminal status of an accepted interrupted turn", () => {
+  const attached = projectSnapshot(state([], "completed"), null, 100);
+  const interrupted = state([
+    { type: "userMessage", id: "request", clientId: "operation", content: [{ type: "text", text: "From VK" }] },
+  ], "interrupted");
+  const history = (interrupted.turnHistory as IpcObject).history as IpcObject;
+  ((history.entitiesByKey as IpcObject).tail as IpcObject).turnId = "accepted-turn";
+  const baseline = projectSnapshot(interrupted, attached.checkpoint, 300, { rebaseline: true });
+  assert.equal(baseline.events.length, 0);
+  const recovered = projectSnapshot(interrupted, baseline.checkpoint, 400, {
+    rebaseline: true, recoverFinalTurnIds: ["accepted-turn"], finalRecorded: () => false,
+  });
+  assert.deepEqual(recovered.events, [
+    { type: "status", id: "status:accepted-turn", turnId: "accepted-turn", status: "interrupted" },
+  ]);
+});
+
 test("editing a Codex message does not replay history rebuilt with new item ids", () => {
   const attached = projectSnapshot({ id: ref.threadId, hostId: ref.hostId, rolloutPath: "C:/profiles/work/sessions/base.jsonl", turns: [] }, null, 100);
   const beforeEdit = { id: ref.threadId, hostId: ref.hostId, rolloutPath: "C:/profiles/work/sessions/base.jsonl", turns: [{

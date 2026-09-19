@@ -76,7 +76,7 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   };
   const inputs: TaskObservedInput[] = [];
   for (const turn of turns) {
-    const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since;
+    const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
     const lastAgentId = string(agentItems.at(-1)?.id);
@@ -100,7 +100,8 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     if (eligible) {
       const status = turn.status === "inProgress" ? "running" : turn.status === "completed" ? "completed"
         : turn.status === "failed" ? "failed" : turn.status === "interrupted" ? "interrupted" : null;
-      if (status) emit({ type: "status", id: `status:${turn.id}`, turnId: turn.id, status }, previous === null && status === "running");
+      if (status) emit({ type: "status", id: `status:${turn.id}`, turnId: turn.id, status },
+        previous === null && status === "running" || status !== "running" && status !== "completed" && recoverFinal.has(turn.id));
     }
   }
   const latest = turns.at(-1);

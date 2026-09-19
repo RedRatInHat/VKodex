@@ -166,3 +166,18 @@ test("native observer recovers an accepted final after reconnect without replayi
     { rebaseline: true, recoverFinalTurnIds: ["turn"], finalRecorded: () => false });
   assert.deepEqual(recovered.events.filter(event => event.type !== "status").map(event => event.type), ["final"]);
 });
+
+test("native observer recovers the terminal status of an accepted interrupted turn", () => {
+  const interrupted: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "idle", context: null, turns: [turn("turn", "interrupted", [
+      { type: "userMessage", id: "user", clientId: "operation", content: [{ type: "text", text: "prompt" }] },
+    ], 10)] };
+  const first = observeAppServerTaskState(interrupted, null, 10_000);
+  const baseline = observeAppServerTaskState(interrupted, first.checkpoint, 20_000, { rebaseline: true });
+  assert.equal(baseline.events.length, 0);
+  const recovered = observeAppServerTaskState(interrupted, baseline.checkpoint, 30_000,
+    { rebaseline: true, recoverFinalTurnIds: ["turn"], finalRecorded: () => false });
+  assert.deepEqual(recovered.events, [
+    { type: "status", id: "status:turn", turnId: "turn", status: "interrupted" },
+  ]);
+});
