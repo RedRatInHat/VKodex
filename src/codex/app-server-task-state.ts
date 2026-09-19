@@ -53,7 +53,9 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   if (state.kind !== "app-server" || !Array.isArray(state.turns)) throw new AppServerUnavailableError("Codex App Server вернул неизвестное состояние задачи.");
   const snapshot = state as NativeSnapshot;
   const turns = snapshot.turns;
-  const since = previous?.since ?? now;
+  // Native turn timestamps have one-second precision. Floor the attachment
+  // boundary so a turn started later in the same second is not classified as history.
+  const since = previous?.since ?? Math.floor(now / 1_000) * 1_000;
   const active = turns.filter(turn => turn.status === "inProgress").map(turn => turn.id);
   const activeAtAttach = previous?.activeAtAttach ?? active;
   const previousActive = new Set(previous?.active ?? []);
@@ -80,9 +82,9 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
         const text = textInput(item.content);
         if (eligible && text) emit({ type: "user", id, turnId: turn.id, text, ...(operationId ? { operationId } : {}) });
       } else if (item.type === "agentMessage" && typeof item.text === "string" && item.delivery !== "async" && eligible) {
-        if (item.phase === "commentary" || item.phase == null && turn.status === "inProgress") {
+        if (turn.status === "inProgress" || item.phase === "commentary") {
           emit({ type: "progress", id, turnId: turn.id, text: item.text });
-        } else if (item.phase === "final_answer" || item.phase == null && turn.status === "completed" && id === lastAgentId) {
+        } else if (turn.status === "completed" && (item.phase === "final_answer" || item.phase == null) && id === lastAgentId) {
           const event = { type: "final", id, turnId: turn.id, text: item.text } as const;
           const missingAcceptedFinal = recoverFinal.has(turn.id) && !(options.finalRecorded?.(id) ?? false);
           emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id));
@@ -182,7 +184,12 @@ class AppServerTaskStream implements TaskStateStream {
     const upsert = (value: unknown): void => {
       const turn = parseTurn(value); if (!turn) return;
       const index = turns.findIndex(item => item.id === turn.id);
-      if (index >= 0) turns[index] = turn; else turns.push(turn);
+      const existing = index >= 0 ? turns[index] : undefined;
+      const complete = { ...turn,
+        startedAt: turn.startedAt || existing?.startedAt || Date.now(),
+        items: turn.items.length ? turn.items : existing?.items ?? [],
+      };
+      if (index >= 0) turns[index] = complete; else turns.push(complete);
       turns.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
     };
     if (notification.method === "turn/started" || notification.method === "turn/completed") upsert(notification.params.turn);

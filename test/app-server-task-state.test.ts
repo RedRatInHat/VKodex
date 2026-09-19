@@ -64,6 +64,19 @@ test("native state stream pages history, buffers races and filters other tasks",
   transport.close();
 });
 
+test("native state stream keeps a live turn eligible when notifications omit timestamps", async () => {
+  const rpc = new FakeRpc(); rpc.responses.set("thread/resume", [resume([])]);
+  const states: TaskState[] = [];
+  const stream = new AppServerTaskStateTransport(rpc).subscribe({ hostId: "h", threadId: "task" }, state => states.push(state), () => {});
+  await stream.start();
+  rpc.notify("turn/started", { threadId: "task", turn: { id: "live", status: "inProgress", startedAt: null, error: null, items: [] } });
+  rpc.notify("item/completed", { threadId: "task", turnId: "live", item: item("answer", "done") });
+  rpc.notify("turn/completed", { threadId: "task", turn: { id: "live", status: "completed", startedAt: null, error: null, items: [] } });
+  const latest = (states.at(-1)?.turns as JsonObject[]).at(-1)!;
+  assert.equal(latest.status, "completed"); assert.ok(Number(latest.startedAt) > 0);
+  assert.equal((latest.items as JsonObject[])[0]?.text, "done");
+});
+
 test("native observer baselines old history and emits live progress and final once", () => {
   const base: TaskState = { kind: "app-server", threadId: "task", title: "Task", cwd: "D:\\work", model: "gpt-test", effort: "high",
     runtimeStatus: "active", context: null, turns: [{ id: "turn", status: "inProgress", startedAt: 1_000,
@@ -82,6 +95,29 @@ test("native observer baselines old history and emits live progress and final on
   assert.deepEqual(third.events.map(event => event.type), ["final", "status"]);
   const repeated = observeAppServerTaskState(completed, third.checkpoint, 5_000);
   assert.deepEqual(repeated.events, []);
+});
+
+test("a streamed final-answer item remains progress until the turn completes", () => {
+  const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "idle", context: null, turns: [] };
+  const first = observeAppServerTaskState(empty, null, 10_000);
+  const streaming = structuredClone(empty); streaming.runtimeStatus = "active";
+  streaming.turns = [turn("turn", "inProgress", [item("answer", "partial", "final_answer")], 11_000)];
+  const live = observeAppServerTaskState(streaming, first.checkpoint, 11_500);
+  assert.deepEqual(live.events.map(event => event.type), ["progress", "status"]);
+  const done = structuredClone(streaming); done.runtimeStatus = "idle"; (done.turns as JsonObject[])[0]!.status = "completed";
+  const completed = observeAppServerTaskState(done, live.checkpoint, 12_000);
+  assert.deepEqual(completed.events.map(event => event.type), ["final", "status"]);
+});
+
+test("native observer accepts a turn started later in the attachment second", () => {
+  const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "idle", context: null, turns: [] };
+  const first = observeAppServerTaskState(empty, null, 10_999);
+  const live = structuredClone(empty); live.runtimeStatus = "active";
+  live.turns = [turn("same-second", "inProgress", [], 10_000)];
+  const next = observeAppServerTaskState(live, first.checkpoint, 11_001);
+  assert.deepEqual(next.events.map(event => event.type), ["status"]);
 });
 
 test("native observer recovers an accepted final after reconnect without replaying commentary", () => {
