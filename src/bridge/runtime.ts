@@ -1,13 +1,13 @@
 import { isObject } from "../desktop/ipc-client.js";
 import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { DesktopTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../desktop/state-transport.js";
-import { RolloutRecordTooLargeError, RolloutTailer } from "../desktop/rollout-tailer.js";
+import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../desktop/history-recovery.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type TaskCreationUpdate, type TaskDetails, type TaskEvent } from "../desktop/contracts.js";
+import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type TaskCreationUpdate, type TaskDetails } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
@@ -16,7 +16,6 @@ import type { BridgeHealthSnapshot } from "./contracts.js";
 import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
-import { comparablePath } from "../desktop/paths.js";
 
 export class DesktopBridgeRuntime {
   private readonly gate: AccessGate;
@@ -32,11 +31,6 @@ export class DesktopBridgeRuntime {
   private readonly retryAfter = new Map<string, number>();
   private readonly ownerVerifiedAt = new Map<string, number>();
   private readonly ownerChecks = new Map<string, Promise<void>>();
-  /** Tasks whose desktop owner exists but does not emit stream snapshots. */
-  private readonly rolloutFallback = new Set<string>();
-  private readonly rolloutFallbackSince = new Map<string, number>();
-  private readonly rolloutPollAfter = new Map<string, number>();
-  private readonly rollout = new RolloutTailer();
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = false;
@@ -52,7 +46,7 @@ export class DesktopBridgeRuntime {
     private readonly streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
-    inboundFileLimits?: InboundFileLimits) {
+    inboundFileLimits?: InboundFileLimits, private historyRecovery: TaskHistoryRecovery = new RolloutTaskHistoryRecovery()) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.gate = new AccessGate(access, store);
@@ -182,16 +176,11 @@ export class DesktopBridgeRuntime {
 
   private enableRolloutFallback(binding: Binding, since = this.now()): void {
     if (!binding.rolloutPath) return;
-    this.rolloutFallback.add(binding.id);
-    this.rolloutFallbackSince.set(binding.id, Math.min(this.rolloutFallbackSince.get(binding.id) ?? since, since));
-    this.rolloutPollAfter.delete(binding.id);
+    this.historyRecovery.enable(binding.id, since);
   }
 
   private disableRolloutFallback(binding: Binding): void {
-    this.rolloutFallback.delete(binding.id);
-    this.rolloutFallbackSince.delete(binding.id);
-    this.rolloutPollAfter.delete(binding.id);
-    this.rollout.clear(binding);
+    this.historyRecovery.disable(binding.id, binding);
     if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
   }
 
@@ -201,43 +190,29 @@ export class DesktopBridgeRuntime {
    * stable visible assistant message IDs until Codex rebuilds the branch.
    */
   private async mirrorRolloutFallback(binding: Binding): Promise<void> {
-    if (!this.rolloutFallback.has(binding.id) || !binding.attached || binding.peerId === null) return;
-    if (this.now() < (this.rolloutPollAfter.get(binding.id) ?? 0)) return;
-    this.rolloutPollAfter.set(binding.id, this.now() + 1_000);
+    if (!binding.attached || binding.peerId === null) return;
     const checkpoint = this.store.getValue<ProjectionCheckpoint>(`projection:${binding.id}`);
     // A rewritten Codex branch may assign new item IDs to answers already
     // delivered from the old rollout. Without an owner snapshot there is no
     // authoritative way to distinguish those from new direct-app turns.
     // Recover only turns whose VK submission was durably accepted; wait for the
     // live stream to reconcile the rest of the rebuilt history.
-    const historyRebuilt = !!checkpoint?.rolloutPath && !!binding.rolloutPath
-      && comparablePath(checkpoint.rolloutPath) !== comparablePath(binding.rolloutPath);
-    const acceptedTurnIds = historyRebuilt
-      ? new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId)) : null;
-    // A final can land after stream failure but before this first poll. Keep
-    // the connection boundary and accepted VK turn durable across restarts;
-    // the event journal suppresses anything the live stream already delivered.
-    const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
-      this.store.oldestAcceptedTurnAt(binding.id) ?? Infinity,
-      this.rolloutFallbackSince.get(binding.id) ?? this.now());
-    let events: readonly TaskEvent[];
-    try {
-      events = await this.rollout.poll(binding, since);
-      if (historyRebuilt) {
-        const previous = this.store.getValue<{ at: number; kind: string }>(`rollout-failure:${binding.id}`);
-        if (previous?.kind !== "historyRebuilt") this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: "historyRebuilt" });
-      }
-      else if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
-    } catch (error) {
-      this.store.setValue(`rollout-failure:${binding.id}`, {
-        at: this.now(), kind: error instanceof RolloutRecordTooLargeError ? "recordTooLarge" : "readFailed",
-      });
+    const result = await this.historyRecovery.poll(binding.id, binding, checkpoint,
+      this.store.oldestAcceptedTurnAt(binding.id), new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId)), this.now());
+    if (!result) return;
+    if (result.failure) {
+      this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: result.failure });
       return;
     }
+    const events = result.events;
+    if (result.historyRebuilt) {
+        const previous = this.store.getValue<{ at: number; kind: string }>(`rollout-failure:${binding.id}`);
+        if (previous?.kind !== "historyRebuilt") this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: "historyRebuilt" });
+    }
+    else if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
     if (!events.length || this.stopped || !this.store.getBinding(binding.id)?.attached) return;
     this.store.atomic(() => {
       for (const event of events) {
-        if (acceptedTurnIds && !acceptedTurnIds.has(event.turnId)) continue;
         this.mirror.accept(binding.id, event);
         if (event.type === "final") {
           this.store.settleAcceptedTurn(binding.id, event.turnId);
