@@ -34,6 +34,7 @@ export interface AppServerRpc {
   start(): Promise<void>;
   request(method: string, params?: JsonObject, options?: AppServerRequestOptions): Promise<JsonObject>;
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void;
+  onDisconnect?(listener: (error: Error) => void): () => void;
   onServerRequest(handler: AppServerServerRequestHandler | null): void;
   close(): Promise<void>;
 }
@@ -59,6 +60,7 @@ export class AppServerConnection implements AppServerRpc {
   private stopped = false;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly notificationListeners = new Set<(notification: AppServerEnvelope) => void>();
+  private readonly disconnectListeners = new Set<(error: Error) => void>();
   private serverRequestHandler: AppServerServerRequestHandler | null = null;
 
   constructor(private readonly launch: () => ChildProcessWithoutNullStreams,
@@ -69,6 +71,11 @@ export class AppServerConnection implements AppServerRpc {
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
     this.notificationListeners.add(listener);
     return () => { this.notificationListeners.delete(listener); };
+  }
+
+  onDisconnect(listener: (error: Error) => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => { this.disconnectListeners.delete(listener); };
   }
 
   onServerRequest(handler: AppServerServerRequestHandler | null): void { this.serverRequestHandler = handler; }
@@ -207,6 +214,9 @@ export class AppServerConnection implements AppServerRpc {
       pending.reject(pending.mutating ? new AppServerUncertainError() : fallback);
     }
     this.closing = this.closing.then(() => closeAppServer(child)).catch(() => {});
+    for (const listener of this.disconnectListeners) {
+      try { listener(fallback); } catch { /* One observer cannot break recovery. */ }
+    }
   }
 
   async close(): Promise<void> {
