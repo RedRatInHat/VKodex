@@ -26,6 +26,7 @@ interface NativeSnapshot extends TaskState {
   readonly effort: string | null;
   readonly runtimeStatus: string;
   readonly context: TaskDetails["context"];
+  readonly questions: readonly CodexQuestions[];
   readonly turns: readonly NativeTurn[];
 }
 
@@ -111,7 +112,8 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   };
   return {
     checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen }, events, details,
-    questions: [] as CodexQuestions[], inputs, latestTurnId: latest?.id ?? "runtime", activeTurnId: active.at(-1) ?? null,
+    questions: Array.isArray(snapshot.questions) ? snapshot.questions : [], inputs,
+    latestTurnId: latest?.id ?? "runtime", activeTurnId: active.at(-1) ?? null,
   };
 }
 
@@ -124,7 +126,8 @@ class AppServerTaskStream implements TaskStateStream {
 
   constructor(private readonly rpc: AppServerRpc, readonly task: TaskRef,
     private readonly onState: (state: TaskState, initial: boolean) => void,
-    private readonly onError: (error: Error) => void) {}
+    private readonly onError: (error: Error) => void,
+    private readonly questions: (threadId: string) => readonly CodexQuestions[]) {}
 
   async start(): Promise<void> {
     this.unsubscribeNotification = this.rpc.onNotification(notification => this.receive(notification));
@@ -168,7 +171,8 @@ class AppServerTaskStream implements TaskStateStream {
     const turns = [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
     const status = isObject(thread.status) ? String(thread.status.type ?? "") : "";
     return { kind: "app-server", threadId: this.task.threadId, title: string(thread.name), cwd: string(result.cwd) ?? string(thread.cwd),
-      model: string(result.model), effort: string(result.reasoningEffort), runtimeStatus: status, context: null, turns };
+      model: string(result.model), effort: string(result.reasoningEffort), runtimeStatus: status, context: null,
+      questions: this.questions(this.task.threadId), turns };
   }
 
   private receive(notification: AppServerEnvelope): void {
@@ -218,6 +222,12 @@ class AppServerTaskStream implements TaskStateStream {
     this.snapshot = { ...current, title, model, effort, cwd, runtimeStatus, context, turns };
   }
 
+  refreshQuestions(): void {
+    if (!this.snapshot || this.closed) return;
+    this.snapshot = { ...this.snapshot, questions: this.questions(this.task.threadId) };
+    this.onState(this.snapshot, false);
+  }
+
   close(): void {
     this.closed = true; this.unsubscribeNotification?.(); this.unsubscribeDisconnect?.();
     this.unsubscribeNotification = null; this.unsubscribeDisconnect = null; this.queued.length = 0;
@@ -227,10 +237,14 @@ class AppServerTaskStream implements TaskStateStream {
 /** Native task streams for one profile-scoped App Server connection. */
 export class AppServerTaskStateTransport implements TaskStateTransport {
   private readonly streams = new Set<AppServerTaskStream>();
-  constructor(private readonly rpc: AppServerRpc) {}
+  constructor(private readonly rpc: AppServerRpc,
+    private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => []) {}
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
-    const stream = new AppServerTaskStream(this.rpc, task, onState, onError);
+    const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions);
     this.streams.add(stream); return stream;
+  }
+  refresh(threadId: string): void {
+    for (const stream of this.streams) if (stream.task.threadId === threadId) stream.refreshQuestions();
   }
   close(): void { for (const stream of this.streams) stream.close(); this.streams.clear(); }
 }

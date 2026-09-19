@@ -77,6 +77,17 @@ test("native state stream keeps a live turn eligible when notifications omit tim
   assert.equal((latest.items as JsonObject[])[0]?.text, "done");
 });
 
+test("native state stream publishes structured question changes immediately", async () => {
+  const rpc = new FakeRpc(); rpc.responses.set("thread/resume", [resume([])]);
+  let questions: readonly any[] = [];
+  const states: TaskState[] = []; const transport = new AppServerTaskStateTransport(rpc, () => questions);
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, state => states.push(state), () => {});
+  await stream.start();
+  questions = [{ fingerprint: "f", kind: "blocking", key: "q", turnId: "turn", questions: [] }];
+  transport.refresh("task");
+  assert.equal((states.at(-1)?.questions as unknown[]).length, 1);
+});
+
 test("native observer baselines old history and emits live progress and final once", () => {
   const base: TaskState = { kind: "app-server", threadId: "task", title: "Task", cwd: "D:\\work", model: "gpt-test", effort: "high",
     runtimeStatus: "active", context: null, turns: [{ id: "turn", status: "inProgress", startedAt: 1_000,

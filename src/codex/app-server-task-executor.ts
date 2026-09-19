@@ -32,6 +32,7 @@ function idOf(value: unknown): string | null { return typeof value === "string" 
 export class AppServerTaskExecutor {
   private readonly loaded = new Map<string, LoadedTask>();
   private readonly questions = new Map<string, PendingQuestion>();
+  private readonly questionListeners = new Set<(threadId: string) => void>();
   private readonly unsubscribe: () => void;
 
   constructor(private readonly rpc: AppServerRpc) {
@@ -101,6 +102,14 @@ export class AppServerTaskExecutor {
     return pending ? [pending.question] : [];
   }
 
+  questionSnapshot(threadId: string): readonly CodexQuestions[] {
+    const pending = this.questions.get(threadId); return pending ? [pending.question] : [];
+  }
+
+  onQuestionsChanged(listener: (threadId: string) => void): () => void {
+    this.questionListeners.add(listener); return () => { this.questionListeners.delete(listener); };
+  }
+
   async answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     _operationId: string, beforeSend: () => Promise<void>): Promise<void> {
     const key = task.threadId; const pending = this.questions.get(key);
@@ -113,6 +122,7 @@ export class AppServerTaskExecutor {
     }
     await beforeSend();
     this.questions.delete(key);
+    this.notifyQuestions(key);
     pending.resolve({ answers: result });
   }
 
@@ -167,12 +177,18 @@ export class AppServerTaskExecutor {
     const key = threadId;
     const previous = this.questions.get(key);
     previous?.reject(new Error("Question replaced"));
-    return new Promise((resolve, reject) => { this.questions.set(key, { question, resolve, reject }); });
+    return new Promise((resolve, reject) => {
+      this.questions.set(key, { question, resolve, reject }); this.notifyQuestions(key);
+    });
+  }
+
+  private notifyQuestions(threadId: string): void {
+    for (const listener of this.questionListeners) listener(threadId);
   }
 
   close(): void {
     this.unsubscribe(); this.rpc.onServerRequest(null);
     for (const pending of this.questions.values()) pending.reject(new Error("Executor closed"));
-    this.questions.clear(); this.loaded.clear();
+    this.questions.clear(); this.loaded.clear(); this.questionListeners.clear();
   }
 }

@@ -11,10 +11,12 @@ export class AppServerProfileOwner {
   readonly states: TaskStateTransport;
   private readonly executor: AppServerTaskExecutor;
   private readonly nativeStates: AppServerTaskStateTransport;
+  private readonly unsubscribeQuestions: () => void;
 
   constructor(readonly sourceId: string, private readonly rpc: AppServerRpc) {
     this.executor = new AppServerTaskExecutor(rpc);
-    this.nativeStates = new AppServerTaskStateTransport(rpc);
+    this.nativeStates = new AppServerTaskStateTransport(rpc, threadId => this.executor.questionSnapshot(threadId));
+    this.unsubscribeQuestions = this.executor.onQuestionsChanged(threadId => this.nativeStates.refresh(threadId));
     this.states = {
       subscribe: (task, onState, onError) => {
         this.assertOwner(task);
@@ -47,7 +49,7 @@ export class AppServerProfileOwner {
   }
 
   async close(): Promise<void> {
-    this.nativeStates.close(); this.executor.close(); await this.rpc.close();
+    this.unsubscribeQuestions(); this.nativeStates.close(); this.executor.close(); await this.rpc.close();
   }
 }
 
