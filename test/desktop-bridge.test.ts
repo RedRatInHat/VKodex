@@ -3197,4 +3197,3 @@ test("a process crash during question submission preserves the uncertain state",
   assert.equal(s.desktop.questionAnswers.length, 0);
   assert.equal(s.desktop.submissions.length, 0);
 });
-
