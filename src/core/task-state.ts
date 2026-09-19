@@ -1,4 +1,4 @@
-import { taskKey, type TaskRef } from "./codex-tasks.js";
+import { TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js";
 
 export type TaskState = Record<string, unknown>;
 
@@ -21,11 +21,35 @@ export interface TaskStateOwnerRoute {
   readonly states: TaskStateTransport;
 }
 
+class RoutedTaskStateStream implements TaskStateStream {
+  private active: TaskStateStream;
+  private closed = false;
+  private primaryClosed = false;
+  constructor(readonly task: TaskRef, private readonly primary: TaskStateStream,
+    private readonly fallback: () => TaskStateStream) { this.active = primary; }
+  async start(timeoutMs?: number): Promise<void> {
+    try { await this.primary.start(timeoutMs); }
+    catch (error) {
+      if (!(error instanceof TaskOwnedByClientError) || this.closed) throw error;
+      this.primary.close(); this.primaryClosed = true; this.active = this.fallback();
+      await this.active.start(timeoutMs);
+    }
+  }
+  verifyOwner(timeoutMs?: number): Promise<void> { return this.active.verifyOwner(timeoutMs); }
+  close(): void {
+    this.closed = true; this.active.close();
+    if (this.active !== this.primary && !this.primaryClosed) this.primary.close();
+  }
+}
+
 /** Selects the configured source owner before opening a task stream. */
 export class RoutedTaskStateTransport implements TaskStateTransport {
   constructor(private readonly fallback: TaskStateTransport, private readonly owners: readonly TaskStateOwnerRoute[]) {}
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
-    return (this.owners.find(owner => owner.owns(task))?.states ?? this.fallback).subscribe(task, onState, onError);
+    const owner = this.owners.find(owner => owner.owns(task));
+    if (!owner) return this.fallback.subscribe(task, onState, onError);
+    return new RoutedTaskStateStream(task, owner.states.subscribe(task, onState, onError),
+      () => this.fallback.subscribe(task, onState, onError));
   }
   close(): void {
     this.fallback.close();

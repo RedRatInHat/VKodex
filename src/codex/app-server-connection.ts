@@ -8,7 +8,8 @@ export class AppServerUnavailableError extends Error {
 }
 
 export class AppServerRejectedError extends Error {
-  constructor(readonly code: number | string | null = null) {
+  constructor(readonly code: number | string | null = null,
+    readonly reason: "active-writer" | null = null) {
     super("Codex App Server отклонил запрос."); this.name = "AppServerRejectedError";
   }
 }
@@ -181,7 +182,9 @@ export class AppServerConnection implements AppServerRpc {
     if (value.error !== undefined) {
       const error = isObject(value.error) ? value.error : {};
       const code = typeof error.code === "number" || typeof error.code === "string" ? error.code : null;
-      pending.reject(new AppServerRejectedError(code)); return;
+      const reason = typeof error.message === "string" && /already has an active writer/iu.test(error.message)
+        ? "active-writer" as const : null;
+      pending.reject(new AppServerRejectedError(code, reason)); return;
     }
     if (!isObject(value.result)) { pending.reject(new AppServerUnavailableError("Codex App Server вернул некорректный ответ.")); return; }
     pending.resolve(value.result);

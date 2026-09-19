@@ -272,6 +272,8 @@ export interface CodexTasks {
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;
   submitWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
+  /** Submit only through an owner that is already connected; never launch UI. */
+  submitConnectedWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
   interrupt(task: TaskRef): Promise<void>;
@@ -346,6 +348,14 @@ export class TaskNotOpenError extends DesktopUnavailableError {
   constructor() {
     super("У задачи нет активного подключения в Codex. Автоматически восстановить его не удалось. Владельцу VKodex нужно проверить клиент выбранного каталога и открыть задачу через /open, затем повторить сообщение.");
     this.name = "TaskNotOpenError";
+  }
+}
+
+/** A profile App Server cannot load a task while an application owns its writer. */
+export class TaskOwnedByClientError extends DesktopUnavailableError {
+  constructor() {
+    super("Задача уже открыта в клиенте Codex и должна обслуживаться его активным подключением.");
+    this.name = "TaskOwnedByClientError";
   }
 }
 

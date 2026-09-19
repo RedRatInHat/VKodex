@@ -1,5 +1,5 @@
 import type { CodexQuestions } from "./codex-questions.js";
-import { ActionRejectedError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { ActionRejectedError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -29,36 +29,83 @@ export class RoutedCodexTasks implements CodexTasks {
   catalogWarnings(): readonly string[] { return this.base.catalogWarnings?.() ?? []; }
   createTask(request: CreateTaskRequest): Promise<DesktopTask> { return this.base.createTask(request); }
   async submit(request: SubmitTaskRequest): Promise<void> { await this.submitWithReceipt(request); }
-  submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
-    const owner = this.owner(request.task); return owner ? owner.submitWithReceipt(request)
-      : this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
+  async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
+    const owner = this.owner(request.task);
+    if (!owner) return this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
+    try { return await owner.submitWithReceipt(request); }
+    catch (error) {
+      if (!(error instanceof TaskOwnedByClientError)) throw error;
+      if (!this.base.submitConnectedWithReceipt) throw new ActionRejectedError("Задача открыта в Codex, но её активное подключение недоступно. Повтори после восстановления клиента.");
+      return this.base.submitConnectedWithReceipt(request);
+    }
   }
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
     return this.owner(task)?.findAcceptedInput(task, operationId) ?? this.base.findAcceptedInput?.(task, operationId) ?? Promise.resolve(null);
   }
-  editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
-    if (this.owner(request.task)) throw new ActionRejectedError("Нативное редактирование последнего хода пока не включено для этого каталога Codex.");
+  async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
+    const owner = this.owner(request.task);
+    if (owner) {
+      try { await owner.inspectTask(request.task); }
+      catch (error) {
+        if (error instanceof TaskOwnedByClientError && this.base.editLastUserTurn) return this.base.editLastUserTurn(request);
+        throw error;
+      }
+      throw new ActionRejectedError("Нативное редактирование последнего хода пока не включено для этого каталога Codex.");
+    }
     if (!this.base.editLastUserTurn) throw new ActionRejectedError("Редактирование последнего хода недоступно.");
     return this.base.editLastUserTurn(request);
   }
-  interrupt(task: TaskRef): Promise<void> { return this.owner(task)?.interrupt(task) ?? this.base.interrupt(task); }
-  queue(request: SubmitTaskRequest): Promise<string> {
-    const owner = this.owner(request.task); if (owner) return owner.queue(request);
+  async interrupt(task: TaskRef): Promise<void> {
+    const owner = this.owner(task); if (!owner) return this.base.interrupt(task);
+    try { return await owner.interrupt(task); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.interrupt(task); }
+  }
+  async queue(request: SubmitTaskRequest): Promise<string> {
+    const owner = this.owner(request.task);
+    if (owner) {
+      try { return await owner.queue(request); }
+      catch (error) {
+        if (!(error instanceof TaskOwnedByClientError)) throw error;
+        if (!this.base.queue) throw new ActionRejectedError("Штатная очередь активного клиента недоступна.");
+        return this.base.queue(request);
+      }
+    }
     if (!this.base.queue) throw new ActionRejectedError("Штатная очередь недоступна."); return this.base.queue(request);
   }
-  pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
-    const owner = this.owner(task); if (owner) return owner.pendingQuestions(task);
+  async pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
+    const owner = this.owner(task);
+    if (owner) {
+      try { await owner.inspectTask(task); return owner.pendingQuestions(task); }
+      catch (error) {
+        if (!(error instanceof TaskOwnedByClientError)) throw error;
+        return this.base.pendingQuestions?.(task) ?? [];
+      }
+    }
     return this.base.pendingQuestions?.(task) ?? Promise.resolve([]);
   }
-  answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
+  async answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void> {
-    const owner = this.owner(task); if (owner) return owner.answerQuestions(task, question, answers, operationId, beforeSend);
+    const owner = this.owner(task);
+    if (owner) {
+      try { await owner.inspectTask(task); return owner.answerQuestions(task, question, answers, operationId, beforeSend); }
+      catch (error) {
+        if (!(error instanceof TaskOwnedByClientError)) throw error;
+        if (!this.base.answerQuestions) throw new ActionRejectedError("Ответы на вопросы активного клиента недоступны.");
+        return this.base.answerQuestions(task, question, answers, operationId, beforeSend);
+      }
+    }
     if (!this.base.answerQuestions) throw new ActionRejectedError("Ответы на вопросы Codex недоступны.");
     return this.base.answerQuestions(task, question, answers, operationId, beforeSend);
   }
-  inspectTask(task: TaskRef): Promise<TaskDetails> { return this.owner(task)?.inspectTask(task) ?? this.base.inspectTask(task); }
-  selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
-    return this.owner(task)?.selectModel(task, model, effort) ?? this.base.selectModel(task, model, effort);
+  async inspectTask(task: TaskRef): Promise<TaskDetails> {
+    const owner = this.owner(task); if (!owner) return this.base.inspectTask(task);
+    try { return await owner.inspectTask(task); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.inspectTask(task); }
+  }
+  async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
+    const owner = this.owner(task); if (!owner) return this.base.selectModel(task, model, effort);
+    try { return await owner.selectModel(task, model, effort); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.selectModel(task, model, effort); }
   }
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]> { return this.base.listModels(task); }
   moveTask(task: TaskRef, projectId: string | null): Promise<void> { return this.base.moveTask(task, projectId); }
@@ -105,8 +152,9 @@ export class RoutedCodexTasks implements CodexTasks {
   clearGoal(task: TaskRef): Promise<boolean> { return this.base.clearGoal?.(task) ?? Promise.resolve(false); }
   continueGoal(task: TaskRef): Promise<void> { return this.base.continueGoal?.(task) ?? Promise.resolve(); }
   revealTask(task: TaskRef): Promise<void> { return this.base.revealTask?.(task) ?? Promise.resolve(); }
-  ensureOpen(task: TaskRef): Promise<void> {
-    if (this.owner(task)) return this.inspectTask(task).then(() => {}); return this.base.ensureOpen?.(task) ?? Promise.resolve();
+  async ensureOpen(task: TaskRef): Promise<void> {
+    if (this.owner(task)) { await this.inspectTask(task); return; }
+    return this.base.ensureOpen?.(task) ?? Promise.resolve();
   }
   isCreationActive(task: TaskRef): boolean { return this.base.isCreationActive?.(task) ?? false; }
   onCreationUpdate(listener: (update: TaskCreationUpdate) => void): () => void { return this.base.onCreationUpdate?.(listener) ?? (() => {}); }

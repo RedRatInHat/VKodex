@@ -85,6 +85,17 @@ test("known App Server rejections remain rejected without exposing server text",
   } finally { await connection.close(); }
 });
 
+test("active-writer rejection is classified without exposing the task identity", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
+    : { id: message.id, error: { code: -32600, message: "thread private-id already has an active writer" } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    await assert.rejects(connection.request("thread/resume", { threadId: "private-id" }), error =>
+      error instanceof AppServerRejectedError && error.reason === "active-writer" && !error.message.includes("private-id"));
+  } finally { await connection.close(); }
+});
+
 test("disconnect classifies reads as unavailable and dispatched mutations as uncertain, then reconnects", async () => {
   const first = new AppServerChild(); first.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
   const second = new AppServerChild();

@@ -560,7 +560,17 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.submitLive(request, task, prepared);
   }
 
-  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: PreparedTaskInput, allowEmpty = false): Promise<SubmitTaskReceipt> {
+  async submitConnectedWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
+    const text = request.text.trim();
+    if ((!text && !request.inputFiles?.length) || text.length > 64_000) throw new ActionRejectedError("Пришли текст до 64000 символов или вложение.");
+    const task = (await this.listTasks()).find(task => sameTask(task, request.task));
+    if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
+    const prepared = taskInput(request);
+    return this.submitLive(request, task, prepared, false, false);
+  }
+
+  private async submitLive(request: SubmitTaskRequest, task: TaskRef, prepared: PreparedTaskInput,
+    allowEmpty = false, allowLaunch = true): Promise<SubmitTaskReceipt> {
     let opened = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       let connection: Awaited<ReturnType<ConnectedDesktopTasks["connect"]>> | undefined;
@@ -570,7 +580,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
         catch (error) {
           // Recover missing ownership only for new input, at most once per
           // request. A generic IPC error never justifies opening a window.
-          if (!(error instanceof TaskNotOpenError) || !this.live?.launcher || opened) throw error;
+          if (!allowLaunch || !(error instanceof TaskNotOpenError) || !this.live?.launcher || opened) throw error;
           await request.beforeSend?.();
           opened = true;
           await this.live.launcher.open(task);

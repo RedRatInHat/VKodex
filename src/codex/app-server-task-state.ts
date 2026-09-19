@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestions } from "../core/codex-questions.js";
-import type { TaskDetails, TaskEvent, TaskRef } from "../core/codex-tasks.js";
+import { TaskOwnedByClientError, type TaskDetails, type TaskEvent, type TaskRef } from "../core/codex-tasks.js";
 import type { TaskObservation, TaskObservationCheckpoint, TaskObservationOptions, TaskObservedInput } from "../core/task-observation.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
-import { AppServerUnavailableError, type AppServerEnvelope, type AppServerRpc } from "./app-server-connection.js";
+import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelope, type AppServerRpc } from "./app-server-connection.js";
 
 type JsonObject = Record<string, unknown>;
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -158,6 +158,7 @@ class AppServerTaskStream implements TaskStateStream {
       if (!this.closed) this.onState(this.snapshot, true);
     } catch (error) {
       this.close();
+      if (error instanceof AppServerRejectedError && error.reason === "active-writer") throw new TaskOwnedByClientError();
       throw error;
     }
   }

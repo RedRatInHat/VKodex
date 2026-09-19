@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
-import { ActionRejectedError, UncertainActionError, taskKey,
+import { ActionRejectedError, TaskOwnedByClientError, UncertainActionError, taskKey,
   type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef } from "../core/codex-tasks.js";
 import { taskInput } from "../core/task-input.js";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError,
@@ -22,6 +22,7 @@ interface PendingQuestion {
 }
 
 const operationError = (error: unknown): Error => error instanceof AppServerUncertainError ? new UncertainActionError()
+  : error instanceof AppServerRejectedError && error.reason === "active-writer" ? new TaskOwnedByClientError()
   : error instanceof AppServerRejectedError ? new ActionRejectedError("Codex отклонил команду. Состояние задачи не изменено.")
   : error instanceof AppServerUnavailableError ? new ActionRejectedError("Владелец задачи Codex недоступен. Команда не отправлена.")
   : error instanceof Error ? error : new ActionRejectedError("Codex не выполнил команду.");

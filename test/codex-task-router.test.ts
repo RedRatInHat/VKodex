@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
-import { ActionRejectedError, type CodexTasks, type TaskRef } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, TaskOwnedByClientError, type CodexTasks, type TaskRef } from "../src/core/codex-tasks.js";
 import { RoutedTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
@@ -14,6 +14,7 @@ function fixture() {
     listTasks: async () => [], listProjects: async () => [], createTask: async () => { throw new Error("unused"); },
     submit: async () => { calls.push("base:submit"); },
     submitWithReceipt: async () => { calls.push("base:submitWithReceipt"); return { mode: "start" as const, turnId: "base-turn" }; },
+    submitConnectedWithReceipt: async () => { calls.push("base:connectedSubmit"); return { mode: "steer" as const, turnId: "client-turn" }; },
     interrupt: async () => { calls.push("base:interrupt"); }, moveTask: async () => { calls.push("base:move"); },
     inspectTask: async () => ({ status: "idle" as const, workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
     listModels: async () => [], selectModel: async () => { calls.push("base:model"); },
@@ -41,9 +42,17 @@ test("command router uses exactly the configured source owner", async () => {
 
 test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {
   const f = fixture(); await f.routed.ensureOpen!(work); assert.deepEqual(f.calls, []);
-  assert.throws(() => f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);
+  await assert.rejects(f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);
   assert.deepEqual(f.calls, []);
   await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["base:open"]);
+});
+
+test("an active UI writer receives a connected-only fallback before any native mutation", async () => {
+  const f = fixture();
+  f.owner.submitWithReceipt = async () => { f.calls.push("owner:busy"); throw new TaskOwnedByClientError(); };
+  const result = await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" });
+  assert.equal(result.turnId, "client-turn");
+  assert.deepEqual(f.calls, ["owner:busy", "base:connectedSubmit"]);
 });
 
 test("state router sends each task only to its selected owner", () => {
@@ -57,4 +66,19 @@ test("state router sends each task only to its selected owner", () => {
   const routed = new RoutedTaskStateTransport(fallback, [owner]);
   routed.subscribe(primary, () => {}, () => {}); routed.subscribe(work, () => {}, () => {}); routed.close();
   assert.deepEqual(used, ["client:primary", "native:work", "client:close", "native:close"]);
+});
+
+test("state router falls back to an already connected UI owner only for an active writer", async () => {
+  const used: string[] = [];
+  const native: TaskStateTransport = {
+    subscribe: task => ({ task, start: async () => { used.push("native:start"); throw new TaskOwnedByClientError(); }, verifyOwner: async () => {}, close: () => used.push("native:close") }),
+    close: () => {},
+  };
+  const client: TaskStateTransport = {
+    subscribe: task => ({ task, start: async () => { used.push("client:start"); }, verifyOwner: async () => {}, close: () => used.push("client:close") }),
+    close: () => {},
+  };
+  const routed = new RoutedTaskStateTransport(client, [{ owns: task => task.sourceId === "work", states: native }]);
+  const stream = routed.subscribe(work, () => {}, () => {}); await stream.start(); stream.close();
+  assert.deepEqual(used, ["native:start", "native:close", "client:start", "client:close"]);
 });
