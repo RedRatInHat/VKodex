@@ -30,6 +30,14 @@ export interface AppServerEnvelope {
 
 export type AppServerServerRequestHandler = (request: AppServerEnvelope) => Promise<JsonObject> | JsonObject;
 
+export interface AppServerRpc {
+  start(): Promise<void>;
+  request(method: string, params?: JsonObject, options?: AppServerRequestOptions): Promise<JsonObject>;
+  onNotification(listener: (notification: AppServerEnvelope) => void): () => void;
+  onServerRequest(handler: AppServerServerRequestHandler | null): void;
+  close(): Promise<void>;
+}
+
 interface PendingRequest {
   readonly mutating: boolean;
   readonly resolve: (value: JsonObject) => void;
@@ -41,7 +49,7 @@ const isObject = (value: unknown): value is JsonObject => value !== null && type
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 /** One restartable JSONL App Server connection owned by a single Codex profile. */
-export class AppServerConnection {
+export class AppServerConnection implements AppServerRpc {
   private child: ChildProcessWithoutNullStreams | null = null;
   private generation = 0;
   private nextId = 1;
