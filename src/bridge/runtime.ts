@@ -1,6 +1,6 @@
 import { isObject } from "../desktop/ipc-client.js";
 import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
-import { DesktopTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../desktop/state-transport.js";
+import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../desktop/state-transport.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../desktop/history-recovery.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
@@ -25,12 +25,7 @@ export class DesktopBridgeRuntime {
   private readonly activity: TaskActivity;
   private readonly files: TaskFiles | undefined;
   private readonly health: BridgeHealthMonitor;
-  private readonly subscriptions = new Map<string, TaskStateStream>();
-  private readonly subscriptionTasks = new Map<string, string>();
-  private readonly readySubscriptions = new Set<string>();
-  private readonly retryAfter = new Map<string, number>();
-  private readonly ownerVerifiedAt = new Map<string, number>();
-  private readonly ownerChecks = new Map<string, Promise<void>>();
+  private readonly connections: TaskStateConnections;
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = false;
@@ -43,12 +38,13 @@ export class DesktopBridgeRuntime {
   private lastOperationReconciliationAt = 0;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
+    streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
     inboundFileLimits?: InboundFileLimits, private historyRecovery: TaskHistoryRecovery = new RolloutTaskHistoryRecovery()) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
+    this.connections = new TaskStateConnections(streams, now);
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
@@ -110,15 +106,14 @@ export class DesktopBridgeRuntime {
 
   private runtimeHealth(): RuntimeHealthState {
     const active = this.store.bindings().filter(binding => binding.attached && binding.peerId !== null);
-    const isConnected = (binding: Binding): boolean => !!this.desktop.isCreationActive?.(binding)
-      || (this.readySubscriptions.has(binding.id) && this.now() - (this.ownerVerifiedAt.get(binding.id) ?? 0) <= 45_000);
+    const isConnected = (binding: Binding): boolean => !!this.desktop.isCreationActive?.(binding) || this.connections.connected(binding.id);
     const connected = active.filter(isConnected).length;
     const required = active.filter(binding => ["running", "approval"].includes(this.store.getValue<TaskDetails>(`task-details:${binding.id}`)?.status ?? ""));
     const bindings = active.map(binding => {
       const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
       return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
         status: details?.status ?? "unavailable", connected: isConnected(binding),
-        lastConfirmedAt: this.ownerVerifiedAt.get(binding.id) ?? null, failure: details?.failure ?? null };
+        lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null };
     });
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
@@ -163,12 +158,7 @@ export class DesktopBridgeRuntime {
     if (!this.stopped) await this.delivery.flush();
   }
   private closeSubscription(bindingId: string): void {
-    this.subscriptions.get(bindingId)?.close();
-    this.subscriptions.delete(bindingId);
-    this.subscriptionTasks.delete(bindingId);
-    this.readySubscriptions.delete(bindingId);
-    this.ownerVerifiedAt.delete(bindingId);
-    this.retryAfter.delete(bindingId);
+    this.connections.close(bindingId);
     this.manager.panels.disconnected(bindingId);
     this.activity.disconnected(bindingId);
     this.files?.observe(bindingId, "unavailable");
@@ -225,33 +215,21 @@ export class DesktopBridgeRuntime {
     });
   }
 
-  private subscriptionFailed(bindingId: string, subscription: TaskStateStream, error: Error): void {
-    if (this.subscriptions.get(bindingId) !== subscription) return;
+  private subscriptionFailed(bindingId: string, failure: TaskStateConnectionFailure): void {
     const binding = this.store.getBinding(bindingId);
-    const lastVerifiedAt = this.ownerVerifiedAt.get(bindingId);
-    this.closeSubscription(bindingId);
-    if (this.stopped || !binding?.attached || !sameTask(binding, subscription.task)) return;
-    this.enableRolloutFallback(binding, lastVerifiedAt ?? this.now());
-    this.manager.panels.disconnected(bindingId, error instanceof TaskNotOpenError);
-    this.retryAfter.set(bindingId, this.now() + 5_000);
-    const reason = error instanceof DesktopUnavailableError ? error.message : "Подключение к десктопу Codex недоступно.";
+    this.manager.panels.disconnected(bindingId);
+    this.activity.disconnected(bindingId);
+    this.files?.observe(bindingId, "unavailable");
+    if (this.stopped || !binding?.attached || !sameTask(binding, failure.task)) return;
+    this.enableRolloutFallback(binding, failure.lastVerifiedAt ?? this.now());
+    this.manager.panels.disconnected(bindingId, failure.error instanceof TaskNotOpenError);
+    this.connections.postpone(bindingId, 5_000);
+    const reason = failure.error instanceof DesktopUnavailableError ? failure.error.message : "Подключение к десктопу Codex недоступно.";
     this.store.enqueue(`disconnected:${bindingId}`, this.access.ownerId, { text: `Связь с задачей «${binding.title.slice(0, 200)}» прервалась. ${reason} Подключение будет повторено; команды автоматически не повторяются.` });
   }
 
-  private verifySubscription(bindingId: string, subscription: TaskStateStream): void {
-    if (this.ownerChecks.has(bindingId) || this.now() - (this.ownerVerifiedAt.get(bindingId) ?? 0) < 30_000) return;
-    // Independent bounded reads: an unresponsive owner must not delay other
-    // subscriptions, VK messages or the activity timer.
-    const check = subscription.verifyOwner().then(() => {
-      if (this.subscriptions.get(bindingId) === subscription) this.ownerVerifiedAt.set(bindingId, this.now());
-    }, error => this.subscriptionFailed(bindingId, subscription, error)).finally(() => {
-      if (this.ownerChecks.get(bindingId) === check) this.ownerChecks.delete(bindingId);
-    });
-    this.ownerChecks.set(bindingId, check);
-  }
-
   private closeInactiveSubscriptions(): void {
-    for (const id of this.subscriptions.keys()) {
+    for (const id of this.connections.ids()) {
       const binding = this.store.getBinding(id);
       if (!binding?.attached || binding.peerId === null) { this.closeSubscription(id); if (binding) this.disableRolloutFallback(binding); }
     }
@@ -282,9 +260,9 @@ export class DesktopBridgeRuntime {
     const starting = new Set<Promise<void>>();
     for (const listed of this.store.bindings()) {
       let binding = listed;
-      let existing = this.subscriptions.get(binding.id);
-      if (existing && this.subscriptionTasks.get(binding.id) !== taskKey(binding)) {
-        this.closeSubscription(binding.id); existing = undefined;
+      let existing = this.connections.has(binding.id);
+      if (existing && !this.connections.matches(binding.id, binding)) {
+        this.closeSubscription(binding.id); existing = false;
       }
       if (!binding.attached || binding.peerId === null) {
         this.closeSubscription(binding.id); this.disableRolloutFallback(binding); continue;
@@ -297,9 +275,7 @@ export class DesktopBridgeRuntime {
       }
       this.flushCreation(binding);
       if (this.desktop.isCreationActive?.(binding)) {
-        if (existing) {
-          existing.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id); this.retryAfter.delete(binding.id);
-        }
+        if (existing) this.closeSubscription(binding.id);
         try {
           const details = await this.desktop.inspectTask(binding);
           this.manager.panels.observe(binding.id, details);
@@ -307,14 +283,14 @@ export class DesktopBridgeRuntime {
         } catch { /* The creation owner may have handed off between both checks. */ }
         continue;
       }
-      if (!existing && this.now() < (this.retryAfter.get(binding.id) ?? 0)) continue;
-      if (existing) { this.verifySubscription(binding.id, existing); continue; }
+      if (!existing && !this.connections.canAttempt(binding.id)) continue;
+      if (existing) { this.connections.maintain(binding.id); continue; }
       listedTasks ??= await this.desktop.listTasks();
       const task = listedTasks.find(task => sameTask(task, binding));
       const current = this.store.getBinding(binding.id);
       if (this.stopped || !current?.attached) { this.closeSubscription(binding.id); continue; }
       if (!task) {
-        this.retryAfter.set(binding.id, this.now() + 30_000);
+        this.connections.postpone(binding.id, 30_000);
         this.manager.panels.disconnected(binding.id, true);
         this.activity.disconnected(binding.id);
         this.files?.observe(binding.id, "unavailable");
@@ -322,84 +298,77 @@ export class DesktopBridgeRuntime {
       }
       this.store.ensureBinding(task);
       const checkpointKey = `projection:${binding.id}`;
-      const subscription = this.streams.subscribe(task, (state, initial) => {
-        const current = this.store.getBinding(binding.id);
-        if (this.subscriptions.get(binding.id) !== subscription || !current?.attached || !sameTask(current, task)) return;
-        this.store.atomic(() => {
-          this.readySubscriptions.add(binding.id);
-          this.disableRolloutFallback(current);
-          this.store.markDesktopHandoff(binding.id, task, "live", this.now());
-          // Native queued submissions acquire a turn later, including while the bridge is offline.
-          const pendingFiles = this.files?.pendingQueuedOperations(binding.id);
-          const pendingQueue = new Set(this.store.queuedInputs(binding.id).map(item => item.operationId));
-          for (const turn of pendingFiles?.size || pendingQueue.size ? turnsFromState(state) : []) {
-            if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
-            for (const item of turn.items.filter(isObject)) {
-              if (item.type === "userMessage" && typeof item.clientId === "string") {
-                if (pendingFiles?.has(item.clientId)) {
-                  this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
-                  if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
-                }
-                if (pendingQueue.has(item.clientId)) {
-                  this.store.settleQueuedInput(binding.id, item.clientId);
-                  this.store.rememberAcceptedTurn(binding.id, turn.turnId, item.clientId);
+      const start = (async () => {
+        const connectStartedAt = this.now();
+        try {
+          await this.connections.connect(binding.id, task, (state, initial) => {
+            const current = this.store.getBinding(binding.id);
+            if (!this.connections.matches(binding.id, task) || !current?.attached || !sameTask(current, task)) return;
+            this.store.atomic(() => {
+              this.disableRolloutFallback(current);
+              this.store.markDesktopHandoff(binding.id, task, "live", this.now());
+              // Native queued submissions acquire a turn later, including while the bridge is offline.
+              const pendingFiles = this.files?.pendingQueuedOperations(binding.id);
+              const pendingQueue = new Set(this.store.queuedInputs(binding.id).map(item => item.operationId));
+              for (const turn of pendingFiles?.size || pendingQueue.size ? turnsFromState(state) : []) {
+                if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
+                for (const item of turn.items.filter(isObject)) {
+                  if (item.type === "userMessage" && typeof item.clientId === "string") {
+                    if (pendingFiles?.has(item.clientId)) {
+                      this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
+                      if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
+                    }
+                    if (pendingQueue.has(item.clientId)) {
+                      this.store.settleQueuedInput(binding.id, item.clientId);
+                      this.store.rememberAcceptedTurn(binding.id, turn.turnId, item.clientId);
+                    }
+                  }
                 }
               }
-            }
-          }
-          const editable = this.store.editableRequest(binding.id);
-          if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
-          const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
-          if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
-          const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey), this.now(), {
-            rebaseline: initial,
-            recoverFinalTurnIds: [...recoverFinalTurnIds],
-            finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
-          });
-          for (const event of projected.events) {
-            this.mirror.accept(binding.id, event);
-            if (event.type === "final") {
-              this.store.settleAcceptedTurn(binding.id, event.turnId);
-              this.files?.observe(binding.id, "idle", event.turnId);
-            } else if (event.type === "status") {
-              this.files?.observe(binding.id, event.status === "running" ? "running" : event.status === "completed" ? "idle" : event.status, event.turnId);
-              if (event.status !== "running") this.store.settleAcceptedTurn(binding.id, event.turnId);
-            }
-          }
-          this.store.setValue(checkpointKey, projected.checkpoint);
-          const details = taskDetails(state);
-          this.manager.questions.observe(current, state);
-          this.manager.panels.observe(binding.id, details);
-          const failure = taskFailureText(details.failure);
-          if (failure) {
-            const turnId = String(turnsFromState(state).at(-1)?.turnId ?? "runtime");
-            this.store.enqueue(`task-failure:${binding.id}:${turnId}`, current.peerId!, { text: failure, buttons: [MENU_BUTTON] }, binding.id);
-          }
-          this.files?.observe(binding.id, details.status);
-          const activeTurn = activeTurnsFromState(state).at(-1);
-          this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
-        });
-      }, error => this.subscriptionFailed(binding.id, subscription, error));
-      this.subscriptions.set(binding.id, subscription);
-      this.subscriptionTasks.set(binding.id, taskKey(task));
-      const connectStartedAt = this.now();
-      const start = (async () => {
-        try {
-          await subscription.start();
-          if (this.stopped || this.subscriptions.get(binding.id) !== subscription) return;
-          this.readySubscriptions.add(binding.id);
-          this.ownerVerifiedAt.set(binding.id, this.now());
+              const editable = this.store.editableRequest(binding.id);
+              if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
+              const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
+              if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
+              const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey), this.now(), {
+                rebaseline: initial,
+                recoverFinalTurnIds: [...recoverFinalTurnIds],
+                finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
+              });
+              for (const event of projected.events) {
+                this.mirror.accept(binding.id, event);
+                if (event.type === "final") {
+                  this.store.settleAcceptedTurn(binding.id, event.turnId);
+                  this.files?.observe(binding.id, "idle", event.turnId);
+                } else if (event.type === "status") {
+                  this.files?.observe(binding.id, event.status === "running" ? "running" : event.status === "completed" ? "idle" : event.status, event.turnId);
+                  if (event.status !== "running") this.store.settleAcceptedTurn(binding.id, event.turnId);
+                }
+              }
+              this.store.setValue(checkpointKey, projected.checkpoint);
+              const details = taskDetails(state);
+              this.manager.questions.observe(current, state);
+              this.manager.panels.observe(binding.id, details);
+              const failure = taskFailureText(details.failure);
+              if (failure) {
+                const turnId = String(turnsFromState(state).at(-1)?.turnId ?? "runtime");
+                this.store.enqueue(`task-failure:${binding.id}:${turnId}`, current.peerId!, { text: failure, buttons: [MENU_BUTTON] }, binding.id);
+              }
+              this.files?.observe(binding.id, details.status);
+              const activeTurn = activeTurnsFromState(state).at(-1);
+              this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
+            });
+          }, failure => this.subscriptionFailed(binding.id, failure));
+          if (this.stopped || !this.connections.matches(binding.id, task)) return;
           this.store.markDesktopHandoff(binding.id, task, "live", this.now());
         } catch (error) {
-          if (this.subscriptions.get(binding.id) !== subscription) return;
+          if (this.connections.has(binding.id)) this.closeSubscription(binding.id);
           this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
-          subscription.close(); this.subscriptions.delete(binding.id); this.subscriptionTasks.delete(binding.id); this.readySubscriptions.delete(binding.id);
           const current = this.store.getBinding(binding.id);
           if (this.stopped || !current?.attached) return;
           this.enableRolloutFallback(current, connectStartedAt);
           this.activity.disconnected(binding.id);
           this.files?.observe(binding.id, "unavailable");
-          this.retryAfter.set(binding.id, this.now() + 5_000);
+          this.connections.postpone(binding.id, 5_000);
           // A configured launcher may still be bringing the owner online. Keep
           // probing without filling the manager conversation with expected retries.
           if (error instanceof TaskNotOpenError) return;
@@ -433,13 +402,7 @@ export class DesktopBridgeRuntime {
     // Deliver buffered incoming text before closing its native connection.
     await this.manager.idle();
     await this.operationReconciliation?.catch(() => {});
-    for (const subscription of this.subscriptions.values()) subscription.close();
-    this.subscriptions.clear();
-    this.subscriptionTasks.clear();
-    this.readySubscriptions.clear();
-    this.ownerVerifiedAt.clear();
-    this.streams.close();
-    await Promise.allSettled(this.ownerChecks.values());
+    await this.connections.stop();
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
     await this.ticking?.catch(() => {});
     await this.manager.idle();

@@ -22,7 +22,7 @@ import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/des
 import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } from "../src/desktop/questions.js";
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
-import { DesktopTaskStateTransport, type TaskStateTransport } from "../src/desktop/state-transport.js";
+import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateTransport } from "../src/desktop/state-transport.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import type { Binding, BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
 
@@ -310,6 +310,48 @@ test("bridge core consumes task state through a transport without Desktop IPC", 
   assert.match(s.sent.at(-1)!.view.text, /^думаю\.\.\. · обновлено/u);
   await s.runtime.stop();
   assert.equal(transport.closed, true);
+});
+
+test("task state connections classify one start failure only once", async () => {
+  const failure = new Error("fixture disconnect");
+  let closed = 0;
+  const transport: TaskStateTransport = {
+    subscribe: (task, _onState, onError) => ({
+      task,
+      start: async () => { onError(failure); throw failure; },
+      verifyOwner: async () => {},
+      close: () => { closed++; },
+    }),
+    close: () => {},
+  };
+  const connections = new TaskStateConnections(transport, () => 100);
+  const failures: Error[] = [];
+  await connections.connect("binding", ref, () => {}, result => failures.push(result.error));
+  assert.deepEqual(failures, [failure]);
+  assert.equal(connections.has("binding"), false);
+  assert.equal(closed, 1);
+  await connections.stop();
+});
+
+test("task state connections ignore snapshots from a replaced generation", async () => {
+  const snapshots: ((state: IpcObject, initial: boolean) => void)[] = [];
+  const transport: TaskStateTransport = {
+    subscribe: (task, onState) => {
+      snapshots.push(onState);
+      return { task, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
+    },
+    close: () => {},
+  };
+  const connections = new TaskStateConnections(transport, () => 100);
+  const observed: string[] = [];
+  await connections.connect("binding", ref, value => observed.push(String(value.generation)), () => {});
+  const replacement = { ...ref, threadId: "replacement-task" };
+  await connections.connect("binding", replacement, value => observed.push(String(value.generation)), () => {});
+  snapshots[0]!({ generation: "old" }, false);
+  snapshots[1]!({ generation: "current" }, false);
+  assert.deepEqual(observed, ["current"]);
+  assert.equal(connections.matches("binding", replacement), true);
+  await connections.stop();
 });
 
 test("a rejected scheduled health report cannot terminate the runtime", async t => {
