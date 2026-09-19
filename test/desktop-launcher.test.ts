@@ -34,12 +34,12 @@ test("custom launcher expands only documented placeholders and keeps the source 
   assert.equal(env.CODEX_CLI_PATH, path.resolve("fixture-owner-launcher.exe"));
 });
 
-test("Windows Desktop opens the current AppX with its supported open-url contract", async () => {
-  const home = path.resolve("fixture-desktop-home"); const executable = process.execPath; const child = new Spawned();
+test("Desktop tasks use the registered protocol handler instead of starting the packaged executable directly", async () => {
+  const home = path.resolve("fixture-desktop-home"); const child = new Spawned();
   let call: { executable: string; args: readonly string[] } | null = null;
   const launcher = new SourceTaskLauncher([{ home, launcher: { type: "desktop" } }], () => home,
-    (file, args) => { call = { executable: file, args }; queueMicrotask(() => child.emit("spawn")); return child; }, async () => executable);
+    (file, args) => { call = { executable: file, args }; queueMicrotask(() => child.emit("spawn")); return child; });
   await launcher.open({ hostId: "local", threadId: "11111111-1111-4111-8111-111111111111" });
-  assert.equal(call!.executable, executable);
-  assert.deepEqual(call!.args, ["--open-url", "codex://threads/11111111-1111-4111-8111-111111111111"]);
+  assert.equal(call!.executable, process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open");
+  assert.deepEqual(call!.args, ["codex://threads/11111111-1111-4111-8111-111111111111"]);
 });
