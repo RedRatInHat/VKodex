@@ -64,6 +64,13 @@ test("owner route never opens a UI client and rejects unsupported edit instead o
   await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["base:open"]);
 });
 
+test("ensure open accepts an active writer as proof that the task is already open", async () => {
+  const f = fixture();
+  f.owner.inspectTask = async () => { throw new TaskOwnedByClientError(); };
+  await f.routed.ensureOpen!(work);
+  assert.deepEqual(f.calls, []);
+});
+
 test("an active UI writer receives a connected-only fallback before any native mutation", async () => {
   const f = fixture();
   f.owner.submitWithReceipt = async () => { f.calls.push("owner:busy"); throw new TaskOwnedByClientError(); };

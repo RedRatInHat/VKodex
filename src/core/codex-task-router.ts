@@ -191,7 +191,17 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   revealTask(task: TaskRef): Promise<void> { return this.base.revealTask?.(task) ?? Promise.resolve(); }
   async ensureOpen(task: TaskRef): Promise<void> {
-    if (this.owner(task)) { await this.inspectTask(task); return; }
+    const owner = this.owner(task);
+    if (owner) {
+      try { await owner.inspectTask(task); }
+      catch (error) {
+        // An active-writer rejection is positive evidence that the selected
+        // task is already open in another Codex client. Do not launch/focus a
+        // UI and then wait for the retired follower adapter to rediscover it.
+        if (!(error instanceof TaskOwnedByClientError)) throw error;
+      }
+      return;
+    }
     return this.base.ensureOpen?.(task) ?? Promise.resolve();
   }
   isCreationActive(task: TaskRef): boolean { return this.base.isCreationActive?.(task) ?? false; }
