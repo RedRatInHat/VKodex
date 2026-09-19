@@ -25,6 +25,12 @@ interface StagedRollout {
   cleanup(): Promise<void>;
 }
 
+interface TransferContext {
+  readonly model?: string;
+  readonly effort?: string;
+  readonly cwd?: string;
+}
+
 export class TransferRpc {
   constructor(
     codexHome: string,
@@ -94,6 +100,33 @@ function inside(root: string, candidate: string): boolean {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+async function readTransferContext(rolloutPath: string, lastTurnId: string): Promise<TransferContext> {
+  let matching: IpcObject | null = null; let latest: IpcObject | null = null;
+  try {
+    const lines = createInterface({ input: createReadStream(rolloutPath, { encoding: "utf8" }), crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line.includes('"turn_context"')) continue;
+      let record: unknown;
+      try { record = JSON.parse(line); } catch { throw new TransferConflictError("Журнал задачи повреждён; настройки переноса не подтверждены."); }
+      if (!isObject(record) || record.type !== "turn_context" || !isObject(record.payload)) continue;
+      latest = record.payload;
+      if (record.payload.turn_id === lastTurnId) matching = record.payload;
+    }
+  } catch (error) {
+    if (error instanceof TransferConflictError) throw error;
+    throw new DesktopUnavailableError("Не удалось прочитать настройки из истории задачи.");
+  }
+  const context = matching ?? latest;
+  const model = optionalString(context?.model); const effort = optionalString(context?.effort); const cwd = optionalString(context?.cwd);
+  return { ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(cwd ? { cwd } : {}) };
+}
+
+function contextChanged(expected: TransferCheckpoint, actual: TransferContext): boolean {
+  return (expected.model !== undefined && actual.model !== expected.model)
+    || (expected.effort !== undefined && actual.effort !== expected.effort)
+    || (expected.workspace !== undefined && (actual.cwd === undefined || comparablePath(actual.cwd) !== comparablePath(expected.workspace)));
 }
 
 /**
@@ -239,14 +272,20 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       const staged = await this.stage(request.task.rolloutPath, sourceHome, targetHome, request.operationId, lastTurnId);
       try {
         if (request.checkpoint) await this.verifySource(request.task, request.checkpoint);
+        if (request.checkpoint && contextChanged(request.checkpoint, staged)) {
+          throw new TransferConflictError("Модель, effort или рабочая папка источника изменились после снимка. Перенос остановлен.");
+        }
+        const model = request.checkpoint?.model ?? staged.model;
+        const effort = request.checkpoint?.effort ?? staged.effort;
+        const cwd = request.checkpoint?.workspace ?? staged.cwd;
         request.onForkSubmitted?.();
         const response = await rpc.call("thread/fork", {
           threadId: request.task.threadId,
           path: staged.path,
           lastTurnId,
-          ...(staged.model ? { model: staged.model } : {}),
-          ...(staged.cwd ? { cwd: staged.cwd } : {}),
-          ...(staged.effort ? { config: { model_reasoning_effort: staged.effort } } : {}),
+          ...(model ? { model } : {}),
+          ...(cwd ? { cwd } : {}),
+          ...(effort ? { config: { model_reasoning_effort: effort } } : {}),
           threadSource: "user",
           excludeTurns: true,
           deferGoalContinuation: true,
@@ -297,18 +336,23 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     const lastTurnId = await this.lastTerminalTurn(home, task.threadId);
     const semanticDigest = await completedHistoryDigest(task.threadId, lastTurnId,
       params => this.createRpc(home).call("thread/turns/list", params));
+    const context = await readTransferContext(task.rolloutPath, lastTurnId);
     const after = await stat(task.rolloutPath);
     if (!after.isFile() || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
       throw new DesktopUnavailableError("История ещё обновляется; снимок переноса будет повторён после завершения записи.");
     }
-    return { lastTurnId, rolloutPath: task.rolloutPath, size: after.size, mtimeMs: after.mtimeMs, semanticDigest };
+    return { lastTurnId, rolloutPath: task.rolloutPath, size: after.size, mtimeMs: after.mtimeMs, semanticDigest,
+      ...(context.cwd ? { workspace: context.cwd } : {}), ...(context.model ? { model: context.model } : {}),
+      ...(context.effort ? { effort: context.effort } : {}) };
   }
 
   async verifySource(task: TaskRef, expected: TransferCheckpoint): Promise<void> {
     const actual = await this.checkpoint(task);
     if (actual.lastTurnId !== expected.lastTurnId || comparablePath(actual.rolloutPath) !== comparablePath(expected.rolloutPath)
       || (expected.semanticDigest ? actual.semanticDigest !== expected.semanticDigest
-        : actual.size !== expected.size || actual.mtimeMs !== expected.mtimeMs)) {
+        : actual.size !== expected.size || actual.mtimeMs !== expected.mtimeMs)
+      || contextChanged(expected, { ...(actual.workspace ? { cwd: actual.workspace } : {}),
+        ...(actual.model ? { model: actual.model } : {}), ...(actual.effort ? { effort: actual.effort } : {}) })) {
       throw new TransferConflictError("Исходная история изменилась после снимка. Переключение и архивация остановлены, чтобы не потерять новые сообщения.");
     }
   }
@@ -321,6 +365,15 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     }
     const targetHome = this.catalog.sourceHome(target);
     await this.verifyLineage(request.task, target);
+    if (request.checkpoint.workspace !== undefined && comparablePath(target.workspace) !== comparablePath(request.checkpoint.workspace)) {
+      throw new TransferConflictError("Рабочая папка копии не совпадает со снимком исходной задачи.");
+    }
+    if (request.checkpoint.model !== undefined || request.checkpoint.effort !== undefined || request.checkpoint.workspace !== undefined) {
+      const context = await readTransferContext(target.rolloutPath, request.checkpoint.lastTurnId);
+      if (contextChanged(request.checkpoint, context)) {
+        throw new TransferConflictError("Модель, effort или рабочая папка копии не совпадают со снимком источника.");
+      }
+    }
     const project = await this.targetProject(request.projectId, request.targetSourceId);
     const current = await this.metadata.read(target);
     if (current.title !== request.task.title || current.projectId !== (project?.rawId ?? null)) {

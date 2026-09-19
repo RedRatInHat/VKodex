@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { Duplex } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
-import { appendFile, mkdtemp, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
@@ -1211,11 +1211,39 @@ test("semantic transfer checkpoints ignore harmless file metadata changes but re
   const file = path.resolve("fixture-source.jsonl");
   const transfer = new AppServerTaskTransfer({ sourceHome: () => path.dirname(file) } as never,
     { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} });
-  transfer.checkpoint = async () => ({ lastTurnId: "last", rolloutPath: file, size: 200, mtimeMs: 20, semanticDigest: "same-content" });
+  transfer.checkpoint = async () => ({ lastTurnId: "last", rolloutPath: file, size: 200, mtimeMs: 20, semanticDigest: "same-content",
+    workspace: path.dirname(file), model: "model-a", effort: "high" });
   const task = { hostId: "local", threadId: "source" };
-  await transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "same-content" });
+  const expected = { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "same-content",
+    workspace: path.dirname(file), model: "model-a", effort: "high" };
+  await transfer.verifySource(task, expected);
+  await assert.rejects(transfer.verifySource(task, { ...expected, effort: "medium" }), TransferConflictError);
   await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "different" }), TransferConflictError);
   await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10 }), TransferConflictError);
+});
+
+test("transfer verifies workspace, model and effort from the target rollout before switching", async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-settings-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const rollout = path.join(home, "target.jsonl");
+  const writeContext = (model: string, effort: string) => writeFile(rollout, `${JSON.stringify({ type: "turn_context",
+    payload: { turn_id: "boundary", cwd: home, model, effort } })}\n`);
+  await writeContext("model-a", "high");
+  const target: DesktopTask = { ...ref, threadId: "target", sourceId: "work", title: "Fixture", workspace: home,
+    rolloutPath: rollout, updatedAt: 1 };
+  const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+    listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => assert.fail("Verification is read-only"), archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    read: async () => ({ title: target.title, projectId: null }) },
+  () => ({ call: async method => method === "thread/read"
+    ? { thread: { id: target.threadId, forkedFromId: ref.threadId } }
+    : { data: [{ id: "boundary", status: "completed" }] } }));
+  const request: TransferTaskRequest = { operationId: "settings", startedAt: 1, task: { ...ref, title: target.title },
+    targetSourceId: "work", projectId: null, checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"),
+      size: 1, mtimeMs: 1, workspace: home, model: "model-a", effort: "high" } };
+  await transfer.verifyTarget(request, target);
+  await writeContext("model-a", "medium");
+  await assert.rejects(transfer.verifyTarget(request, target), /Модель, effort или рабочая папка копии/u);
 });
 
 test("desktop transfer delegates from the catalog without opening an idle source task", async () => {

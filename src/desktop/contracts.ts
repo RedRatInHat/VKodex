@@ -70,6 +70,10 @@ export interface TransferCheckpoint {
   readonly mtimeMs: number;
   /** Hash of all persisted completed turns. Older in-flight transfers lack it. */
   readonly semanticDigest?: string;
+  /** Settings persisted at the copied turn boundary. Older checkpoints may not have them. */
+  readonly workspace?: string;
+  readonly model?: string;
+  readonly effort?: string;
 }
 
 export interface SubmitTaskRequest {
