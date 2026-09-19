@@ -12,8 +12,15 @@ class FakeRpc implements AppServerRpc {
   private readonly listeners = new Set<(notification: AppServerEnvelope) => void>();
   private handler: AppServerServerRequestHandler | null = null;
   activeTurnId: string | null = null;
+  title: string | null = "Task";
+  projectId: string | null = null;
+  goal: JsonObject | null = null;
   fail: Error | null = null;
   failMethod: string | null = null;
+  failAfterMethod: string | null = null;
+  private after(method: string): void {
+    if (this.failAfterMethod === method) { this.failAfterMethod = null; throw new AppServerUncertainError(); }
+  }
   async start(): Promise<void> {}
   async request(method: string, params: JsonObject = {}, options: AppServerRequestOptions = {}): Promise<JsonObject> {
     this.requests.push({ method, params, options });
@@ -27,8 +34,16 @@ class FakeRpc implements AppServerRpc {
     if (method === "turn/steer") return { turnId: this.activeTurnId };
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
     if (method === "thread/list") return { data: [], nextCursor: null };
-    if (method === "thread/read") return { thread: { id: params.threadId, status: { type: "idle" } } };
-    if (method === "thread/goal/get") return { goal: null };
+    if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId, status: { type: "idle" } } };
+    if (method === "thread/name/set") { this.title = String(params.name); this.after(method); return {}; }
+    if (method === "thread/metadata/update") { this.projectId = params.projectId ? String(params.projectId) : null; this.after(method); return {}; }
+    if (method === "thread/goal/get") return { goal: this.goal };
+    if (method === "thread/goal/set") {
+      const previous = this.goal ?? { threadId: params.threadId, objective: "Goal", status: "paused", tokenBudget: null,
+        tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+      this.goal = { ...previous, ...params, updatedAt: 2 }; this.after(method); return { goal: this.goal };
+    }
+    if (method === "thread/goal/clear") { const cleared = this.goal !== null; this.goal = null; this.after(method); return { cleared }; }
     return {};
   }
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
@@ -78,6 +93,40 @@ test("App Server executor uses native interrupt, queue and settings APIs", async
       { threadId: "task", model: "model-b", effort: "xhigh" });
     for (const method of ["turn/interrupt", "thread/queue/add", "thread/settings/update"]) {
       assert.equal(rpc.requests.find(item => item.method === method)?.options.mutating, true);
+    }
+  } finally { executor.close(); }
+});
+
+test("App Server executor keeps metadata and goals on its native owner connection", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    assert.deepEqual(await executor.renameTask(task, "Renamed"), { liveTitleUpdated: true });
+    await executor.assignProject(task, "raw-project");
+    assert.equal((await executor.getGoal(task)), null);
+    const goal = await executor.setGoal(task, { objective: "Ship safely", tokenBudget: 2_000, status: "paused" });
+    assert.equal(goal.objective, "Ship safely"); assert.equal(goal.tokenBudget, 2_000);
+    assert.equal(await executor.clearGoal(task), true);
+    assert.equal(await executor.getGoal(task), null);
+    for (const method of ["thread/name/set", "thread/metadata/update", "thread/goal/set", "thread/goal/clear"]) {
+      assert.equal(rpc.requests.filter(item => item.method === method).length, 1);
+      assert.equal(rpc.requests.find(item => item.method === method)?.options.mutating, true);
+    }
+  } finally { executor.close(); }
+});
+
+test("owner metadata reconciles lost acknowledgments without repeating mutations", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    rpc.failAfterMethod = "thread/name/set";
+    assert.deepEqual(await executor.renameTask(task, "Recovered"), { liveTitleUpdated: true });
+    rpc.failAfterMethod = "thread/metadata/update";
+    await executor.assignProject(task, "project-after-timeout");
+    rpc.failAfterMethod = "thread/goal/set";
+    assert.equal((await executor.setGoal(task, { objective: "Recovered goal", status: "paused" })).objective, "Recovered goal");
+    rpc.failAfterMethod = "thread/goal/clear";
+    assert.equal(await executor.clearGoal(task), true);
+    for (const method of ["thread/name/set", "thread/metadata/update", "thread/goal/set", "thread/goal/clear"]) {
+      assert.equal(rpc.requests.filter(item => item.method === method).length, 1);
     }
   } finally { executor.close(); }
 });

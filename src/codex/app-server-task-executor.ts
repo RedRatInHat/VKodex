@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
-import { ActionRejectedError, TaskOwnedByClientError, UncertainActionError, taskKey,
-  type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskOwnedByClientError, UncertainActionError, taskKey,
+  type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
+import { goalMatchesUpdate, normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 import { taskInput } from "../core/task-input.js";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError,
   type AppServerEnvelope, type AppServerRpc } from "./app-server-connection.js";
@@ -106,6 +107,76 @@ export class AppServerTaskExecutor {
       const loaded = this.loaded.get(taskKey(task));
       if (loaded) this.loaded.set(taskKey(task), { ...loaded, model, effort });
     } catch (error) { throw operationError(error); }
+  }
+
+  async renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
+    const name = title.trim();
+    if (!name || name.length > 120 || /[\r\n\x00-\x1f]/u.test(name)) {
+      throw new ActionRejectedError("Название должно быть одной строкой от 1 до 120 символов.");
+    }
+    this.assertWritable(task.threadId);
+    try {
+      await this.rpc.request("thread/name/set", { threadId: task.threadId, name }, { mutating: true });
+    } catch (error) {
+      const mapped = operationError(error);
+      try { if ((await this.readMetadata(task)).title === name) return { liveTitleUpdated: true }; }
+      catch { /* Preserve the mutation outcome when readback is unavailable. */ }
+      throw mapped;
+    }
+    if ((await this.readMetadata(task)).title !== name) throw new UncertainActionError();
+    return { liveTitleUpdated: true };
+  }
+
+  async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
+    this.assertWritable(task.threadId);
+    try {
+      await this.rpc.request("thread/metadata/update", { threadId: task.threadId, projectId: projectId ?? "" }, { mutating: true });
+    } catch (error) {
+      const mapped = operationError(error);
+      try { if ((await this.readMetadata(task)).projectId === projectId) return; }
+      catch { /* Preserve the mutation outcome when readback is unavailable. */ }
+      throw mapped;
+    }
+    if ((await this.readMetadata(task)).projectId !== projectId) throw new ProjectAssignmentUnconfirmedError();
+  }
+
+  async getGoal(task: TaskRef): Promise<TaskGoal | null> {
+    try {
+      const response = await this.rpc.request("thread/goal/get", { threadId: task.threadId });
+      return parseTaskGoal(response.goal ?? null, task.threadId);
+    } catch (error) { throw operationError(error); }
+  }
+
+  async setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
+    const normalized = normalizeTaskGoalUpdate(update);
+    this.assertWritable(task.threadId);
+    try {
+      const response = await this.rpc.request("thread/goal/set", { threadId: task.threadId, ...normalized }, { mutating: true });
+      const goal = parseTaskGoal(response.goal, task.threadId);
+      if (!goal) throw new DesktopUnavailableError("Codex не подтвердил состояние цели.");
+      return goal;
+    } catch (error) {
+      const mapped = operationError(error);
+      try {
+        const goal = await this.getGoal(task);
+        if (goalMatchesUpdate(goal, normalized)) return goal;
+      } catch { /* Preserve the mutation outcome when readback is unavailable. */ }
+      throw mapped;
+    }
+  }
+
+  async clearGoal(task: TaskRef): Promise<boolean> {
+    this.assertWritable(task.threadId);
+    try {
+      const response = await this.rpc.request("thread/goal/clear", { threadId: task.threadId }, { mutating: true });
+      if (typeof response.cleared !== "boolean") throw new DesktopUnavailableError("Codex не подтвердил снятие цели.");
+      return response.cleared;
+    } catch (error) {
+      const mapped = operationError(error);
+      try { if (await this.getGoal(task) === null) return true; }
+      catch { /* Preserve the mutation outcome when readback is unavailable. */ }
+      throw mapped;
+    }
   }
 
   async pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
@@ -216,6 +287,21 @@ export class AppServerTaskExecutor {
       cursor = response.nextCursor; cursors.add(cursor);
     } while (true);
     return ids;
+  }
+
+  private async readMetadata(task: TaskRef): Promise<{ readonly title: string | null; readonly projectId: string | null }> {
+    try {
+      const response = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+      const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
+      if (!thread || !(thread.name === null || typeof thread.name === "string" || thread.name === undefined)
+        || !(thread.projectId === null || typeof thread.projectId === "string" || thread.projectId === undefined)) {
+        throw new DesktopUnavailableError("Codex не подтвердил метаданные выбранной задачи.");
+      }
+      return {
+        title: typeof thread.name === "string" && thread.name ? thread.name : null,
+        projectId: typeof thread.projectId === "string" && thread.projectId ? thread.projectId : null,
+      };
+    } catch (error) { throw operationError(error); }
   }
 
   private assertWritable(threadId: string): void {

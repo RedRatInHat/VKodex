@@ -25,7 +25,12 @@ function fixture() {
     owns: task => (task.sourceId ?? "") === "work",
     submitWithReceipt: async () => { calls.push("owner:submit"); return { mode: "start", turnId: "owner-turn" }; },
     interrupt: async () => { calls.push("owner:interrupt"); }, queue: async () => "queued",
-    selectModel: async () => { calls.push("owner:model"); }, pendingQuestions: async () => [], answerQuestions: async () => {},
+    selectModel: async () => { calls.push("owner:model"); }, renameTask: async () => { calls.push("owner:rename"); return { liveTitleUpdated: true }; },
+    moveTask: async () => { calls.push("owner:move"); },
+    getGoal: async () => null, setGoal: async (_task, update) => ({ threadId: "work", objective: update.objective ?? "goal", status: update.status ?? "paused",
+      tokenBudget: update.tokenBudget ?? null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 }),
+    clearGoal: async () => { calls.push("owner:clear-goal"); return true; },
+    pendingQuestions: async () => [], answerQuestions: async () => {},
     findAcceptedInput: async () => "accepted", inspectTask: async () => ({ status: "idle", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
     archiveTask: async () => { calls.push("owner:archive"); }, archiveRetryReady: async () => true,
   };
@@ -39,6 +44,17 @@ test("command router uses exactly the configured source owner", async () => {
   await f.routed.interrupt(work); await f.routed.interrupt(primary);
   await f.routed.selectModel(work, "model", "high"); await f.routed.selectModel(primary, "model", "high");
   assert.deepEqual(f.calls, ["owner:submit", "base:submitWithReceipt", "owner:interrupt", "base:interrupt", "owner:model", "base:model"]);
+});
+
+test("metadata and goals use the selected profile owner", async () => {
+  const f = fixture();
+  assert.deepEqual(await f.routed.renameTask(work, "Renamed"), { liveTitleUpdated: true });
+  await f.routed.moveTask(work, "project");
+  assert.equal(await f.routed.getGoal!(work), null);
+  assert.equal((await f.routed.setGoal!(work, { objective: "Goal", status: "paused" })).objective, "Goal");
+  assert.equal(await f.routed.clearGoal!(work), true);
+  await f.routed.continueGoal!(work);
+  assert.deepEqual(f.calls, ["owner:rename", "owner:move", "owner:clear-goal"]);
 });
 
 test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {

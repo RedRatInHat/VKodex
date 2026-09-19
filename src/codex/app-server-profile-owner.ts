@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal,
+  type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
 import type { CodexQuestions } from "../core/codex-questions.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
 import { AppServerConnection, type AppServerRpc } from "./app-server-connection.js";
@@ -16,7 +17,8 @@ export class AppServerProfileOwner {
   private readonly nativeStates: AppServerTaskStateTransport;
   private readonly unsubscribeQuestions: () => void;
 
-  constructor(readonly sourceId: string, private readonly rpc: AppServerRpc) {
+  constructor(readonly sourceId: string, private readonly rpc: AppServerRpc,
+    private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>) {
     this.executor = new AppServerTaskExecutor(rpc);
     this.nativeStates = new AppServerTaskStateTransport(rpc, threadId => this.executor.questionSnapshot(threadId));
     this.unsubscribeQuestions = this.executor.onQuestionsChanged(threadId => this.nativeStates.refresh(threadId));
@@ -43,6 +45,20 @@ export class AppServerProfileOwner {
   selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
     this.assertOwner(task); return this.executor.selectModel(task, model, effort);
   }
+  renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
+    this.assertOwner(task); return this.executor.renameTask(task, title);
+  }
+  async moveTask(task: TaskRef, projectId: string | null): Promise<void> {
+    this.assertOwner(task);
+    if (projectId === null) return this.executor.assignProject(task, null);
+    if (!this.resolveProject) throw new ActionRejectedError("Назначение проекта недоступно для этого владельца Codex.");
+    const resolved = await this.resolveProject(projectId);
+    if ((resolved.sourceId ?? "") !== this.sourceId) throw new ActionRejectedError("Нельзя перенести задачу между разными каталогами CODEX_HOME.");
+    return this.executor.assignProject(task, resolved.rawProjectId);
+  }
+  getGoal(task: TaskRef): Promise<TaskGoal | null> { this.assertOwner(task); return this.executor.getGoal(task); }
+  setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> { this.assertOwner(task); return this.executor.setGoal(task, update); }
+  clearGoal(task: TaskRef): Promise<boolean> { this.assertOwner(task); return this.executor.clearGoal(task); }
   archiveTask(task: TaskRef): Promise<void> {
     this.assertOwner(task); return this.executor.archiveIdle(task);
   }
@@ -100,12 +116,13 @@ export class AppServerProfileOwner {
   }
 }
 
-export function createAppServerProfileOwner(sourceId: string, codexHome: string): AppServerProfileOwner {
+export function createAppServerProfileOwner(sourceId: string, codexHome: string,
+  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>): AppServerProfileOwner {
   const rpc = new AppServerConnection(() => spawn(nativeCodexPath(), ["app-server", "--stdio"], {
     windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     env: { ...buildCodexEnvironment(process.env), CODEX_HOME: codexHome },
   }));
-  return new AppServerProfileOwner(sourceId, rpc);
+  return new AppServerProfileOwner(sourceId, rpc, resolveProject);
 }
 
 /** Routes state subscriptions to an explicit profile owner without fallback. */

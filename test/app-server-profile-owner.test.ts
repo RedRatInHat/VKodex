@@ -6,7 +6,7 @@ import { ActionRejectedError } from "../src/core/codex-tasks.js";
 
 type JsonObject = Record<string, unknown>;
 class Rpc implements AppServerRpc {
-  readonly calls: string[] = []; closed = 0;
+  readonly calls: string[] = []; closed = 0; projectId: string | null = null;
   private readonly notifications = new Set<(notification: AppServerEnvelope) => void>();
   async start(): Promise<void> {}
   async request(method: string, _params: JsonObject = {}, _options?: AppServerRequestOptions): Promise<JsonObject> {
@@ -14,7 +14,8 @@ class Rpc implements AppServerRpc {
     if (method === "thread/resume") return { thread: { id: "task", name: "Task", cwd: "D:\\w", status: { type: "idle" } },
       cwd: "D:\\w", model: "gpt", reasoningEffort: "high", initialTurnsPage: { data: [], nextCursor: null } };
     if (method === "turn/start") return { turn: { id: "turn" } };
-    if (method === "thread/read") return { thread: { id: "task", status: { type: "idle" } } };
+    if (method === "thread/read") return { thread: { id: "task", name: "Task", projectId: this.projectId, status: { type: "idle" } } };
+    if (method === "thread/metadata/update") { this.projectId = _params.projectId ? String(_params.projectId) : null; return {}; }
     if (method === "thread/list") return { data: [], nextCursor: null };
     if (method === "thread/goal/get") return { goal: null };
     if (method === "thread/archive") return {};
@@ -72,4 +73,19 @@ test("profile owner archives through its shared App Server connection", async ()
   await owner.archiveTask(task);
   assert.equal(rpc.calls.filter(method => method === "thread/archive").length, 1);
   await owner.close();
+});
+
+test("profile owner resolves a visible project inside its own source before the native write", async () => {
+  const rpc = new Rpc();
+  const owner = new AppServerProfileOwner("work", rpc, async projectId => ({ rawProjectId: `raw:${projectId}`, sourceId: "work" }));
+  const task = { hostId: "local", threadId: "task", sourceId: "work" };
+  await owner.moveTask(task, "visible-project");
+  assert.equal(rpc.projectId, "raw:visible-project");
+  await owner.close();
+
+  const foreignRpc = new Rpc();
+  const foreign = new AppServerProfileOwner("work", foreignRpc, async () => ({ rawProjectId: "raw", sourceId: "other" }));
+  await assert.rejects(foreign.moveTask(task, "visible-project"), ActionRejectedError);
+  assert.equal(foreignRpc.calls.includes("thread/metadata/update"), false);
+  await foreign.close();
 });

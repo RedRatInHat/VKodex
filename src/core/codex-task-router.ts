@@ -11,6 +11,11 @@ export interface CodexTaskOwner {
   interrupt(task: TaskRef): Promise<void>;
   queue(request: SubmitTaskRequest): Promise<string>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;
+  renameTask(task: TaskRef, title: string): Promise<TaskRenameResult>;
+  moveTask(task: TaskRef, projectId: string | null): Promise<void>;
+  getGoal(task: TaskRef): Promise<TaskGoal | null>;
+  setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
+  clearGoal(task: TaskRef): Promise<boolean>;
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]>;
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
@@ -110,7 +115,11 @@ export class RoutedCodexTasks implements CodexTasks {
     catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.selectModel(task, model, effort); }
   }
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]> { return this.base.listModels(task); }
-  moveTask(task: TaskRef, projectId: string | null): Promise<void> { return this.base.moveTask(task, projectId); }
+  async moveTask(task: TaskRef, projectId: string | null): Promise<void> {
+    const owner = this.owner(task); if (!owner) return this.base.moveTask(task, projectId);
+    try { return await owner.moveTask(task, projectId); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.moveTask(task, projectId); }
+  }
   transferTask(request: TransferTaskRequest): Promise<DesktopTask> {
     if (!this.base.transferTask) throw new ActionRejectedError("Перенос задач недоступен."); return this.base.transferTask(request);
   }
@@ -137,7 +146,11 @@ export class RoutedCodexTasks implements CodexTasks {
   ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
     if (this.owner(task)) return Promise.resolve("ready"); return this.base.ownerAdapterStatus?.(task) ?? Promise.resolve("missing");
   }
-  renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> { return this.base.renameTask(task, title); }
+  async renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
+    const owner = this.owner(task); if (!owner) return this.base.renameTask(task, title);
+    try { return await owner.renameTask(task, title); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.renameTask(task, title); }
+  }
   async archiveTask(task: TaskRef): Promise<void> {
     const owner = this.owner(task); if (!owner) return this.base.archiveTask(task);
     try { return await owner.archiveTask(task); }
@@ -161,12 +174,21 @@ export class RoutedCodexTasks implements CodexTasks {
   consumeUsageReset(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome> {
     if (!this.base.consumeUsageReset) throw new ActionRejectedError("Сброс лимита недоступен."); return this.base.consumeUsageReset(task, idempotencyKey);
   }
-  getGoal(task: TaskRef): Promise<TaskGoal | null> { return this.base.getGoal?.(task) ?? Promise.resolve(null); }
+  getGoal(task: TaskRef): Promise<TaskGoal | null> {
+    const owner = this.owner(task); return owner?.getGoal(task) ?? this.base.getGoal?.(task) ?? Promise.resolve(null);
+  }
   setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
+    const owner = this.owner(task);
+    if (owner) return owner.setGoal(task, update);
     if (!this.base.setGoal) throw new ActionRejectedError("Управление целью недоступно."); return this.base.setGoal(task, update);
   }
-  clearGoal(task: TaskRef): Promise<boolean> { return this.base.clearGoal?.(task) ?? Promise.resolve(false); }
-  continueGoal(task: TaskRef): Promise<void> { return this.base.continueGoal?.(task) ?? Promise.resolve(); }
+  clearGoal(task: TaskRef): Promise<boolean> {
+    const owner = this.owner(task); return owner?.clearGoal(task) ?? this.base.clearGoal?.(task) ?? Promise.resolve(false);
+  }
+  continueGoal(task: TaskRef): Promise<void> {
+    if (this.owner(task)) return Promise.resolve();
+    return this.base.continueGoal?.(task) ?? Promise.resolve();
+  }
   revealTask(task: TaskRef): Promise<void> { return this.base.revealTask?.(task) ?? Promise.resolve(); }
   async ensureOpen(task: TaskRef): Promise<void> {
     if (this.owner(task)) { await this.inspectTask(task); return; }

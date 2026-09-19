@@ -3,7 +3,9 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalStatus, type TaskGoalUpdate, type TaskRef, type SubmitTaskRequest, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
+import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalUpdate, type TaskRef, type SubmitTaskRequest, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
+import { normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
+export { parseTaskGoal } from "../core/task-goals.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { mirrorLegacyProjectAssignment } from "./projects.js";
 import { comparablePath } from "./paths.js";
@@ -395,33 +397,6 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   }
 }
 
-const goalStatuses = new Set<TaskGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
-
-export function parseTaskGoal(value: unknown, expectedThreadId: string): TaskGoal | null {
-  if (value === null) return null;
-  if (!isObject(value)
-    || value.threadId !== expectedThreadId
-    || typeof value.objective !== "string" || !value.objective.trim() || value.objective.length > 16_000
-    || typeof value.status !== "string" || !goalStatuses.has(value.status as TaskGoalStatus)
-    || !(value.tokenBudget === null || (typeof value.tokenBudget === "number" && Number.isSafeInteger(value.tokenBudget) && value.tokenBudget > 0))
-    || typeof value.tokensUsed !== "number" || !Number.isSafeInteger(value.tokensUsed) || value.tokensUsed < 0
-    || typeof value.timeUsedSeconds !== "number" || !Number.isSafeInteger(value.timeUsedSeconds) || value.timeUsedSeconds < 0
-    || typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt <= 0
-    || typeof value.updatedAt !== "number" || !Number.isSafeInteger(value.updatedAt) || value.updatedAt <= 0) {
-    throw new DesktopUnavailableError("Codex вернул некорректное состояние цели.");
-  }
-  return {
-    threadId: value.threadId,
-    objective: value.objective,
-    status: value.status as TaskGoalStatus,
-    tokenBudget: value.tokenBudget,
-    tokensUsed: value.tokensUsed,
-    timeUsedSeconds: value.timeUsedSeconds,
-    createdAt: value.createdAt,
-    updatedAt: value.updatedAt,
-  };
-}
-
 export class NativeDesktopGoals implements DesktopGoals {
   constructor(private readonly rpc: Pick<MetadataRpc, "call">) {}
   private local(task: TaskRef): void {
@@ -434,18 +409,10 @@ export class NativeDesktopGoals implements DesktopGoals {
   }
   async set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
     this.local(task);
-    const objective = update.objective?.trim();
-    if (objective !== undefined && (!objective || objective.length > 8_000 || /\x00/u.test(objective))) throw new ActionRejectedError("Цель должна содержать от 1 до 8000 символов.");
-    if (update.status !== undefined && !goalStatuses.has(update.status)) throw new ActionRejectedError("Некорректный статус цели.");
-    if (update.tokenBudget !== undefined && update.tokenBudget !== null && (!Number.isSafeInteger(update.tokenBudget) || update.tokenBudget <= 0 || update.tokenBudget > 100_000_000)) {
-      throw new ActionRejectedError("Лимит цели должен быть от 1 до 100 000 000 токенов.");
-    }
-    if (objective === undefined && update.status === undefined && update.tokenBudget === undefined) throw new ActionRejectedError("Изменения цели не указаны.");
+    const normalized = normalizeTaskGoalUpdate(update);
     const response = await this.rpc.call("thread/goal/set", {
       threadId: task.threadId,
-      ...(objective !== undefined ? { objective } : {}),
-      ...(update.status !== undefined ? { status: update.status } : {}),
-      ...(update.tokenBudget !== undefined ? { tokenBudget: update.tokenBudget } : {}),
+      ...normalized,
     });
     return parseTaskGoal(response.goal, task.threadId)!;
   }

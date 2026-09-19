@@ -47,7 +47,10 @@ const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
   { launcher, creator, transfer });
 const sourceIds = catalog.listSources();
 const appServerOwners = config.codexSources.flatMap((source, index) => source.owner === "app-server"
-  ? [createAppServerProfileOwner(sourceIds[index]!.id, source.home)] : []);
+  ? [createAppServerProfileOwner(sourceIds[index]!.id, source.home, async projectId => {
+    const resolved = await catalog.resolveProject(projectId);
+    return { rawProjectId: resolved.rawProjectId, ...(resolved.sourceId ? { sourceId: resolved.sourceId } : {}) };
+  })] : []);
 const tasks = appServerOwners.length ? new RoutedCodexTasks(desktop, appServerOwners) : desktop;
 const desktopStates = new DesktopTaskStateTransport();
 const states = appServerOwners.length ? new RoutedTaskStateTransport(desktopStates, appServerOwners) : desktopStates;
