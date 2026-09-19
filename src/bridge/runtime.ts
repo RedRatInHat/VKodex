@@ -356,12 +356,19 @@ export class DesktopBridgeRuntime {
           this.store.markDesktopHandoff(binding.id, task, "live", this.now());
           // Native queued submissions acquire a turn later, including while the bridge is offline.
           const pendingFiles = this.files?.pendingQueuedOperations(binding.id);
-          for (const turn of pendingFiles?.size ? turnsFromState(state) : []) {
+          const pendingQueue = new Set(this.store.queuedInputs(binding.id).map(item => item.operationId));
+          for (const turn of pendingFiles?.size || pendingQueue.size ? turnsFromState(state) : []) {
             if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
             for (const item of turn.items.filter(isObject)) {
-              if (item.type === "userMessage" && typeof item.clientId === "string" && pendingFiles!.has(item.clientId)) {
-                this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
-                if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
+              if (item.type === "userMessage" && typeof item.clientId === "string") {
+                if (pendingFiles?.has(item.clientId)) {
+                  this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
+                  if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
+                }
+                if (pendingQueue.has(item.clientId)) {
+                  this.store.settleQueuedInput(binding.id, item.clientId);
+                  this.store.rememberAcceptedTurn(binding.id, turn.turnId, item.clientId);
+                }
               }
             }
           }

@@ -180,6 +180,12 @@ export class BridgeHealthMonitor {
         checks.push({ name: `codex_pending_final:${binding.id}`, state,
           detail: `«${binding.title.slice(0, 120)}» (${binding.source}): принятый VK-запрос остаётся без подтверждения завершения ${Math.round(acceptedAge / 1_000)} с при состоянии Codex «${binding.status}». Мост сверяет историю и не повторяет запрос автоматически.` });
       }
+      const queued = this.store.queuedInputs(binding.id);
+      const queuedAge = queued.length ? Math.max(0, checkedAt - Math.min(...queued.map(item => item.acceptedAt))) : 0;
+      if (queued.length && queuedAge > 2 * 60_000 && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
+        checks.push({ name: `codex_native_queue:${binding.id}`, state: binding.status === "unavailable" ? "degraded" : "failed",
+          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${queued.length} VK-запрос(а) остаются в штатной очереди Codex ${Math.round(queuedAge / 1_000)} с при состоянии «${binding.status}». VKodex не запускает и не повторяет их самостоятельно.` });
+      }
       if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
       const problem = binding.failure === "usageLimit" ? "исчерпан лимит аккаунта"
         : binding.failure === "systemError" ? "Codex сообщил системную ошибку"

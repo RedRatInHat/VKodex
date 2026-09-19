@@ -694,7 +694,8 @@ export class TaskManager {
       if (queued) {
         if (!this.desktop.queue) throw new ActionRejectedError("Штатная очередь недоступна в этом подключении Codex.");
         this.files?.markQueued(binding.id, operationId);
-        await this.desktop.queue(request);
+        const queuedId = await this.desktop.queue(request);
+        this.store.rememberQueuedInput(binding.id, operationId, queuedId);
         this.store.finishOperation(operationId, "accepted");
         this.files?.finish(binding.id, operationId, "accepted");
         this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });

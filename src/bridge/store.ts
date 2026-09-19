@@ -71,6 +71,11 @@ interface AcceptedTaskTurn {
   readonly turnId: string;
   readonly operationId: string;
 }
+interface QueuedTaskInput {
+  readonly operationId: string;
+  readonly queuedId: string;
+  readonly acceptedAt: number;
+}
 
 export interface DesktopHandoffState {
   readonly taskKey: string;
@@ -337,6 +342,7 @@ export class BridgeStore {
       // accepted turn IDs into the fork makes an idle target look unfinished
       // and may recover a source answer through the target conversation.
       this.setValue(`accepted-turns:${record.bindingId}`, []);
+      this.setValue(`queued-inputs:${record.bindingId}`, []);
       this.setValue(`health:legacy-accepted:${record.bindingId}`, null);
       this.setValue(`editable-request:${record.bindingId}`, null);
       this.setValue(`expected-edited-user:${record.bindingId}`, null);
@@ -627,6 +633,22 @@ export class BridgeStore {
   }
   settleAcceptedTurn(bindingId: string, turnId: string): void {
     this.setValue(`accepted-turns:${bindingId}`, this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId));
+  }
+  rememberQueuedInput(bindingId: string, operationId: string, queuedId: string, now = Date.now()): void {
+    const queued = this.queuedInputs(bindingId).filter(item => item.operationId !== operationId);
+    this.setValue(`queued-inputs:${bindingId}`, [...queued, { operationId, queuedId, acceptedAt: now }].slice(-32));
+  }
+  queuedInputs(bindingId: string): readonly QueuedTaskInput[] {
+    const value = this.getValue<unknown>(`queued-inputs:${bindingId}`);
+    if (!Array.isArray(value)) return [];
+    const current = this.getBinding(bindingId);
+    return value.filter((item): item is QueuedTaskInput => !!item && typeof item === "object"
+      && typeof (item as QueuedTaskInput).operationId === "string" && typeof (item as QueuedTaskInput).queuedId === "string"
+      && Number.isSafeInteger((item as QueuedTaskInput).acceptedAt) && (item as QueuedTaskInput).acceptedAt > 0
+      && !!current && this.isOwnOperation((item as QueuedTaskInput).operationId, current));
+  }
+  settleQueuedInput(bindingId: string, operationId: string): void {
+    this.setValue(`queued-inputs:${bindingId}`, this.queuedInputs(bindingId).filter(item => item.operationId !== operationId));
   }
   saveEditableRequest(bindingId: string, request: EditableVkRequest): void { this.setValue(`editable-request:${bindingId}`, request); }
   clearEditableRequest(bindingId: string): void { this.setValue(`editable-request:${bindingId}`, null); }

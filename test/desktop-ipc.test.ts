@@ -263,6 +263,24 @@ test("runtime reconciles an uncertain prompt from Codex history after restart", 
   assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
 });
 
+test("runtime follows a native queued request into its actual Codex turn", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "native-queued-operation";
+  s.store.recordOperation(operationId, s.binding, "vk-inbox", s.binding.id, 90_000);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "native-queue-id", 90_000);
+  await s.runtime.tick();
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+
+  s.server.dataState = state([{ type: "userMessage", id: "queued-user", clientId: operationId,
+    content: [{ type: "text", text: "Queued request" }] }]);
+  s.server.snapshot();
+  await new Promise<void>(resolve => setImmediate(resolve));
+
+  assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "fixture-turn", operationId }]);
+});
+
 test("a rejected scheduled health report cannot terminate the runtime", async t => {
   let checks = 0;
   const s = runtimeSetup(t, async () => {

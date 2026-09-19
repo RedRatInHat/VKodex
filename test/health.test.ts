@@ -247,6 +247,33 @@ test("health detects an accepted VK turn stranded behind an idle or unavailable 
   assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_pending_final:${binding.id}`), false);
 });
 
+test("health detects native queued VK input stranded behind an idle task", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding(task);
+  store.setChat(binding.id, 2_000_000_001, 1);
+  store.setAttached(binding.id, true);
+  store.recordOperation("queued-op", binding, "vk-inbox", binding.id, 100_000);
+  store.finishOperation("queued-op", "accepted");
+  store.rememberQueuedInput(binding.id, "queued-op", "native-queue-id", 100_000);
+  let status = "running";
+  const now = 300_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1,
+    connectedBindings: 1, requiredBindings: status === "running" ? 1 : 0,
+    connectedRequiredBindings: status === "running" ? 1 : 0,
+    bindings: [{ id: binding.id, title: binding.title, source: ".codex", status, connected: true,
+      lastConfirmedAt: now, failure: null }],
+  }), undefined, () => now);
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);
+  status = "idle";
+  const stranded = (await monitor.check(true)).checks.find(check => check.name === `codex_native_queue:${binding.id}`)!;
+  assert.equal(stranded.state, "failed");
+  assert.match(stranded.detail, /Fixture.*штатной очереди Codex/u);
+  store.settleQueuedInput(binding.id, "queued-op");
+  assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);
+});
+
 test("health detects stuck and legacy transfers even when streams and the database are healthy", async t => {
   const s = setup(t);
   const task = (await s.desktop.listTasks())[0]!;

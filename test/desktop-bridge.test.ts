@@ -794,6 +794,9 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   s.store.recordOperation("source-operation", { ...original, threadId: "older-source" });
   s.store.finishOperation("source-operation", "accepted");
   s.store.rememberAcceptedTurn(original.id, "source-turn", "source-operation");
+  s.store.recordOperation("queued-source-operation", { ...original, threadId: "older-source" });
+  s.store.finishOperation("queued-source-operation", "accepted");
+  s.store.rememberQueuedInput(original.id, "queued-source-operation", "old-native-queue");
   s.store.setValue(`health:legacy-accepted:${original.id}`, { signature: "old", firstSeenAt: 1 });
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
@@ -816,6 +819,8 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   assert.equal(s.store.getValue(`projection:${original.id}`), null);
   assert.deepEqual(s.store.acceptedTurns(original.id), []);
   assert.deepEqual(s.store.getValue(`accepted-turns:${original.id}`), []);
+  assert.deepEqual(s.store.queuedInputs(original.id), []);
+  assert.deepEqual(s.store.getValue(`queued-inputs:${original.id}`), []);
   assert.equal(s.store.getValue(`health:legacy-accepted:${original.id}`), null);
   assert.equal(s.store.streamGeneration(original.id), 2);
 });
@@ -1224,6 +1229,21 @@ test("transfer cannot discard an accepted VK turn whose completion is still unkn
   const saved = s.store.transfer(record.bindingId)!;
   assert.equal(saved.blocked, true);
   assert.match(saved.detail ?? "", /принятый VK-ход без подтверждённого завершения/u);
+  assert.equal(saved.checkpoint, undefined);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
+});
+
+test("transfer waits for the native Codex queue instead of losing queued VK input", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.recordOperation("queued-operation", record.source, "vk-inbox", record.bindingId, s.now());
+  s.store.finishOperation("queued-operation", "accepted");
+  s.store.rememberQueuedInput(record.bindingId, "queued-operation", "native-queue-id", s.now());
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const saved = s.store.transfer(record.bindingId)!;
+  assert.equal(saved.blocked, true);
+  assert.match(saved.detail ?? "", /штатной очереди исходной задачи/u);
   assert.equal(saved.checkpoint, undefined);
   assert.equal(s.desktop.transfers.length, 0);
   assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
@@ -2760,6 +2780,7 @@ test("queue strips only its prefix, preserves command-like prompt, and never ste
   await s.manager.handle(input); await s.manager.handle(input); await s.worker.flush();
   assert.equal(s.desktop.queued.length, 1);
   assert.equal(s.desktop.queued[0]!.text, "/stop\nDo this later");
+  assert.deepEqual(s.store.queuedInputs(s.store.byPeer(peerId)!.id).map(item => item.operationId), [s.desktop.queued[0]!.operationId]);
   assert.equal(s.desktop.submissions.length, 0); assert.equal(s.desktop.stops.length, 0);
   await s.handle("/queue", peerId);
   assert.equal(s.desktop.queued.length, 1);
@@ -2770,6 +2791,7 @@ test("uncertain native queue insertion never falls back to a turn or retries", a
   const input = s.input("/queue later", peerId);
   await s.manager.handle(input); await s.manager.handle(input);
   assert.equal(s.desktop.queued.length, 1); assert.equal(s.desktop.submissions.length, 0);
+  assert.deepEqual(s.store.queuedInputs(s.store.byPeer(peerId)!.id), []);
 });
 
 test("queued outbox waits for its actual native turn, not the current turn completion", async t => {

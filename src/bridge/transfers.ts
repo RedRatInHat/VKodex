@@ -202,6 +202,9 @@ export class TaskTransfers {
           if (this.store.acceptedTurns(record.bindingId).length) {
             throw new TransferConflictError("У исходной задачи есть принятый VK-ход без подтверждённого завершения. Перенос остановлен до сверки ответа; запрос не повторяется.");
           }
+          if (this.store.queuedInputs(record.bindingId).length) {
+            throw new TransferConflictError("В штатной очереди исходной задачи остаётся VK-запрос. Перенос остановлен до его запуска и завершения; очередь не копируется и запрос не повторяется.");
+          }
           step("snapshot");
           // First check idle, then save the goal BEFORE pausing it. A crash after
           // set(paused) must not replace the original active status in the journal.
