@@ -16,6 +16,8 @@ export interface CodexTaskOwner {
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
+  archiveTask(task: TaskRef): Promise<void>;
+  archiveRetryReady(task: TaskRef): Promise<boolean>;
 }
 
 /** Routes execution-sensitive commands to the one configured owner of a source. */
@@ -128,13 +130,27 @@ export class RoutedCodexTasks implements CodexTasks {
   isTaskArchived(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean> {
     return this.base.isTaskArchived?.(task, checkpoint) ?? Promise.resolve(false);
   }
-  archiveRetryReady(task: TaskRef): Promise<boolean> { return this.base.archiveRetryReady?.(task) ?? Promise.resolve(false); }
+  archiveRetryReady(task: TaskRef): Promise<boolean> {
+    const owner = this.owner(task);
+    return owner?.archiveRetryReady(task) ?? this.base.archiveRetryReady?.(task) ?? Promise.resolve(false);
+  }
   ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
     if (this.owner(task)) return Promise.resolve("ready"); return this.base.ownerAdapterStatus?.(task) ?? Promise.resolve("missing");
   }
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> { return this.base.renameTask(task, title); }
-  archiveTask(task: TaskRef): Promise<void> { return this.base.archiveTask(task); }
-  archiveTransferredSource(task: TaskRef): Promise<void> {
+  async archiveTask(task: TaskRef): Promise<void> {
+    const owner = this.owner(task); if (!owner) return this.base.archiveTask(task);
+    try { return await owner.archiveTask(task); }
+    catch (error) { if (!(error instanceof TaskOwnedByClientError)) throw error; return this.base.archiveTask(task); }
+  }
+  async archiveTransferredSource(task: TaskRef): Promise<void> {
+    const owner = this.owner(task);
+    if (owner) {
+      try { return await owner.archiveTask(task); }
+      catch (error) {
+        if (!(error instanceof TaskOwnedByClientError)) throw error;
+      }
+    }
     if (!this.base.archiveTransferredSource) throw new ActionRejectedError("Архивация источника переноса недоступна.");
     return this.base.archiveTransferredSource(task);
   }

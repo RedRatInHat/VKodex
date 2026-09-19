@@ -14,7 +14,10 @@ class Rpc implements AppServerRpc {
     if (method === "thread/resume") return { thread: { id: "task", name: "Task", cwd: "D:\\w", status: { type: "idle" } },
       cwd: "D:\\w", model: "gpt", reasoningEffort: "high", initialTurnsPage: { data: [], nextCursor: null } };
     if (method === "turn/start") return { turn: { id: "turn" } };
-    if (method === "thread/read") return { thread: { id: "task" } };
+    if (method === "thread/read") return { thread: { id: "task", status: { type: "idle" } } };
+    if (method === "thread/list") return { data: [], nextCursor: null };
+    if (method === "thread/goal/get") return { goal: null };
+    if (method === "thread/archive") return {};
     if (method === "thread/turns/list") return { data: [{ id: "accepted-turn", items: [
       { type: "userMessage", clientId: "accepted-operation" },
     ] }], nextCursor: null };
@@ -59,5 +62,14 @@ test("profile owner reconciles an uncertain input from native paged history", as
   const task = { hostId: "local", threadId: "task" };
   assert.equal(await owner.findAcceptedInput(task, "accepted-operation"), "accepted-turn");
   assert.equal(await owner.findAcceptedInput(task, "missing-operation"), null);
+  await owner.close();
+});
+
+test("profile owner archives through its shared App Server connection", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const task = { hostId: "local", threadId: "task", sourceId: "work" };
+  assert.equal(await owner.archiveRetryReady(task), true);
+  await owner.archiveTask(task);
+  assert.equal(rpc.calls.filter(method => method === "thread/archive").length, 1);
   await owner.close();
 });

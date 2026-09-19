@@ -26,6 +26,9 @@ class FakeRpc implements AppServerRpc {
     if (method === "turn/start") { this.activeTurnId = "started-turn"; return { turn: { id: this.activeTurnId } }; }
     if (method === "turn/steer") return { turnId: this.activeTurnId };
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
+    if (method === "thread/list") return { data: [], nextCursor: null };
+    if (method === "thread/read") return { thread: { id: params.threadId, status: { type: "idle" } } };
+    if (method === "thread/goal/get") return { goal: null };
     return {};
   }
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
@@ -103,5 +106,28 @@ test("App Server executor never hides an uncertain mutation behind a retry", asy
     rpc.fail = new AppServerUncertainError(); rpc.failMethod = "turn/start";
     await assert.rejects(executor.submitWithReceipt(request()), UncertainActionError);
     assert.equal(rpc.requests.filter(item => item.method === "turn/start").length, 1);
+  } finally { executor.close(); }
+});
+
+test("App Server executor archives an idle tree once and gates concurrent mutations", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.archiveIdle(task);
+    const archive = rpc.requests.filter(item => item.method === "thread/archive");
+    assert.equal(archive.length, 1); assert.equal(archive[0]?.options.mutating, true);
+    assert.equal(await executor.archiveRetryReady(task), true);
+  } finally { executor.close(); }
+});
+
+test("App Server executor preserves an uncertain archive gate and never retries it", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    rpc.fail = new AppServerUncertainError(); rpc.failMethod = "thread/archive";
+    await assert.rejects(executor.archiveIdle(task), UncertainActionError);
+    await assert.rejects(executor.submitWithReceipt(request()), /архивируется/u);
+    await assert.rejects(executor.archiveIdle(task), /архивируется/u);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 1);
+    rpc.emit({ method: "thread/archived", params: { threadId: task.threadId } });
+    assert.equal(await executor.archiveRetryReady(task), true);
   } finally { executor.close(); }
 });

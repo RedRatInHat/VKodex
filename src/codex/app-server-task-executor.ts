@@ -33,6 +33,8 @@ function idOf(value: unknown): string | null { return typeof value === "string" 
 export class AppServerTaskExecutor {
   private readonly loaded = new Map<string, LoadedTask>();
   private readonly questions = new Map<string, PendingQuestion>();
+  private readonly archiving = new Set<string>();
+  private readonly archiveGroups = new Map<string, Set<string>>();
   private readonly questionListeners = new Set<(threadId: string) => void>();
   private readonly unsubscribe: () => void;
 
@@ -42,10 +44,12 @@ export class AppServerTaskExecutor {
   }
 
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
+    this.assertWritable(request.task.threadId);
     const prepared = taskInput(request);
     const loaded = await this.resume(request.task);
     if (this.questions.has(request.task.threadId)) throw new ActionRejectedError("В задаче открыт вопрос Codex. Сначала ответь на него; сообщение не отправлено.");
     await request.beforeSend?.();
+    this.assertWritable(request.task.threadId);
     try {
       if (loaded.activeTurnId) {
         const result = await this.rpc.request("turn/steer", {
@@ -67,17 +71,21 @@ export class AppServerTaskExecutor {
   }
 
   async interrupt(task: TaskRef): Promise<void> {
+    this.assertWritable(task.threadId);
     const loaded = await this.resume(task);
     if (!loaded.activeTurnId) throw new ActionRejectedError("У задачи нет активного хода.");
+    this.assertWritable(task.threadId);
     try {
       await this.rpc.request("turn/interrupt", { threadId: task.threadId, turnId: loaded.activeTurnId }, { mutating: true });
     } catch (error) { throw operationError(error); }
   }
 
   async queue(request: SubmitTaskRequest): Promise<string> {
+    this.assertWritable(request.task.threadId);
     const prepared = taskInput(request);
     await this.resume(request.task);
     await request.beforeSend?.();
+    this.assertWritable(request.task.threadId);
     try {
       const result = await this.rpc.request("thread/queue/add", {
         threadId: request.task.threadId, clientUserMessageId: request.operationId, input: [...prepared.input],
@@ -90,7 +98,9 @@ export class AppServerTaskExecutor {
 
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
     if (!model || !effort) throw new ActionRejectedError("Модель и уровень рассуждения обязательны.");
+    this.assertWritable(task.threadId);
     await this.resume(task);
+    this.assertWritable(task.threadId);
     try {
       await this.rpc.request("thread/settings/update", { threadId: task.threadId, model, effort }, { mutating: true });
       const loaded = this.loaded.get(taskKey(task));
@@ -113,6 +123,7 @@ export class AppServerTaskExecutor {
 
   async answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     _operationId: string, beforeSend: () => Promise<void>): Promise<void> {
+    this.assertWritable(task.threadId);
     const key = task.threadId; const pending = this.questions.get(key);
     if (!pending || pending.question.fingerprint !== question.fingerprint) throw new ActionRejectedError("Вопрос уже закрыт или изменился.");
     const result: Record<string, { answers: string[] }> = {};
@@ -122,9 +133,99 @@ export class AppServerTaskExecutor {
       result[item.id] = { answers: [answer] };
     }
     await beforeSend();
+    this.assertWritable(task.threadId);
     this.questions.delete(key);
     this.notifyQuestions(key);
     pending.resolve({ answers: result });
+  }
+
+  async archiveRetryReady(task: TaskRef): Promise<boolean> {
+    if (this.archiving.has(task.threadId)) return false;
+    try { return !(await this.resume(task)).activeTurnId; }
+    catch (error) {
+      if (error instanceof TaskOwnedByClientError) return false;
+      throw error;
+    }
+  }
+
+  /** Archive through the same profile connection that owns the task. The
+   * preflight mirrors the client adapter: source and every descendant must be
+   * idle and have no active goal, the descendant set must stay stable, and an
+   * uncertain mutation is never retried. */
+  async archiveIdle(task: TaskRef): Promise<void> {
+    const root = task.threadId;
+    if (!root || root.length > 128 || /[\r\n\x00-\x1f]/u.test(root) || this.archiving.has(root)) {
+      throw new ActionRejectedError("Задача уже архивируется или имеет некорректный идентификатор.");
+    }
+    const group = new Set([root]);
+    this.archiving.add(root); this.archiveGroups.set(root, group);
+    let uncertain = false;
+    try {
+      const loaded = await this.resume(task);
+      if (loaded.activeTurnId) throw new ActionRejectedError("Сначала дождись завершения хода или останови его в Codex.");
+      const descendants = await this.listDescendants(root);
+      for (const id of descendants) {
+        if (this.archiving.has(id)) throw new ActionRejectedError("Дочерняя задача уже архивируется.");
+        this.archiving.add(id); group.add(id);
+      }
+      for (const id of group) {
+        const read = await this.rpc.request("thread/read", { threadId: id, includeTurns: false });
+        const thread = isObject(read.thread) && read.thread.id === id ? read.thread : null;
+        if (!thread || !isObject(thread.status) || thread.status.type !== "idle") {
+          throw new ActionRejectedError("Исходная и дочерние задачи должны быть завершены перед архивацией.");
+        }
+        const response = await this.rpc.request("thread/goal/get", { threadId: id });
+        const goal = response.goal;
+        if (goal !== null && (!isObject(goal) || !["paused", "complete", "blocked", "usageLimited", "budgetLimited"].includes(String(goal.status)))) {
+          throw new ActionRejectedError("Перед архивацией приостанови цели исходной и дочерних задач.");
+        }
+      }
+      const confirmed = await this.listDescendants(root);
+      if (confirmed.size !== descendants.size || [...confirmed].some(id => !descendants.has(id))) {
+        throw new ActionRejectedError("Список дочерних задач изменился во время проверки архивации.");
+      }
+      await this.rpc.request("thread/archive", { threadId: root }, { mutating: true });
+    } catch (error) {
+      const mapped = operationError(error);
+      uncertain = mapped instanceof UncertainActionError;
+      throw mapped;
+    } finally {
+      if (!uncertain) this.releaseArchive(root);
+    }
+  }
+
+  private async listDescendants(threadId: string): Promise<Set<string>> {
+    const ids = new Set<string>(); const cursors = new Set<string>(); let cursor: string | undefined;
+    do {
+      const response = await this.rpc.request("thread/list", {
+        ancestorThreadId: threadId, archived: false, limit: 100, ...(cursor ? { cursor } : {}),
+        sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact",
+          "subAgentThreadSpawn", "subAgentOther", "unknown"],
+      });
+      if (!Array.isArray(response.data)) throw new ActionRejectedError("Codex не вернул список дочерних задач.");
+      for (const value of response.data) {
+        if (!isObject(value) || typeof value.id !== "string" || !value.id || value.id === threadId || ids.has(value.id)) {
+          throw new ActionRejectedError("Codex вернул нестабильный список дочерних задач.");
+        }
+        ids.add(value.id);
+      }
+      if (response.nextCursor == null) break;
+      if (typeof response.nextCursor !== "string" || !response.nextCursor || cursors.has(response.nextCursor)) {
+        throw new ActionRejectedError("Codex повторил страницу дочерних задач.");
+      }
+      cursor = response.nextCursor; cursors.add(cursor);
+    } while (true);
+    return ids;
+  }
+
+  private assertWritable(threadId: string): void {
+    if (this.archiving.has(threadId)) throw new ActionRejectedError("Задача архивируется; новая команда не отправлена.");
+  }
+
+  private releaseArchive(threadId: string): void {
+    const group = this.archiveGroups.get(threadId);
+    if (group) for (const id of group) this.archiving.delete(id);
+    this.archiveGroups.delete(threadId);
   }
 
   private async resume(task: TaskRef): Promise<LoadedTask> {
@@ -148,6 +249,7 @@ export class AppServerTaskExecutor {
   private observe(notification: AppServerEnvelope): void {
     const threadId = idOf(notification.params.threadId);
     if (!threadId) return;
+    if (notification.method === "thread/archived") this.releaseArchive(threadId);
     const entries = [...this.loaded.entries()].filter(([key]) => {
       try { return (JSON.parse(key) as unknown[])[1] === threadId; } catch { return false; }
     });
@@ -190,6 +292,6 @@ export class AppServerTaskExecutor {
   close(): void {
     this.unsubscribe(); this.rpc.onServerRequest(null);
     for (const pending of this.questions.values()) pending.reject(new Error("Executor closed"));
-    this.questions.clear(); this.loaded.clear(); this.questionListeners.clear();
+    this.questions.clear(); this.loaded.clear(); this.archiving.clear(); this.archiveGroups.clear(); this.questionListeners.clear();
   }
 }

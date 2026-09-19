@@ -18,7 +18,7 @@ function fixture() {
     interrupt: async () => { calls.push("base:interrupt"); }, moveTask: async () => { calls.push("base:move"); },
     inspectTask: async () => ({ status: "idle" as const, workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
     listModels: async () => [], selectModel: async () => { calls.push("base:model"); },
-    renameTask: async () => ({ liveTitleUpdated: false }), archiveTask: async () => {}, exportMarkdown: async () => "",
+    renameTask: async () => ({ liveTitleUpdated: false }), archiveTask: async () => {}, archiveTransferredSource: async () => {}, exportMarkdown: async () => "",
     ensureOpen: async () => { calls.push("base:open"); },
   } satisfies CodexTasks;
   const owner: CodexTaskOwner = {
@@ -27,6 +27,7 @@ function fixture() {
     interrupt: async () => { calls.push("owner:interrupt"); }, queue: async () => "queued",
     selectModel: async () => { calls.push("owner:model"); }, pendingQuestions: async () => [], answerQuestions: async () => {},
     findAcceptedInput: async () => "accepted", inspectTask: async () => ({ status: "idle", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null }),
+    archiveTask: async () => { calls.push("owner:archive"); }, archiveRetryReady: async () => true,
   };
   return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
 }
@@ -53,6 +54,21 @@ test("an active UI writer receives a connected-only fallback before any native m
   const result = await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" });
   assert.equal(result.turnId, "client-turn");
   assert.deepEqual(f.calls, ["owner:busy", "base:connectedSubmit"]);
+});
+
+test("archive and transfer cleanup use the selected owner and fall back only for an active UI writer", async () => {
+  const f = fixture();
+  let baseArchives = 0; let transferArchives = 0;
+  f.base.archiveTask = async () => { baseArchives++; };
+  f.base.archiveTransferredSource = async () => { transferArchives++; };
+  await f.routed.archiveTask(work);
+  await f.routed.archiveTransferredSource!(work);
+  assert.deepEqual(f.calls, ["owner:archive", "owner:archive"]);
+  assert.equal(await f.routed.archiveRetryReady!(work), true);
+  f.owner.archiveTask = async () => { throw new TaskOwnedByClientError(); };
+  await f.routed.archiveTask(work);
+  await f.routed.archiveTransferredSource!(work);
+  assert.equal(baseArchives, 1); assert.equal(transferArchives, 1);
 });
 
 test("state router sends each task only to its selected owner", () => {

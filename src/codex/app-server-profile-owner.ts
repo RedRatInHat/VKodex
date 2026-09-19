@@ -43,6 +43,12 @@ export class AppServerProfileOwner {
   selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
     this.assertOwner(task); return this.executor.selectModel(task, model, effort);
   }
+  archiveTask(task: TaskRef): Promise<void> {
+    this.assertOwner(task); return this.executor.archiveIdle(task);
+  }
+  archiveRetryReady(task: TaskRef): Promise<boolean> {
+    this.assertOwner(task); return this.executor.archiveRetryReady(task);
+  }
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
     this.assertOwner(task); return this.executor.pendingQuestions(task);
   }
