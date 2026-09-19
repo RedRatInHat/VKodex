@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { ActionRejectedError, UncertainActionError, taskKey, type CodexTasks } from "../desktop/contracts.js";
-import { pendingCodexQuestions, type CodexQuestions } from "../desktop/questions.js";
+import { ActionRejectedError, UncertainActionError, taskKey, type CodexTasks } from "../core/codex-tasks.js";
+import type { CodexQuestions } from "../core/codex-questions.js";
+import { pendingCodexQuestions } from "../desktop/questions.js";
 import type { IpcObject } from "../desktop/ipc-client.js";
 import type { Binding, BridgeInput, Button, ManagerAction } from "./contracts.js";
 import { BridgeStore } from "./store.js";

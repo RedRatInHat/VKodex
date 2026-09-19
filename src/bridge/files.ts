@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
-import { ActionRejectedError, type TaskDetails } from "../desktop/contracts.js";
+import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
 import type { Binding, BridgeChat } from "./contracts.js";

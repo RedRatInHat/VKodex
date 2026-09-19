@@ -1,22 +1,9 @@
 import { createHash } from "node:crypto";
+import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { activeTurnsFromState } from "./projector.js";
 
-export interface CodexQuestion {
-  readonly id: string;
-  readonly title: string;
-  readonly options: readonly { readonly label: string; readonly description?: string }[];
-  readonly secret: boolean;
-}
-
-export interface CodexQuestions {
-  readonly key: string;
-  readonly fingerprint: string;
-  readonly kind: "blocking" | "async";
-  readonly turnId: string;
-  readonly requestId?: string | number;
-  readonly questions: readonly CodexQuestion[];
-}
+export type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
 
 const OPEN = "<send_user_message_question_reply>";
 const CLOSE = "</send_user_message_question_reply>";

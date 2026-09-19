@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { sameTask, type DesktopCompatibility, type CodexTasks } from "../desktop/contracts.js";
+import { sameTask, type DesktopCompatibility, type CodexTasks } from "../core/codex-tasks.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 

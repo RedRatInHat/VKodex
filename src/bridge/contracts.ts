@@ -1,4 +1,4 @@
-import type { DesktopTask, TaskRef, TaskGoal, TransferCheckpoint } from "../desktop/contracts.js";
+import type { DesktopTask, TaskRef, TaskGoal, TransferCheckpoint } from "../core/codex-tasks.js";
 import type { RemoteAttachment } from "../domain/models.js";
 
 export interface MessageHandle { readonly peerId: number; readonly conversationMessageId: number }

@@ -20,7 +20,7 @@ import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
 import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
-import { taskInput as desktopTaskInput } from "../src/desktop/desktop-tasks.js";
+import { taskInput as desktopTaskInput } from "../src/core/task-input.js";
 import { pendingCodexQuestions, type CodexQuestions } from "../src/desktop/questions.js";
 
 // Deliberately fictional fixture IDs; production identity is supplied only through local configuration.

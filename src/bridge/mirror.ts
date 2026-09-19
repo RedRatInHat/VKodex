@@ -1,4 +1,4 @@
-import type { TaskEvent } from "../desktop/contracts.js";
+import type { TaskEvent } from "../core/codex-tasks.js";
 import { chunkText } from "../lib/text.js";
 import { BridgeStore } from "./store.js";
 import { MENU_BUTTON } from "./contracts.js";

@@ -1,5 +1,5 @@
 import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, sameTask, taskKey,
-  type CodexTasks, type TransferTaskRequest } from "../desktop/contracts.js";
+  type CodexTasks, type TransferTaskRequest } from "../core/codex-tasks.js";
 import { MENU_BUTTON, type TaskTransferRecord } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 import { randomUUID } from "node:crypto";

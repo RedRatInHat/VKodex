@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { InputBatcher } from "./input-batcher.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -8,7 +8,7 @@ import { BridgeStore } from "./store.js";
 import { TaskPanels } from "./panels.js";
 import { TaskFiles } from "./files.js";
 import { systemLoadText } from "./system-load.js";
-import { taskInput } from "../desktop/desktop-tasks.js";
+import { taskInput } from "../core/task-input.js";
 import path from "node:path";
 import os from "node:os";
 import { comparablePath } from "../desktop/paths.js";

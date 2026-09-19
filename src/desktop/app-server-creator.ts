@@ -8,7 +8,7 @@ import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sam
 import { nativeCodexPath } from "./metadata.js";
 import type { MultiDesktopCatalog, ResolvedDesktopProject } from "./multi-catalog.js";
 import { createTaskWorktree } from "./task-workspaces.js";
-import { withVkResponseFormat } from "./vk-response-format.js";
+import { withVkResponseFormat } from "../core/task-input.js";
 
 const efforts = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 

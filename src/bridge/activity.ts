@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { TaskDetails } from "../desktop/contracts.js";
+import type { TaskDetails } from "../core/codex-tasks.js";
 import { BridgeStore } from "./store.js";
 import type { View } from "./contracts.js";
 

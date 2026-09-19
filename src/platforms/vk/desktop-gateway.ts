@@ -4,7 +4,7 @@ import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
 import { ChatRateLimitError, FileUploadRejectedError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
-import { ActionRejectedError, UncertainActionError } from "../../desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError } from "../../core/codex-tasks.js";
 import { isObject } from "../../desktop/ipc-client.js";
 import type { RemoteAttachment } from "../../domain/models.js";
 import { safeFileName } from "../../lib/files.js";

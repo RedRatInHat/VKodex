@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";

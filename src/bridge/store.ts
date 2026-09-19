@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../desktop/contracts.js";
+import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../desktop/paths.js";
