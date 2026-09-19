@@ -406,7 +406,7 @@ The **Task menu:** line and **Menu** button are appended to the final Codex answ
 | **Share** | Explicitly open the app, send the deep link, or export. A public share URL is not created automatically. |
 | **Move to project** | Save a new Codex project assignment or remove the task from its project. This does not move an existing task's working directory. |
 | **Move** → **Another profile** | Create a native fork of completed history in another `CODEX_HOME`, explicitly restore and verify its user title, preserve model, effort, and working directory, retarget the current VK conversation, and archive the source task. The target can use a selected project or **No project**. |
-| `/stop` | Interrupt the active turn. The response confirms the interrupted turn ID and does not archive the task. |
+| `/stop` | Interrupt the active turn. VKodex fixes the exact turn ID, then reads that turn back after a rejection or lost reply and never touches a newer turn. It retries only after an explicit rejection while the same immutable turn is still confirmed running; an unknown result is never replayed blindly. The task is not archived. |
 | `/detach` | Disable only VK streaming. The task is neither interrupted nor archived. |
 
 An unknown slash command from the owner opens the relevant help and is not sent to the agent. Messages from other participants, including text starting with `/`, remain ordinary prompts.
