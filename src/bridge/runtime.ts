@@ -1,6 +1,6 @@
-import { DesktopIpcClient, isObject } from "../desktop/ipc-client.js";
+import { isObject } from "../desktop/ipc-client.js";
 import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
-import { TaskSubscription } from "../desktop/subscription.js";
+import { DesktopTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../desktop/state-transport.js";
 import { RolloutRecordTooLargeError, RolloutTailer } from "../desktop/rollout-tailer.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
@@ -26,7 +26,7 @@ export class DesktopBridgeRuntime {
   private readonly activity: TaskActivity;
   private readonly files: TaskFiles | undefined;
   private readonly health: BridgeHealthMonitor;
-  private readonly subscriptions = new Map<string, TaskSubscription>();
+  private readonly subscriptions = new Map<string, TaskStateStream>();
   private readonly subscriptionTasks = new Map<string, string>();
   private readonly readySubscriptions = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
@@ -49,7 +49,7 @@ export class DesktopBridgeRuntime {
   private lastOperationReconciliationAt = 0;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly client = new DesktopIpcClient(), private readonly now: () => number = Date.now, fileRoot?: string,
+    private readonly streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
     inboundFileLimits?: InboundFileLimits) {
@@ -250,7 +250,7 @@ export class DesktopBridgeRuntime {
     });
   }
 
-  private subscriptionFailed(bindingId: string, subscription: TaskSubscription, error: Error): void {
+  private subscriptionFailed(bindingId: string, subscription: TaskStateStream, error: Error): void {
     if (this.subscriptions.get(bindingId) !== subscription) return;
     const binding = this.store.getBinding(bindingId);
     const lastVerifiedAt = this.ownerVerifiedAt.get(bindingId);
@@ -263,7 +263,7 @@ export class DesktopBridgeRuntime {
     this.store.enqueue(`disconnected:${bindingId}`, this.access.ownerId, { text: `Связь с задачей «${binding.title.slice(0, 200)}» прервалась. ${reason} Подключение будет повторено; команды автоматически не повторяются.` });
   }
 
-  private verifySubscription(bindingId: string, subscription: TaskSubscription): void {
+  private verifySubscription(bindingId: string, subscription: TaskStateStream): void {
     if (this.ownerChecks.has(bindingId) || this.now() - (this.ownerVerifiedAt.get(bindingId) ?? 0) < 30_000) return;
     // Independent bounded reads: an unresponsive owner must not delay other
     // subscriptions, VK messages or the activity timer.
@@ -347,7 +347,7 @@ export class DesktopBridgeRuntime {
       }
       this.store.ensureBinding(task);
       const checkpointKey = `projection:${binding.id}`;
-      const subscription = new TaskSubscription(this.client, task, (state, initial) => {
+      const subscription = this.streams.subscribe(task, (state, initial) => {
         const current = this.store.getBinding(binding.id);
         if (this.subscriptions.get(binding.id) !== subscription || !current?.attached || !sameTask(current, task)) return;
         this.store.atomic(() => {
@@ -463,7 +463,7 @@ export class DesktopBridgeRuntime {
     this.subscriptionTasks.clear();
     this.readySubscriptions.clear();
     this.ownerVerifiedAt.clear();
-    this.client.close();
+    this.streams.close();
     await Promise.allSettled(this.ownerChecks.values());
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
     await this.ticking?.catch(() => {});
