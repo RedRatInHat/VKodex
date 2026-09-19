@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppServerEnvelope, AppServerRequestOptions, AppServerRpc, AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
-import { AppServerUncertainError } from "../src/codex/app-server-connection.js";
+import { AppServerRejectedError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import { AppServerTaskExecutor } from "../src/codex/app-server-task-executor.js";
 import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from "../src/core/codex-tasks.js";
 
@@ -19,6 +19,7 @@ class FakeRpc implements AppServerRpc {
   fail: Error | null = null;
   failMethod: string | null = null;
   failAfterMethod: string | null = null;
+  interruptPlan: ("success" | "reject-running" | "reject-stopped" | "uncertain-running" | "uncertain-stopped")[] = [];
   private after(method: string): void {
     if (this.failAfterMethod === method) { this.failAfterMethod = null; throw new AppServerUncertainError(); }
   }
@@ -33,8 +34,17 @@ class FakeRpc implements AppServerRpc {
     };
     if (method === "turn/start") { this.activeTurnId = "started-turn"; return { turn: { id: this.activeTurnId } }; }
     if (method === "turn/steer") return { turnId: this.activeTurnId };
+    if (method === "turn/interrupt") {
+      const action = this.interruptPlan.shift() ?? "success";
+      if (action.endsWith("stopped") || action === "success") this.activeTurnId = null;
+      if (action.startsWith("reject")) throw new AppServerRejectedError();
+      if (action.startsWith("uncertain")) throw new AppServerUncertainError();
+      return {};
+    }
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
     if (method === "thread/list") return { data: [], nextCursor: null };
+    if (method === "thread/turns/list") return { data: [{ id: "started-turn",
+      status: this.activeTurnId === "started-turn" ? "inProgress" : "interrupted", items: [] }], nextCursor: null };
     // Native thread/read can briefly lag an acknowledged turn/start.
     if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId,
       cwd: "D:\\work", status: { type: "idle" } } };
@@ -125,6 +135,46 @@ test("App Server executor uses native interrupt, queue and settings APIs", async
     for (const method of ["turn/interrupt", "thread/queue/add", "thread/settings/update"]) {
       assert.equal(rpc.requests.find(item => item.method === method)?.options.mutating, true);
     }
+  } finally { executor.close(); }
+});
+
+test("App Server interrupt confirms a stopped turn after a rejected or lost reply", async () => {
+  for (const outcome of ["reject-stopped", "uncertain-stopped"] as const) {
+    const rpc = new FakeRpc(); rpc.activeTurnId = "started-turn"; rpc.interruptPlan = [outcome];
+    const executor = new AppServerTaskExecutor(rpc);
+    try {
+      await executor.interrupt(task);
+      assert.equal(rpc.requests.filter(item => item.method === "turn/interrupt").length, 1);
+    } finally { executor.close(); }
+  }
+});
+
+test("App Server interrupt retries only an explicitly rejected immutable running turn", async () => {
+  const rpc = new FakeRpc(); rpc.activeTurnId = "started-turn"; rpc.interruptPlan = ["reject-running", "success"];
+  const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.interrupt(task);
+    const requests = rpc.requests.filter(item => item.method === "turn/interrupt");
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map(item => item.params.turnId), ["started-turn", "started-turn"]);
+  } finally { executor.close(); }
+});
+
+test("App Server interrupt never retries an uncertain running turn", async () => {
+  const rpc = new FakeRpc(); rpc.activeTurnId = "started-turn"; rpc.interruptPlan = ["uncertain-running"];
+  const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await assert.rejects(executor.interrupt(task), UncertainActionError);
+    assert.equal(rpc.requests.filter(item => item.method === "turn/interrupt").length, 1);
+  } finally { executor.close(); }
+});
+
+test("App Server interrupt reports a known refusal when the same turn stays active", async () => {
+  const rpc = new FakeRpc(); rpc.activeTurnId = "started-turn"; rpc.interruptPlan = ["reject-running", "reject-running"];
+  const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await assert.rejects(executor.interrupt(task), /всё ещё выполняется/u);
+    assert.equal(rpc.requests.filter(item => item.method === "turn/interrupt").length, 2);
   } finally { executor.close(); }
 });
 

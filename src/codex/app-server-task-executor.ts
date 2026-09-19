@@ -105,10 +105,43 @@ export class AppServerTaskExecutor {
     this.assertWritable(task.threadId);
     const loaded = await this.resume(task);
     if (!loaded.activeTurnId) throw new ActionRejectedError("У задачи нет активного хода.");
+    const expectedTurnId = loaded.activeTurnId;
     this.assertWritable(task.threadId);
+    const send = () => this.rpc.request("turn/interrupt", { threadId: task.threadId, turnId: expectedTurnId }, { mutating: true });
     try {
-      await this.rpc.request("turn/interrupt", { threadId: task.threadId, turnId: loaded.activeTurnId }, { mutating: true });
-    } catch (error) { throw operationError(error); }
+      await send();
+    } catch (error) {
+      const state = await this.interruptState(task.threadId, expectedTurnId);
+      if (state === "stopped") return;
+      // A lost reply is never replayed. The immutable turn ID makes one retry
+      // safe only after an explicit rejection proves that the first request was
+      // not accepted and a read confirms that same turn is still running.
+      if (error instanceof AppServerUncertainError) throw new UncertainActionError();
+      if (!(error instanceof AppServerRejectedError) || state !== "running") throw operationError(error);
+      try { await send(); return; }
+      catch (retryError) {
+        const retryState = await this.interruptState(task.threadId, expectedTurnId);
+        if (retryState === "stopped") return;
+        if (retryError instanceof AppServerUncertainError) throw new UncertainActionError();
+        if (retryError instanceof AppServerRejectedError && retryState === "running") {
+          throw new ActionRejectedError("Codex отклонил остановку; этот ход всё ещё выполняется.");
+        }
+        throw operationError(retryError);
+      }
+    }
+  }
+
+  private async interruptState(threadId: string, expectedTurnId: string): Promise<"running" | "stopped" | "unknown"> {
+    try {
+      const response = await this.rpc.request("thread/turns/list", {
+        threadId, limit: 20, sortDirection: "desc", itemsView: "summary",
+      });
+      if (!Array.isArray(response.data)) return "unknown";
+      const turn = response.data.find(value => isObject(value) && value.id === expectedTurnId);
+      if (!isObject(turn)) return "unknown";
+      if (turn.status === "inProgress") return "running";
+      return ["completed", "failed", "interrupted"].includes(String(turn.status)) ? "stopped" : "unknown";
+    } catch { return "unknown"; }
   }
 
   async queue(request: SubmitTaskRequest): Promise<string> {
