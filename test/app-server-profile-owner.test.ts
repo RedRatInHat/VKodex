@@ -15,6 +15,9 @@ class Rpc implements AppServerRpc {
       cwd: "D:\\w", model: "gpt", reasoningEffort: "high", initialTurnsPage: { data: [], nextCursor: null } };
     if (method === "turn/start") return { turn: { id: "turn" } };
     if (method === "thread/read") return { thread: { id: "task" } };
+    if (method === "thread/turns/list") return { data: [{ id: "accepted-turn", items: [
+      { type: "userMessage", clientId: "accepted-operation" },
+    ] }], nextCursor: null };
     throw new Error(method);
   }
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
@@ -49,4 +52,12 @@ test("state router never falls back to another account", () => {
   const router = new AppServerOwnerStateRouter([first, second]);
   assert.throws(() => router.subscribe({ hostId: "local", threadId: "task", sourceId: "three" }, () => {}, () => {}), ActionRejectedError);
   router.close();
+});
+
+test("profile owner reconciles an uncertain input from native paged history", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("", rpc);
+  const task = { hostId: "local", threadId: "task" };
+  assert.equal(await owner.findAcceptedInput(task, "accepted-operation"), "accepted-turn");
+  assert.equal(await owner.findAcceptedInput(task, "missing-operation"), null);
+  await owner.close();
 });

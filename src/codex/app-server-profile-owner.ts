@@ -43,6 +43,33 @@ export class AppServerProfileOwner {
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
     this.assertOwner(task); return this.executor.pendingQuestions(task);
   }
+
+  async findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
+    this.assertOwner(task);
+    if (!operationId) return null;
+    let cursor: string | null = null; const seen = new Set<string>();
+    do {
+      if (cursor) {
+        if (seen.has(cursor)) throw new ActionRejectedError("Codex повторил страницу истории задачи.");
+        seen.add(cursor);
+      }
+      const page = await this.rpc.request("thread/turns/list", {
+        threadId: task.threadId, ...(cursor ? { cursor } : {}), limit: 100, sortDirection: "desc", itemsView: "full",
+      });
+      if (!Array.isArray(page.data)) throw new ActionRejectedError("Codex вернул неполную историю задачи.");
+      for (const value of page.data) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+        const turn = value as Record<string, unknown>;
+        if (typeof turn.id !== "string" || !Array.isArray(turn.items)) continue;
+        const accepted = turn.items.some(item => !!item && typeof item === "object" && !Array.isArray(item)
+          && (item as Record<string, unknown>).type === "userMessage"
+          && (item as Record<string, unknown>).clientId === operationId);
+        if (accepted) return turn.id;
+      }
+      cursor = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+    } while (cursor);
+    return null;
+  }
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void> {
     this.assertOwner(task); return this.executor.answerQuestions(task, question, answers, operationId, beforeSend);
