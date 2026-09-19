@@ -98,6 +98,8 @@ export class AppServerProfileOwner {
 
   async inspectTask(task: TaskRef): Promise<TaskDetails> {
     this.assertOwner(task);
+    const loaded = await this.executor.inspectLoadedTask(task);
+    if (loaded) return loaded;
     let state: TaskState | null = null;
     const stream = this.nativeStates.subscribe(task, value => { state = value; }, () => {});
     try {

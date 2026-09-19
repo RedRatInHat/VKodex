@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
 import { ActionRejectedError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskOwnedByClientError, UncertainActionError, taskKey,
-  type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
+  type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
 import { goalMatchesUpdate, normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 import { taskInput } from "../core/task-input.js";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError,
@@ -38,10 +38,40 @@ export class AppServerTaskExecutor {
   private readonly archiveGroups = new Map<string, Set<string>>();
   private readonly questionListeners = new Set<(threadId: string) => void>();
   private readonly unsubscribe: () => void;
+  private readonly unsubscribeDisconnect: () => void;
 
   constructor(private readonly rpc: AppServerRpc) {
     this.unsubscribe = rpc.onNotification(notification => this.observe(notification));
+    this.unsubscribeDisconnect = rpc.onDisconnect?.(error => this.connectionLost(error)) ?? (() => {});
     rpc.onServerRequest(request => this.serverRequest(request));
+  }
+
+  /** Inspect a task already loaded by this owner without issuing another
+   * thread/resume. Resuming an active thread on the same App Server aborts its
+   * current turn, so every command and diagnostic must share this ownership
+   * cache. */
+  async inspectLoadedTask(task: TaskRef): Promise<TaskDetails | null> {
+    const loaded = this.loaded.get(taskKey(task));
+    if (!loaded) return null;
+    try {
+      const response = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+      const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
+      if (!thread || !isObject(thread.status)) throw new AppServerUnavailableError();
+      const nativeStatus = String(thread.status.type ?? "");
+      // turn/start is acknowledged before thread/read is guaranteed to expose
+      // the new active status. The accepted turn ID is stronger evidence and
+      // remains authoritative until turn/completed clears it via notification.
+      const status = loaded.activeTurnId || nativeStatus === "active" ? "running" as const
+        : nativeStatus === "idle" ? "idle" as const
+        : nativeStatus === "systemError" ? "failed" as const : "unavailable" as const;
+      return {
+        title: typeof thread.name === "string" && thread.name ? thread.name : null,
+        status, workspace: typeof thread.cwd === "string" && thread.cwd ? thread.cwd : null,
+        model: loaded.model, effort: loaded.effort,
+        nextModel: loaded.model, nextEffort: loaded.effort, context: null,
+        ...(status === "failed" ? { failure: "systemError" as const } : {}),
+      };
+    } catch (error) { throw operationError(error); }
   }
 
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
@@ -315,6 +345,8 @@ export class AppServerTaskExecutor {
   }
 
   private async resume(task: TaskRef): Promise<LoadedTask> {
+    const cached = this.loaded.get(taskKey(task));
+    if (cached) return cached;
     try {
       const result = await this.rpc.request("thread/resume", {
         threadId: task.threadId, excludeTurns: true,
@@ -335,7 +367,12 @@ export class AppServerTaskExecutor {
   private observe(notification: AppServerEnvelope): void {
     const threadId = idOf(notification.params.threadId);
     if (!threadId) return;
-    if (notification.method === "thread/archived") this.releaseArchive(threadId);
+    if (notification.method === "thread/archived") {
+      this.releaseArchive(threadId);
+      for (const key of this.loaded.keys()) {
+        try { if ((JSON.parse(key) as unknown[])[1] === threadId) this.loaded.delete(key); } catch { /* Ignore malformed private cache keys. */ }
+      }
+    }
     const entries = [...this.loaded.entries()].filter(([key]) => {
       try { return (JSON.parse(key) as unknown[])[1] === threadId; } catch { return false; }
     });
@@ -375,8 +412,16 @@ export class AppServerTaskExecutor {
     for (const listener of this.questionListeners) listener(threadId);
   }
 
+  private connectionLost(error: Error): void {
+    this.loaded.clear();
+    for (const [threadId, pending] of this.questions) {
+      pending.reject(error);
+      this.questions.delete(threadId); this.notifyQuestions(threadId);
+    }
+  }
+
   close(): void {
-    this.unsubscribe(); this.rpc.onServerRequest(null);
+    this.unsubscribe(); this.unsubscribeDisconnect(); this.rpc.onServerRequest(null);
     for (const pending of this.questions.values()) pending.reject(new Error("Executor closed"));
     this.questions.clear(); this.loaded.clear(); this.archiving.clear(); this.archiveGroups.clear(); this.questionListeners.clear();
   }

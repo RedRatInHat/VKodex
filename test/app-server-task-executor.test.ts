@@ -10,6 +10,7 @@ type JsonObject = Record<string, unknown>;
 class FakeRpc implements AppServerRpc {
   readonly requests: { method: string; params: JsonObject; options: AppServerRequestOptions }[] = [];
   private readonly listeners = new Set<(notification: AppServerEnvelope) => void>();
+  private readonly disconnectListeners = new Set<(error: Error) => void>();
   private handler: AppServerServerRequestHandler | null = null;
   activeTurnId: string | null = null;
   title: string | null = "Task";
@@ -34,7 +35,9 @@ class FakeRpc implements AppServerRpc {
     if (method === "turn/steer") return { turnId: this.activeTurnId };
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
     if (method === "thread/list") return { data: [], nextCursor: null };
-    if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId, status: { type: "idle" } } };
+    // Native thread/read can briefly lag an acknowledged turn/start.
+    if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId,
+      cwd: "D:\\work", status: { type: "idle" } } };
     if (method === "thread/name/set") { this.title = String(params.name); this.after(method); return {}; }
     if (method === "thread/metadata/update") { this.projectId = params.projectId ? String(params.projectId) : null; this.after(method); return {}; }
     if (method === "thread/goal/get") return { goal: this.goal };
@@ -49,8 +52,12 @@ class FakeRpc implements AppServerRpc {
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
     this.listeners.add(listener); return () => { this.listeners.delete(listener); };
   }
+  onDisconnect(listener: (error: Error) => void): () => void {
+    this.disconnectListeners.add(listener); return () => { this.disconnectListeners.delete(listener); };
+  }
   onServerRequest(handler: AppServerServerRequestHandler | null): void { this.handler = handler; }
   emit(notification: AppServerEnvelope): void { for (const listener of this.listeners) listener(notification); }
+  disconnect(): void { for (const listener of this.disconnectListeners) listener(new Error("Disconnected")); }
   ask(request: AppServerEnvelope): Promise<JsonObject> { return Promise.resolve(this.handler!(request)); }
   async close(): Promise<void> {}
 }
@@ -71,6 +78,30 @@ test("App Server executor starts an idle turn and steers only the confirmed acti
     const steer = rpc.requests.find(item => item.method === "turn/steer")!;
     assert.equal(steer.params.expectedTurnId, "started-turn");
     assert.equal(steer.params.clientUserMessageId, "operation-2");
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 1);
+  } finally { executor.close(); }
+});
+
+test("inspection of an owned active task never resumes and aborts it", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.submitWithReceipt(request());
+    const details = await executor.inspectLoadedTask(task);
+    assert.equal(details?.status, "running");
+    assert.equal(details?.model, "model-a");
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 1);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/read").length, 1);
+  } finally { executor.close(); }
+});
+
+test("a disconnected owner drops its loaded-task cache before reconnecting", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.submitWithReceipt(request());
+    rpc.disconnect(); rpc.activeTurnId = null;
+    assert.equal(await executor.inspectLoadedTask(task), null);
+    await executor.submitWithReceipt({ ...request(), operationId: "operation-after-reconnect" });
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 2);
   } finally { executor.close(); }
 });
 
