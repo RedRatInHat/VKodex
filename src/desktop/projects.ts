@@ -35,6 +35,7 @@ function legacyProjectId(codexHome: string, nativeProjectId: string): string {
  */
 export async function mirrorLegacyProjectAssignment(codexHome: string, threadId: string, nativeProjectId: string | null): Promise<boolean> {
   const statePath = path.join(codexHome, ".codex-global-state.json");
+  const targetProjectId = nativeProjectId === null ? null : legacyProjectId(codexHome, nativeProjectId);
   for (let attempt = 0; attempt < 4; attempt++) {
     let original: string; let before: { size: number; mtimeMs: number };
     try {
@@ -51,13 +52,28 @@ export async function mirrorLegacyProjectAssignment(codexHome: string, threadId:
 
     const assignments = isObject(state["thread-project-assignments"])
       ? { ...state["thread-project-assignments"] as IpcObject } : {};
-    const projectless = Array.isArray(state["projectless-thread-ids"])
-      ? state["projectless-thread-ids"].filter((id): id is string => typeof id === "string" && id !== threadId) : [];
+    const originalProjectless = Array.isArray(state["projectless-thread-ids"])
+      ? state["projectless-thread-ids"].filter((id): id is string => typeof id === "string") : [];
+    const existing = assignments[threadId];
+    const wasProjectless = originalProjectless.includes(threadId);
+
+    // During partial migration, new App Server threads intentionally have no
+    // legacy entry. Their native threads.project_id is authoritative and is
+    // already consumed by the catalog. Treat the legacy file as an override
+    // only when this thread actually has an old assignment to replace. This
+    // prevents harmless concurrent sidebar writes from turning a confirmed
+    // native mutation into an uncertain create/transfer result.
+    if (existing === undefined && !wasProjectless) return false;
+    if (targetProjectId === null && existing === undefined && wasProjectless) return true;
+    if (targetProjectId !== null && isObject(existing) && existing.projectKind === "local"
+      && existing.projectId === targetProjectId && !wasProjectless) return true;
+
+    const projectless = originalProjectless.filter(id => id !== threadId);
     if (nativeProjectId === null) {
       delete assignments[threadId];
       projectless.push(threadId);
     } else {
-      assignments[threadId] = { projectKind: "local", projectId: legacyProjectId(codexHome, nativeProjectId) };
+      assignments[threadId] = { projectKind: "local", projectId: targetProjectId };
     }
     const next = { ...state, "thread-project-assignments": assignments, "projectless-thread-ids": projectless };
     const serialized = `${JSON.stringify(next)}${original.endsWith("\n") ? "\n" : ""}`;
@@ -67,6 +83,7 @@ export async function mirrorLegacyProjectAssignment(codexHome: string, threadId:
       const current = await stat(statePath);
       if (current.size !== before.size || current.mtimeMs !== before.mtimeMs) {
         await rm(temporary, { force: true });
+        await new Promise(resolve => setTimeout(resolve, 20 * 2 ** attempt));
         continue;
       }
       await rename(temporary, statePath);

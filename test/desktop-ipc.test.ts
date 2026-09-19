@@ -1168,6 +1168,26 @@ test("transfer history digest covers every page and ignores fork-assigned item I
   await assert.rejects(completedHistoryDigest("source", "wrong-boundary", pages("Original", "source-item")), ActionRejectedError);
 });
 
+test("transfer history digest ignores only empty App Server reasoning placeholders", async () => {
+  const page = (items: IpcObject[]) => async (): Promise<IpcObject> => ({
+    data: [{ id: "last", status: "completed", items }], nextCursor: null,
+  });
+  const visible = [
+    { id: "user", type: "userMessage", content: [{ type: "text", text: "Keep me" }] },
+    { id: "agent", type: "agentMessage", text: "Done" },
+  ];
+  const withoutPlaceholder = await completedHistoryDigest("target", "last", page(visible));
+  assert.equal(await completedHistoryDigest("source", "last", page([
+    visible[0]!, { id: "empty", type: "reasoning", summary: [], content: [] }, visible[1]!,
+  ])), withoutPlaceholder);
+  assert.notEqual(await completedHistoryDigest("source", "last", page([
+    visible[0]!, { id: "meaningful", type: "reasoning", summary: [{ text: "Summary" }], content: [] }, visible[1]!,
+  ])), withoutPlaceholder);
+  assert.notEqual(await completedHistoryDigest("source", "last", page([
+    visible[0]!, { id: "future", type: "reasoning", summary: [], content: [], encryptedContent: "opaque" }, visible[1]!,
+  ])), withoutPlaceholder);
+});
+
 test("a switched target may have newer turns while the copied boundary stays identical", async () => {
   const list = async (): Promise<IpcObject> => ({ data: [
     { id: "boundary", status: "completed", items: [{ id: "original", type: "userMessage", text: "Move me" }] },

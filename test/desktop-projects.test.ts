@@ -48,6 +48,32 @@ test("fully migrated project state is not rewritten", async () => {
   assert.equal(await readFile(file, "utf8"), original);
 });
 
+test("a new native thread does not require a legacy assignment during partial migration", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-native-thread-"));
+  const migration = { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } };
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({ "app-server-projects-migration-by-host": migration,
+    "thread-project-assignments": { untouched: { projectKind: "local", projectId: "other" } },
+    "projectless-thread-ids": ["another"] });
+  await writeFile(file, original);
+  assert.equal(await mirrorLegacyProjectAssignment(home, "new-native-thread", "native-project"), false);
+  assert.equal(await readFile(file, "utf8"), original);
+  assert.equal(await mirrorLegacyProjectAssignment(home, "new-native-thread", null), false);
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("an already matching legacy assignment is idempotent", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-matching-"));
+  const migration = { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } };
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({ "app-server-projects-migration-by-host": migration,
+    "thread-project-assignments": { fixture: { projectKind: "local", projectId: "native-project" } },
+    "projectless-thread-ids": [] });
+  await writeFile(file, original);
+  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), true);
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
 test("imported native projects replace stale IDs while assignment migration controls sidebar membership", async t => {
   const db = new Database(":memory:"); t.after(() => db.close());
   db.exec(`CREATE TABLE projects (id TEXT, name TEXT, position INTEGER);
