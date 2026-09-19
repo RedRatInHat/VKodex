@@ -1,5 +1,5 @@
 import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, sameTask, taskKey,
-  type DesktopTasks, type TransferTaskRequest } from "../desktop/contracts.js";
+  type CodexTasks, type TransferTaskRequest } from "../desktop/contracts.js";
 import { MENU_BUTTON, type TaskTransferRecord } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 import { randomUUID } from "node:crypto";
@@ -49,7 +49,7 @@ export class TaskTransfers {
   private readonly archiveChecks = new Map<string, number>();
   private stopped = false;
 
-  constructor(private readonly store: BridgeStore, private readonly desktop: DesktopTasks, private readonly now: () => number = Date.now) {}
+  constructor(private readonly store: BridgeStore, private readonly desktop: CodexTasks, private readonly now: () => number = Date.now) {}
 
   start(record: TaskTransferRecord): void {
     this.store.beginTransfer({ ...record, version: 2, step: "snapshot", revision: 0, updatedAt: this.now(), attempt: 0 });

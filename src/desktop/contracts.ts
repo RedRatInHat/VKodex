@@ -253,7 +253,8 @@ export interface DesktopCompatibility {
   readonly message: string;
 }
 
-export interface DesktopTasks {
+/** Transport-neutral Codex task port consumed by the VK bridge core. */
+export interface CodexTasks {
   pendingQuestions?(task: TaskRef): Promise<readonly import("./questions.js").CodexQuestions[]>;
   answerQuestions?(task: TaskRef, question: import("./questions.js").CodexQuestions, answers: Readonly<Record<string, string>>, operationId: string, beforeSend: () => Promise<void>): Promise<void>;
   queue?(request: SubmitTaskRequest): Promise<string>;
@@ -301,6 +302,9 @@ export interface DesktopTasks {
   checkCompatibility?(): Promise<DesktopCompatibility>;
   compatibility?(): DesktopCompatibility;
 }
+
+/** @deprecated Concrete adapters may retain this name while migrating to CodexTasks. */
+export type DesktopTasks = CodexTasks;
 
 export function taskKey(task: TaskRef): string {
   return JSON.stringify(task.sourceId ? [task.hostId, task.threadId, task.sourceId] : [task.hostId, task.threadId]);

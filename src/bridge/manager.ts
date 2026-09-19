@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { InputBatcher } from "./input-batcher.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type DesktopTasks, type TaskRef } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -82,7 +82,7 @@ export class TaskManager {
 
   constructor(
     private readonly access: OwnerAccess,
-    private readonly desktop: DesktopTasks,
+    private readonly desktop: CodexTasks,
     private readonly chat: BridgeChat,
     private readonly store: BridgeStore,
     private readonly gate: AccessGate,

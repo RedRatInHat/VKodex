@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type DesktopTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../desktop/contracts.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -127,7 +127,7 @@ export class TaskPanels {
   private lastCatalogAt = 0;
   private catalogCount: number | null = null;
 
-  constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore,
+  constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore,
     private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>) {
     this.transfers = new TaskTransfers(store, desktop);
   }

@@ -7,7 +7,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type DesktopTasks, type TaskCreationUpdate, type TaskDetails } from "../desktop/contracts.js";
+import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails } from "../desktop/contracts.js";
 import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
@@ -37,7 +37,7 @@ export class DesktopBridgeRuntime {
   private operationReconciliation: Promise<void> | null = null;
   private lastOperationReconciliationAt = 0;
 
-  constructor(private readonly access: OwnerAccess, private readonly desktop: DesktopTasks, chat: BridgeChat, private readonly store: BridgeStore,
+  constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, chat: BridgeChat, private readonly store: BridgeStore,
     streams: TaskStateTransport = new DesktopTaskStateTransport(), private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
@@ -256,7 +256,7 @@ export class DesktopBridgeRuntime {
     // reconnect proportional to the number of bindings. During a renderer
     // outage, serial five-second subscription attempts could hold one update
     // for minutes and make the health report itself stale.
-    let listedTasks: Awaited<ReturnType<DesktopTasks["listTasks"]>> | null = null;
+    let listedTasks: Awaited<ReturnType<CodexTasks["listTasks"]>> | null = null;
     const starting = new Set<Promise<void>>();
     for (const listed of this.store.bindings()) {
       let binding = listed;

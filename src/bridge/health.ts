@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { sameTask, type DesktopCompatibility, type DesktopTasks } from "../desktop/contracts.js";
+import { sameTask, type DesktopCompatibility, type CodexTasks } from "../desktop/contracts.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 
@@ -65,7 +65,7 @@ export class BridgeHealthMonitor {
 
   constructor(
     private readonly access: OwnerAccess,
-    private readonly desktop: DesktopTasks,
+    private readonly desktop: CodexTasks,
     private readonly chat: BridgeChat,
     private readonly store: BridgeStore,
     private readonly runtime: () => RuntimeHealthState,

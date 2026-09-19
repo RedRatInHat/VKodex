@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ActionRejectedError, UncertainActionError, taskKey, type DesktopTasks } from "../desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, taskKey, type CodexTasks } from "../desktop/contracts.js";
 import { pendingCodexQuestions, type CodexQuestions } from "../desktop/questions.js";
 import type { IpcObject } from "../desktop/ipc-client.js";
 import type { Binding, BridgeInput, Button, ManagerAction } from "./contracts.js";
@@ -19,7 +19,7 @@ interface QuestionCard {
 /** Durable UI state only. Codex owns question lifetime and execution. */
 export class TaskQuestions {
   private readonly inFlight = new Set<string>();
-  constructor(private readonly desktop: DesktopTasks, private readonly store: BridgeStore, private readonly gate: AccessGate, private readonly ownerId: number) {}
+  constructor(private readonly desktop: CodexTasks, private readonly store: BridgeStore, private readonly gate: AccessGate, private readonly ownerId: number) {}
 
   private scope(binding: Binding): string { return JSON.stringify([taskKey(binding), this.store.streamGeneration(binding.id)]); }
   private cards(binding: Binding): QuestionCard[] { return this.store.getValue<QuestionCard[]>(`questions:${binding.id}`) ?? []; }
