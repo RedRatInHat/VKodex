@@ -1,14 +1,12 @@
-import { isObject } from "../desktop/ipc-client.js";
-import { activeTurnsFromState, projectSnapshot, turnsFromState, type ProjectionCheckpoint } from "../desktop/projector.js";
 import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../desktop/state-transport.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../desktop/history-recovery.js";
+import { observeTaskState, type TaskObservationCheckpoint } from "../desktop/task-observation.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
 import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
 import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails } from "../desktop/contracts.js";
-import { taskDetails } from "../desktop/details.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
@@ -181,7 +179,7 @@ export class DesktopBridgeRuntime {
    */
   private async mirrorRolloutFallback(binding: Binding): Promise<void> {
     if (!binding.attached || binding.peerId === null) return;
-    const checkpoint = this.store.getValue<ProjectionCheckpoint>(`projection:${binding.id}`);
+    const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
     // A rewritten Codex branch may assign new item IDs to answers already
     // delivered from the old rollout. Without an owner snapshot there is no
     // authoritative way to distinguish those from new direct-app turns.
@@ -310,31 +308,28 @@ export class DesktopBridgeRuntime {
               // Native queued submissions acquire a turn later, including while the bridge is offline.
               const pendingFiles = this.files?.pendingQueuedOperations(binding.id);
               const pendingQueue = new Set(this.store.queuedInputs(binding.id).map(item => item.operationId));
-              for (const turn of pendingFiles?.size || pendingQueue.size ? turnsFromState(state) : []) {
-                if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
-                for (const item of turn.items.filter(isObject)) {
-                  if (item.type === "userMessage" && typeof item.clientId === "string") {
-                    if (pendingFiles?.has(item.clientId)) {
-                      this.files?.associateTurn(binding.id, item.clientId, turn.turnId);
-                      if (["completed", "failed", "interrupted"].includes(String(turn.status))) this.files?.observe(binding.id, "idle", turn.turnId);
-                    }
-                    if (pendingQueue.has(item.clientId)) {
-                      this.store.settleQueuedInput(binding.id, item.clientId);
-                      this.store.rememberAcceptedTurn(binding.id, turn.turnId, item.clientId);
-                    }
-                  }
-                }
-              }
               const editable = this.store.editableRequest(binding.id);
               if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
               const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
               if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
-              const projected = projectSnapshot(state, this.store.getValue<ProjectionCheckpoint>(checkpointKey), this.now(), {
+              const observation = observeTaskState(state, this.store.getValue<TaskObservationCheckpoint>(checkpointKey), this.now(), {
                 rebaseline: initial,
                 recoverFinalTurnIds: [...recoverFinalTurnIds],
                 finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
               });
-              for (const event of projected.events) {
+              if (pendingFiles?.size || pendingQueue.size) for (const input of observation.inputs) {
+                for (const operationId of input.operationIds) {
+                  if (pendingFiles?.has(operationId)) {
+                    this.files?.associateTurn(binding.id, operationId, input.turnId);
+                    if (["completed", "failed", "interrupted"].includes(input.status)) this.files?.observe(binding.id, "idle", input.turnId);
+                  }
+                  if (pendingQueue.has(operationId)) {
+                    this.store.settleQueuedInput(binding.id, operationId);
+                    this.store.rememberAcceptedTurn(binding.id, input.turnId, operationId);
+                  }
+                }
+              }
+              for (const event of observation.events) {
                 this.mirror.accept(binding.id, event);
                 if (event.type === "final") {
                   this.store.settleAcceptedTurn(binding.id, event.turnId);
@@ -344,18 +339,16 @@ export class DesktopBridgeRuntime {
                   if (event.status !== "running") this.store.settleAcceptedTurn(binding.id, event.turnId);
                 }
               }
-              this.store.setValue(checkpointKey, projected.checkpoint);
-              const details = taskDetails(state);
-              this.manager.questions.observe(current, state);
+              this.store.setValue(checkpointKey, observation.checkpoint);
+              const details = observation.details;
+              this.manager.questions.observeQuestions(current, observation.questions);
               this.manager.panels.observe(binding.id, details);
               const failure = taskFailureText(details.failure);
               if (failure) {
-                const turnId = String(turnsFromState(state).at(-1)?.turnId ?? "runtime");
-                this.store.enqueue(`task-failure:${binding.id}:${turnId}`, current.peerId!, { text: failure, buttons: [MENU_BUTTON] }, binding.id);
+                this.store.enqueue(`task-failure:${binding.id}:${observation.latestTurnId}`, current.peerId!, { text: failure, buttons: [MENU_BUTTON] }, binding.id);
               }
               this.files?.observe(binding.id, details.status);
-              const activeTurn = activeTurnsFromState(state).at(-1);
-              this.activity.observe(binding.id, details.status, typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null);
+              this.activity.observe(binding.id, details.status, observation.activeTurnId);
             });
           }, failure => this.subscriptionFailed(binding.id, failure));
           if (this.stopped || !this.connections.matches(binding.id, task)) return;

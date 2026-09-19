@@ -69,7 +69,8 @@ export class TaskQuestions {
     return { ...card, buttons: [...q.options.slice(0, 8).map((o, i) => button(`${i + 1}. ${o.label}`.slice(0, 40), i)), button("Свой ответ", -1)] };
   }
 
-  observe(binding: Binding, state: IpcObject): void { this.reconcile(binding, pendingCodexQuestions(state)); }
+  observe(binding: Binding, state: IpcObject): void { this.observeQuestions(binding, pendingCodexQuestions(state)); }
+  observeQuestions(binding: Binding, questions: readonly CodexQuestions[]): void { this.reconcile(binding, questions); }
 
   private reconcile(binding: Binding, pending: readonly CodexQuestions[], refresh = false): void {
     if (!this.desktop.answerQuestions || !binding.attached || binding.peerId === null) return;

@@ -19,6 +19,7 @@ import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
 import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/desktop/history-recovery.js";
+import { observeTaskState } from "../src/desktop/task-observation.js";
 import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } from "../src/desktop/questions.js";
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
@@ -310,6 +311,18 @@ test("bridge core consumes task state through a transport without Desktop IPC", 
   assert.match(s.sent.at(-1)!.view.text, /^думаю\.\.\. · обновлено/u);
   await s.runtime.stop();
   assert.equal(transport.closed, true);
+});
+
+test("task observation normalizes client snapshots for the bridge core", () => {
+  const snapshot = { ...state([{ type: "userMessage", id: "user", clientId: "vk-operation",
+    content: [{ type: "text", text: "Fixture prompt" }] }]), requests: [questionRequest] };
+  const observed = observeTaskState(snapshot, null, 200);
+  assert.deepEqual(observed.inputs, [{ turnId: "fixture-turn", status: "inProgress", operationIds: ["vk-operation"] }]);
+  assert.equal(observed.details.status, "approval");
+  assert.equal(observed.activeTurnId, "fixture-turn");
+  assert.equal(observed.latestTurnId, "fixture-turn");
+  assert.equal(observed.questions.length, 1);
+  assert.equal(observed.checkpoint.since, 200);
 });
 
 test("task state connections classify one start failure only once", async () => {
