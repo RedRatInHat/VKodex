@@ -62,6 +62,15 @@ function shortTitle(title: string, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
+function codexTitleFromVk(value: string): string {
+  let title = value.replace(/\s+/gu, " ").trim();
+  if (title.startsWith("[VKodex]")) title = title.slice("[VKodex]".length).trim();
+  if (!title || title.length > 120 || /[\x00-\x1f]/u.test(title)) {
+    throw new ActionRejectedError("Название VK-беседы должно содержать от 1 до 120 символов.");
+  }
+  return title;
+}
+
 function enteredPath(text: string): string {
   const trimmed = text.trim();
   const unquoted = trimmed.length >= 2 && ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))
@@ -189,6 +198,33 @@ export class TaskManager {
           this.inactiveInput(input, binding); finish(); return;
         }
         if (!await this.gate.check(input.peerId)) { finish(); return; }
+      }
+      if (!managerPeer && input.conversationTitle !== undefined) {
+        // A native VK title edit is an explicit owner action. Group members
+        // may send prompts, but must never be able to rename a Codex task.
+        if (input.senderId !== this.access.ownerId) { finish(); return; }
+        const binding = this.store.byPeer(input.peerId);
+        if (!binding?.attached || binding.peerId === null) { finish(); return; }
+        const title = codexTitleFromVk(input.conversationTitle);
+        if (title === binding.title) { finish(); return; }
+        const generation = this.store.streamGeneration(binding.id);
+        const result = await this.desktop.renameTask(binding, title);
+        const renamed = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+        if (!renamed || renamed.title !== title) throw new UncertainActionError();
+        const current = this.store.byPeer(input.peerId);
+        if (!current || current.id !== binding.id || !current.attached || this.store.streamGeneration(binding.id) !== generation) {
+          throw new ActionRejectedError("Название Codex сохранено, но VK-беседа больше не подключена.");
+        }
+        this.store.ensureBinding(renamed);
+        this.store.setValue(`rename:${binding.id}`, {
+          title,
+          liveTitleUpdated: result.liveTitleUpdated,
+          vkTitleUpdated: true,
+          origin: "vk",
+          attempts: 0,
+          retryAt: 0,
+        });
+        finish(); return;
       }
       const incomingId = /^message:(\d+)$/u.exec(input.eventId);
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));

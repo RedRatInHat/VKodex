@@ -636,6 +636,25 @@ test("a Codex title change automatically renames the linked VK conversation once
   assert.equal(s.desktop.renames.length, 0); assert.equal(s.desktop.submissions.length, 0);
 });
 
+test("a native owner VK title change renames the linked Codex task and strips the bridge prefix", async t => {
+  const s = setup(t); const binding = s.attach();
+  await s.manager.handle({ ...s.input("", peerId), eventId: "chat-title:2000000017:41:fixture", conversationTitle: "[VKodex] ARC : NeuroDynTruss - WORKER" });
+  assert.deepEqual(s.desktop.renames, [{ task: binding, title: "ARC : NeuroDynTruss - WORKER" }]);
+  assert.equal(s.store.getBinding(binding.id)!.title, "ARC : NeuroDynTruss - WORKER");
+  assert.deepEqual(s.store.getValue(`rename:${binding.id}`), {
+    title: "ARC : NeuroDynTruss - WORKER", liveTitleUpdated: true, vkTitleUpdated: true, origin: "vk", attempts: 0, retryAt: 0,
+  });
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.chat.renames.length, 0);
+});
+
+test("a native VK title change from another participant cannot rename the Codex task", async t => {
+  const s = setup(t); s.attach();
+  await s.manager.handle({ ...s.input("", peerId), senderId: 303, eventId: "chat-title:2000000017:42:fixture", conversationTitle: "[VKodex] Malicious rename" });
+  assert.equal(s.desktop.renames.length, 0);
+  assert.equal(s.store.getBinding(s.attach().id)!.title, task.title);
+});
+
 test("upgrade verifies an existing linked chat even when the old bridge already cached the Codex title", async t => {
   const s = setup(t); const binding = s.attach();
   assert.equal(s.store.getValue(`rename:${binding.id}`), null);
@@ -1919,6 +1938,24 @@ test("VK service events do not detach a task and message edits keep their origin
   assert.equal(s.desktop.messageEdits.length, 1); assert.equal(s.desktop.messageEdits[0]!.text, "Corrected text");
   assert.deepEqual(s.desktop.messageEdits[0]!.author, { id: 999, name: "Second User" });
   assert.equal(s.chat.memberReads, 0); assert.equal(s.store.getBinding(binding.id)!.paused, false);
+});
+
+test("VK native chat title updates reach the linked task as metadata instead of a prompt", async t => {
+  const s = setup(t); const binding = s.attach(); const inputs: BridgeInput[] = [];
+  const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
+  t.mock.method(vk.updates, "stop", async () => {});
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  await gateway.start(async input => { inputs.push(input); await s.manager.handle(input); });
+  await vk.updates.handleWebhookUpdate({ type: "message_new", group_id: access.groupId, event_id: "title-fixture", v: "5.199", object: {
+    message: { id: 0, conversation_message_id: 55, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0, text: "", attachments: [], action: { type: "chat_title_update", text: "[VKodex] Renamed from VK" } }, client_info: {},
+  } });
+  await gateway.stop();
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0]!.conversationTitle, "[VKodex] Renamed from VK");
+  assert.equal(s.desktop.renames.length, 1);
+  assert.equal(s.desktop.renames[0]!.title, "Renamed from VK");
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.store.getBinding(binding.id)!.title, "Renamed from VK");
 });
 
 test("explicit detach during an ambiguous send recovery prevents follow-up edits and stale retries", async t => {

@@ -222,6 +222,14 @@ export class DesktopVkGateway implements BridgeChat {
     // Membership service messages are irrelevant: a linked task chat accepts
     // prompts from every sender except the community itself.
     this.receiveMessage = async (context: MessageContext) => {
+      if (context.eventType === "chat_title_update") {
+        const title = context.eventText?.replace(/[\x00-\x1f]+/gu, " ").replace(/\s+/gu, " ").trim();
+        if (!title) return;
+        const eventId = context.conversationMessageId ?? context.id ?? 0;
+        const digest = createHash("sha256").update(JSON.stringify([eventId, context.updatedAt ?? 0, title])).digest("hex").slice(0, 16);
+        await onInput({ eventId: `chat-title:${context.peerId}:${eventId}:${digest}`, peerId: context.peerId, senderId: context.senderId, text: "", conversationTitle: title });
+        return;
+      }
       if (context.eventType) return;
       if (!context.is(["message_new", "message_edit"]) || context.isOutbox) return;
       if ([this.config.access.groupId, -this.config.access.groupId].includes(context.senderId)) return;

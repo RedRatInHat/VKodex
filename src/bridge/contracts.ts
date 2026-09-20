@@ -59,6 +59,8 @@ export interface BridgeInput {
   /** Present only for an incoming VK message_edit event. */
   readonly editOfMessageId?: number;
   readonly replyToMessageId?: number;
+  /** Present when the owner changed a linked VK conversation title natively. */
+  readonly conversationTitle?: string;
 }
 
 export interface Binding extends TaskRef {
