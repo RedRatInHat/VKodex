@@ -95,6 +95,17 @@ try {
   await gateway.start(input => runtime.handle(input));
   gateway.startReconciliation(store);
   runtime.start();
+  // A controlled bridge restart leaves a one-shot intent next to the private
+  // database. Recover it only after VK and the task streams are live; the
+  // durable inbox event ID makes a second startup idempotent.
+  await runtime.recoverRestartIntent(config.dataDir).catch(error => {
+    logger.warn({ error: formatFatalDetail(error) }, "VKodex restart recovery is waiting for a task owner");
+    const retry = setTimeout(() => {
+      void runtime.recoverRestartIntent(config.dataDir).catch(retryError =>
+        logger.warn({ error: formatFatalDetail(retryError) }, "VKodex restart recovery retry is still waiting"));
+    }, 30_000);
+    retry.unref();
+  });
   logger.info("VKodex desktop bridge and VK Long Poll are ready");
 } catch (error) {
   exitReason = "startup_error";

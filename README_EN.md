@@ -19,7 +19,7 @@ Continue existing Codex tasks or create new ones from your phone: choose a proje
 
 The private chat with the community is the manager. Each separate VK conversation represents one Codex task. Agent progress arrives without notifications; final answers arrive as regular messages.
 
-**Status: experimental Codex integration on Windows.** For every profile configured with `owner: "app-server"`, VKodex keeps one long-lived App Server for commands and events. If Codex Desktop or VS Code already holds a task's active writer, routing switches to that confirmed client owner before dispatch; there is no automatic fallback after a mutation starts. The launcher is used only by explicit `/open`, so an ordinary prompt does not focus the application window. Codex's internal protocols may change after an update, so compatibility is checked at startup and while the bridge is running. Start by testing with a non-critical task.
+**Status: experimental Codex integration on Windows.** For every profile configured with `owner: "app-server"`, VKodex keeps one long-lived App Server for commands and events, but a task's stream lease is held only while its turn is running and released after the final answer is durably queued. An idle task can therefore be opened in Codex Desktop or VS Code without the “chat is open elsewhere” warning; the next VK prompt reacquires only that task. If Codex Desktop or VS Code already holds a task's active writer, routing switches to that confirmed client owner before dispatch; there is no automatic fallback after a mutation starts. The launcher is used only by explicit `/open`, so an ordinary prompt does not focus the application window. Codex's internal protocols may change after an update, so compatibility is checked at startup and while the bridge is running. Start by testing with a non-critical task.
 
 ## Contents
 
@@ -444,6 +444,8 @@ Inbound files are stored in `BOT_DATA_DIR/files/<request-identifier>/inbox/`; ou
 
 Each outbox supports up to 10 files, 200 MiB per file, and 200 MiB total. The bridge sends only regular files directly inside `outbox/`: hidden files are skipped, and links or files still being written are rejected. Paths mentioned in answer text and other project directories are never scanned. Archives are not extracted automatically. Document contents remain user data, not bridge commands.
 
+If VK returns `no_free_space` while uploading a document, VKodex can remove the oldest documents previously uploaded by the bridge and retry the same upload. This requires a separate user VK token with document permissions; the community token cannot call `docs.delete`. The token is never written to `.env`, the database, or logs. On Windows, run `npm run vk:token:setup` once from the VKodex directory and paste the token into the hidden prompt. If VK saved the OAuth response to a file, use `npm run vk:token:import -- -InputPath "C:\path\to\vk_auth.txt"`; the importer extracts `access_token` from a VK OAuth URL or JSON response without printing it. It is stored in the DPAPI file `%LOCALAPPDATA%\VKodex\secrets\vk-document-token.xml`; VKodex reads it only after a confirmed storage-full response. Only VKodex-registered uploads are eligible, while current and undelivered attachments are protected. Without this local secret, the bridge reports the required setup instead of retrying indefinitely.
+
 Rescanning and restarting do not resend an unchanged file. Binding activity is checked before download, upload, and delivery, but the participant list is not. Old folders are not sent automatically after a disabled binding is reconnected. Local files remain on disk; move unwanted data to the Recycle Bin manually and never add `BOT_DATA_DIR` to Git.
 
 ### Leaving a conversation and disabling a binding
@@ -540,6 +542,8 @@ The supervisor window intentionally remains visible with the VKodex logo and the
 Inspect it with `Get-ScheduledTask -TaskName VKodex` and `Get-ScheduledTaskInfo -TaskName VKodex`. Run `npm run service:uninstall` to remove it. Reinstall the task after moving the clone so its absolute paths are refreshed.
 
 Do not run the scheduled task and `desktop:start` in a terminal at the same time. Codex must also be running and authenticated after login.
+
+For a controlled bridge update while turns are active, run `npm run service:controlled-restart`. It first writes `data/desktop/restart-intent.json` with only the identities of running tasks, then stops the bridge from an independent worker; the supervisor starts the new process. Startup verifies each task, leaves turns that survived the restart alone, and sends at most one technical continuation prompt to tasks that were actually interrupted. Codex questions are reattached instead of becoming a new turn. The intent remains until recovery finishes, and the durable inbound event journal makes a repeated startup idempotent.
 
 ### Dedicated process for TUN rules
 
