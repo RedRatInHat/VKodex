@@ -402,7 +402,17 @@ export class BridgeRuntime {
     this.manager.panels.transfers.tick();
     this.closeInactiveSubscriptions();
     this.activity.tick();
-    await Promise.allSettled(this.store.bindings().map(binding => this.mirrorRolloutFallback(binding)));
+    await Promise.allSettled(this.store.bindings().map(binding => {
+      // Detached ownership is persisted across a bridge restart. Rehydrate
+      // the read-only rollout observer before polling, otherwise direct
+      // Desktop/VS Code turns become invisible until VK explicitly reopens
+      // the task and reacquires its writer lease.
+      if (binding.attached && binding.peerId !== null && this.streamMode(binding.id) === "detached") {
+        const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
+        this.enableRolloutFallback(binding, checkpoint?.lastObservedAt ?? checkpoint?.since ?? this.now());
+      }
+      return this.mirrorRolloutFallback(binding);
+    }));
     await this.manager.panels.tick();
     // Re-reading every profile catalog for each conversation made a full
     // reconnect proportional to the number of bindings. During a renderer
