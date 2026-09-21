@@ -1111,6 +1111,26 @@ test("App Server creator materializes a new task with its atomic first turn", as
   assert.deepEqual(metadata, ["project:raw", "name:Created"]);
 });
 
+test("an idle lease stays detached across restart and is reacquired for a VK prompt", async t => {
+  const s = runtimeSetup(t);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
+  await s.runtime.tick();
+  assert.deepEqual(s.follows(), []);
+  await s.runtime.handle({ eventId: "vk-lease-reacquire", peerId: s.peerId, senderId: 101, text: "Continue" });
+  await new Promise(resolve => setImmediate(resolve));
+  await s.runtime.tick();
+  assert.ok(s.follows().length >= 1);
+  assert.equal(s.store.getValue(`task-stream-mode:${s.binding.id}`), "attached");
+});
+
+test("a VK prompt keeps an idle reacquisition leased until turn/start is dispatched", async t => {
+  const s = runtimeSetup(t, undefined, new FakeStateTransport(state([], "completed")));
+  await s.runtime.handle({ eventId: "vk-idle-reacquire", peerId: s.peerId, senderId: 101, text: "Continue" });
+  assert.ok(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))),
+    "the completed initial snapshot must not release the stream before the VK turn is sent");
+});
+
 test("App Server creator rejects a model absent from its own CLI before creating a task", async () => {
   let started = 0;
   const profileRoot = path.resolve("fixture-app-server-home");

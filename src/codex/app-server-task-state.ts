@@ -134,6 +134,8 @@ class AppServerTaskStream implements TaskStateStream {
   private snapshot: NativeSnapshot | null = null;
   private readonly queued: AppServerEnvelope[] = [];
   private closed = false;
+  private started = false;
+  private disconnected = false;
 
   constructor(private readonly rpc: AppServerRpc, readonly task: TaskRef,
     private readonly onState: (state: TaskState, initial: boolean) => void,
@@ -144,7 +146,10 @@ class AppServerTaskStream implements TaskStateStream {
 
   async start(): Promise<void> {
     this.unsubscribeNotification = this.rpc.onNotification(notification => this.receive(notification));
-    this.unsubscribeDisconnect = this.rpc.onDisconnect?.(error => { if (!this.closed) this.onError(error); }) ?? null;
+    this.unsubscribeDisconnect = this.rpc.onDisconnect?.(error => {
+      this.disconnected = true;
+      if (!this.closed) this.onError(error);
+    }) ?? null;
     try {
       const result = await this.startGate(async () => {
         if (this.closed) throw new AppServerUnavailableError("Подключение к задаче уже закрыто.");
@@ -161,6 +166,7 @@ class AppServerTaskStream implements TaskStateStream {
       const initial = isObject(result.initialTurnsPage) ? result.initialTurnsPage : {};
       const turns = Array.isArray(initial.data) ? initial.data.map(parseTurn).filter((turn): turn is NativeTurn => !!turn) : [];
       this.snapshot = this.makeSnapshot(thread, result, turns);
+      this.started = true;
       for (const notification of this.queued.splice(0)) this.apply(notification);
       if (!this.closed) this.onState(this.snapshot, true);
     } catch (error) {
@@ -241,6 +247,12 @@ class AppServerTaskStream implements TaskStateStream {
     if (this.closed) return;
     this.closed = true; this.unsubscribeNotification?.(); this.unsubscribeDisconnect?.();
     this.unsubscribeNotification = null; this.unsubscribeDisconnect = null; this.queued.length = 0;
+    // Codex keeps a resumed thread owned by this App Server until the client
+    // explicitly unsubscribes. Release only this thread; closing the profile
+    // connection would disrupt unrelated VK conversations.
+    if (this.started && !this.disconnected) {
+      void this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 5_000 }).catch(() => {});
+    }
     this.onClose(this);
   }
 }
@@ -251,7 +263,8 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   private readonly startWaiters: Array<() => void> = [];
   private activeStarts = 0;
   constructor(private readonly rpc: AppServerRpc,
-    private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => []) {}
+    private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => [],
+    private readonly onTaskClose: (task: TaskRef) => void = () => {}) {}
   private async gate<T>(work: () => Promise<T>): Promise<T> {
     if (this.activeStarts >= 2) await new Promise<void>(resolve => this.startWaiters.push(resolve));
     this.activeStarts++;
@@ -263,7 +276,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   }
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
     const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions,
-      work => this.gate(work), closed => this.streams.delete(closed));
+      work => this.gate(work), closed => { this.streams.delete(closed); this.onTaskClose(closed.task); });
     this.streams.add(stream); return stream;
   }
   refresh(threadId: string): void {

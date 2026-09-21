@@ -128,7 +128,8 @@ export class TaskPanels {
   private catalogCount: number | null = null;
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, private readonly chat: BridgeChat, private readonly store: BridgeStore,
-    private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>) {
+    private readonly gate: AccessGate, private readonly healthCheck?: () => Promise<BridgeHealthSnapshot>,
+    private readonly beforeReveal?: (binding: Binding) => Promise<void>) {
     this.transfers = new TaskTransfers(store, desktop);
   }
 
@@ -191,6 +192,7 @@ export class TaskPanels {
         throw new ActionRejectedError("Эта VK-беседа привязана к архивной задаче Codex. /open архив не восстановит. Отправь /detach либо выбери актуальную копию задачи в менеджере.");
       }
       if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
+      await this.beforeReveal?.(binding);
       await (this.desktop.revealTask?.(binding) ?? this.desktop.ensureOpen!(binding));
       this.store.markDesktopHandoff(binding.id, binding, "launched");
       this.reply(input, { text: "Команда открытия отправлена настроенному приложению Codex." });
@@ -318,6 +320,7 @@ export class TaskPanels {
     switch (action.command) {
       case "openDesktop": {
         if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
+        await this.beforeReveal?.(binding);
         await (this.desktop.revealTask?.(binding) ?? this.desktop.ensureOpen!(binding));
         this.store.markDesktopHandoff(binding.id, binding, "launched");
         this.reply(input, { text: "Команда открытия отправлена настроенному приложению Codex. Дождись загрузки задачи и повтори сообщение." });

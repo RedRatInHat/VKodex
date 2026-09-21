@@ -46,6 +46,13 @@ export class AppServerTaskExecutor {
     rpc.onServerRequest(request => this.serverRequest(request));
   }
 
+  /** Forget one task after its native stream lease is released. The next
+   * command must resume it again instead of using a stale loaded-task cache. */
+  forget(task: TaskRef): void {
+    this.loaded.delete(taskKey(task));
+    this.questions.delete(task.threadId);
+  }
+
   /** Inspect a task already loaded by this owner without issuing another
    * thread/resume. Resuming an active thread on the same App Server aborts its
    * current turn, so every command and diagnostic must share this ownership
@@ -400,7 +407,7 @@ export class AppServerTaskExecutor {
   private observe(notification: AppServerEnvelope): void {
     const threadId = idOf(notification.params.threadId);
     if (!threadId) return;
-    if (notification.method === "thread/archived") {
+    if (notification.method === "thread/archived" || notification.method === "thread/closed" || notification.method === "thread/deleted") {
       this.releaseArchive(threadId);
       for (const key of this.loaded.keys()) {
         try { if ((JSON.parse(key) as unknown[])[1] === threadId) this.loaded.delete(key); } catch { /* Ignore malformed private cache keys. */ }

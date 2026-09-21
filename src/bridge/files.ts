@@ -5,13 +5,15 @@ import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
 import type { Binding, BridgeChat } from "./contracts.js";
-import { FileUploadRejectedError } from "./contracts.js";
+import { FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 30_000 };
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
 export const INBOUND_FILE_LIMITS: InboundFileLimits = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 600_000 };
+export interface OutputFile { readonly name: string; readonly contents: Buffer; readonly kind: "image" | "file" }
+interface OutputFileReadOptions { readonly allowBatchOverflow?: boolean }
 interface FileJob {
   operationId: string;
   generation: number;
@@ -29,6 +31,7 @@ const digest = (value: string | Buffer): string => createHash("sha256").update(v
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
 const mebibytes = (bytes: number): number => Math.ceil(bytes / (1024 * 1024));
 const VK_DOCUMENT_PAGE_LIMIT = 1024 * 1024;
+const MAX_OUTPUT_ENTRIES = 4_096;
 
 export function validateVkFileUrl(raw: string): URL {
   let url: URL;
@@ -171,29 +174,29 @@ async function directory(root: string, ...segments: string[]): Promise<string> {
   return current;
 }
 
-export async function readOutputFiles(root: string, limits = FILE_LIMITS): Promise<{ name: string; contents: Buffer; kind: "image" | "file" }[]> {
+export async function readOutputFiles(root: string, limits = FILE_LIMITS, options: OutputFileReadOptions = {}): Promise<OutputFile[]> {
   if ((await lstat(root)).isSymbolicLink()) throw new OutputFilesError("Папка выходных файлов не должна быть ссылкой.");
   const canonicalRoot = await realpath(root);
   const checkPath = async (file: string): Promise<void> => {
     const relative = path.relative(canonicalRoot, await realpath(file));
     if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new OutputFilesError("Выходной файл находится вне папки отправки.");
   };
-  const files: { name: string; contents: Buffer; kind: "image" | "file" }[] = []; let total = 0; let entries = 0;
+  const files: OutputFile[] = []; let total = 0; let entries = 0;
   const walk = async (folder: string, depth: number): Promise<void> => {
     const stat = await lstat(folder);
     if (depth > 8 || stat.isSymbolicLink() || !stat.isDirectory()) throw new OutputFilesError("Небезопасная структура папки выходных файлов.");
     await checkPath(folder);
     for (const entry of await readdir(folder)) {
-      if (++entries > 256) throw new OutputFilesError("В папке выдачи больше 256 элементов.");
+      if (++entries > MAX_OUTPUT_ENTRIES) throw new OutputFilesError(`В папке выдачи больше ${MAX_OUTPUT_ENTRIES} элементов.`);
       if (entry.startsWith(".")) continue;
       const file = path.join(folder, entry); const before = await lstat(file);
       if (before.isSymbolicLink() || (before.isFile() && before.nlink !== 1)) throw new OutputFilesError("Ссылки в папке выходных файлов не отправляются.");
       if (before.isDirectory()) { await walk(file, depth + 1); continue; }
       if (!before.isFile()) continue;
       await checkPath(file);
-      if (files.length >= limits.maxFiles) throw new OutputFilesError(`В одной выдаче можно отправить не больше ${limits.maxFiles} файлов.`);
+      if (!options.allowBatchOverflow && files.length >= limits.maxFiles) throw new OutputFilesError(`В одной выдаче можно отправить не больше ${limits.maxFiles} файлов.`);
       if (before.size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» занимает ${mebibytes(before.size)} МиБ при лимите ${mebibytes(limits.maxFileBytes)} МиБ.`);
-      if (total + before.size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
+      if (!options.allowBatchOverflow && total + before.size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
       const handle = await open(file, "r"); const chunks: Buffer[] = []; let size = 0;
       try {
         const opened = await handle.stat();
@@ -203,7 +206,7 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS): Promi
           const read = await handle.read(buffer, 0, buffer.length, null); if (!read.bytesRead) break;
           size += read.bytesRead;
           if (size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» превышает лимит ${mebibytes(limits.maxFileBytes)} МиБ.`);
-          if (total + size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
+          if (!options.allowBatchOverflow && total + size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
           chunks.push(buffer.subarray(0, read.bytesRead));
         }
         const after = await handle.stat();
@@ -217,6 +220,28 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS): Promi
   await walk(canonicalRoot, 0); return files;
 }
 
+/**
+ * Split a completed outbox into VKodex delivery batches. The bridge sends one
+ * VK attachment per queued message, but keeping the batches explicit prevents
+ * the old all-or-nothing file-count and total-size check from discarding an
+ * otherwise valid outbox.
+ */
+export function batchOutputFiles(files: readonly OutputFile[], limits = FILE_LIMITS): OutputFile[][] {
+  const batches: OutputFile[][] = [];
+  let current: OutputFile[] = [];
+  let currentBytes = 0;
+  for (const file of files) {
+    const startsNewBatch = current.length > 0 && (current.length >= limits.maxFiles || currentBytes + file.contents.length > limits.maxTotalBytes);
+    if (startsNewBatch) { batches.push(current); current = []; currentBytes = 0; }
+    current.push(file); currentBytes += file.contents.length;
+    // A single file is already bounded by maxFileBytes. Keep it as a batch on
+    // its own even if a caller supplies a smaller total limit.
+    if (current.length >= limits.maxFiles || currentBytes >= limits.maxTotalBytes) { batches.push(current); current = []; currentBytes = 0; }
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
 export class TaskFiles {
   private readonly completed = new Set<string>();
   private readonly completedTurns = new Map<string, Set<string>>();
@@ -228,6 +253,39 @@ export class TaskFiles {
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
+  private documentRegistry(): VkDocumentRecord[] {
+    const saved = this.store.getValue<VkDocumentRecord[]>("vk-document-registry") ?? [];
+    const known = new Set(saved.map(record => record.attachment));
+    const migrated = [...saved];
+    for (const item of this.store.deliveryAttachmentHistory()) {
+      if (known.has(item.attachment)) continue;
+      const match = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(item.attachment);
+      if (!match) continue;
+      migrated.push({ attachment: item.attachment, ownerId: Number(match[1]), documentId: Number(match[2]), name: "historical VKodex upload", uploadedAt: item.order, fileKey: `legacy:${item.order}:${item.attachment}` });
+      known.add(item.attachment);
+    }
+    if (migrated.length !== saved.length) this.store.setValue("vk-document-registry", migrated.slice(-4096));
+    return migrated;
+  }
+  private rememberDocument(record: VkDocumentRecord): void {
+    const records = this.documentRegistry().filter(item => item.attachment !== record.attachment);
+    this.store.setValue("vk-document-registry", [...records, record].slice(-4096));
+  }
+  private async cleanupDocuments(except: readonly string[]): Promise<boolean> {
+    if (!this.chat.cleanupDocuments) return false;
+    const protectedAttachments = new Set(except);
+    for (const delivery of this.store.pendingDeliveries()) for (const attachment of delivery.view.attachments ?? []) protectedAttachments.add(attachment);
+    const candidates = this.documentRegistry()
+      .filter(record => !protectedAttachments.has(record.attachment))
+      .sort((a, b) => a.uploadedAt - b.uploadedAt)
+      .slice(0, 100);
+    if (!candidates.length) return false;
+    const removed = await this.chat.cleanupDocuments(candidates);
+    if (!removed.length) return false;
+    const deleted = new Set(removed);
+    this.store.setValue("vk-document-registry", this.documentRegistry().filter(record => !deleted.has(record.attachment)));
+    return true;
+  }
   private async check(binding: Binding, generation: number): Promise<void> {
     if (this.stopped || binding.peerId === null || this.store.streamGeneration(binding.id) !== generation || !await this.gate.check(binding.peerId) || this.store.streamGeneration(binding.id) !== generation) throw new ActionRejectedError("Передача файлов остановлена: беседа больше не подключена.");
   }
@@ -292,7 +350,7 @@ export class TaskFiles {
       && (manual || (!job.done && (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id)))))) {
       const outbox = await directory(this.root, job.directory, "outbox");
       let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
-      try { outputFiles = await readOutputFiles(outbox); }
+      try { outputFiles = await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true }); }
       catch (error) {
         if (!(error instanceof OutputFilesError)) throw error;
         this.store.enqueue(`files-error:${binding.id}:${job.operationId}`, binding.peerId!, {
@@ -302,28 +360,49 @@ export class TaskFiles {
         else this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
         continue;
       }
-      for (const file of outputFiles) {
-        const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
-        if (this.store.getValue<boolean>(`${key}:queued`)) continue;
-        if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) continue;
-        await this.check(binding, generation);
-        let attachment = this.store.getValue<string>(`${key}:uploaded`);
-        if (!attachment) {
-          try { attachment = await this.chat.uploadFile(binding.peerId!, file.name, file.contents, file.kind); }
-          catch (error) {
-            if (!(error instanceof FileUploadRejectedError)) throw error;
-            await this.check(binding, generation);
-            this.store.setValue(`${key}:rejected`, true);
-            this.store.enqueue(`${key}:error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен. ${error.message}`, silent: true }, binding.id);
-            continue;
+      for (const batch of batchOutputFiles(outputFiles)) {
+        const pending: { file: OutputFile; key: string; attachment: string }[] = [];
+        for (const file of batch) {
+          const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
+          if (this.store.getValue<boolean>(`${key}:queued`)) continue;
+          if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) continue;
+          await this.check(binding, generation);
+          let attachment = this.store.getValue<string>(`${key}:uploaded`);
+          if (!attachment) {
+            let cleanupAttempted = false;
+            for (;;) {
+              try { attachment = await this.chat.uploadFile(binding.peerId!, file.name, file.contents, file.kind); break; }
+              catch (error) {
+                if (error instanceof FileUploadStorageFullError) {
+                  if (cleanupAttempted) throw error;
+                  cleanupAttempted = true;
+                  if (!await this.cleanupDocuments([])) throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено. Для автоматической очистки один раз запусти npm run vk:token:setup на компьютере VKodex.");
+                  continue;
+                }
+                if (!(error instanceof FileUploadRejectedError)) throw error;
+                await this.check(binding, generation);
+                this.store.setValue(`${key}:rejected`, true);
+                this.store.enqueue(`${key}:error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен. ${error.message}`, silent: true }, binding.id);
+                attachment = null;
+                break;
+              }
+            }
+            if (!attachment) continue;
+            const document = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(attachment);
+            if (document) this.rememberDocument({ attachment, ownerId: Number(document[1]), documentId: Number(document[2]), name: file.name, uploadedAt: Date.now(), fileKey: key });
+            this.store.setValue(`${key}:uploaded`, attachment);
           }
-          this.store.setValue(`${key}:uploaded`, attachment);
+          pending.push({ file, key, attachment });
         }
-        await this.check(binding, generation);
-        this.store.atomic(() => {
-          this.store.enqueue(key, binding.peerId!, { text: file.name, attachments: [attachment!] }, binding.id);
-          this.store.setValue(`${key}:queued`, true);
-        }); count++;
+        if (pending.length) {
+          await this.check(binding, generation);
+          const batchKey = `files:${binding.id}:${job.operationId}:${digest(pending.map(item => item.key).join("|"))}`;
+          const names = pending.map(item => item.file.name).join("\n");
+          this.store.atomic(() => {
+            this.store.enqueue(batchKey, binding.peerId!, { text: pending.length === 1 ? pending[0]!.file.name : `Файлы (${pending.length}):\n${names}`, attachments: pending.map(item => item.attachment) }, binding.id);
+            for (const item of pending) this.store.setValue(`${item.key}:queued`, true);
+          }); count += pending.length;
+        }
       }
       this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
     }

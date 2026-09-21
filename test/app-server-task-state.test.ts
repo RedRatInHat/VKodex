@@ -89,6 +89,19 @@ test("native state stream starts at most two profile reads concurrently", async 
   await Promise.all(starts); transport.close();
 });
 
+test("native state stream releases only its task lease when closed", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  rpc.responses.set("thread/unsubscribe", [{}]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  await stream.start();
+  transport.close();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(rpc.calls.map(call => call.method), ["thread/resume", "thread/unsubscribe"]);
+  assert.deepEqual(rpc.calls[1]?.params, { threadId: "task" });
+});
+
 test("native state stream keeps a live turn eligible when notifications omit timestamps", async () => {
   const rpc = new FakeRpc(); rpc.responses.set("thread/resume", [resume([])]);
   const states: TaskState[] = [];

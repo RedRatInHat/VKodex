@@ -2,7 +2,7 @@ import { APIError, VK, MessageContext, UpdateSource, DocumentAttachment, type Me
 import { BridgeStore } from "../../bridge/store.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
-import { ChatRateLimitError, FileUploadRejectedError, VK_MAX_INLINE_BUTTONS } from "../../bridge/contracts.js";
+import { ChatRateLimitError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../core/codex-tasks.js";
 import { isObject } from "../../desktop/ipc-client.js";
@@ -10,6 +10,7 @@ import type { RemoteAttachment } from "../../domain/models.js";
 import { safeFileName } from "../../lib/files.js";
 import { checkVkReadiness } from "./readiness.js";
 import { createHash } from "node:crypto";
+import { readProtectedVkToken } from "./document-token.js";
 
 export function vkKeyboard(view: View): string {
   const buttons = (view.buttons ?? []).map(button => ({
@@ -83,6 +84,7 @@ export async function collectVkFiles(message: unknown): Promise<RemoteAttachment
 }
 
 export class DesktopVkGateway implements BridgeChat {
+  private userVkPromise: Promise<VK> | undefined;
   private receiveMessage?: (context: MessageContext) => Promise<void>;
   private reconcileTimer: ReturnType<typeof setInterval> | undefined;
   private reconcileBusy = false;
@@ -383,9 +385,8 @@ export class DesktopVkGateway implements BridgeChat {
           }
           if (!isObject(uploaded) || uploaded.error !== undefined || typeof uploaded.file !== "string" || !uploaded.file.trim()) {
             this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response" }, "VK document upload rejected");
-            throw new ActionRejectedError(storageFull
-              ? "На сервере загрузки VK закончилось свободное место. Файл не отправлен; лимит размера VKodex здесь ни при чём. Повтори /files позже."
-              : "Сервер загрузки VK не подтвердил приём файла. Файл не отправлен; повтори /files позже.");
+            throw (storageFull ? new FileUploadStorageFullError("На сервере загрузки VK закончилось свободное место.") : new ActionRejectedError(
+              "Сервер загрузки VK не подтвердил приём файла. Файл не отправлен; повтори /files позже."));
           }
           return this.vk.api.docs.save({ file: uploaded.file, title: name });
         },
@@ -395,5 +396,32 @@ export class DesktopVkGateway implements BridgeChat {
     }
     if (!/^(?:photo|doc)-?\d+_\d+(?:_[a-zA-Z0-9_-]+)?$/u.test(attachment)) throw new ActionRejectedError("VK не подтвердил загрузку файла. Повтори /files позже.");
     return attachment;
+  }
+
+  private userVk(): Promise<VK> {
+    if (!this.userVkPromise) {
+      this.userVkPromise = readProtectedVkToken(this.config.documentTokenPath).then(token => new VK({ token, apiVersion: "5.199", apiRetryLimit: 0 }));
+    }
+    return this.userVkPromise;
+  }
+
+  async cleanupDocuments(records: readonly VkDocumentRecord[]): Promise<readonly string[]> {
+    if (!records.length) return [];
+    let vk: VK;
+    try { vk = await this.userVk(); }
+    catch (error) { this.userVkPromise = undefined; throw error; }
+    const removed: string[] = [];
+    for (const record of records) {
+      try {
+        await vk.api.docs.delete({ owner_id: record.ownerId, doc_id: record.documentId });
+        removed.push(record.attachment);
+      } catch (error) {
+        // A document already deleted or expired is safe to forget. Other
+        // failures remain registered so a later retry can reconcile them.
+        if (error instanceof APIError && [10, 18, 30, 183].includes(Number(error.code))) removed.push(record.attachment);
+        else this.logger?.warn({ attachment: record.attachment, code: error instanceof APIError ? error.code : undefined }, "VK document cleanup skipped");
+      }
+    }
+    return removed;
   }
 }

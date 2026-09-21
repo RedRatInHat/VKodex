@@ -14,6 +14,8 @@ export interface DesktopBridgeConfig {
   readonly codexSources: readonly CodexSourceConfig[];
   readonly healthIntervalMs: number;
   readonly inboundFileLimits: { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number };
+  /** DPAPI-protected file read by the local PowerShell helper on demand. */
+  readonly documentTokenPath: string;
 }
 
 export type CodexLauncherConfig =
@@ -129,6 +131,7 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
   const automaticRoot = env.VKODEX_PROJECTLESS_ROOT?.trim();
   if (automaticRoot && /[\x00-\x1f]/u.test(automaticRoot)) throw new Error("VKODEX_PROJECTLESS_ROOT must be a valid directory path");
   const localData = env.LOCALAPPDATA?.trim() || env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), ".local", "share");
+  const documentTokenPath = path.resolve(env.VK_DOCUMENT_TOKEN_PATH?.trim() || path.join(localData, "VKodex", "secrets", "vk-document-token.xml"));
   return {
     token,
     access: { ownerId: id("VK_OWNER_ID"), groupId: id("VK_GROUP_ID") },
@@ -136,5 +139,6 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
     projectlessRoot: path.resolve(automaticRoot || path.join(localData, "VKodex", "workspaces")),
     codexHome: codexHomes[0]!, codexHomes, codexSources, healthIntervalMs,
     inboundFileLimits: { maxFiles: maxInboundFiles, maxFileBytes: maxInboundFileBytes, maxTotalBytes: maxInboundTotalBytes, timeoutMs: downloadTimeoutMs },
+    documentTokenPath,
   };
 }

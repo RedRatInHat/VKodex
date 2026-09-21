@@ -99,11 +99,12 @@ export class TaskManager {
     healthCheck?: () => Promise<BridgeHealthSnapshot>,
     private readonly loadReport: () => Promise<string> = systemLoadText,
     private readonly projectlessRoot: string = path.join(os.tmpdir(), "VKodex", "workspaces"),
+    beforeReveal?: (binding: Binding) => Promise<void>,
   ) {
     this.inputBatcher = new InputBatcher(input => this.enqueueInput(input), input => input.peerId !== access.ownerId
       && ![access.groupId, -access.groupId].includes(input.senderId) && !!store.byPeer(input.peerId)?.attached,
       1500, 3000, store);
-    this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck);
+    this.panels = new TaskPanels(access, desktop, chat, store, gate, healthCheck, beforeReveal);
     this.questions = new TaskQuestions(desktop, store, gate, access.ownerId);
   }
 

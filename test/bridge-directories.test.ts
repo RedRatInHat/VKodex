@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { prepareBridgeTurnDirectories } from "../src/lib/files.js";
-import { downloadVkFile, FILE_LIMITS, readOutputFiles, validateVkFileUrl } from "../src/bridge/files.js";
+import { batchOutputFiles, downloadVkFile, FILE_LIMITS, readOutputFiles, validateVkFileUrl } from "../src/bridge/files.js";
 
 test("bridge turn directories are created inside the workspace and ignored by Git", async () => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "vkodex-workspace-"));
@@ -53,6 +53,13 @@ test("output file snapshots preserve bytes and reject oversized files, symlinks 
   await assert.rejects(readOutputFiles(root), /Ссылки/u);
   const other = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-")); await symlink(outside, path.join(other, "linked"));
   await assert.rejects(readOutputFiles(other), /Ссылки/u);
+});
+
+test("output batches keep the VK file-count and total-size limits local to each batch", () => {
+  const files = Array.from({ length: 12 }, (_, index) => ({ name: `${index}.txt`, contents: Buffer.alloc(3), kind: "file" as const }));
+  const batches = batchOutputFiles(files, { maxFiles: 10, maxFileBytes: 100, maxTotalBytes: 10, timeoutMs: 1 });
+  assert.deepEqual(batches.map(batch => batch.length), [3, 3, 3, 3]);
+  assert.equal(batches.flat().length, files.length);
 });
 
 test("outgoing files exceed the old 20 MiB ceiling but remain bounded at 200 MiB", async () => {

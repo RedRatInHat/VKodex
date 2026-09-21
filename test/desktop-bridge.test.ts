@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { APIError, VK } from "vk-io";
-import type { BridgeChat, BridgeInput, MessageHandle, View } from "../src/bridge/contracts.js";
-import { ChatRateLimitError, FileUploadRejectedError, MENU_BUTTON } from "../src/bridge/contracts.js";
+import type { BridgeChat, BridgeInput, MessageHandle, View, VkDocumentRecord } from "../src/bridge/contracts.js";
+import { ChatRateLimitError, FileUploadRejectedError, FileUploadStorageFullError, MENU_BUTTON } from "../src/bridge/contracts.js";
 import { AccessGate, DeliveryWorker } from "../src/bridge/delivery.js";
 import { TaskManager } from "../src/bridge/manager.js";
 import { TaskTransfers, transferStatus } from "../src/bridge/transfers.js";
@@ -50,7 +50,10 @@ class Chat implements BridgeChat {
   memberReads = 0;
   readonly uploads: { peerId: number; name: string; contents: string }[] = [];
   readonly binaryUploads: { name: string; contents: Buffer; kind: string }[] = [];
+  readonly cleanupCalls: VkDocumentRecord[][] = [];
+  cleanupResult: readonly string[] = [];
   async uploadFile(_peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string> { this.binaryUploads.push({ name, contents, kind }); return `doc-202_${this.binaryUploads.length}`; }
+  async cleanupDocuments(records: readonly VkDocumentRecord[]): Promise<readonly string[]> { this.cleanupCalls.push([...records]); return this.cleanupResult; }
   async uploadDocument(peerId: number, name: string, contents: string): Promise<string> { this.uploads.push({ peerId, name, contents }); return "doc-202_42_fixture"; }
   async members(): Promise<readonly number[]> { this.memberReads++; if (this.memberError) throw new Error("offline"); return this.participants; }
   async createConversation(): Promise<{ peerId: number; chatId: number }> {
@@ -2782,7 +2785,7 @@ test("a stale idle snapshot cannot collect a new turn's outbox before that exact
   assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "result");
 });
 
-test("an invalid old outbox does not block files from newer turns", async t => {
+test("an outbox with more than ten files is delivered in batches without blocking newer turns", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
   const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", "accepted");
@@ -2792,15 +2795,16 @@ test("an invalid old outbox does not block files from newer turns", async t => {
 
   files.observe(binding.id, "idle"); await files.tick(); await s.worker.flush();
 
-  assert.equal(s.chat.binaryUploads.length, 1);
-  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "new result");
-  assert.ok(s.chat.sent.some(item => /не больше 10 файлов/u.test(item.view.text)));
+  assert.equal(s.chat.binaryUploads.length, 12);
+  assert.ok(s.chat.binaryUploads.some(item => item.contents.toString() === "new result"));
+  assert.equal(s.chat.sent.some(item => /не больше 10 файлов/u.test(item.view.text)), false);
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.length === 10));
   assert.ok(s.chat.sent.some(item => item.view.attachments?.length === 1));
   const jobs = s.store.getValue<{ operationId: string; done: boolean }[]>(`file-jobs:${binding.id}`)!;
   assert.deepEqual(jobs.map(job => [job.operationId, job.done]), [["invalid-output", true], ["valid-output", true]]);
 
   await files.tick(); await s.worker.flush();
-  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.equal(s.chat.binaryUploads.length, 12);
 });
 
 test("attachment transfer stops on explicit detach during download or upload and never replays old jobs", async t => {
@@ -3143,6 +3147,28 @@ test("a rejected output does not block other files or retry automatically after 
   assert.equal(await restarted.collect(binding), 0); assert.equal(upload.mock.callCount(), 2);
   await s.worker.flush(); assert.ok(s.chat.sent.some(message => message.view.text.includes("wrong_file")));
   assert.equal(await restarted.collect(binding, true), 0); assert.equal(upload.mock.callCount(), 3);
+});
+
+test("a full VK document store is cleaned once and the same file is retried", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-document-cleanup-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "cleanup-op", []); files.finish(binding.id, "cleanup-op", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "installer.exe"), "fixture");
+  s.store.setValue("vk-document-registry", [{ attachment: "doc-202_7", ownerId: -202, documentId: 7, name: "old.zip", uploadedAt: 1, fileKey: "old" }]);
+  s.chat.cleanupResult = ["doc-202_7"];
+  let attempts = 0;
+  t.mock.method(s.chat, "uploadFile", async () => {
+    attempts++;
+    if (attempts === 1) throw new FileUploadStorageFullError("storage full");
+    return "doc-202_8";
+  });
+  files.observe(binding.id, "idle");
+  assert.equal(await files.collect(binding), 1);
+  assert.equal(attempts, 2);
+  assert.equal(s.chat.cleanupCalls.length, 1);
+  assert.deepEqual(s.chat.cleanupCalls[0]!.map(record => record.attachment), ["doc-202_7"]);
+  assert.deepEqual(s.store.getValue<VkDocumentRecord[]>("vk-document-registry")?.map(record => record.attachment), ["doc-202_8"]);
 });
 
 

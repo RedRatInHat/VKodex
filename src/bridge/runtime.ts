@@ -6,7 +6,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails } from "../core/codex-tasks.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
@@ -14,6 +14,7 @@ import type { BridgeHealthSnapshot } from "./contracts.js";
 import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
+import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -40,6 +41,34 @@ export class BridgeRuntime {
   private lastHealthAt = 0;
   private operationReconciliation: Promise<void> | null = null;
   private lastOperationReconciliationAt = 0;
+  /** Tasks released after a terminal turn stay detached until VK needs them. */
+  private readonly releasedIdle = new Set<string>();
+  /** A new VK request asks the next update to acquire that task again. */
+  private readonly demanded = new Set<string>();
+  /** Keeps a just-reacquired task leased until TaskManager has dispatched the VK input. */
+  private readonly pendingReacquire = new Set<string>();
+
+  private streamMode(bindingId: string): "attached" | "detached" | null {
+    return this.store.getValue<"attached" | "detached">(`task-stream-mode:${bindingId}`);
+  }
+
+  private setStreamMode(bindingId: string, mode: "attached" | "detached"): void {
+    this.store.setValue(`task-stream-mode:${bindingId}`, mode);
+  }
+
+  private recordLease(bindingId: string, mode: "attached" | "detached", activeTurnId: string | null = null): void {
+    const key = `task-lease:${bindingId}`;
+    const previous = this.store.getValue<{ leaseSince?: number | null }>(key);
+    const at = this.now();
+    this.store.setValue(key, {
+      owner: mode === "attached" ? "vkodex" : "external",
+      mode,
+      leaseSince: mode === "attached" ? (typeof previous?.leaseSince === "number" ? previous.leaseSince : at) : null,
+      lastEventAt: at,
+      activeTurnId,
+      generation: this.store.streamGeneration(bindingId),
+    });
+  }
 
   private readonly observeTaskState: TaskStateObserver;
   private readonly historyRecovery: TaskHistoryRecovery;
@@ -58,7 +87,8 @@ export class BridgeRuntime {
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
-    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot);
+    this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot,
+      binding => this.releaseForExternalClient(binding));
     this.mirror = new TaskMirror(store);
     this.activity = new TaskActivity(store, now);
     this.unsubscribeCreation = desktop.onCreationUpdate?.(update => this.acceptCreation(update)) ?? null;
@@ -120,9 +150,12 @@ export class BridgeRuntime {
     const required = active.filter(binding => ["running", "approval"].includes(this.store.getValue<TaskDetails>(`task-details:${binding.id}`)?.status ?? ""));
     const bindings = active.map(binding => {
       const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+      const streamMode: "attached" | "detached" | "unknown" = this.streamMode(binding.id) ?? (isConnected(binding) ? "attached" : "unknown");
+      const lease = this.store.getValue<{ lastEventAt?: number | null; leaseSince?: number | null }>(`task-lease:${binding.id}`);
       return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
         status: details?.status ?? "unavailable", connected: isConnected(binding),
-        lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null };
+        lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
+        streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null };
     });
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
@@ -162,9 +195,71 @@ export class BridgeRuntime {
 
   async handle(input: BridgeInput): Promise<void> {
     if (this.stopped) return;
-    await this.manager.handle(input);
+    const binding = this.store.byPeer(input.peerId);
+    const taskInput = binding?.attached && binding.peerId !== null && !input.action;
+    if (taskInput) {
+      this.releasedIdle.delete(binding.id);
+      this.demanded.add(binding.id);
+      this.pendingReacquire.add(binding.id);
+      // Acquire the task stream before the manager can call turn/start. A
+      // resume after turn/start may abort that active turn in Codex, so this
+      // ordering is deliberately awaited for an idle, detached task.
+      await this.tick();
+    }
+    try {
+      await this.manager.handle(input);
+    } finally {
+      if (taskInput) this.pendingReacquire.delete(binding.id);
+    }
+    if (taskInput) {
+      const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+      if (details && ["idle", "failed", "interrupted"].includes(details.status) && !this.hasPendingTaskWork(binding.id)) {
+        // A known rejection did not create work. Unknown/sending operations
+        // remain in hasPendingTaskWork and keep the lease for reconciliation.
+        this.demanded.delete(binding.id);
+        await this.tick();
+      }
+    }
     this.closeInactiveSubscriptions();
     if (!this.stopped) await this.delivery.flush();
+  }
+
+  /**
+   * Replays only the synthetic, durable recovery inputs captured before a
+   * controlled bridge restart. Existing VK inbox state remains the authority:
+   * calling this again after a crash cannot submit the same recovery turn twice.
+   */
+  async recoverRestartIntent(dataDir: string): Promise<void> {
+    const intent = await readRestartIntent(dataDir);
+    if (!intent || this.stopped) return;
+    // Refresh the durable task snapshot before deciding whether a turn truly
+    // needs continuation; the value in SQLite is the pre-restart state.
+    await this.tick();
+    const pending: RestartTaskSnapshot[] = [];
+    for (const snapshot of intent.tasks) {
+      const binding = this.store.getBinding(snapshot.bindingId);
+      if (!binding || !binding.attached || binding.peerId === null || !sameTask(binding, snapshot)
+        || this.store.streamGeneration(binding.id) !== snapshot.generation) continue;
+      const eventId = `restart-recovery:${intent.id}:${binding.id}`;
+      const inputKey = JSON.stringify([binding.peerId, eventId]);
+      if (this.store.inputSettled(inputKey)) continue;
+      let details: TaskDetails | null = null;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        try { details = await this.desktop.inspectTask(binding); break; }
+        catch { await new Promise(resolve => setTimeout(resolve, 1_000)); }
+      }
+      if (!details) { pending.push(snapshot); continue; }
+      // A task that survived the process restart, or still has a question,
+      // must not receive a second synthetic turn.
+      if (details.status === "running" || details.status === "approval") continue;
+      await this.handle({ eventId, peerId: binding.peerId, senderId: this.access.ownerId,
+        text: "Продолжи работу, прерванную техническим перезапуском VKodex. Проверь текущее состояние задачи и файлов, не повторяй уже завершённые действия и продолжи с ближайшего незавершённого шага." });
+      this.store.enqueue(`restart-recovery-note:${intent.id}:${binding.id}`, binding.peerId, {
+        text: "VKodex восстановил эту задачу после контролируемого перезапуска и отправил один запрос на продолжение.", silent: true,
+      }, binding.id);
+    }
+    if (pending.length) throw new Error(`Restart recovery is waiting for ${pending.length} Codex task owner(s)`);
+    await archiveRestartIntent(dataDir, intent);
   }
   private closeSubscription(bindingId: string): void {
     this.connections.close(bindingId);
@@ -244,6 +339,45 @@ export class BridgeRuntime {
     }
   }
 
+  private releaseIdleSubscription(binding: Binding): void {
+    if (!this.connections.has(binding.id) || this.store.getBinding(binding.id)?.attached !== true) return;
+    this.demanded.delete(binding.id);
+    this.pendingReacquire.delete(binding.id);
+    this.releasedIdle.add(binding.id);
+    this.setStreamMode(binding.id, "detached");
+    this.recordLease(binding.id, "detached");
+    // This is a normal handoff, not a connection failure. Keep the projected
+    // task status and VK controls intact while releasing the Codex writer.
+    this.connections.close(binding.id);
+  }
+
+  private async releaseForExternalClient(binding: Binding): Promise<void> {
+    const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+    if (details && (details.status === "running" || details.status === "approval") || this.hasPendingTaskWork(binding.id)) {
+      throw new ActionRejectedError("Задача ещё выполняется, ожидает ответа или сверки результата. Дождись завершения либо используй /stop; управление не передано приложению Codex.");
+    }
+    if (this.hasPendingCriticalDelivery(binding.id)) {
+      throw new ActionRejectedError("Финальный ответ задачи ещё отправляется в VK. Повтори /open после завершения доставки.");
+    }
+    this.demanded.delete(binding.id);
+    this.pendingReacquire.delete(binding.id);
+    this.releasedIdle.add(binding.id);
+    this.setStreamMode(binding.id, "detached");
+    this.recordLease(binding.id, "detached");
+    this.connections.close(binding.id);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
+  private hasPendingTaskWork(bindingId: string): boolean {
+    return this.store.acceptedTurns(bindingId).length > 0 || this.store.queuedInputs(bindingId).length > 0
+      || this.store.unresolvedPromptOperations(bindingId).length > 0;
+  }
+
+  private hasPendingCriticalDelivery(bindingId: string): boolean {
+    return this.store.pendingDeliveries().some(delivery => delivery.bindingId === bindingId
+      && (delivery.kind === "send" || delivery.kind === "panel"));
+  }
+
   tick(): Promise<void> {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
@@ -282,6 +416,17 @@ export class BridgeRuntime {
         this.store.setPaused(binding.id, false);
         binding = this.store.getBinding(binding.id)!;
       }
+      // A final answer is persisted before delivery is attempted. Once the
+      // critical VK queue drains, release a still-open stream on the next
+      // tick; this also covers the case where the answer was queued while the
+      // first terminal snapshot was being handled.
+      if (this.connections.has(binding.id)) {
+        const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+        if (details && ["idle", "failed", "interrupted"].includes(details.status)
+          && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id) && !this.hasPendingCriticalDelivery(binding.id)) {
+          this.releaseIdleSubscription(binding);
+        }
+      }
       this.flushCreation(binding);
       if (this.desktop.isCreationActive?.(binding)) {
         if (existing) this.closeSubscription(binding.id);
@@ -292,6 +437,10 @@ export class BridgeRuntime {
         } catch { /* The creation owner may have handed off between both checks. */ }
         continue;
       }
+      const storedDetails = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+      const terminal = !storedDetails || ["idle", "failed", "interrupted", "unavailable"].includes(storedDetails.status);
+      if (!existing && (this.releasedIdle.has(binding.id) || this.streamMode(binding.id) === "detached") && !this.demanded.has(binding.id)
+        && terminal && !this.hasPendingTaskWork(binding.id)) continue;
       if (!existing && !this.connections.canAttempt(binding.id)) continue;
       if (existing) { this.connections.maintain(binding.id); continue; }
       listedTasks ??= await this.desktop.listTasks();
@@ -323,8 +472,11 @@ export class BridgeRuntime {
               if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
               const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
               if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
+              const reconnectingOnDemand = this.demanded.has(binding.id) || this.releasedIdle.has(binding.id);
               const observation = this.observeTaskState(state, this.store.getValue<TaskObservationCheckpoint>(checkpointKey), this.now(), {
-                rebaseline: initial,
+                // A task released after a completed turn must reconcile direct
+                // Desktop/VS Code changes made while VKodex was detached.
+                rebaseline: initial && !reconnectingOnDemand,
                 recoverFinalTurnIds: [...recoverFinalTurnIds],
                 finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
               });
@@ -360,7 +512,20 @@ export class BridgeRuntime {
               }
               this.files?.observe(binding.id, details.status);
               this.activity.observe(binding.id, details.status, observation.activeTurnId);
+              this.recordLease(binding.id, "attached", observation.activeTurnId);
+              if (details.status === "running" || details.status === "approval") {
+                this.releasedIdle.delete(binding.id);
+                this.setStreamMode(binding.id, "attached");
+              }
+              if (details.status !== "running" && details.status !== "approval" && !this.pendingReacquire.has(binding.id)) {
+                this.demanded.delete(binding.id);
+              }
             });
+            const latest = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+            if (latest && ["idle", "failed", "interrupted"].includes(latest.status)
+              && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id) && !this.hasPendingCriticalDelivery(binding.id)) {
+              this.releaseIdleSubscription(binding);
+            }
           }, failure => this.subscriptionFailed(binding.id, failure));
           if (this.stopped || !this.connections.matches(binding.id, task)) return;
           this.store.markDesktopHandoff(binding.id, task, "live", this.now());

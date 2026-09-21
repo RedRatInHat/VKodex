@@ -20,6 +20,10 @@ export interface RuntimeHealthState {
     readonly source: string;
     readonly status: string;
     readonly connected: boolean;
+    /** Whether VKodex currently holds the Codex task stream lease. */
+    readonly streamMode?: "attached" | "detached" | "unknown";
+    readonly lastEventAt?: number | null;
+    readonly leaseSince?: number | null;
     readonly lastConfirmedAt: number | null;
     readonly failure: "usageLimit" | "systemError" | null;
   }[];
@@ -126,8 +130,11 @@ export class BridgeHealthMonitor {
     });
 
     const connectedState: HealthState = runtime.connectedRequiredBindings < runtime.requiredBindings ? "degraded" : "ok";
+    const detached = (runtime.bindings ?? []).filter(binding => binding.streamMode === "detached").length;
+    const leased = (runtime.bindings ?? []).filter(binding => binding.streamMode === "attached").length;
+    const detachedTitles = (runtime.bindings ?? []).filter(binding => binding.streamMode === "detached").map(binding => `«${binding.title.slice(0, 80)}»`);
     checks.push({ name: "codex_streams", state: connectedState,
-      detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}. Остальные беседы подключатся при активности.` });
+      detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; владельцев потока VKodex: ${leased}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}; освобождённых после хода: ${detached}${detachedTitles.length ? ` (${detachedTitles.join(", ")})` : ""}. Остальные беседы подключатся при активности.` });
     const failedTasks = runtime.failedBindings ?? 0;
     checks.push({ name: "codex_tasks", state: failedTasks ? "degraded" : "ok",
       detail: failedTasks ? `Задач с ошибкой Codex: ${failedTasks}. Проверь /menu и /limits в соответствующей беседе. Это состояние задач, а не обрыв VK.` : "У подключённых задач нет подтверждённых системных ошибок Codex." });

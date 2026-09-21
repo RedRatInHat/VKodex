@@ -9,6 +9,8 @@ export const VK_MAX_INLINE_BUTTONS = 10;
 export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
 /** A file-specific VK rejection: automatic retries of identical bytes cannot help. */
 export class FileUploadRejectedError extends Error {}
+/** VK upload servers report this when the document storage is full. */
+export class FileUploadStorageFullError extends Error {}
 export class ChatRateLimitError extends Error {
   constructor(readonly retryAfterMs: number) { super("VK временно ограничил частоту запросов. Отправка продолжится после паузы."); }
 }
@@ -38,6 +40,8 @@ export interface BridgeChat {
   delete(handle: MessageHandle): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
   uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string>;
+  /** Remove only documents previously registered as VKodex uploads. */
+  cleanupDocuments?(records: readonly VkDocumentRecord[]): Promise<readonly string[]>;
   /** Read-only operational checks. Implementations must never expose credentials in details. */
   health?(): Promise<readonly HealthCheckResult[]>;
 }
@@ -61,6 +65,15 @@ export interface BridgeInput {
   readonly replyToMessageId?: number;
   /** Present when the owner changed a linked VK conversation title natively. */
   readonly conversationTitle?: string;
+}
+
+export interface VkDocumentRecord {
+  readonly attachment: string;
+  readonly ownerId: number;
+  readonly documentId: number;
+  readonly name: string;
+  readonly uploadedAt: number;
+  readonly fileKey: string;
 }
 
 export interface Binding extends TaskRef {

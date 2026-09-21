@@ -243,6 +243,8 @@ export class BridgeStore {
       // Retain delivery IDs and handles, but never retry a cancelled send or edit.
       this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE binding_id = ? OR peer_id = ?").run(id, binding.peerId);
       this.setValue(`projection:${id}`, null);
+      this.setValue(`task-stream-mode:${id}`, null);
+      this.setValue(`task-lease:${id}`, null);
       this.setValue(`stream-generation:${id}`, this.streamGeneration(id) + 1);
     });
   }
@@ -340,6 +342,8 @@ export class BridgeStore {
       this.setValue(`projection:${record.bindingId}`, null);
       this.setValue(`activity:${record.bindingId}`, null);
       this.setValue(`task-details:${record.bindingId}`, null);
+      this.setValue(`task-stream-mode:${record.bindingId}`, null);
+      this.setValue(`task-lease:${record.bindingId}`, null);
       // Delivery recovery belongs to the source task identity. Carrying its
       // accepted turn IDs into the fork makes an idle target look unfinished
       // and may recover a source answer through the target conversation.
@@ -779,6 +783,23 @@ export class BridgeStore {
       id: number; key: string; binding_id: string | null; peer_id: number; kind: Delivery["kind"]; view: string; first_view: string | null; handle: string | null; revision: number; delivered_revision: number;
     }[];
     return rows.map(row => ({ id: row.id, key: row.key, bindingId: row.binding_id, peerId: row.peer_id, kind: row.kind, view: JSON.parse(row.view) as View, firstView: row.first_view ? JSON.parse(row.first_view) as View : null, handle: row.handle ? JSON.parse(row.handle) as MessageHandle : null, revision: row.revision, deliveredRevision: row.delivered_revision }));
+  }
+
+  /** Outgoing attachments previously registered by this bridge, including
+   * messages delivered before the cleanup registry was introduced. */
+  deliveryAttachmentHistory(): readonly { attachment: string; order: number }[] {
+    const rows = this.db.prepare("SELECT id, view FROM bridge_delivery WHERE kind <> 'delete' ORDER BY id").all() as { id: number; view: string }[];
+    const result: { attachment: string; order: number }[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      let view: View;
+      try { view = JSON.parse(row.view) as View; } catch { continue; }
+      for (const attachment of view.attachments ?? []) {
+        if (!/^doc-?\d+_\d+(?:_|$)/u.test(attachment) || seen.has(attachment)) continue;
+        seen.add(attachment); result.push({ attachment, order: row.id });
+      }
+    }
+    return result;
   }
 
   sending(delivery: Delivery): void {
