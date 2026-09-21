@@ -340,7 +340,12 @@ export class BridgeRuntime {
   }
 
   private releaseIdleSubscription(binding: Binding): void {
-    if (!this.connections.has(binding.id) || this.store.getBinding(binding.id)?.attached !== true) return;
+    if (this.store.getBinding(binding.id)?.attached !== true) return;
+    // Releasing the Codex writer is a normal handoff, not a loss of
+    // observability. Keep tailing the append-only rollout while Desktop/VS
+    // Code owns the task so direct turns still reach VK without reacquiring a
+    // competing stream lease.
+    this.enableRolloutFallback(binding, this.now());
     this.demanded.delete(binding.id);
     this.pendingReacquire.delete(binding.id);
     this.releasedIdle.add(binding.id);
@@ -362,6 +367,10 @@ export class BridgeRuntime {
     this.demanded.delete(binding.id);
     this.pendingReacquire.delete(binding.id);
     this.releasedIdle.add(binding.id);
+    // The explicit /open handoff follows the same read-only observation path
+    // as an idle release. Do not leave the VK projection blind while the
+    // external client is working.
+    this.enableRolloutFallback(binding, this.now());
     this.setStreamMode(binding.id, "detached");
     this.recordLease(binding.id, "detached");
     this.connections.close(binding.id);
