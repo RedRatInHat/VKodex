@@ -1198,7 +1198,7 @@ test("transfer history digest covers every page and ignores fork-assigned item I
   await assert.rejects(completedHistoryDigest("source", "wrong-boundary", pages("Original", "source-item")), ActionRejectedError);
 });
 
-test("transfer history digest ignores only empty App Server reasoning placeholders", async () => {
+test("transfer history digest ignores non-portable App Server projection items", async () => {
   const page = (items: IpcObject[]) => async (): Promise<IpcObject> => ({
     data: [{ id: "last", status: "completed", items }], nextCursor: null,
   });
@@ -1207,14 +1207,13 @@ test("transfer history digest ignores only empty App Server reasoning placeholde
     { id: "agent", type: "agentMessage", text: "Done" },
   ];
   const withoutPlaceholder = await completedHistoryDigest("target", "last", page(visible));
-  assert.equal(await completedHistoryDigest("source", "last", page([
-    visible[0]!, { id: "empty", type: "reasoning", summary: [], content: [] }, visible[1]!,
-  ])), withoutPlaceholder);
+  for (const type of ["reasoning", "fileChange", "contextCompaction"]) {
+    assert.equal(await completedHistoryDigest("source", "last", page([
+      visible[0]!, { id: `projection-${type}`, type, summary: [{ text: "private" }], content: [], changes: [] }, visible[1]!,
+    ])), withoutPlaceholder);
+  }
   assert.notEqual(await completedHistoryDigest("source", "last", page([
-    visible[0]!, { id: "meaningful", type: "reasoning", summary: [{ text: "Summary" }], content: [] }, visible[1]!,
-  ])), withoutPlaceholder);
-  assert.notEqual(await completedHistoryDigest("source", "last", page([
-    visible[0]!, { id: "future", type: "reasoning", summary: [], content: [], encryptedContent: "opaque" }, visible[1]!,
+    visible[0]!, { id: "future", type: "newProjectionType", content: [] }, visible[1]!,
   ])), withoutPlaceholder);
 });
 

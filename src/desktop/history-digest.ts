@@ -2,15 +2,14 @@ import { createHash } from "node:crypto";
 import { ActionRejectedError, DesktopUnavailableError } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
-function isEmptyReasoningItem(item: IpcObject): boolean {
-  if (item.type !== "reasoning") return false;
-  const emptyArray = (value: unknown): boolean => value === undefined || (Array.isArray(value) && value.length === 0);
-  if (!emptyArray(item.summary) || !emptyArray(item.content)) return false;
-  // App Server may materialize empty reasoning placeholders in the source
-  // projection and omit them while importing the same rollout into another
-  // profile. Ignore only metadata-free placeholders; any future meaningful
-  // field keeps the item inside the strict semantic digest.
-  return Object.keys(item).every(key => ["id", "type", "summary", "content"].includes(key));
+function isNonPortableProjectionItem(item: IpcObject): boolean {
+  // These records belong to the local App Server projection, not to the
+  // portable user/agent transcript. A cross-profile fork currently rebuilds
+  // the same visible transcript without them: reasoning is private, while
+  // file changes and compaction markers are regenerated (or omitted) by the
+  // receiving profile. Including them made a valid large-history fork fail
+  // verification even though every user and agent message was preserved.
+  return ["reasoning", "fileChange", "contextCompaction"].includes(String(item.type));
 }
 
 /** Hash the persisted, model-visible turns rather than rollout file metadata.
@@ -40,7 +39,7 @@ export async function completedHistoryDigest(
       latest = value.id;
       const items = value.items.map(item => {
         if (!isObject(item) || typeof item.type !== "string") throw new ActionRejectedError("Codex вернул неполный элемент истории.");
-        if (isEmptyReasoningItem(item)) return null;
+        if (isNonPortableProjectionItem(item)) return null;
         const { id: _itemId, ...content } = item;
         return content;
       }).filter(item => item !== null);
