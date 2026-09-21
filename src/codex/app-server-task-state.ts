@@ -111,11 +111,13 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     }
   }
   const latest = turns.at(-1);
-  const failureInfo = latest?.error?.codexErrorInfo;
+  const failureInfo = latest?.error?.codexErrorInfo ?? latest?.error?.codex_error_info ?? latest?.error?.errorInfo;
+  const failure = failureInfo === "usageLimitExceeded" ? "usageLimit" as const
+    : failureInfo === "server_overloaded" || failureInfo === "serverOverloaded" ? "serverOverloaded" as const : "systemError" as const;
   const failed = snapshot.runtimeStatus === "systemError" || latest?.status === "failed";
   const details: TaskDetails = {
     title: snapshot.title,
-    ...(failed ? { failure: failureInfo === "usageLimitExceeded" ? "usageLimit" as const : "systemError" as const } : {}),
+    ...(failed ? { failure } : {}),
     status: snapshot.runtimeStatus === "active" || active.length ? "running" : failed ? "failed"
       : latest?.status === "interrupted" ? "interrupted" : snapshot.runtimeStatus === "idle" ? "idle" : "unavailable",
     workspace: snapshot.cwd, model: snapshot.model, effort: snapshot.effort,

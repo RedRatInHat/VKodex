@@ -27,9 +27,12 @@ export function taskDetails(state: IpcObject): TaskDetails {
   const nextModel = string(settings.model) ?? string(state.latestModel);
   const nextEffort = string(settings.effort) ?? string(state.latestReasoningEffort);
   const error = Array.isArray(turn?.items) ? turn.items.filter(isObject).findLast(item => item.type === "error") : undefined;
+  const errorInfo = typeof error?.errorInfo === "string" ? error.errorInfo : typeof error?.codexErrorInfo === "string" ? error.codexErrorInfo : null;
+  const failure = errorInfo === "usageLimitExceeded" ? "usageLimit" as const
+    : errorInfo === "server_overloaded" || errorInfo === "serverOverloaded" ? "serverOverloaded" as const : "systemError" as const;
   return {
     title: string(state.title),
-    ...(systemError ? { failure: error?.errorInfo === "usageLimitExceeded" ? "usageLimit" as const : "systemError" as const } : {}),
+    ...(systemError ? { failure } : {}),
     status: systemError ? "failed" : Array.isArray(state.requests) && state.requests.length > 0 ? "approval" : running ? "running" : !idleKnown ? "unavailable" : turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "idle",
     workspace: string(state.cwd),
     model: running ? string(mode.model) ?? string(params.model) ?? nextModel : nextModel,

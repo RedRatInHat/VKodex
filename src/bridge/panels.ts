@@ -80,6 +80,7 @@ export const taskDeepLink = (threadId: string): string => `codex://threads/${enc
 
 export function taskFailureText(failure: TaskDetails["failure"]): string | null {
   if (failure === "usageLimit") return "Codex остановлен: исчерпан лимит аккаунта этого каталога. /limits — проверить аккаунт и время сброса. Перенос в другой каталог доступен через меню; автоматически аккаунт не меняется.";
+  if (failure === "serverOverloaded") return "Codex остановлен: выбранная модель временно перегружена. Выбери другую модель через меню или повтори позже; прежний ход автоматически не дублируется.";
   if (failure === "systemError") return "Codex сообщает системную ошибку. Ход сейчас не выполняется. Подробности доступны в приложении Codex; сообщение можно повторить после устранения причины.";
   return null;
 }

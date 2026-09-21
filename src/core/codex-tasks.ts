@@ -113,7 +113,7 @@ export interface DesktopModel {
 
 export interface TaskDetails {
   readonly title?: string | null;
-  readonly failure?: "usageLimit" | "systemError";
+  readonly failure?: "usageLimit" | "serverOverloaded" | "systemError";
   readonly status: "running" | "idle" | "failed" | "interrupted" | "approval" | "unavailable";
   readonly workspace: string | null;
   readonly model: string | null;

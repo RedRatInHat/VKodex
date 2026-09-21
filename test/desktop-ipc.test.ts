@@ -624,6 +624,16 @@ test("systemError overrides orphaned history, reports usage limits once and perm
   assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
 });
 
+test("server overload is reported separately from a generic Codex system error", () => {
+  const details = taskDetails({
+    id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "systemError" },
+    turns: [{ turnId: "fixture-turn", turnStartedAtMs: 100, status: "failed",
+      items: [{ type: "error", errorInfo: "server_overloaded", message: "PRIVATE CAPACITY DETAIL" }] }],
+  });
+  assert.equal(details.status, "failed");
+  assert.equal(details.failure, "serverOverloaded");
+});
+
 test("first-turn creation output survives a runtime restart before its VK binding exists", async () => {
   const access = { ownerId: 101, groupId: 202 };
   const peerId = 2_000_000_017;

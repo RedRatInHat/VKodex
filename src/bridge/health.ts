@@ -25,7 +25,7 @@ export interface RuntimeHealthState {
     readonly lastEventAt?: number | null;
     readonly leaseSince?: number | null;
     readonly lastConfirmedAt: number | null;
-    readonly failure: "usageLimit" | "systemError" | null;
+    readonly failure: "usageLimit" | "serverOverloaded" | "systemError" | null;
   }[];
 }
 
@@ -195,6 +195,7 @@ export class BridgeHealthMonitor {
       }
       if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
       const problem = binding.failure === "usageLimit" ? "последний ход завершился из-за лимита аккаунта"
+        : binding.failure === "serverOverloaded" ? "последний ход остановлен: выбранная модель была перегружена"
         : binding.failure === "systemError" ? "последний ход завершился системной ошибкой Codex"
           : "нет подтверждённой связи с владельцем выполняющейся задачи";
       const lastSeen = binding.lastConfirmedAt === null ? "подтверждения ещё не было"
@@ -202,6 +203,8 @@ export class BridgeHealthMonitor {
       const next = binding.connected
         ? binding.failure === "usageLimit"
           ? "Связь с задачей подтверждена; проверь текущие лимиты через /limits и повтори запрос, если лимит уже восстановился."
+          : binding.failure === "serverOverloaded"
+            ? "Выбери другую модель или повтори позже; прежний ход не повторяется автоматически."
           : "Связь с задачей подтверждена; проверь /menu задачи перед повтором запроса."
         : "Связь не подтверждена; мост повторяет подключение, проверь /menu задачи.";
       checks.push({ name: `codex_task:${binding.id}`, state: binding.failure === "systemError" ? "failed" : "degraded",
