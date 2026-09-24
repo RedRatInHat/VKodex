@@ -639,6 +639,31 @@ test("a Codex title change automatically renames the linked VK conversation once
   assert.equal(s.desktop.renames.length, 0); assert.equal(s.desktop.submissions.length, 0);
 });
 
+test("a reacquired owner does not resend a final already mirrored with another item ID", async t => {
+  const s = setup(t); const binding = s.attach();
+  const oldId = "msg-from-rollout";
+  const turnId = "completed-turn";
+  const text = "Previously delivered answer";
+  // Simulate a final journaled before semantic IDs existed. Its VK message
+  // was split into chunks and the native owner later names it differently.
+  s.store.rememberEvent(binding.id, oldId);
+  s.store.enqueue(`event:${binding.id}:${oldId}:0`, peerId, { text: "Previously " }, binding.id, false, turnId);
+  s.store.enqueue(`event:${binding.id}:${oldId}:1`, peerId, { text: "delivered answer\n\nМеню задачи:", buttons: [MENU_BUTTON] }, binding.id, false, turnId);
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 2);
+
+  s.mirror.accept(binding.id, { type: "final", id: "item-441", turnId, text });
+  s.mirror.accept(binding.id, { type: "final", id: "item-442", turnId, text });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 2);
+  assert.equal(s.store.hasEvent(binding.id, "item-441"), true);
+
+  s.mirror.accept(binding.id, { type: "final", id: "corrected", turnId, text: "Corrected answer" });
+  s.mirror.accept(binding.id, { type: "final", id: "same-text-next-turn", turnId: "next-turn", text });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 4);
+});
+
 test("a native owner VK title change renames the linked Codex task and strips the bridge prefix", async t => {
   const s = setup(t); const binding = s.attach();
   await s.manager.handle({ ...s.input("", peerId), eventId: "chat-title:2000000017:41:fixture", conversationTitle: "[VKodex] ARC : NeuroDynTruss - WORKER" });

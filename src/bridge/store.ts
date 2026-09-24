@@ -703,6 +703,30 @@ export class BridgeStore {
     this.clearExpectedEditedUser(bindingId); return true;
   }
   rememberEvent(bindingId: string, eventId: string): boolean { return this.db.prepare("INSERT OR IGNORE INTO bridge_events(binding_id, event_id) VALUES (?, ?)").run(bindingId, eventId).changes === 1; }
+  /** Read older final deliveries when a client rewrites the same Codex answer
+   * with a different item ID. This also covers finals sent before semantic
+   * markers were introduced, without scanning unrelated chats. */
+  finalDeliveries(bindingId: string, turnId: string): readonly { text: string; menu: boolean }[] {
+    const prefix = `event:${bindingId}:`;
+    const rows = this.db.prepare(`SELECT key, view FROM bridge_delivery
+      WHERE key GLOB ? AND turn_id = ? AND kind = 'send' ORDER BY id`).all(`${prefix}*`, turnId) as { key: string; view: string }[];
+    const parts = new Map<string, Map<number, View>>();
+    for (const row of rows) {
+      const suffix = row.key.slice(prefix.length);
+      const split = suffix.lastIndexOf(":");
+      if (split < 0 || !/^\d+$/u.test(suffix.slice(split + 1))) continue;
+      const view = JSON.parse(row.view) as View;
+      if (view.silent || typeof view.text !== "string") continue; // User echoes are silent.
+      const itemId = suffix.slice(0, split);
+      const chunks = parts.get(itemId) ?? new Map<number, View>();
+      chunks.set(Number(suffix.slice(split + 1)), view);
+      parts.set(itemId, chunks);
+    }
+    return [...parts.values()].map(chunks => {
+      const ordered = [...chunks].sort(([a], [b]) => a - b).map(([, view]) => view);
+      return { text: ordered.map(view => view.text).join(""), menu: !!ordered.at(-1)?.buttons?.length };
+    });
+  }
   hasEvent(bindingId: string, eventId: string): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM bridge_events WHERE binding_id = ? AND event_id = ?").get(bindingId, eventId));
   }

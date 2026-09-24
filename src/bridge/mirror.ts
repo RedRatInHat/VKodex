@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { TaskEvent } from "../core/codex-tasks.js";
 import { chunkText } from "../lib/text.js";
 import { BridgeStore } from "./store.js";
@@ -97,6 +98,18 @@ export class TaskMirror {
       // a crash and is being observed again during recovery.
       if (event.type === "final") this.store.retireTurnCommentary(binding.id, event.turnId);
       if (!this.store.rememberEvent(binding.id, event.id)) return;
+      if (event.type === "final") {
+        const normalize = (text: string): string => text.replace(/\r\n?/gu, "\n").trimEnd();
+        const content = normalize(event.text);
+        const digest = createHash("sha256").update(content).digest("hex");
+        const semanticId = `final-content:${event.turnId}:${digest}`;
+        if (!this.store.rememberEvent(binding.id, semanticId)) return;
+        // Existing installations have finals in the delivery journal but no
+        // semantic marker yet. A later owner snapshot can give that same final
+        // a new item ID, especially after the idle stream is reacquired.
+        if (this.store.finalDeliveries(binding.id, event.turnId)
+          .some(({ text, menu }) => normalize(menu && text.endsWith(MENU_FOOTER) ? text.slice(0, -MENU_FOOTER.length) : text) === content)) return;
+      }
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
       if (event.type === "user" && this.store.consumeExpectedEditedUser(binding.id, event.text)) return;
       const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";
