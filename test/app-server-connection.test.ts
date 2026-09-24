@@ -120,12 +120,14 @@ test("a timed-out mutation is never replayed when the profile connection recover
   const second = new AppServerChild();
   const children = [first, second];
   const connection = new AppServerConnection(() => children.shift()!.asChild(), undefined, 20);
+  // The fake child has no process handle; production request timers are unref'ed.
+  const keepAlive = setInterval(() => {}, 1_000);
   try {
     await assert.rejects(connection.request("turn/start", { threadId: "task" }, { mutating: true }), AppServerUncertainError);
     assert.equal(first.messages.filter(message => message.method === "turn/start").length, 1);
     assert.deepEqual(await connection.request("thread/read", { threadId: "task" }), { ok: true });
     assert.equal(second.messages.some(message => message.method === "turn/start"), false);
-  } finally { await connection.close(); }
+  } finally { clearInterval(keepAlive); await connection.close(); }
 });
 
 test("a timed-out read does not disconnect unrelated profile work", async () => {
@@ -133,9 +135,10 @@ test("a timed-out read does not disconnect unrelated profile work", async () => 
   child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
     : message.method === "thread/read" ? null : { id: message.id, result: { ok: true } };
   const connection = new AppServerConnection(() => child.asChild(), undefined, 20);
+  const keepAlive = setInterval(() => {}, 1_000);
   try {
     await assert.rejects(connection.request("thread/read", { threadId: "slow" }), AppServerUnavailableError);
     assert.deepEqual(await connection.request("model/list"), { ok: true });
     assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
-  } finally { await connection.close(); }
+  } finally { clearInterval(keepAlive); await connection.close(); }
 });

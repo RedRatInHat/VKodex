@@ -276,8 +276,13 @@ export class TaskManager {
     if (["/start", "/list"].includes(text)) { await this.chooseProject(input, 0); return; }
     if (text === "/new") { await this.newTask(input); return; }
     if (text === "/cancel") { this.cancel(input); return; }
-    if (text.startsWith("/")) { this.reply(input, { text: unknownCommand(managerHelp) }); return; }
     const draft = this.store.getDraft();
+    // An absolute POSIX workspace path also starts with "/". Do not treat it
+    // as an unknown manager command while the wizard is waiting for a path.
+    if (text.startsWith("/") && !(draft?.stage === "workspace" && path.isAbsolute(text))) {
+      this.reply(input, { text: unknownCommand(managerHelp) });
+      return;
+    }
     if (draft?.stage === "workspace") {
       // Drafts created by the previous mobile-hostile wizard did not carry an
       // explicit manual marker. Treat their next non-path message as the title
