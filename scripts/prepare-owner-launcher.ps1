@@ -13,10 +13,12 @@ $nativePath = (Resolve-Path -LiteralPath $NativeExecutable).Path
 $runtimePath = (Resolve-Path -LiteralPath $RuntimeExecutable).Path
 $target = [IO.Path]::GetFullPath($Destination)
 if (Test-Path -LiteralPath $target) { throw 'Choose a new installation directory; existing installations are not overwritten.' }
-$files = @('owner-launcher.js', 'owner-channel.js', 'owner-transport.js', 'paths.js')
+$files = @('owner-launcher.js', 'owner-channel.js', 'owner-transport.js')
 foreach ($file in $files) {
   if (-not (Test-Path -LiteralPath (Join-Path $repo "dist\src\desktop\$file") -PathType Leaf)) { throw 'Run npm run build before preparing the launcher.' }
 }
+$corePaths = Join-Path $repo 'dist\src\core\paths.js'
+if (-not (Test-Path -LiteralPath $corePaths -PathType Leaf)) { throw 'Run npm run build before preparing the launcher.' }
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'The Windows .NET Framework compiler is required.' }
 New-Item -ItemType Directory -Path $target | Out-Null
@@ -30,8 +32,14 @@ foreach ($directory in @($target, $registry)) {
   if ($LASTEXITCODE -ne 0) { throw 'Could not protect the local owner transport directory.' }
 }
 foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $repo "dist\src\desktop\$file") -Destination (Join-Path $target $file) }
+# desktop/paths.js is a re-export of ../core/paths.js in the repository.
+# Ship the implementation as paths.js so this installation is self-contained.
+Copy-Item -LiteralPath $corePaths -Destination (Join-Path $target 'paths.js')
 $utf8 = New-Object Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $target 'package.json'), '{"private":true,"type":"module"}', $utf8)
+# Resolve the installed module graph before changing a client's CLI setting.
+& $runtimePath --input-type=module -e "import { pathToFileURL } from 'node:url'; await import(pathToFileURL(process.argv[1]).href)" (Join-Path $target 'owner-channel.js')
+if ($LASTEXITCODE -ne 0) { throw 'Owner adapter module graph is incomplete.' }
 $config = @{version=1;codexHome=$homePath;nativeExecutable=$nativePath;runtimeExecutable=$runtimePath;adapterEntry=(Join-Path $target 'owner-launcher.js')}
 $extensionDirectory = Split-Path (Split-Path (Split-Path $nativePath -Parent) -Parent) -Parent
 $extensionRegistry = Join-Path (Split-Path $extensionDirectory -Parent) 'extensions.json'

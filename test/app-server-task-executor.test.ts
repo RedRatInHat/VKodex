@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppServerEnvelope, AppServerRequestOptions, AppServerRpc, AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
-import { AppServerRejectedError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
+import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import { AppServerTaskExecutor } from "../src/codex/app-server-task-executor.js";
-import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, TaskNotOpenError, UncertainActionError, type SubmitTaskRequest } from "../src/core/codex-tasks.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -20,6 +20,9 @@ class FakeRpc implements AppServerRpc {
   failMethod: string | null = null;
   failAfterMethod: string | null = null;
   interruptPlan: ("success" | "reject-running" | "reject-stopped" | "uncertain-running" | "uncertain-stopped")[] = [];
+  modelUpdatePlan: Error[] = [];
+  descendants: string[] = [];
+  unloadedDescendantStatus: "completed" | "failed" | "interrupted" | "inProgress" | null = null;
   private after(method: string): void {
     if (this.failAfterMethod === method) { this.failAfterMethod = null; throw new AppServerUncertainError(); }
   }
@@ -42,12 +45,14 @@ class FakeRpc implements AppServerRpc {
       return {};
     }
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
-    if (method === "thread/list") return { data: [], nextCursor: null };
+    if (method === "thread/settings/update" && this.modelUpdatePlan.length) throw this.modelUpdatePlan.shift()!;
+    if (method === "thread/list") return { data: this.descendants.map(id => ({ id })), nextCursor: null };
     if (method === "thread/turns/list") return { data: [{ id: "started-turn",
-      status: this.activeTurnId === "started-turn" ? "inProgress" : "interrupted", items: [] }], nextCursor: null };
+      status: this.unloadedDescendantStatus && params.threadId !== "task" ? this.unloadedDescendantStatus
+        : this.activeTurnId === "started-turn" ? "inProgress" : "interrupted", items: [] }], nextCursor: null };
     // Native thread/read can briefly lag an acknowledged turn/start.
     if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId,
-      cwd: "D:\\work", status: { type: "idle" } } };
+      cwd: "D:\\work", status: { type: this.unloadedDescendantStatus && params.threadId !== "task" ? "notLoaded" : "idle" } } };
     if (method === "thread/name/set") { this.title = String(params.name); this.after(method); return {}; }
     if (method === "thread/metadata/update") { this.projectId = params.projectId ? String(params.projectId) : null; this.after(method); return {}; }
     if (method === "thread/goal/get") return { goal: this.goal };
@@ -123,6 +128,15 @@ test("App Server executor rechecks access before dispatch and does not mutate af
   } finally { executor.close(); }
 });
 
+test("an unavailable owner before dispatch is a retryable route failure, not an uncertain mutation", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    rpc.fail = new AppServerUnavailableError("resume timed out"); rpc.failMethod = "thread/resume";
+    await assert.rejects(executor.submitWithReceipt(request()), TaskNotOpenError);
+    assert.equal(rpc.requests.some(item => item.method === "turn/start" || item.method === "turn/steer"), false);
+  } finally { executor.close(); }
+});
+
 test("App Server executor uses native interrupt, queue and settings APIs", async () => {
   const rpc = new FakeRpc(); rpc.activeTurnId = "active-turn"; const executor = new AppServerTaskExecutor(rpc);
   try {
@@ -136,6 +150,32 @@ test("App Server executor uses native interrupt, queue and settings APIs", async
       assert.equal(rpc.requests.find(item => item.method === method)?.options.mutating, true);
     }
   } finally { executor.close(); }
+});
+
+test("model selection retries one confirmed transient rejection but never an uncertain write", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    rpc.modelUpdatePlan = [new AppServerRejectedError(-32000)];
+    await executor.selectModel(task, "gpt-6-astra", "high");
+    assert.equal(rpc.requests.filter(item => item.method === "thread/settings/update").length, 2);
+    assert.equal((await executor.inspectLoadedTask(task))?.nextModel, "gpt-6-astra");
+
+    rpc.modelUpdatePlan = [new AppServerUncertainError()];
+    await assert.rejects(executor.selectModel(task, "gpt-6-astra", "xhigh"), UncertainActionError);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/settings/update").length, 3);
+  } finally { executor.close(); }
+});
+
+test("model selection does not retry a malformed request or repeated rejection", async () => {
+  for (const first of [new AppServerRejectedError(-32602), new AppServerRejectedError(-32000)]) {
+    const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+    try {
+      rpc.modelUpdatePlan = [first, new AppServerRejectedError(-32000)];
+      await assert.rejects(executor.selectModel(task, "gpt-6-astra", "high"), ActionRejectedError);
+      assert.equal(rpc.requests.filter(item => item.method === "thread/settings/update").length,
+        first.code === -32602 ? 1 : 2);
+    } finally { executor.close(); }
+  }
 });
 
 test("App Server interrupt confirms a stopped turn after a rejected or lost reply", async () => {
@@ -246,6 +286,27 @@ test("App Server executor archives an idle tree once and gates concurrent mutati
     const archive = rpc.requests.filter(item => item.method === "thread/archive");
     assert.equal(archive.length, 1); assert.equal(archive[0]?.options.mutating, true);
     assert.equal(await executor.archiveRetryReady(task), true);
+  } finally { executor.close(); }
+});
+
+test("archive checks an unloaded descendant's terminal turn without resuming it", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  rpc.descendants = ["finished-child"]; rpc.unloadedDescendantStatus = "failed";
+  try {
+    await executor.archiveIdle(task);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 1);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume" && item.params.threadId === "finished-child").length, 0);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/turns/list" && item.params.threadId === "finished-child").length, 1);
+  } finally { executor.close(); }
+});
+
+test("archive rejects an unloaded descendant with an active last turn", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  rpc.descendants = ["running-child"]; rpc.unloadedDescendantStatus = "inProgress";
+  try {
+    await assert.rejects(executor.archiveIdle(task), /дочерние задачи должны быть завершены/u);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 0);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume" && item.params.threadId === "running-child").length, 0);
   } finally { executor.close(); }
 });
 

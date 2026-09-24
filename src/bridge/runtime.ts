@@ -6,7 +6,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
@@ -20,6 +20,7 @@ export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
   readonly observe: TaskStateObserver;
   readonly history: TaskHistoryRecovery;
+  readonly inspectExternalOwner?: (task: TaskRef) => Promise<"idle" | "active" | "systemError" | null>;
 }
 
 export class BridgeRuntime {
@@ -47,6 +48,9 @@ export class BridgeRuntime {
   private readonly demanded = new Set<string>();
   /** Keeps a just-reacquired task leased until TaskManager has dispatched the VK input. */
   private readonly pendingReacquire = new Set<string>();
+  private readonly observedTasks = new Map<string, Binding>();
+  /** Native resume of a large task may take minutes; it must not hold the health/update loop. */
+  private readonly connecting = new Map<string, Promise<void>>();
 
   private streamMode(bindingId: string): "attached" | "detached" | null {
     return this.store.getValue<"attached" | "detached">(`task-stream-mode:${bindingId}`);
@@ -72,6 +76,7 @@ export class BridgeRuntime {
 
   private readonly observeTaskState: TaskStateObserver;
   private readonly historyRecovery: TaskHistoryRecovery;
+  private readonly inspectExternalOwner: BridgeRuntimeAdapters["inspectExternalOwner"];
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, chat: BridgeChat, private readonly store: BridgeStore,
     adapters: BridgeRuntimeAdapters, private readonly now: () => number = Date.now, fileRoot?: string,
@@ -83,6 +88,8 @@ export class BridgeRuntime {
     this.connections = new TaskStateConnections(adapters.states, now);
     this.observeTaskState = adapters.observe;
     this.historyRecovery = adapters.history;
+    this.inspectExternalOwner = adapters.inspectExternalOwner;
+    for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
@@ -136,11 +143,11 @@ export class BridgeRuntime {
       void this.files?.tick().catch(() => {});
       try { this.manager.replaySavedInputs(); } catch { /* Health reports a broken journal. */ }
       this.reconcileUncertainOperation();
-      void this.tick().catch(() => {});
+      void this.tick(false).catch(() => {});
     }, 1_000);
     // Establish subscriptions before the first report so a healthy restart does
     // not look degraded merely because its first one-second tick has not run.
-    void this.tick().then(() => this.checkHealth(true), () => this.checkHealth(true)).catch(() => {});
+    void this.tick(false).then(() => this.checkHealth(true), () => this.checkHealth(true)).catch(() => {});
   }
 
   private runtimeHealth(): RuntimeHealthState {
@@ -157,9 +164,11 @@ export class BridgeRuntime {
         lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
         streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null };
     });
+    const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
+      && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
-      failedBindings: bindings.filter(binding => binding.failure !== null).length, bindings };
+      failedBindings: bindings.filter(actionableFailure).length, bindings };
   }
 
   private checkHealth(force = false): Promise<BridgeHealthSnapshot> {
@@ -234,7 +243,7 @@ export class BridgeRuntime {
     if (!intent || this.stopped) return;
     // Refresh the durable task snapshot before deciding whether a turn truly
     // needs continuation; the value in SQLite is the pre-restart state.
-    await this.tick();
+    await this.tick(false);
     const pending: RestartTaskSnapshot[] = [];
     for (const snapshot of intent.tasks) {
       const binding = this.store.getBinding(snapshot.bindingId);
@@ -243,15 +252,24 @@ export class BridgeRuntime {
       const eventId = `restart-recovery:${intent.id}:${binding.id}`;
       const inputKey = JSON.stringify([binding.peerId, eventId]);
       if (this.store.inputSettled(inputKey)) continue;
+      // A live Desktop/VS Code owner kept its turn through the bridge restart.
+      // Do not resume that task through the profile writer or send a duplicate
+      // continuation while the owner is still working.
+      try { if (await this.inspectExternalOwner?.(binding) === "active") continue; }
+      catch { pending.push(snapshot); continue; }
       let details: TaskDetails | null = null;
       for (let attempt = 0; attempt < 30; attempt++) {
         try { details = await this.desktop.inspectTask(binding); break; }
         catch { await new Promise(resolve => setTimeout(resolve, 1_000)); }
       }
       if (!details) { pending.push(snapshot); continue; }
-      // A task that survived the process restart, or still has a question,
-      // must not receive a second synthetic turn.
-      if (details.status === "running" || details.status === "approval") continue;
+      // Only a confirmed interrupted turn needs a synthetic continuation.
+      // An idle/failed task may have completed during the restart; replaying
+      // its old prompt would create an unrelated duplicate turn.
+      if (details.status !== "interrupted") {
+        if (details.status === "unavailable") pending.push(snapshot);
+        continue;
+      }
       await this.handle({ eventId, peerId: binding.peerId, senderId: this.access.ownerId,
         text: "Продолжи работу, прерванную техническим перезапуском VKodex. Проверь текущее состояние задачи и файлов, не повторяй уже завершённые действия и продолжи с ближайшего незавершённого шага." });
       this.store.enqueue(`restart-recovery-note:${intent.id}:${binding.id}`, binding.peerId, {
@@ -284,7 +302,8 @@ export class BridgeRuntime {
    * stable visible assistant message IDs until Codex rebuilds the branch.
    */
   private async mirrorRolloutFallback(binding: Binding): Promise<void> {
-    if (!binding.attached || binding.peerId === null) return;
+    const original = this.store.getBinding(binding.id);
+    if (!binding.attached || binding.peerId === null || !original?.attached || !sameTask(original, binding)) return;
     const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
     // A rewritten Codex branch may assign new item IDs to answers already
     // delivered from the old rollout. Without an owner snapshot there is no
@@ -294,20 +313,53 @@ export class BridgeRuntime {
     const result = await this.historyRecovery.poll(binding.id, binding, checkpoint,
       this.store.oldestAcceptedTurnAt(binding.id), new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId)), this.now());
     if (!result) return;
+    const current = this.store.getBinding(binding.id);
+    if (!current?.attached || !sameTask(current, binding)) return;
     if (result.failure) {
       this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: result.failure });
       return;
     }
     const events = result.events;
     if (result.historyRebuilt) {
-        const previous = this.store.getValue<{ at: number; kind: string }>(`rollout-failure:${binding.id}`);
-        if (previous?.kind !== "historyRebuilt") this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: "historyRebuilt" });
+      // A rebuilt rollout has now been safely rebased.  The old branch was
+      // never replayed, and the persisted checkpoint makes the new branch
+      // observable on the next poll even while the task remains detached.
+      this.store.setValue(`rollout-rebase:${binding.id}`, { at: this.now(), rolloutPath: result.checkpoint?.rolloutPath ?? binding.rolloutPath });
+      this.store.setValue(`rollout-failure:${binding.id}`, null);
     }
     else if (this.store.getValue(`rollout-failure:${binding.id}`) !== null) this.store.setValue(`rollout-failure:${binding.id}`, null);
-    if (!events.length || this.stopped || !this.store.getBinding(binding.id)?.attached) return;
+    if (!events.length || this.stopped) {
+      if (result.checkpoint) this.store.setValue(`projection:${binding.id}`, result.checkpoint);
+      return;
+    }
     this.store.atomic(() => {
+      const current = this.store.getBinding(binding.id);
+      if (!current?.attached || !sameTask(current, binding)) return;
+      const inputTurnIds = new Set(events.filter(event => event.type === "user").map(event => event.turnId));
+      for (const turn of this.store.acceptedTurns(binding.id)) inputTurnIds.add(turn.turnId);
+      const eventTurns = new Set(events.map(event => event.turnId));
+      for (const key of Object.keys(checkpoint?.seen ?? {})) {
+        const [turnId, type] = JSON.parse(key) as [string, string];
+        if (type === "user" && eventTurns.has(turnId)) inputTurnIds.add(turnId);
+      }
+      this.mirror.acceptObservation(binding.id, events, [...inputTurnIds]);
       for (const event of events) {
-        this.mirror.accept(binding.id, event);
+        const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+        if (details && event.type !== "user") {
+          if (event.type === "progress") {
+            const { failure: _failure, ...withoutFailure } = details;
+            this.store.setValue(`task-details:${binding.id}`, { ...withoutFailure, status: "running" });
+          } else if (event.type === "final" || event.type === "status" && event.status === "completed") {
+            const { failure: _failure, ...withoutFailure } = details;
+            this.store.setValue(`task-details:${binding.id}`, { ...withoutFailure, status: "idle" });
+          } else if (event.type === "status" && event.status === "interrupted") {
+            const { failure: _failure, ...withoutFailure } = details;
+            this.store.setValue(`task-details:${binding.id}`, { ...withoutFailure, status: "interrupted" });
+          } else if (event.type === "status" && event.status === "approval") {
+            const { failure: _failure, ...withoutFailure } = details;
+            this.store.setValue(`task-details:${binding.id}`, { ...withoutFailure, status: "approval" });
+          }
+        }
         if (event.type === "final") {
           this.store.settleAcceptedTurn(binding.id, event.turnId);
           this.files?.observe(binding.id, "idle", event.turnId);
@@ -316,6 +368,7 @@ export class BridgeRuntime {
           this.activity.observe(binding.id, event.status === "running" ? "running" : "idle", event.status === "running" ? event.turnId : null);
         }
       }
+      if (result.checkpoint) this.store.setValue(`projection:${binding.id}`, result.checkpoint);
     });
   }
 
@@ -387,14 +440,22 @@ export class BridgeRuntime {
       && (delivery.kind === "send" || delivery.kind === "panel"));
   }
 
-  tick(): Promise<void> {
+  tick(waitForConnections = true): Promise<void> {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
     if (!this.stopped && this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth().catch(() => {});
-    if (this.ticking) return this.ticking;
-    this.updateStartedAt = this.now();
-    this.ticking = this.update().finally(() => { this.ticking = null; this.updateStartedAt = null; });
-    return this.ticking;
+    if (!this.ticking) {
+      this.updateStartedAt = this.now();
+      this.ticking = this.update().finally(() => { this.ticking = null; this.updateStartedAt = null; });
+    }
+    const update = this.ticking;
+    // Explicit callers can await the native subscriptions they initiated.
+    // The production one-second timer never waits for a huge thread/resume:
+    // otherwise the health watchdog kills the bridge and its active turns.
+    return waitForConnections ? update.then(async () => {
+      await Promise.allSettled(this.connecting.values());
+      void this.delivery.flush().catch(() => {});
+    }) : update;
   }
 
   private async update(): Promise<void> {
@@ -403,6 +464,16 @@ export class BridgeRuntime {
     this.closeInactiveSubscriptions();
     this.activity.tick();
     await Promise.allSettled(this.store.bindings().map(binding => {
+      const previousTask = this.observedTasks.get(binding.id);
+      if (previousTask && !sameTask(previousTask, binding)) {
+        // Transfer changes the task behind a stable VK binding. An in-memory
+        // fallback boundary from the source must never be reused for the fork.
+        this.historyRecovery.disable(binding.id, previousTask);
+        this.releasedIdle.delete(binding.id);
+        this.demanded.delete(binding.id);
+        this.pendingReacquire.delete(binding.id);
+      }
+      this.observedTasks.set(binding.id, binding);
       // Detached ownership is persisted across a bridge restart. Rehydrate
       // the read-only rollout observer before polling, otherwise direct
       // Desktop/VS Code turns become invisible until VK explicitly reopens
@@ -419,13 +490,16 @@ export class BridgeRuntime {
     // outage, serial five-second subscription attempts could hold one update
     // for minutes and make the health report itself stale.
     let listedTasks: Awaited<ReturnType<CodexTasks["listTasks"]>> | null = null;
-    const starting = new Set<Promise<void>>();
     for (const listed of this.store.bindings()) {
       let binding = listed;
       let existing = this.connections.has(binding.id);
       if (existing && !this.connections.matches(binding.id, binding)) {
         this.closeSubscription(binding.id); existing = false;
       }
+      // A subscription already being resumed is owned by its original task.
+      // Wait for that attempt to settle before trying this binding again, but
+      // keep the rest of the bridge update and health checks running.
+      if (this.connecting.has(binding.id)) continue;
       if (!binding.attached || binding.peerId === null) {
         this.closeSubscription(binding.id); this.disableRolloutFallback(binding); continue;
       }
@@ -434,6 +508,14 @@ export class BridgeRuntime {
         // membership as an authorization boundary.
         this.store.setPaused(binding.id, false);
         binding = this.store.getBinding(binding.id)!;
+      }
+      // A command that was rejected before dispatch because neither the
+      // profile owner nor the active UI owner was reachable remains safe to
+      // probe. Reacquire it in the background until one route becomes
+      // available; never replay the rejected user input itself.
+      if (this.store.getValue<{ kind?: string }>(`route-failure:${binding.id}`)?.kind === "no-active-owner") {
+        this.releasedIdle.delete(binding.id);
+        this.demanded.add(binding.id);
       }
       // A final answer is persisted before delivery is attempted. Once the
       // critical VK queue drains, release a still-open stream on the next
@@ -462,6 +544,7 @@ export class BridgeRuntime {
         && terminal && !this.hasPendingTaskWork(binding.id)) continue;
       if (!existing && !this.connections.canAttempt(binding.id)) continue;
       if (existing) { this.connections.maintain(binding.id); continue; }
+      if (this.connecting.size >= 6) continue;
       listedTasks ??= await this.desktop.listTasks();
       const task = listedTasks.find(task => sameTask(task, binding));
       const current = this.store.getBinding(binding.id);
@@ -482,6 +565,7 @@ export class BridgeRuntime {
             const current = this.store.getBinding(binding.id);
             if (!this.connections.matches(binding.id, task) || !current?.attached || !sameTask(current, task)) return;
             this.store.atomic(() => {
+              this.store.setValue(`route-failure:${binding.id}`, null);
               this.disableRolloutFallback(current);
               this.store.markDesktopHandoff(binding.id, task, "live", this.now());
               // Native queued submissions acquire a turn later, including while the bridge is offline.
@@ -511,8 +595,11 @@ export class BridgeRuntime {
                   }
                 }
               }
+              this.mirror.acceptObservation(binding.id, observation.events, [
+                ...observation.inputTurnIds,
+                ...this.store.acceptedTurns(binding.id).map(turn => turn.turnId),
+              ]);
               for (const event of observation.events) {
-                this.mirror.accept(binding.id, event);
                 if (event.type === "final") {
                   this.store.settleAcceptedTurn(binding.id, event.turnId);
                   this.files?.observe(binding.id, "idle", event.turnId);
@@ -566,15 +653,14 @@ export class BridgeRuntime {
           });
         }
       })();
-      starting.add(start);
-      void start.finally(() => starting.delete(start));
-      // Limit concurrent native subscriptions without serializing unrelated
-      // conversations behind an unavailable client.
-      if (starting.size >= 6) await Promise.race(starting);
+      this.connecting.set(binding.id, start);
+      const settled = () => {
+        if (this.connecting.get(binding.id) === start) this.connecting.delete(binding.id);
+      };
+      void start.then(settled, settled);
       if (this.stopped) break;
       this.closeInactiveSubscriptions();
     }
-    await Promise.all(starting);
     // VK writes have their own serialized worker and may take many seconds.
     // Keep task reconciliation independent from that queue; the one-second
     // timer also flushes it, and stop() waits for its in-flight operation.
@@ -591,6 +677,7 @@ export class BridgeRuntime {
     await this.manager.idle();
     await this.operationReconciliation?.catch(() => {});
     await this.connections.stop();
+    await Promise.allSettled(this.connecting.values());
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
     await this.ticking?.catch(() => {});
     await this.manager.idle();

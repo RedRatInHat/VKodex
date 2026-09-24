@@ -26,8 +26,17 @@ class RoutedTaskStateStream implements TaskStateStream {
   private closed = false;
   private primaryClosed = false;
   constructor(readonly task: TaskRef, private readonly primary: TaskStateStream,
-    private readonly fallback: () => TaskStateStream) { this.active = primary; }
+    private readonly fallback: () => TaskStateStream,
+    private readonly preferFallback?: (task: TaskRef) => Promise<boolean>) { this.active = primary; }
   async start(timeoutMs?: number): Promise<void> {
+    // A live Desktop/VS Code owner can keep thread/resume pending for minutes
+    // on a large task. Discover that owner before touching the profile writer.
+    if (this.preferFallback && await this.preferFallback(this.task)) {
+      if (this.closed) throw new Error("Task subscription was closed before owner discovery finished.");
+      this.primary.close(); this.primaryClosed = true; this.active = this.fallback();
+      await this.active.start(timeoutMs);
+      return;
+    }
     try { await this.primary.start(timeoutMs); }
     catch (error) {
       if (!(error instanceof TaskOwnedByClientError) || this.closed) throw error;
@@ -44,12 +53,13 @@ class RoutedTaskStateStream implements TaskStateStream {
 
 /** Selects the configured source owner before opening a task stream. */
 export class RoutedTaskStateTransport implements TaskStateTransport {
-  constructor(private readonly fallback: TaskStateTransport, private readonly owners: readonly TaskStateOwnerRoute[]) {}
+  constructor(private readonly fallback: TaskStateTransport, private readonly owners: readonly TaskStateOwnerRoute[],
+    private readonly preferFallback?: (task: TaskRef) => Promise<boolean>) {}
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
     const owner = this.owners.find(owner => owner.owns(task));
     if (!owner) return this.fallback.subscribe(task, onState, onError);
     return new RoutedTaskStateStream(task, owner.states.subscribe(task, onState, onError),
-      () => this.fallback.subscribe(task, onState, onError));
+      () => this.fallback.subscribe(task, onState, onError), this.preferFallback);
   }
   close(): void {
     this.fallback.close();

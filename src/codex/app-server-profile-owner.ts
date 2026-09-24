@@ -20,7 +20,11 @@ export class AppServerProfileOwner {
   constructor(readonly sourceId: string, private readonly rpc: AppServerRpc,
     private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>) {
     this.executor = new AppServerTaskExecutor(rpc);
-    this.nativeStates = new AppServerTaskStateTransport(rpc, threadId => this.executor.questionSnapshot(threadId), task => this.executor.forget(task));
+    this.nativeStates = new AppServerTaskStateTransport(rpc,
+      threadId => this.executor.questionSnapshot(threadId),
+      (task, release) => this.executor.release(task, release),
+      (task, result) => { this.executor.acceptResumedTask(task, result); },
+      task => this.executor.resumeForStream(task));
     this.unsubscribeQuestions = this.executor.onQuestionsChanged(threadId => this.nativeStates.refresh(threadId));
     this.states = {
       subscribe: (task, onState, onError) => {

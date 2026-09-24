@@ -13,6 +13,61 @@ export class TaskMirror {
     }
   }
 
+  /** Owner snapshots can publish assistant items before their user item. Keep
+   * those items durable until the input is visible, then enqueue in causal order. */
+  acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[]): void {
+    const knownInputs = new Set(inputTurnIds);
+    const byTurn = new Map<string, TaskEvent[]>();
+    for (const event of events) {
+      const group = byTurn.get(event.turnId) ?? [];
+      group.push(event);
+      byTurn.set(event.turnId, group);
+      if (event.type === "user") knownInputs.add(event.turnId);
+    }
+    for (const [turnId, group] of byTurn) {
+      for (const event of group) if (event.type === "user") this.accept(bindingId, event);
+      // A terminal answer with no visible input can be a system-started turn
+      // or a truncated recovery snapshot. Never strand its answer forever.
+      const ready = knownInputs.has(turnId) || group.some(event => event.type === "final");
+      if (ready) this.flushDeferred(bindingId, turnId);
+      for (const event of group) {
+        if (event.type === "user") continue;
+        if ((event.type === "progress" || event.type === "final") && !ready) {
+          this.defer(bindingId, event);
+        } else this.accept(bindingId, event);
+      }
+    }
+    // A baseline input may become visible with no new event in this snapshot.
+    for (const turnId of inputTurnIds) if (!byTurn.has(turnId)) this.flushDeferred(bindingId, turnId);
+  }
+
+  private deferredKey(bindingId: string, turnId: string): string {
+    return `deferred-mirror:${bindingId}:${turnId}`;
+  }
+
+  private defer(bindingId: string, event: Extract<TaskEvent, { type: "progress" | "final" }>): void {
+    const key = this.deferredKey(bindingId, event.turnId);
+    const pending = this.store.getValue<TaskEvent[]>(key) ?? [];
+    const index = pending.findIndex(item => item.type === event.type && item.id === event.id);
+    if (index >= 0) pending[index] = event;
+    else pending.push(event);
+    // An unbounded commentary stream must not grow the SQLite value forever.
+    while (pending.length > 128) {
+      const oldestProgress = pending.findIndex(item => item.type === "progress");
+      if (oldestProgress < 0) break;
+      pending.splice(oldestProgress, 1);
+    }
+    this.store.setValue(key, pending);
+  }
+
+  private flushDeferred(bindingId: string, turnId: string): void {
+    const key = this.deferredKey(bindingId, turnId);
+    const pending = this.store.getValue<TaskEvent[]>(key) ?? [];
+    if (!pending.length) return;
+    for (const event of pending) this.accept(bindingId, event);
+    this.store.setValue(key, null);
+  }
+
   accept(bindingId: string, event: TaskEvent): void {
     if (event.type === "status") {
       if (event.status !== "running") this.store.retireTurnCommentary(bindingId, event.turnId);

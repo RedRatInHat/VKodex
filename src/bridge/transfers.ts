@@ -154,8 +154,13 @@ export class TaskTransfers {
           const next = this.store.updateTransfer(record, { blockedReason: "sourceChanged", detail: error.message }, this.now());
           this.publish(next);
         } catch { /* Another worker or a changed binding wins over this read. */ }
+      } else if (error instanceof ActionRejectedError || error instanceof DesktopUnavailableError) {
+        try {
+          const next = this.store.updateTransfer(record, { detail: error.message }, this.now());
+          this.publish(next);
+        } catch { /* Keep the last confirmed archive state if another worker won. */ }
       }
-      // An unavailable read leaves the original failure visible to health.
+      // An unavailable read does not authorize a second archive mutation.
     }
   }
 
@@ -247,6 +252,7 @@ export class TaskTransfers {
           step("fork");
           const target = await this.desktop.transferTask({ ...this.request(record),
             onForkSubmitted: () => save({ forkSubmitted: true }),
+            onForkRejected: () => save({ forkSubmitted: false }),
             onForkCreated: target => save({ target, phase: "preparingTarget" }),
           });
           save({ target, phase: "targetCreated" });
@@ -281,7 +287,7 @@ export class TaskTransfers {
         await this.verifySourceGoal(record);
         await this.desktop.verifyTransferTarget(this.request(record), target);
         // The commit and stream generation change share one SQLite transaction.
-        this.store.switchTransfer(record, { ...target, title: record.source.title, projectId: record.targetProjectId });
+        this.store.switchTransfer(record, { ...target, title: record.source.title, projectId: record.targetProjectId }, this.now());
         record = this.store.transfer(record.bindingId)!;
         this.store.markDesktopHandoff(record.bindingId, record.target!, "live");
       }

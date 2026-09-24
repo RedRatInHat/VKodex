@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
-import { Duplex } from "node:stream";
+import { EventEmitter } from "node:events";
+import { Duplex, PassThrough } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
-import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
-import { AppServerTaskTransfer, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
+import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
 import { findAcceptedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
@@ -19,12 +20,14 @@ import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
 import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/desktop/history-recovery.js";
+import { comparablePath } from "../src/desktop/paths.js";
 import { observeTaskState } from "../src/desktop/task-observation.js";
 import { pendingCodexQuestions, asyncQuestionReply, parseAsyncQuestionReply } from "../src/desktop/questions.js";
 import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateTransport } from "../src/desktop/state-transport.js";
 import { BridgeStore } from "../src/bridge/store.js";
+import { captureRestartIntent, readRestartIntent } from "../src/desktop/restart-intent.js";
 import type { Binding, BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
@@ -152,7 +155,8 @@ const runtimeAdapters = (states: TaskStateTransport) => ({
 });
 
 function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => Promise<import("../src/bridge/contracts.js").BridgeHealthSnapshot>,
-  streamTransport?: TaskStateTransport) {
+  streamTransport?: TaskStateTransport,
+  inspectExternalOwner?: (task: import("../src/core/codex-tasks.js").TaskRef) => Promise<"idle" | "active" | "systemError" | null>) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -172,11 +176,54 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client);
   let now = 100_000;
   const runtime = new DesktopBridgeRuntime(access, desktop, chat, store,
-    runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), () => now, undefined, undefined, 60_000, healthCheckOverride);
+    { ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)),
+      ...(inspectExternalOwner ? { inspectExternalOwner } : {}) },
+    () => now, undefined, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
+
+test("restart recovery does not resume a turn still active in a UI owner", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-recovery-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const s = runtimeSetup(t, undefined, undefined, async () => "active");
+  s.server.onFollow = () => s.server.snapshot();
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  let inspected = false;
+  s.desktop.inspectTask = async () => { inspected = true; throw new Error("Native resume must not run"); };
+  await s.runtime.recoverRestartIntent(root);
+  assert.equal(inspected, false);
+  assert.equal(await readRestartIntent(root), null);
+  assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
+});
+
+test("a slow native resume does not stall the bridge update or start duplicate subscriptions", async t => {
+  let release!: () => void;
+  const resumed = new Promise<void>(resolve => { release = resolve; });
+  let subscriptions = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      subscriptions++;
+      let closed = false;
+      return {
+        task,
+        start: async () => { await resumed; if (!closed) onState(state([], "completed"), true); },
+        verifyOwner: async () => { if (closed) throw new Error("closed"); },
+        close: () => { closed = true; },
+      };
+    },
+    close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  t.after(release);
+  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("bridge tick waited for native resume")), 250));
+  await Promise.race([s.runtime.tick(false), timeout]);
+  await s.runtime.tick(false);
+  assert.equal(subscriptions, 1);
+  release();
+});
 
 const rolloutFinal = (timestamp: number, id: string, turnId: string, text: string) => JSON.stringify({
   timestamp: new Date(timestamp).toISOString(), type: "response_item",
@@ -190,6 +237,10 @@ test("rollout fallback catches a final written between stream failure and the fi
   const rolloutPath = path.join(root, "rollout.jsonl");
   await writeFile(rolloutPath, rolloutFinal(80_000, "old-final", "old-turn", "Old answer"));
   const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  s.store.setValue(`task-details:${binding.id}`, {
+    title: "Fixture", status: "failed", failure: "systemError", workspace: "/fixture",
+    model: "gpt-5.6-sol", effort: "high", nextModel: "gpt-5.6-sol", nextEffort: "high", context: null,
+  });
   const fallback = s.runtime as unknown as {
     enableRolloutFallback(binding: Binding): void;
     mirrorRolloutFallback(binding: Binding): Promise<void>;
@@ -201,6 +252,9 @@ test("rollout fallback catches a final written between stream failure and the fi
   const deliveries = s.store.pendingDeliveries().map(delivery => delivery.view.text);
   assert.ok(deliveries.some(text => text.includes("Recovered answer")));
   assert.ok(deliveries.every(text => !text.includes("Old answer")));
+  const details = s.store.getValue<{ status: string; failure?: string }>(`task-details:${binding.id}`);
+  assert.equal(details?.status, "idle");
+  assert.equal(details?.failure, undefined);
 });
 
 test("rollout fallback recovers an accepted VK turn that finished before reconnection", async t => {
@@ -226,16 +280,20 @@ test("rollout fallback recovers an accepted VK turn that finished before reconne
   assert.deepEqual(s.store.acceptedTurns(binding.id), []);
 });
 
-test("rollout fallback does not replay a rebuilt branch with fresh message IDs", async t => {
+test("rollout fallback rebases a rebuilt branch and resumes new events without replay", async t => {
   const s = runtimeSetup(t);
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
   const originalPath = path.join(root, "original.jsonl");
   const rebuiltPath = path.join(root, "rebuilt.jsonl");
   await writeFile(rebuiltPath, rolloutFinal(101_000, "rewritten-final", "rewritten-turn", "Previously delivered answer")
-    + rolloutFinal(102_000, "accepted-final", "accepted-turn", "New accepted answer"));
+    + rolloutFinal(102_000, "accepted-final", "accepted-turn", "New accepted answer")
+    + rolloutFinal(103_000, "direct-final", "direct-turn", "New direct answer during rebase"));
   const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: rebuiltPath });
   s.store.setValue(`projection:${binding.id}`, {
-    since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], seen: {}, semanticByIdentity: {}, rolloutPath: originalPath,
+    since: 80_000, lastObservedAt: 90_000, activeAtAttach: [],
+    // The rebuilt branch repeats this previously projected turn under the
+    // same item identity. A later direct turn must still cross the rebase.
+    seen: { '["rewritten-turn","final","rewritten-final"]': "known" }, semanticByIdentity: {}, rolloutPath: originalPath,
   });
   s.store.recordOperation("accepted-operation", binding, "vk-inbox", binding.id, 95_000);
   s.store.finishOperation("accepted-operation", "accepted");
@@ -250,8 +308,15 @@ test("rollout fallback does not replay a rebuilt branch with fresh message IDs",
   const deliveries = s.store.pendingDeliveries().map(delivery => delivery.view.text);
   assert.ok(deliveries.every(text => !text.includes("Previously delivered answer")));
   assert.ok(deliveries.some(text => text.includes("New accepted answer")));
+  assert.ok(deliveries.some(text => text.includes("New direct answer during rebase")));
   assert.deepEqual(s.store.acceptedTurns(binding.id), []);
-  assert.equal(s.store.getValue<{ kind: string }>(`rollout-failure:${binding.id}`)?.kind, "historyRebuilt");
+  assert.equal(s.store.getValue(`rollout-failure:${binding.id}`), null);
+  assert.equal(s.store.getValue<{ rolloutPath?: string }>(`projection:${binding.id}`)?.rolloutPath, comparablePath(rebuiltPath));
+
+  await appendFile(rebuiltPath, rolloutFinal(106_000, "new-direct-final", "new-direct-turn", "New direct answer"));
+  s.advance(1_001);
+  await fallback.mirrorRolloutFallback(binding);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("New direct answer")));
 });
 
 test("rollout fallback reports an oversized record and recovers after the file is corrected", async t => {
@@ -273,6 +338,20 @@ test("rollout fallback reports an oversized record and recovers after the file i
   for (let attempt = 0; attempt < 3; attempt++) { await fallback.mirrorRolloutFallback(binding); s.advance(1_001); }
   assert.equal(s.store.getValue(`rollout-failure:${binding.id}`), null);
   assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("Recovered")));
+});
+
+test("a transferred binding never replays copied history from its old fallback epoch", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-fallback-"));
+  const rolloutPath = path.join(root, "target.jsonl");
+  await writeFile(rolloutPath, rolloutFinal(101_000, "copied", "source-turn", "Copied source answer")
+    + rolloutFinal(111_000, "new", "target-turn", "New target answer"));
+  const recovery = new RolloutTaskHistoryRecovery();
+  recovery.enable("stable-vk-binding", 90_000); // In-memory source boundary.
+  const checkpoint = { since: 105_000, lastObservedAt: 105_000, activeAtAttach: [], seen: {},
+    rolloutPath: comparablePath(rolloutPath) };
+  const result = await recovery.poll("stable-vk-binding", { ...ref, rolloutPath }, checkpoint,
+    null, new Set(), 115_000);
+  assert.deepEqual(result?.events.filter(event => event.type === "final").map(event => event.text), ["New target answer"]);
 });
 
 test("runtime reconciles an uncertain prompt from Codex history after restart", async t => {
@@ -402,13 +481,14 @@ test("health keeps checking while the initial task subscription is still pending
   s.runtime.start();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.ok(s.follows().includes(true));
-  assert.equal(checks, 0);
+  const initialChecks = checks;
+  assert.ok(initialChecks >= 1, "health reports even while native resume is pending");
   let settled = false;
   s.advance(60_001);
   void s.runtime.tick().then(() => { settled = true; });
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(settled, false);
-  assert.equal(checks, 1);
+  assert.ok(checks > initialChecks);
 });
 
 test("reconnection shares one catalog read across subscriptions and starts them concurrently", async t => {
@@ -476,6 +556,7 @@ test("IPC decoding accepts large UTF-8 frames in chunks and continues with the n
 test("runtime connects a large task and mirrors progress without forwarding tool output", async t => {
   const s = runtimeSetup(t);
   s.server.dataState = state([
+    { id: "prompt", type: "userMessage", content: [{ type: "text", text: "Inspect this task" }] },
     { id: "command", type: "commandExecution", output: "x".repeat(24 * 1024 * 1024) },
     { id: "old-progress", type: "agentMessage", phase: "commentary", text: "Progress before connecting" },
   ]);
@@ -485,7 +566,7 @@ test("runtime connects a large task and mirrors progress without forwarding tool
   assert.match(s.sent[0]!.view.text, /^думаю\.\.\. · обновлено \d{2}:\d{2}:\d{2}$/u);
   s.server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11, sourceClientId: "owner", targetClientIds: ["bridge-client"], params: {
     hostId: ref.hostId, conversationId: ref.threadId, change: { type: "patches", baseRevision: 1, revision: 2, patches: [
-      { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 2], value: { id: "progress", type: "agentMessage", phase: "commentary", text: "Progress after connecting" } },
+      { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 3], value: { id: "progress", type: "agentMessage", phase: "commentary", text: "Progress after connecting" } },
     ] },
   } });
   await new Promise(resolve => setImmediate(resolve));
@@ -622,6 +703,37 @@ test("systemError overrides orphaned history, reports usage limits once and perm
   await adapter.submit({ operationId: "retry", task, text: "Continue" });
   assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
   assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
+});
+
+test("runtime waits for a delayed owner user item before mirroring its answer", async t => {
+  const s = runtimeSetup(t);
+  s.server.dataState = state();
+  await s.runtime.tick();
+  s.server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11,
+    sourceClientId: "owner", targetClientIds: ["bridge-client"], params: {
+      hostId: ref.hostId, conversationId: ref.threadId,
+      change: { type: "patches", baseRevision: 1, revision: 2, patches: [
+        { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 0],
+          value: { id: "early-answer", type: "agentMessage", phase: "commentary", text: "Answer first in snapshot" } },
+      ] },
+    } });
+  await new Promise(resolve => setImmediate(resolve));
+  await s.runtime.tick();
+  assert.equal(s.sent.some(item => item.view.text === "Answer first in snapshot"), false);
+
+  s.server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11,
+    sourceClientId: "owner", targetClientIds: ["bridge-client"], params: {
+      hostId: ref.hostId, conversationId: ref.threadId,
+      change: { type: "patches", baseRevision: 2, revision: 3, patches: [
+        { op: "add", path: ["turnHistory", "history", "entitiesByKey", "tail", "items", 0],
+          value: { id: "late-input", type: "userMessage", content: [{ type: "text", text: "Original request" }] } },
+      ] },
+    } });
+  await new Promise(resolve => setImmediate(resolve));
+  await s.runtime.tick();
+  assert.deepEqual(s.sent.map(item => item.view.text).filter(text => text.includes("Original request") || text.includes("Answer first")), [
+    "## user request\n\nOriginal request", "Answer first in snapshot",
+  ]);
 });
 
 test("server overload is reported separately from a generic Codex system error", () => {
@@ -1134,6 +1246,17 @@ test("an idle lease stays detached across restart and is reacquired for a VK pro
   assert.equal(s.store.getValue(`task-stream-mode:${s.binding.id}`), "attached");
 });
 
+test("a saved pre-dispatch route failure is probed until ownership recovers without replaying input", async t => {
+  const s = runtimeSetup(t);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
+  s.store.setValue(`route-failure:${s.binding.id}`, { at: 1, kind: "no-active-owner" });
+  await s.runtime.tick();
+  assert.ok(s.follows().length >= 1);
+  assert.equal(s.store.getValue(`route-failure:${s.binding.id}`), null);
+  assert.equal(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))), false);
+});
+
 test("a VK prompt keeps an idle reacquisition leased until turn/start is dispatched", async t => {
   const s = runtimeSetup(t, undefined, new FakeStateTransport(state([], "completed")));
   await s.runtime.handle({ eventId: "vk-idle-reacquire", peerId: s.peerId, senderId: 101, text: "Continue" });
@@ -1198,6 +1321,40 @@ test("transfer history digest covers every page and ignores fork-assigned item I
   await assert.rejects(completedHistoryDigest("source", "wrong-boundary", pages("Original", "source-item")), ActionRejectedError);
 });
 
+test("transfer RPC assembles a large fragmented response without repeatedly copying the prefix", async () => {
+  const stdin = new PassThrough(); const stdout = new PassThrough(); const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, pid: undefined, exitCode: null, signalCode: null });
+  stdin.on("data", (chunk: Buffer) => {
+    const request = JSON.parse(chunk.toString("utf8")) as IpcObject;
+    if (request.id === 1) setImmediate(() => stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`));
+    if (request.id === 2) setImmediate(() => {
+      const frame = Buffer.from(`${JSON.stringify({ id: 2, result: { padding: "x".repeat(20 * 1024 * 1024) } })}\n`);
+      for (let offset = 0; offset < frame.length; offset += 64 * 1024) stdout.write(frame.subarray(offset, offset + 64 * 1024));
+    });
+  });
+  const rpc = new TransferRpc("unused", () => child as never, 5_000);
+  const result = await rpc.call("thread/list", {});
+  assert.equal((result.padding as string).length, 20 * 1024 * 1024);
+});
+
+test("transfer digest retries oversized read-only pages without dropping turns", async () => {
+  const calls: number[] = [];
+  const page = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params.limit as number);
+    if ((params.limit as number) > 10) throw new TransferPageTooLargeError();
+    return params.cursor
+      ? { data: [{ id: "last", status: "completed", items: [{ type: "agentMessage", text: "Done" }] }], nextCursor: null }
+      : { data: [{ id: "first", status: "completed", items: [{ type: "userMessage", text: "Keep" }] }], nextCursor: "last" };
+  };
+  const expected = await completedHistoryDigest("source", "last", async params => params.cursor
+    ? { data: [{ id: "last", status: "completed", items: [{ type: "agentMessage", text: "Done" }] }], nextCursor: null }
+    : { data: [{ id: "first", status: "completed", items: [{ type: "userMessage", text: "Keep" }] }], nextCursor: "last" });
+  assert.equal(await completedHistoryDigest("source", "last", page), expected);
+  assert.deepEqual(calls, [100, 50, 25, 12, 6, 6]);
+  const oversized = async (): Promise<IpcObject> => { throw new TransferPageTooLargeError(); };
+  await assert.rejects(completedHistoryDigest("source", "last", oversized), /Один ход истории Codex превышает предел чтения/u);
+});
+
 test("transfer history digest ignores non-portable App Server projection items", async () => {
   const page = (items: IpcObject[]) => async (): Promise<IpcObject> => ({
     data: [{ id: "last", status: "completed", items }], nextCursor: null,
@@ -1207,14 +1364,56 @@ test("transfer history digest ignores non-portable App Server projection items",
     { id: "agent", type: "agentMessage", text: "Done" },
   ];
   const withoutPlaceholder = await completedHistoryDigest("target", "last", page(visible));
-  for (const type of ["reasoning", "fileChange", "contextCompaction"]) {
+  for (const type of ["reasoning", "fileChange", "contextCompaction", "webSearch", "commandExecution", "newProjectionType"]) {
     assert.equal(await completedHistoryDigest("source", "last", page([
       visible[0]!, { id: `projection-${type}`, type, summary: [{ text: "private" }], content: [], changes: [] }, visible[1]!,
     ])), withoutPlaceholder);
   }
-  assert.notEqual(await completedHistoryDigest("source", "last", page([
-    visible[0]!, { id: "future", type: "newProjectionType", content: [] }, visible[1]!,
+  assert.equal(await completedHistoryDigest("source", "last", page([
+    { ...visible[0]!, clientId: "source-profile-operation" }, { ...visible[1]!, delivery: { state: "source" } },
   ])), withoutPlaceholder);
+  assert.notEqual(await completedHistoryDigest("source", "last", page([
+    { ...visible[0]!, content: [{ type: "text", text: "Changed" }] }, visible[1]!,
+  ])), withoutPlaceholder);
+  assert.notEqual(await completedHistoryDigest("source", "last", page([
+    visible[0]!, { ...visible[1]!, text: "Changed" },
+  ])), withoutPlaceholder);
+});
+
+test("transfer history compares reconstructed user text and media without losing substantive content", async () => {
+  const page = (content: IpcObject[]) => async (): Promise<IpcObject> => ({ data: [{ id: "last", status: "completed", items: [
+    { type: "userMessage", content }, { type: "agentMessage", text: "Done", phase: "final_answer" },
+  ] }], nextCursor: null });
+  const image = { type: "image", url: "data:image/png;base64,AAAA", detail: null };
+  const original = await completedHistoryDigest("source", "last", page([
+    { type: "text", text: "\n", text_elements: [] }, image,
+  ]), { version: 3 });
+  assert.equal(original, await completedHistoryDigest("target", "last", page([
+    { type: "image", image_url: image.url },
+  ]), { version: 3 }));
+  assert.notEqual(original, await completedHistoryDigest("target", "last", page([
+    { type: "text", text: "Describe this" }, image,
+  ]), { version: 3 }));
+  assert.notEqual(original, await completedHistoryDigest("target", "last", page([
+    { type: "image", url: "data:image/png;base64,BBBB" },
+  ]), { version: 3 }));
+  assert.notEqual(original, await completedHistoryDigest("target", "last", page([
+    { type: "image", url: image.url, detail: "low" },
+  ]), { version: 3 }));
+});
+
+test("legacy transfer digest remains available for in-flight checkpoints", async () => {
+  const page = (clientId: string, withTool: boolean) => async (): Promise<IpcObject> => ({
+    data: [{ id: "last", status: "completed", items: [
+      { id: "user", type: "userMessage", clientId, content: [{ type: "text", text: "Keep me" }] },
+      ...(withTool ? [{ id: "tool", type: "webSearch", query: "local projection" }] : []),
+      { id: "agent", type: "agentMessage", text: "Done" },
+    ] }], nextCursor: null,
+  });
+  assert.notEqual(await completedHistoryDigest("source", "last", page("source", true), { version: 1 }),
+    await completedHistoryDigest("target", "last", page("target", false), { version: 1 }));
+  assert.equal(await completedHistoryDigest("source", "last", page("source", true), { version: 2 }),
+    await completedHistoryDigest("target", "last", page("target", false), { version: 2 }));
 });
 
 test("a switched target may have newer turns while the copied boundary stays identical", async () => {
@@ -1270,10 +1469,10 @@ test("semantic transfer checkpoints ignore harmless file metadata changes but re
   const transfer = new AppServerTaskTransfer({ sourceHome: () => path.dirname(file) } as never,
     { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} });
   transfer.checkpoint = async () => ({ lastTurnId: "last", rolloutPath: file, size: 200, mtimeMs: 20, semanticDigest: "same-content",
-    workspace: path.dirname(file), model: "model-a", effort: "high" });
+    semanticDigestVersion: 2, workspace: path.dirname(file), model: "model-a", effort: "high" });
   const task = { hostId: "local", threadId: "source" };
   const expected = { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "same-content",
-    workspace: path.dirname(file), model: "model-a", effort: "high" };
+    semanticDigestVersion: 2 as const, workspace: path.dirname(file), model: "model-a", effort: "high" };
   await transfer.verifySource(task, expected);
   await assert.rejects(transfer.verifySource(task, { ...expected, effort: "medium" }), TransferConflictError);
   await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "different" }), TransferConflictError);
@@ -1302,6 +1501,72 @@ test("transfer verifies workspace, model and effort from the target rollout befo
   await transfer.verifyTarget(request, target);
   await writeContext("model-a", "medium");
   await assert.rejects(transfer.verifyTarget(request, target), /Модель, effort или рабочая папка копии/u);
+});
+
+test("an in-flight v1 transfer verifies a portable target without trusting profile-local projections", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-v1-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  await mkdir(sourceHome, { recursive: true }); await mkdir(targetHome, { recursive: true });
+  const rollout = path.join(targetHome, "target.jsonl");
+  await writeFile(rollout, `${JSON.stringify({ type: "turn_context",
+    payload: { turn_id: "boundary", cwd: root, model: "model-a", effort: "high" } })}\n`);
+  const source = { ...ref, threadId: "source", sourceId: "work", title: "Fixture" };
+  const target: DesktopTask = { ...ref, threadId: "target", title: "Fixture", workspace: root, rolloutPath: rollout, updatedAt: 1 };
+  let targetText = "Done";
+  const transfer = new AppServerTaskTransfer({ sourceHome: task => task.sourceId === "work" ? sourceHome : targetHome,
+    listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }],
+    listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    read: async () => ({ title: target.title, projectId: null }) },
+  () => ({ call: async (method: string, params: IpcObject) => method === "thread/read"
+    ? { thread: { id: "target", forkedFromId: "source" } }
+    : params.itemsView === "summary" ? { data: [{ id: "boundary", status: "completed", items: [] }] }
+    : { data: [{ id: "boundary", status: "completed", items: [
+      { id: "user", type: "userMessage", clientId: params.threadId, content: [{ type: "text", text: "Prompt" }] },
+      ...(params.threadId === "source" ? [{ id: "tool", type: "webSearch", query: "local projection" }] : []),
+      { id: "agent", type: "agentMessage", text: params.threadId === "target" ? targetText : "Done", phase: "final_answer" },
+    ] }], nextCursor: null } }) as never);
+  const request: TransferTaskRequest = { operationId: "legacy-v1", startedAt: 1, task: source,
+    targetSourceId: "", projectId: null, checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(sourceHome, "source.jsonl"),
+      size: 1, mtimeMs: 1, semanticDigest: "saved-v1-digest", workspace: root, model: "model-a", effort: "high" } };
+  await transfer.verifyTarget(request, target);
+  targetText = "Changed";
+  await assert.rejects(transfer.verifyTarget(request, target), TransferConflictError);
+});
+
+test("an in-flight v2 transfer verifies a rebuilt media message without replacing its saved source boundary", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-v2-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  await mkdir(sourceHome, { recursive: true }); await mkdir(targetHome, { recursive: true });
+  const rollout = path.join(targetHome, "target.jsonl");
+  await writeFile(rollout, `${JSON.stringify({ type: "turn_context",
+    payload: { turn_id: "boundary", cwd: root, model: "model-a", effort: "high" } })}\n`);
+  const source = { ...ref, threadId: "source", sourceId: "work", title: "Fixture" };
+  const target: DesktopTask = { ...ref, threadId: "target", title: "Fixture", workspace: root, rolloutPath: rollout, updatedAt: 1 };
+  const sourceItems = [{ type: "userMessage", content: [
+    { type: "text", text: "\n", text_elements: [] }, { type: "image", url: "data:image/png;base64,AAAA" },
+  ] }];
+  let targetImage = "data:image/png;base64,AAAA";
+  const list = (threadId: string): Promise<IpcObject> => Promise.resolve({ data: [{ id: "boundary", status: "completed", items: threadId === "source"
+    ? sourceItems : [{ type: "userMessage", content: [{ type: "image", image_url: targetImage }] }] }], nextCursor: null });
+  const savedV2 = await completedHistoryDigest("source", "boundary", () => list("source"), { version: 2 });
+  const transfer = new AppServerTaskTransfer({ sourceHome: task => task.sourceId === "work" ? sourceHome : targetHome,
+    listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }],
+    listTasks: async () => [target], listProjects: async () => [] },
+  { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    read: async () => ({ title: target.title, projectId: null }) },
+  () => ({ call: async (method: string, params: IpcObject) => method === "thread/read"
+    ? { thread: { id: target.threadId, forkedFromId: source.threadId } }
+    : params.itemsView === "summary" ? { data: [{ id: "boundary", status: "completed", items: [] }] }
+      : list(String(params.threadId)) }) as never);
+  const request: TransferTaskRequest = { operationId: "saved-v2", startedAt: 1, task: source,
+    targetSourceId: "", projectId: null, checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(sourceHome, "source.jsonl"),
+      size: 1, mtimeMs: 1, semanticDigest: savedV2, semanticDigestVersion: 2, workspace: root, model: "model-a", effort: "high" } };
+  await transfer.verifyTarget(request, target);
+  targetImage = "data:image/png;base64,BBBB";
+  await assert.rejects(transfer.verifyTarget(request, target), TransferConflictError);
 });
 
 test("desktop transfer delegates from the catalog without opening an idle source task", async () => {
@@ -1360,12 +1625,80 @@ test("App Server transfer forks a fixed completed boundary into the target profi
   assert.deepEqual(metadata, ["name:Moved task", "project:target-project"]);
 });
 
+test("a definite native fork rejection clears the durable submission marker after empty reconciliation", async () => {
+  const home = path.resolve("fixture-target-home");
+  const markers: string[] = [];
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => home,
+    listSources: () => [{ id: "work", label: ".codex-work" }],
+    listTasks: async () => [], listProjects: async () => [],
+  }, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  () => ({ call: async method => method === "thread/turns/list"
+    ? { data: [{ id: "boundary", status: "completed" }] }
+    : Promise.reject(new ActionRejectedError("Native fork rejected the staged history.")) }),
+  async () => ({ path: path.join(home, "source.jsonl"), cleanup: async () => {} }));
+  await assert.rejects(transfer.fork({ operationId: "rejected-fork", startedAt: 1, task: {
+    hostId: "local", threadId: "source", title: "Source", rolloutPath: path.resolve("source.jsonl"),
+  }, targetSourceId: "work", projectId: null,
+  onForkSubmitted: () => markers.push("submitted"), onForkRejected: () => markers.push("rejected") }),
+  ActionRejectedError);
+  assert.deepEqual(markers, ["submitted", "rejected"]);
+});
+
+test("transfer staging materializes a paginated fork's inherited and resumed rollout prefix", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-segments-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const sessions = path.join(sourceHome, "sessions");
+  await mkdir(sessions, { recursive: true }); await mkdir(targetHome, { recursive: true });
+  const record = (ordinal: number, type: string, payload: IpcObject) => JSON.stringify({ ordinal, type, payload });
+  const base = path.join(sessions, "rollout-parent.jsonl");
+  const resumed = path.join(sessions, "rollout-parent_resume.jsonl");
+  const leaf = path.join(sessions, "rollout-child.jsonl");
+  await writeFile(base, [record(0, "session_meta", { id: "parent", history_mode: "paginated" }),
+    record(1, "event_msg", { type: "task_started", turn_id: "initial" }),
+    record(2, "turn_context", { turn_id: "initial", model: "model-a", cwd: root }),
+    record(3, "event_msg", { type: "stale_writer_record" })].join("\n") + "\n");
+  await writeFile(resumed, [record(3, "session_meta", { id: "parent", history_mode: "paginated" }),
+    record(4, "turn_context", { turn_id: "boundary", model: "model-b", cwd: root }),
+    record(5, "event_msg", { type: "item_completed", item: { type: "AgentMessage", content: [{ type: "Text", text: "Done" }] } })].join("\n") + "\n");
+  await writeFile(leaf, [record(6, "session_meta", { id: "child", forked_from_id: "parent", history_mode: "paginated" }),
+    record(7, "event_msg", { type: "thread_settings_applied" })].join("\n") + "\n");
+  const staged = await stageTransferRollout(leaf, sourceHome, targetHome, "segmented", "boundary");
+  const rows = (await readFile(staged.path, "utf8")).trim().split("\n").map(line => JSON.parse(line) as IpcObject);
+  assert.deepEqual(rows.map(row => row.ordinal), [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(rows[3]!.type, "session_meta"); // Replaced stale writer row.
+  assert.equal((rows[5]!.payload as IpcObject).type, "agent_message");
+  assert.equal(staged.model, "model-b");
+  await staged.cleanup();
+});
+
+test("transfer staging rejects a missing inherited segment before submitting a fork", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-segments-gap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const sessions = path.join(sourceHome, "sessions");
+  await mkdir(sessions, { recursive: true }); await mkdir(targetHome, { recursive: true });
+  const leaf = path.join(sessions, "rollout-child.jsonl");
+  await writeFile(leaf, `${JSON.stringify({ ordinal: 5, type: "session_meta", payload: {
+    id: "child", forked_from_id: "missing", history_mode: "paginated" } })}\n`);
+  await assert.rejects(stageTransferRollout(leaf, sourceHome, targetHome, "missing-parent", "boundary"), TransferConflictError);
+});
+
 test("transfer compatibility keeps Responses history and exposes paginated user and agent items to the target app", () => {
   const session = transferCompatibleRecord({ type: "session_meta", payload: { id: "source", history_mode: "paginated" } }) as IpcObject;
   assert.equal((session.payload as IpcObject).history_mode, "legacy");
   const user = transferCompatibleRecord({ type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", client_id: "client",
-    content: [{ type: "text", text: "hello", text_elements: [] }, { type: "localImage", path: "C:\\image.png" }] } } }) as IpcObject;
-  assert.deepEqual(user.payload, { type: "user_message", client_id: "client", message: "hello", images: [], local_images: ["C:\\image.png"], audio: [], local_audio: [], text_elements: [] });
+    content: [{ type: "text", text: "hello", text_elements: [] }, { type: "image", image_url: "data:image/png;base64,current" },
+      { type: "image", url: "data:image/png;base64,legacy" }, { type: "local_image", path: "C:\\current.png" },
+      { type: "localImage", path: "C:\\legacy.png" }, { type: "audio", audio_url: "data:audio/wav;base64,current" },
+      { type: "audio", url: "data:audio/wav;base64,legacy" }, { type: "local_audio", path: "C:\\current.wav" },
+      { type: "localAudio", path: "C:\\legacy.wav" }] } } }) as IpcObject;
+  assert.deepEqual(user.payload, { type: "user_message", client_id: "client", message: "hello",
+    images: ["data:image/png;base64,current", "data:image/png;base64,legacy"],
+    local_images: ["C:\\current.png", "C:\\legacy.png"],
+    audio: ["data:audio/wav;base64,current", "data:audio/wav;base64,legacy"],
+    local_audio: ["C:\\current.wav", "C:\\legacy.wav"], text_elements: [] });
   const agent = transferCompatibleRecord({ type: "event_msg", payload: { type: "item_completed", item: { type: "AgentMessage", phase: "final_answer",
     content: [{ type: "Text", text: "done" }] } } }) as IpcObject;
   assert.deepEqual(agent.payload, { type: "agent_message", message: "done", phase: "final_answer", memory_citation: null });
@@ -1456,6 +1789,72 @@ test("transfer verification rejects a native fork of another source before switc
     task: { ...ref, title: "Fixture" }, targetSourceId: "work", projectId: null,
     checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(home, "source.jsonl"), size: 1, mtimeMs: 1 } }, target),
   /из другого источника/u);
+});
+
+test("transfer verification accepts a paginated branch whose final inherited session is the source", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-lineage-"));
+  const rollout = path.join(home, "target.jsonl");
+  const source = "source-leaf";
+  const target: DesktopTask = { hostId: "local", threadId: "new-thread", sourceId: "work", title: "Fixture",
+    workspace: home, rolloutPath: rollout, updatedAt: 1 };
+  try {
+    await writeFile(rollout, [
+      { type: "session_meta", payload: { id: target.threadId } },
+      { type: "session_meta", payload: { id: "ancestor" } },
+      { type: "session_meta", payload: { id: source, forked_from_id: "ancestor" } },
+    ].map(record => JSON.stringify(record)).join("\n") + "\n");
+    const transfer = new AppServerTaskTransfer({ sourceHome: () => home,
+      listSources: () => [{ id: "work", label: "work" }], listTasks: async () => [target], listProjects: async () => [] },
+    { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+      read: async () => ({ title: target.title, projectId: null }) },
+    () => ({ call: async method => method === "thread/read"
+      ? { thread: { id: target.threadId, forkedFromId: "ancestor" } }
+      : { data: [{ id: "boundary", status: "completed" }] } }));
+    await transfer.verifyTarget({ operationId: "assembled-fork", startedAt: 1,
+      task: { ...ref, threadId: source, title: target.title }, targetSourceId: "work", projectId: null,
+      checkpoint: { lastTurnId: "boundary", rolloutPath: rollout, size: 1, mtimeMs: 1 } }, target);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("transfer verification falls back to exact persisted messages when native projections differ", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-rollout-digest-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const sourcePath = path.join(sourceHome, "source.jsonl"); const targetPath = path.join(targetHome, "target.jsonl");
+  await mkdir(sourceHome); await mkdir(targetHome);
+  const records = (id: string, message: string, clientId?: string, mode?: string) => [
+    { type: "session_meta", payload: { id, ...(mode ? { history_mode: mode } : {}) } },
+    { type: "turn_context", payload: { turn_id: "boundary" } },
+    { type: "event_msg", payload: { type: "user_message", message: "Prompt", ...(clientId ? { client_id: clientId } : {}) } },
+    { type: "event_msg", payload: { type: "agent_message", message, phase: "final_answer" } },
+    { type: "event_msg", payload: { type: "task_complete" } },
+  ].map(record => JSON.stringify(record)).join("\n") + "\n";
+  try {
+    await writeFile(sourcePath, records("source-thread", "Answer", "original-client"));
+    await writeFile(targetPath, records("target-thread", "Answer"));
+    const target: DesktopTask = { hostId: "local", threadId: "target-thread", sourceId: "target", title: "Fixture",
+      workspace: root, rolloutPath: targetPath, updatedAt: 1 };
+    let fullReads = 0;
+    const transfer = new AppServerTaskTransfer({ sourceHome: task => task.sourceId === "target" ? targetHome : sourceHome,
+      listSources: () => [{ id: "target", label: "target" }], listTasks: async () => [target], listProjects: async () => [] },
+    { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+      read: async () => ({ title: target.title, projectId: null }) },
+    () => ({ call: async (method, params) => method === "thread/read"
+      ? { thread: { id: target.threadId, forkedFromId: "source-thread" } }
+      : params.itemsView === "summary" ? { data: [{ id: "boundary", status: "completed" }] }
+        : (fullReads++, { data: [{ id: "boundary", status: "completed", items: [{ type: "agentMessage", text: "Native projection differs", phase: "final_answer" }] }], nextCursor: null }) }));
+    const request: TransferTaskRequest = { operationId: "rollout-digest", startedAt: 1,
+      task: { hostId: "local", threadId: "source-thread", sourceId: "source", title: target.title, rolloutPath: sourcePath },
+      targetSourceId: "target", projectId: null,
+      checkpoint: { lastTurnId: "boundary", rolloutPath: sourcePath, size: 1, mtimeMs: 1, semanticDigest: "different-native-digest", semanticDigestVersion: 3 } };
+    await transfer.verifyTarget(request, target);
+    await writeFile(targetPath, records("target-thread", "Changed answer"));
+    await assert.rejects(transfer.verifyTarget(request, target), /Переносимая переписка копии не совпадает/u);
+    await writeFile(sourcePath, records("source-thread", "Answer", "original-client", "paginated"));
+    await writeFile(targetPath, records("target-thread", "Answer", undefined, "legacy"));
+    const previousReads = fullReads;
+    await transfer.verifyTarget(request, target);
+    assert.equal(fullReads, previousReads, "cross-mode verification should not rebuild a large native projection");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("transfer verification accepts matching lineage and older clients without lineage", async () => {

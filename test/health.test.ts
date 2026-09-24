@@ -224,6 +224,38 @@ test("health names a disconnected running task but ignores an idle detached owne
   assert.equal(report.checks.some(check => check.name === "codex_task:idle"), false);
 });
 
+test("health ignores a stale terminal failure on a detached task", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+    failedBindings: 0, bindings: [{ id: "stale", title: "Stale task", source: ".codex", status: "failed",
+      connected: false, streamMode: "detached" as const, lastConfirmedAt: 90_000, failure: "systemError" as const }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  assert.equal(report.checks.find(check => check.name === "codex_tasks")?.state, "ok");
+  assert.equal(report.checks.some(check => check.name === "codex_task:stale"), false);
+});
+
+test("health reports a detached task whose command routes rejected before dispatch", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding(task); store.setChat(binding.id, 2_000_000_001, 1); store.setAttached(binding.id, true);
+  store.setValue(`route-failure:${binding.id}`, { at: 90_000, kind: "no-active-owner" });
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+    failedBindings: 0, bindings: [{ id: binding.id, title: binding.title, source: ".codex", status: "idle",
+      connected: false, streamMode: "detached" as const, lastConfirmedAt: null, failure: null }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  const route = report.checks.find(check => check.name === `codex_route:${binding.id}`)!;
+  assert.equal(route.state, "failed");
+  assert.match(route.detail, /отклонён до отправки.*адаптер/u);
+});
+
 test("health detects an accepted VK turn stranded behind an idle or unavailable task", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const task = (await new HealthDesktop().listTasks())[0]!;

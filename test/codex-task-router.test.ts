@@ -131,3 +131,19 @@ test("state router falls back to an already connected UI owner only for an activ
   const stream = routed.subscribe(work, () => {}, () => {}); await stream.start(); stream.close();
   assert.deepEqual(used, ["native:start", "native:close", "client:start", "client:close"]);
 });
+
+test("state router follows a discovered UI owner before resuming the profile writer", async () => {
+  const used: string[] = [];
+  const native: TaskStateTransport = {
+    subscribe: task => ({ task, start: async () => { used.push("native:start"); }, verifyOwner: async () => {}, close: () => used.push("native:close") }),
+    close: () => {},
+  };
+  const client: TaskStateTransport = {
+    subscribe: task => ({ task, start: async () => { used.push("client:start"); }, verifyOwner: async () => {}, close: () => used.push("client:close") }),
+    close: () => {},
+  };
+  const routed = new RoutedTaskStateTransport(client, [{ owns: task => task.sourceId === "work", states: native }],
+    async task => { used.push(`discover:${task.threadId}`); return true; });
+  const stream = routed.subscribe(work, () => {}, () => {}); await stream.start(); stream.close();
+  assert.deepEqual(used, [`discover:${work.threadId}`, "native:close", "client:start", "client:close"]);
+});

@@ -30,6 +30,8 @@ export interface TaskObservation {
   readonly details: TaskDetails;
   readonly questions: readonly CodexQuestions[];
   readonly inputs: readonly TaskObservedInput[];
+  /** Turns whose user input is present in this snapshot, even if it was part of the baseline. */
+  readonly inputTurnIds: readonly string[];
   readonly latestTurnId: string;
   readonly activeTurnId: string | null;
 }

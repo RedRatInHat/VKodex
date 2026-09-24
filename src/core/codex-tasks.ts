@@ -63,6 +63,8 @@ export interface TransferTaskRequest {
   /** Once submitted, retries may reconcile but must never create another fork. */
   readonly forkSubmitted?: boolean;
   readonly onForkSubmitted?: () => void;
+  /** A definitive native rejection and an empty target reconciliation allow a safe retry. */
+  readonly onForkRejected?: () => void;
 }
 
 export interface TransferCheckpoint {
@@ -72,6 +74,8 @@ export interface TransferCheckpoint {
   readonly mtimeMs: number;
   /** Hash of all persisted completed turns. Older in-flight transfers lack it. */
   readonly semanticDigest?: string;
+  /** Digest schema. Version 3 also ignores blank separators dropped before media by a cross-profile fork. */
+  readonly semanticDigestVersion?: 1 | 2 | 3;
   /** Settings persisted at the copied turn boundary. Older checkpoints may not have them. */
   readonly workspace?: string;
   readonly model?: string;
@@ -326,6 +330,14 @@ export class DesktopUnavailableError extends Error {
   constructor(message = "Подключение к десктопу Codex недоступно.") {
     super(message);
     this.name = "DesktopUnavailableError";
+  }
+}
+
+/** A read-only transfer page exceeded the bounded App Server response buffer. */
+export class TransferPageTooLargeError extends DesktopUnavailableError {
+  constructor() {
+    super("Страница истории Codex слишком велика для чтения одним запросом.");
+    this.name = "TransferPageTooLargeError";
   }
 }
 

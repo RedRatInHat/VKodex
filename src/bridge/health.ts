@@ -159,6 +159,13 @@ export class BridgeHealthMonitor {
         : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
+      const routeFailure = this.store.getValue<{ at: number; kind: "no-active-owner" }>(`route-failure:${binding.id}`);
+      if (routeFailure?.kind === "no-active-owner") {
+        const at = Number.isSafeInteger(routeFailure.at) && Math.abs(routeFailure.at) <= 8.64e15
+          ? new Date(routeFailure.at).toISOString() : "неизвестно";
+        checks.push({ name: `codex_route:${binding.id}`, state: "failed",
+          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): последний запрос отклонён до отправки, потому что профильный владелец не смог получить задачу, а подключение клиента, который удерживает её, недоступно; сбой ${at}. Закрой задачу в другом клиенте либо восстанови его адаптер. После успешного подключения проверка снимется автоматически.` });
+      }
       const rolloutFailure = this.store.getValue<{ at: number; kind: "recordTooLarge" | "readFailed" | "historyRebuilt" }>(`rollout-failure:${binding.id}`);
       const failureAt = rolloutFailure && Number.isSafeInteger(rolloutFailure.at) && Math.abs(rolloutFailure.at) <= 8.64e15
         ? new Date(rolloutFailure.at).toISOString() : "неизвестно";
@@ -193,7 +200,9 @@ export class BridgeHealthMonitor {
         checks.push({ name: `codex_native_queue:${binding.id}`, state: binding.status === "unavailable" ? "degraded" : "failed",
           detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${queued.length} VK-запрос(а) остаются в штатной очереди Codex ${Math.round(queuedAge / 1_000)} с при состоянии «${binding.status}». VKodex не запускает и не повторяет их самостоятельно.` });
       }
-      if (!binding.failure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
+      const actionableFailure = binding.failure !== null
+        && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
+      if (!actionableFailure && (binding.connected || !["running", "approval"].includes(binding.status))) continue;
       const problem = binding.failure === "usageLimit" ? "последний ход завершился из-за лимита аккаунта"
         : binding.failure === "serverOverloaded" ? "последний ход остановлен: выбранная модель была перегружена"
         : binding.failure === "systemError" ? "последний ход завершился системной ошибкой Codex"

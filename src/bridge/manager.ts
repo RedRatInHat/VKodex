@@ -253,7 +253,10 @@ export class TaskManager {
       }
       finish();
     } catch (error) {
-      finish(!(error instanceof ActionRejectedError));
+      // A missing task owner is a confirmed pre-dispatch rejection, not an
+      // ambiguous mutation. Keep the durable inbox retry-safe without asking
+      // health reconciliation to search for an input that was never sent.
+      finish(!(error instanceof ActionRejectedError || error instanceof TaskNotOpenError));
       if (panelAction) this.panels.failure(input.peerId, error);
       const view = { text: error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError
         ? error.message : "Операция не завершена. Проверь подключение к Codex; автоматического повтора команды не будет.",
@@ -705,8 +708,23 @@ export class TaskManager {
     }
     if (!queued && ownerCommand && text === "/files") {
       if (!this.files) throw new ActionRejectedError("Передача файлов не настроена.");
-      const count = await this.files.collect(binding, true);
-      this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, { text: count ? `Подготовлено к отправке файлов: ${count}.` : "Новых выходных файлов пока нет. В запросе агенту попроси сохранить результат в папку отправки VKodex." }, binding.id);
+      // File uploads can legitimately take minutes. Do not hold the VK input
+      // handler open until Codex/VK responds; the durable collection lock
+      // makes repeated /files calls share the same operation.
+      this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, {
+        text: "Проверяю выдачу и ставлю файлы в очередь VK. Итог пришлю отдельным сообщением; повторный /files не создаст дубликаты.",
+      }, binding.id);
+      void this.files.collect(binding, true).then(count => {
+        this.store.enqueue(`files-result:${binding.id}:${input.eventId}`, input.peerId, {
+          text: count ? `Файлы поставлены в очередь VK: ${count}. Доставка может продолжаться в фоне.` : "Новых выходных файлов пока нет. В запросе агенту попроси сохранить результат в папку отправки VKodex.",
+          silent: true,
+        }, binding.id);
+      }).catch(error => {
+        this.store.enqueue(`files-result:${binding.id}:${input.eventId}`, input.peerId, {
+          text: error instanceof ActionRejectedError ? error.message : "Файлы пока не отправлены. Операция оставлена в очереди и будет повторена автоматически; повторный /files не создаст дубликаты.",
+          silent: true,
+        }, binding.id);
+      });
       return;
     }
     if (!text && !input.attachments?.length) throw new ActionRejectedError("Пришли текст или вложение для этой задачи.");
@@ -734,6 +752,7 @@ export class TaskManager {
         const queuedId = await this.desktop.queue(request);
         this.store.rememberQueuedInput(binding.id, operationId, queuedId);
         this.store.settlePromptDispatch(operationId, "accepted");
+        this.store.setValue(`route-failure:${binding.id}`, null);
         this.files?.finish(binding.id, operationId, "accepted");
         this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
         return;
@@ -743,6 +762,7 @@ export class TaskManager {
         : (await this.desktop.submit(request), null);
       if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
       this.store.settlePromptDispatch(operationId, "accepted");
+      this.store.setValue(`route-failure:${binding.id}`, null);
       this.files?.finish(binding.id, operationId, "accepted", receipt?.turnId ?? undefined);
       const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
       if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
@@ -766,13 +786,21 @@ export class TaskManager {
         if (acceptedTurn) {
           this.store.rememberAcceptedTurn(binding.id, acceptedTurn, operationId);
           this.store.settlePromptDispatch(operationId, "accepted");
+          this.store.setValue(`route-failure:${binding.id}`, null);
           this.files?.finish(binding.id, operationId, "accepted", acceptedTurn);
           this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
             { text: "Codex принял запрос; подтверждение ответа задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
           return;
         }
       }
-      const state = reported instanceof ActionRejectedError ? "rejected" : "uncertain";
+      // TaskNotOpenError is raised only after both command routes reject the
+      // request before start/steer is dispatched. Treating it as uncertain
+      // strands a prompt that Codex could not possibly have accepted and also
+      // hides the actual routing failure behind the generic uncertainty check.
+      if (reported instanceof TaskNotOpenError) this.store.setValue(`route-failure:${binding.id}`, {
+        at: Date.now(), kind: "no-active-owner",
+      });
+      const state = reported instanceof ActionRejectedError || reported instanceof TaskNotOpenError ? "rejected" : "uncertain";
       this.store.settlePromptDispatch(operationId, state);
       this.files?.finish(binding.id, operationId, state);
       throw reported;

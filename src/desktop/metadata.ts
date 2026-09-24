@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
-import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalUpdate, type TaskRef, type SubmitTaskRequest, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
+import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, TransferPageTooLargeError, UncertainActionError, TransferConflictError, type AccountRateLimit, type AccountRateLimitWindow, type AccountUsage, type AccountUsageProvider, type DesktopGoals, type DesktopMetadata, type TaskGoal, type TaskGoalUpdate, type TaskRef, type SubmitTaskRequest, type TransferCheckpoint, type UsageResetOutcome } from "./contracts.js";
 import { normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 export { parseTaskGoal } from "../core/task-goals.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
@@ -52,7 +52,8 @@ export class MetadataRpc {
     const child = this.launch();
     const mutating = !["model/list","thread/read", "thread/turns/list", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
-      let buffer = ""; let submitted = false; let finished = false;
+      let fragments: Buffer[] = []; let bufferedBytes = 0;
+      let submitted = false; let finished = false;
       const close = (error?: Error, result?: IpcObject) => {
         if (finished) return;
         finished = true; clearTimeout(timer);
@@ -64,13 +65,20 @@ export class MetadataRpc {
       const send = (message: IpcObject) => child.stdin.write(`${JSON.stringify(message)}\n`);
       child.stderr.resume();
       child.on("error", failed); child.on("close", failed); child.stdin.on("error", failed);
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
+      child.stdout.on("data", (chunk: Buffer) => {
         if (finished) return;
-        buffer += chunk;
-        if (Buffer.byteLength(buffer, "utf8") > 16 * 1024 * 1024) { failed(); return; }
-        while (buffer.includes("\n") && !finished) {
-          const end = buffer.indexOf("\n"); const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+        let start = 0;
+        while (start < chunk.length && !finished) {
+          const end = chunk.indexOf(0x0a, start);
+          const part = chunk.subarray(start, end < 0 ? chunk.length : end);
+          if (part.length) { fragments.push(part); bufferedBytes += part.length; }
+          if (bufferedBytes > (method === "thread/turns/list" ? 64 : 16) * 1024 * 1024) {
+            close(method === "thread/turns/list" ? new TransferPageTooLargeError() : new DesktopUnavailableError("Ответ Codex слишком большой."));
+            return;
+          }
+          if (end < 0) break;
+          const line = Buffer.concat(fragments, bufferedBytes).toString("utf8");
+          fragments = []; bufferedBytes = 0; start = end + 1;
           let message: unknown;
           try { message = JSON.parse(line); } catch { failed(); return; }
           if (!isObject(message)) { failed(); return; }
@@ -371,8 +379,12 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
         const relative = archived && path.relative(home, archived.rollout_path);
         if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid archive path");
         if (checkpoint.semanticDigest) {
+          // Archived transfer sources can contain hundreds of large turns.
+          // A normal metadata read uses 30 seconds, but digest pagination may
+          // need longer for one full page even though the archived file is sound.
           const digest = await completedHistoryDigest(task.threadId, checkpoint.lastTurnId,
-            params => new MetadataRpc(home).call("thread/turns/list", params));
+            params => new MetadataRpc(home, undefined, 120_000).call("thread/turns/list", params),
+            { version: checkpoint.semanticDigestVersion ?? 1 });
           if (digest !== checkpoint.semanticDigest) {
             throw new TransferConflictError("Содержимое истории источника изменилось перед архивацией. Архив сохранён, перенос требует проверки.");
           }

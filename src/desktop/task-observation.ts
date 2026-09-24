@@ -19,6 +19,9 @@ export function observeTaskState(state: IpcObject, previous: TaskObservationChec
       .map(item => String(item.clientId));
     return operationIds.length ? [{ turnId: turn.turnId, status: String(turn.status ?? ""), operationIds }] : [];
   });
+  const inputTurnIds = turns.filter(turn => typeof turn.turnId === "string" && Array.isArray(turn.items)
+    && turn.items.some(item => isObject(item) && item.type === "userMessage"))
+    .map(turn => String(turn.turnId));
   const activeTurn = activeTurnsFromState(state).at(-1);
   return {
     checkpoint: projected.checkpoint,
@@ -26,6 +29,7 @@ export function observeTaskState(state: IpcObject, previous: TaskObservationChec
     details: taskDetails(state),
     questions: pendingCodexQuestions(state),
     inputs,
+    inputTurnIds,
     latestTurnId: String(turns.at(-1)?.turnId ?? "runtime"),
     activeTurnId: typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null,
   };

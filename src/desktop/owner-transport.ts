@@ -6,7 +6,11 @@ const object = (value: unknown): value is Message => !!value && typeof value ===
 const owns = (value: Message, key: string) => Object.prototype.hasOwnProperty.call(value, key);
 
 export class OwnerTransportError extends Error {
-  constructor(readonly outcome: "unavailable" | "outdated" | "rejected" | "unknown", message: string) { super(message); }
+  constructor(
+    readonly outcome: "unavailable" | "outdated" | "rejected" | "unknown",
+    message: string,
+    readonly reason?: "endpointMissing",
+  ) { super(message); }
 }
 
 /** Experimental transport, not installed into production clients automatically.
@@ -190,7 +194,12 @@ export class OwnerTransport {
         checkDeadline();
         const result = await this.request("thread/read", { threadId: id, includeTurns: false });
         const thread = result.thread;
-        if (!object(thread) || thread.id !== id || !object(thread.status) || thread.status.type !== "idle") throw new OwnerTransportError("rejected", "Source and descendants must be confirmed idle before archival.");
+        // `systemError` is terminal and has no running turn. Requiring only
+        // `idle` left a safely verified failed source impossible to archive.
+        if (!object(thread) || thread.id !== id || !object(thread.status)
+          || !["idle", "systemError"].includes(String(thread.status.type))) {
+          throw new OwnerTransportError("rejected", "Source and descendants must be confirmed terminal before archival.");
+        }
         const goal = await this.request("thread/goal/get", { threadId: id });
         if (goal.goal !== null && (!object(goal.goal) || !["paused", "complete", "blocked", "usageLimited", "budgetLimited"].includes(String(goal.goal.status)))) throw new OwnerTransportError("rejected", "Pause source and descendant goals before archival.");
       }

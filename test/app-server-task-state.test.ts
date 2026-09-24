@@ -73,6 +73,7 @@ test("native state stream starts at most two profile reads concurrently", async 
   const releases: Array<() => void> = [];
   rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
     rpc.calls.push({ method, params });
+    if (method === "thread/unsubscribe") return {};
     assert.equal(method, "thread/resume"); active++; maximum = Math.max(maximum, active);
     await new Promise<void>(resolve => releases.push(resolve)); active--;
     const id = String(params.threadId);

@@ -103,6 +103,18 @@ test("metadata helper initializes once and exposes no task execution methods", a
   assert.equal(child.messages.length, 3); assert.equal(child.stdin.writableEnded, true);
 });
 
+test("metadata history reader accepts a fragmented response larger than the old 16 MiB cap", async () => {
+  const child = new MetadataChild();
+  const content = "x".repeat(20 * 1024 * 1024);
+  child.respond = message => ({ id: message.id, result: message.id === 2
+    ? { data: [{ id: "turn", status: "completed", items: [{ type: "agentMessage", text: content }] }], nextCursor: null }
+    : {} });
+  const result = await new MetadataRpc("fixture-home", () => child.asChild(), 5_000)
+    .call("thread/turns/list", { threadId: "fixture", limit: 1, itemsView: "full" });
+  assert.equal((result.data as IpcObject[])[0]?.id, "turn");
+  assert.equal(String(((result.data as IpcObject[])[0]?.items as IpcObject[])[0]?.text).length, content.length);
+});
+
 test("RPC helpers wait for process close and transfer identity is saved before releasing the writer", async () => {
   for (const kind of ["metadata", "transfer"] as const) {
     const child = new MetadataChild();

@@ -5,6 +5,7 @@ import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewT
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../core/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
+import type { TaskObservationCheckpoint } from "../core/task-observation.js";
 
 const bindingColumns = `id TEXT PRIMARY KEY, host_id TEXT NOT NULL, thread_id TEXT NOT NULL, title TEXT NOT NULL,
   peer_id INTEGER UNIQUE, chat_id INTEGER, chat_state TEXT NOT NULL DEFAULT 'planned',
@@ -326,7 +327,7 @@ export class BridgeStore {
     });
   }
 
-  switchTransfer(record: TaskTransferRecord, target: DesktopTask): Binding {
+  switchTransfer(record: TaskTransferRecord, target: DesktopTask, now = Date.now()): Binding {
     return this.atomic(() => {
       const current = this.getBinding(record.bindingId);
       if (!current || taskKey(current) !== taskKey(record.source)) throw new Error("Transfer source binding changed");
@@ -339,7 +340,13 @@ export class BridgeStore {
       this.db.prepare(`UPDATE bridge_bindings SET host_id = ?, thread_id = ?, title = ?, source_id = ?, source_label = ?, rollout_path = ?, attached = 1, paused = 0
         WHERE id = ?`).run(target.hostId, target.threadId, target.title, target.sourceId ?? "", target.sourceLabel ?? null, target.rolloutPath ?? null, record.bindingId);
       this.db.prepare("DELETE FROM bridge_events WHERE binding_id = ?").run(record.bindingId);
-      this.setValue(`projection:${record.bindingId}`, null);
+      // The target rollout rewrites copied history with fresh file timestamps.
+      // Its observation boundary must start after the verified fork, otherwise
+      // the tailer treats every inherited answer as a new VK message.
+      this.setValue(`projection:${record.bindingId}`, {
+        since: now, lastObservedAt: now, activeAtAttach: [], active: [], seen: {}, semanticByIdentity: {},
+        ...(target.rolloutPath ? { rolloutPath: comparablePath(target.rolloutPath) } : {}),
+      } satisfies TaskObservationCheckpoint);
       this.setValue(`activity:${record.bindingId}`, null);
       this.setValue(`task-details:${record.bindingId}`, null);
       this.setValue(`task-stream-mode:${record.bindingId}`, null);

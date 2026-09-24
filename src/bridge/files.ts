@@ -13,7 +13,12 @@ export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxT
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
 export const INBOUND_FILE_LIMITS: InboundFileLimits = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 600_000 };
 export interface OutputFile { readonly name: string; readonly contents: Buffer; readonly kind: "image" | "file" }
-interface OutputFileReadOptions { readonly allowBatchOverflow?: boolean }
+interface OutputFileReadOptions {
+  readonly allowBatchOverflow?: boolean;
+  /** Keep valid siblings when one output file is too large. */
+  readonly skipOversizedFiles?: boolean;
+  readonly onSkippedFile?: (error: OutputFilesError) => void;
+}
 interface FileJob {
   operationId: string;
   generation: number;
@@ -195,7 +200,11 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
       if (!before.isFile()) continue;
       await checkPath(file);
       if (!options.allowBatchOverflow && files.length >= limits.maxFiles) throw new OutputFilesError(`В одной выдаче можно отправить не больше ${limits.maxFiles} файлов.`);
-      if (before.size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» занимает ${mebibytes(before.size)} МиБ при лимите ${mebibytes(limits.maxFileBytes)} МиБ.`);
+      if (before.size > limits.maxFileBytes) {
+        const error = new OutputFilesError(`Файл «${safeFileName(entry, "file")}» занимает ${mebibytes(before.size)} МиБ при лимите ${mebibytes(limits.maxFileBytes)} МиБ.`);
+        if (options.skipOversizedFiles) { options.onSkippedFile?.(error); continue; }
+        throw error;
+      }
       if (!options.allowBatchOverflow && total + before.size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
       const handle = await open(file, "r"); const chunks: Buffer[] = []; let size = 0;
       try {
@@ -212,6 +221,11 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
         const after = await handle.stat();
         if (after.size !== size || after.mtimeMs !== before.mtimeMs) throw new OutputFilesError("Выходной файл ещё записывается; отправка будет повторена позже.", true);
         await checkPath(file);
+      } catch (error) {
+        if (options.skipOversizedFiles && error instanceof OutputFilesError && /лимит|превышает/iu.test(error.message)) {
+          options.onSkippedFile?.(error); continue;
+        }
+        throw error;
       } finally { await handle.close(); }
       total += size;
       files.push({ name: safeFileName(path.relative(canonicalRoot, file).replaceAll(path.sep, "_"), "file"), contents: Buffer.concat(chunks, size), kind: imageName(entry) ? "image" : "file" });
@@ -350,7 +364,12 @@ export class TaskFiles {
       && (manual || (!job.done && (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id)))))) {
       const outbox = await directory(this.root, job.directory, "outbox");
       let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
-      try { outputFiles = await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true }); }
+      const skipped: OutputFilesError[] = [];
+      try {
+        outputFiles = await readOutputFiles(outbox, FILE_LIMITS, {
+          allowBatchOverflow: true, skipOversizedFiles: true, onSkippedFile: error => skipped.push(error),
+        });
+      }
       catch (error) {
         if (!(error instanceof OutputFilesError)) throw error;
         this.store.enqueue(`files-error:${binding.id}:${job.operationId}`, binding.peerId!, {
@@ -360,6 +379,9 @@ export class TaskFiles {
         else this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
         continue;
       }
+      for (const error of skipped) this.store.enqueue(`files-error:${binding.id}:${job.operationId}:${digest(error.message)}`, binding.peerId!, {
+        text: `Файл не добавлен в очередь VK: ${error.message} Допустимые файлы из этой же выдачи продолжают отправляться.`, silent: true,
+      }, binding.id);
       for (const batch of batchOutputFiles(outputFiles)) {
         const pending: { file: OutputFile; key: string; attachment: string }[] = [];
         for (const file of batch) {

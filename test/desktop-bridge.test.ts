@@ -840,7 +840,9 @@ test("catalog transfer keeps the VK conversation, retargets streaming and archiv
   assert.equal(s.desktop.transfers.length, 1); assert.equal(s.desktop.opened.length, 1);
   assert.equal(s.desktop.archives.length, 1); assert.equal(s.desktop.archives[0]!.threadId, task.threadId);
   assert.equal(s.store.transfer(original.id)!.phase, "complete");
-  assert.equal(s.store.getValue(`projection:${original.id}`), null);
+  const projection = s.store.getValue<import("../src/core/task-observation.js").TaskObservationCheckpoint>(`projection:${original.id}`);
+  assert.ok(projection && projection.since > 0);
+  assert.deepEqual(projection.seen, {});
   assert.deepEqual(s.store.acceptedTurns(original.id), []);
   assert.deepEqual(s.store.getValue(`accepted-turns:${original.id}`), []);
   assert.deepEqual(s.store.queuedInputs(original.id), []);
@@ -961,6 +963,21 @@ function transferFixture(s: ReturnType<typeof setup>) {
   return { id: "durable-transfer", bindingId: binding.id, startedAt: s.now(), source: { ...task },
     targetSourceId: "work", targetProjectId: null, phase: "forking" as const };
 }
+
+test("transfer switches the VK observation epoch after copied history", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.setValue(`projection:${record.bindingId}`, { since: 1, lastObservedAt: 2,
+    activeAtAttach: ["old-turn"], active: [], seen: { old: "hash" }, rolloutPath: "/source.jsonl" });
+  s.advance(5_000);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const boundary = s.store.getValue<import("../src/core/task-observation.js").TaskObservationCheckpoint>(`projection:${record.bindingId}`);
+  assert.equal(boundary?.since, s.now());
+  assert.equal(boundary?.lastObservedAt, s.now());
+  assert.deepEqual(boundary?.seen, {});
+  assert.deepEqual(boundary?.activeAtAttach, []);
+  assert.match(boundary?.rolloutPath ?? "", /target[\\/]work\.jsonl$/u);
+});
 
 test("background transfer retains its lock while the handler, manager and other conversations remain usable", async t => {
   const s = setup(t); const record = transferFixture(s);
@@ -1103,8 +1120,8 @@ test("a saved fork target and an atomic VK switch survive lost acknowledgments",
     } else {
       const switched = s.store.switchTransfer.bind(s.store);
       let crashed = false;
-      s.store.switchTransfer = (previous, target) => {
-        const binding = switched(previous, target);
+      s.store.switchTransfer = (previous, target, now) => {
+        const binding = switched(previous, target, now);
         if (!crashed) { crashed = true; throw new Error("simulated executor loss after VK switch"); }
         return binding;
       };
@@ -2707,8 +2724,11 @@ test("files enter the same task and completed output is uploaded once across ret
   await files.collect(binding, true); s.store.recover(); const restored = new TaskFiles(root, s.store, s.chat, s.gate);
   await restored.collect(binding, true); await s.worker.flush(); assert.equal(s.chat.binaryUploads.length, 1); assert.equal(s.chat.sent.length, 1);
   await writeFile(path.join(request.outboxDir!, "manual.txt"), "later output");
-  await manager.handle(s.input("/files", peerId)); await s.worker.flush();
-  assert.equal(s.chat.binaryUploads.length, 2); assert.match(s.chat.sent.at(-1)!.view.text, /файлов: 1/u);
+  await manager.handle(s.input("/files", peerId));
+  // /files acknowledges immediately; wait for its durable background
+  // collection before asserting the upload.
+  await files.collect(binding, true); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 2); assert.ok(s.chat.sent.some(message => /Файлы поставлены в очередь VK: 1/u.test(message.view.text)));
   assert.equal(s.desktop.submissions.length, 1);
 });
 
@@ -2805,6 +2825,36 @@ test("an outbox with more than ten files is delivered in batches without blockin
 
   await files.tick(); await s.worker.flush();
   assert.equal(s.chat.binaryUploads.length, 12);
+});
+
+test("late owner input is delivered before already observed commentary", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.mirror.acceptObservation(binding.id, [
+    { type: "progress", id: "first", turnId: "late-turn", text: "Checking" },
+    { type: "progress", id: "second", turnId: "late-turn", text: "Still checking" },
+  ], []);
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 0);
+
+  // Reconstructing the mirror must not drop the held assistant messages.
+  const afterRestart = new TaskMirror(s.store);
+  afterRestart.acceptObservation(binding.id, [
+    { type: "user", id: "prompt", turnId: "late-turn", text: "Direct prompt" },
+  ], ["late-turn"]);
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), [
+    "## user request\n\nDirect prompt", "Checking", "Still checking",
+  ]);
+});
+
+test("baseline or VK accepted input releases held commentary without echoing a prompt", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.mirror.acceptObservation(binding.id, [
+    { type: "progress", id: "comment", turnId: "known-turn", text: "Working" },
+  ], []);
+  s.mirror.acceptObservation(binding.id, [], ["known-turn"]);
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Working"]);
 });
 
 test("attachment transfer stops on explicit detach during download or upload and never replays old jobs", async t => {
@@ -2941,6 +2991,21 @@ test("an archived binding explains detach or rebind instead of offering a useles
   await s.handle("/open", peerId);
   assert.equal(s.desktop.opened.length, 0);
   assert.match(s.chat.sent.at(-1)!.view.text, /архивной задаче.*\/open архив не восстановит.*\/detach/u);
+});
+
+test("a missing task owner is a known rejection and persists a health-visible route failure", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.submitError = new TaskNotOpenError();
+  const input = { ...s.input("continue task", peerId), eventId: "message:1249" };
+  await s.manager.handle(input);
+  await s.worker.flush();
+  const operation = s.desktop.submissions[0]!;
+  assert.equal(s.store.operationState(operation.operationId), "rejected");
+  assert.equal(s.store.inputState(JSON.stringify([peerId, input.eventId])), "done");
+  const failure = s.store.getValue<{ at: number; kind: string }>(`route-failure:${binding.id}`)!;
+  assert.equal(failure.kind, "no-active-owner");
+  assert.ok(Number.isSafeInteger(failure.at) && failure.at > 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /нет активного подключения/u);
 });
 
 test("an incoming VK event saved before dispatch recovers without duplicate submission", async t => {

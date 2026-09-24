@@ -76,7 +76,9 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     seen[key] = hash;
   };
   const inputs: TaskObservedInput[] = [];
+  const inputTurnIds: string[] = [];
   for (const turn of turns) {
+    if (turn.items.some(item => item.type === "userMessage")) inputTurnIds.push(turn.id);
     const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
@@ -125,7 +127,7 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   };
   return {
     checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen }, events, details,
-    questions: Array.isArray(snapshot.questions) ? snapshot.questions : [], inputs,
+    questions: Array.isArray(snapshot.questions) ? snapshot.questions : [], inputs, inputTurnIds,
     latestTurnId: latest?.id ?? "runtime", activeTurnId: active.at(-1) ?? null,
   };
 }
@@ -136,6 +138,8 @@ class AppServerTaskStream implements TaskStateStream {
   private snapshot: NativeSnapshot | null = null;
   private readonly queued: AppServerEnvelope[] = [];
   private closed = false;
+  private starting = false;
+  private closeNotified = false;
   private started = false;
   private disconnected = false;
 
@@ -144,9 +148,12 @@ class AppServerTaskStream implements TaskStateStream {
     private readonly onError: (error: Error) => void,
     private readonly questions: (threadId: string) => readonly CodexQuestions[],
     private readonly startGate: <T>(work: () => Promise<T>) => Promise<T>,
-    private readonly onClose: (stream: AppServerTaskStream) => void) {}
+    private readonly onResume: (task: TaskRef, result: JsonObject) => void,
+    private readonly resumeTask: ((task: TaskRef) => Promise<JsonObject>) | null,
+    private readonly onClose: (stream: AppServerTaskStream, release: Promise<void> | null) => void) {}
 
   async start(): Promise<void> {
+    this.starting = true;
     this.unsubscribeNotification = this.rpc.onNotification(notification => this.receive(notification));
     this.unsubscribeDisconnect = this.rpc.onDisconnect?.(error => {
       this.disconnected = true;
@@ -155,7 +162,7 @@ class AppServerTaskStream implements TaskStateStream {
     try {
       const result = await this.startGate(async () => {
         if (this.closed) throw new AppServerUnavailableError("Подключение к задаче уже закрыто.");
-        return this.rpc.request("thread/resume", {
+        return this.resumeTask?.(this.task) ?? this.rpc.request("thread/resume", {
           threadId: this.task.threadId, excludeTurns: true,
           // The stream is an operational tail, not a transfer verifier. Twenty
           // recent turns cover reconnect recovery while full paged history
@@ -165,16 +172,24 @@ class AppServerTaskStream implements TaskStateStream {
       });
       const thread = isObject(result.thread) ? result.thread : null;
       if (!thread || thread.id !== this.task.threadId) throw new AppServerUnavailableError("Codex открыл другую задачу.");
+      // The profile command executor uses this exact App Server connection.
+      // Publish ownership before the initial state callback so a VK prompt
+      // can go straight to turn/start instead of issuing a second resume.
+      this.onResume(this.task, result);
       const initial = isObject(result.initialTurnsPage) ? result.initialTurnsPage : {};
       const turns = Array.isArray(initial.data) ? initial.data.map(parseTurn).filter((turn): turn is NativeTurn => !!turn) : [];
       this.snapshot = this.makeSnapshot(thread, result, turns);
       this.started = true;
+      if (this.closed) return;
       for (const notification of this.queued.splice(0)) this.apply(notification);
       if (!this.closed) this.onState(this.snapshot, true);
     } catch (error) {
       this.close();
       if (error instanceof AppServerRejectedError && error.reason === "active-writer") throw new TaskOwnedByClientError();
       throw error;
+    } finally {
+      this.starting = false;
+      if (this.closed) this.finishClose();
     }
   }
 
@@ -249,13 +264,25 @@ class AppServerTaskStream implements TaskStateStream {
     if (this.closed) return;
     this.closed = true; this.unsubscribeNotification?.(); this.unsubscribeDisconnect?.();
     this.unsubscribeNotification = null; this.unsubscribeDisconnect = null; this.queued.length = 0;
+    if (!this.starting) this.finishClose();
+  }
+
+  private finishClose(): void {
+    if (this.closeNotified) return;
+    this.closeNotified = true;
     // Codex keeps a resumed thread owned by this App Server until the client
     // explicitly unsubscribes. Release only this thread; closing the profile
     // connection would disrupt unrelated VK conversations.
-    if (this.started && !this.disconnected) {
-      void this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 5_000 }).catch(() => {});
-    }
-    this.onClose(this);
+    const release = this.started && !this.disconnected
+      ? this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 30_000 }).then(() => {})
+      : null;
+    // The transport may be used without a command executor; never leave an
+    // unhandled rejection if its release callback does not observe the result.
+    if (release) void release.catch(() => {});
+    // Do not discard the command-side writer until Codex confirms release.
+    // A slow unsubscribe on a large thread otherwise makes the next resume
+    // collide with this very App Server's still-held writer lock.
+    this.onClose(this, release);
   }
 }
 
@@ -266,7 +293,9 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   private activeStarts = 0;
   constructor(private readonly rpc: AppServerRpc,
     private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => [],
-    private readonly onTaskClose: (task: TaskRef) => void = () => {}) {}
+    private readonly onTaskClose: (task: TaskRef, release: Promise<void> | null) => void = () => {},
+    private readonly onTaskResume: (task: TaskRef, result: JsonObject) => void = () => {},
+    private readonly resumeTask: ((task: TaskRef) => Promise<JsonObject>) | null = null) {}
   private async gate<T>(work: () => Promise<T>): Promise<T> {
     if (this.activeStarts >= 2) await new Promise<void>(resolve => this.startWaiters.push(resolve));
     this.activeStarts++;
@@ -278,7 +307,8 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   }
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
     const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions,
-      work => this.gate(work), closed => { this.streams.delete(closed); this.onTaskClose(closed.task); });
+      work => this.gate(work), this.onTaskResume, this.resumeTask,
+      (closed, release) => { this.streams.delete(closed); this.onTaskClose(closed.task, release); });
     this.streams.add(stream); return stream;
   }
   refresh(threadId: string): void {

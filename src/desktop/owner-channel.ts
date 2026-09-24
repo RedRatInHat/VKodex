@@ -91,9 +91,13 @@ function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "arc
       if (done) return; done = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(result!);
     };
-    const failed = () => finish(new OwnerTransportError(sent && operation === "archive" ? "unknown" : "unavailable", "Owner channel unavailable; no automatic retry."));
+    const failed = (cause?: NodeJS.ErrnoException) => finish(new OwnerTransportError(
+      sent && operation === "archive" ? "unknown" : "unavailable",
+      "Owner channel unavailable; no automatic retry.",
+      !sent && (cause?.code === "ENOENT" || cause?.code === "ECONNREFUSED") ? "endpointMissing" : undefined,
+    ));
     const timer = setTimeout(failed, timeoutMs);
-    socket.on("error", failed); socket.on("end", failed); socket.on("close", failed);
+    socket.on("error", failed); socket.on("end", () => failed()); socket.on("close", () => failed());
     socket.on("connect", () => { sent = true; socket.write(JSON.stringify({ token: descriptor.token, operation, threadId }) + "\n"); });
     socket.setEncoding("utf8"); socket.on("data", (chunk: string) => {
       buffer += chunk; if (buffer.length > 4096) { failed(); return; }
@@ -139,7 +143,14 @@ async function findOwner(home: string, threadId: string, root?: string, timeoutM
   const outdated = probes.find((probe): probe is PromiseRejectedResult => probe.status === "rejected"
     && probe.reason instanceof OwnerTransportError && probe.reason.outcome === "outdated");
   if (outdated) throw outdated.reason;
-  if (probes.some(p => p.status === "rejected")) throw new OwnerTransportError("unavailable", "Could not confirm all registered native owners.");
+  // A descriptor is written only after its unique private endpoint starts
+  // listening. A missing endpoint is therefore a stale descriptor even if
+  // Windows has reused its PID for an unrelated process. Other probe errors
+  // remain fail-closed.
+  if (probes.some(p => p.status === "rejected"
+    && !(p.reason instanceof OwnerTransportError && p.reason.reason === "endpointMissing"))) {
+    throw new OwnerTransportError("unavailable", "Could not confirm all registered native owners.");
+  }
   const owners = probes.flatMap(p => p.status === "fulfilled" && p.value ? [p.value] : []);
   if (!owners.length) return null;
   if (owners.length !== 1) throw new OwnerTransportError("rejected", "Multiple native owners reported the same task.");

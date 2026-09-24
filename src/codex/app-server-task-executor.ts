@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
-import { ActionRejectedError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskOwnedByClientError, UncertainActionError, taskKey,
+import { ActionRejectedError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskNotOpenError, TaskOwnedByClientError, UncertainActionError, taskKey,
   type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
 import { goalMatchesUpdate, normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 import { taskInput } from "../core/task-input.js";
@@ -25,7 +25,11 @@ interface PendingQuestion {
 const operationError = (error: unknown): Error => error instanceof AppServerUncertainError ? new UncertainActionError()
   : error instanceof AppServerRejectedError && error.reason === "active-writer" ? new TaskOwnedByClientError()
   : error instanceof AppServerRejectedError ? new ActionRejectedError("Codex отклонил команду. Состояние задачи не изменено.")
-  : error instanceof AppServerUnavailableError ? new ActionRejectedError("Владелец задачи Codex недоступен. Команда не отправлена.")
+  // AppServerUnavailableError is produced only by reads or before a mutating
+  // request is accepted. Mutating timeouts use AppServerUncertainError. Keep
+  // the distinction here so the bridge can mark a broken owner route for
+  // health/self-healing without risking an automatic duplicate mutation.
+  : error instanceof AppServerUnavailableError ? new TaskNotOpenError()
   : error instanceof Error ? error : new ActionRejectedError("Codex не выполнил команду.");
 
 function idOf(value: unknown): string | null { return typeof value === "string" && value ? value : null; }
@@ -33,6 +37,9 @@ function idOf(value: unknown): string | null { return typeof value === "string" 
 /** Command-side prototype for a VKodex-owned, profile-scoped App Server. */
 export class AppServerTaskExecutor {
   private readonly loaded = new Map<string, LoadedTask>();
+  private readonly resuming = new Map<string, Promise<JsonObject>>();
+  private readonly releasing = new Map<string, Promise<boolean>>();
+  private readonly uncertainReleases = new Set<string>();
   private readonly questions = new Map<string, PendingQuestion>();
   private readonly archiving = new Set<string>();
   private readonly archiveGroups = new Map<string, Set<string>>();
@@ -50,7 +57,53 @@ export class AppServerTaskExecutor {
    * command must resume it again instead of using a stale loaded-task cache. */
   forget(task: TaskRef): void {
     this.loaded.delete(taskKey(task));
+    this.uncertainReleases.delete(taskKey(task));
     this.questions.delete(task.threadId);
+  }
+
+  /** Keep a possibly still-owned writer usable until unsubscribe is confirmed.
+   * A failed/expired release is ambiguous: the next command checks native
+   * ownership before deciding whether to reuse or resume the task. */
+  release(task: TaskRef, pending: Promise<void> | null): void {
+    if (!pending) return;
+    const key = taskKey(task);
+    const work = pending.then(() => true, () => false).then(released => {
+      if (this.releasing.get(key) === work) {
+        if (released) this.forget(task);
+        else this.uncertainReleases.add(key);
+      }
+      return released;
+    }).finally(() => { if (this.releasing.get(key) === work) this.releasing.delete(key); });
+    this.releasing.set(key, work);
+  }
+
+  private async waitForRelease(task: TaskRef): Promise<void> {
+    const key = taskKey(task);
+    await this.releasing.get(key);
+    if (!this.uncertainReleases.has(key) || !this.loaded.has(key)) return;
+    const result = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+    const thread = isObject(result.thread) ? result.thread : null;
+    if (!thread || thread.id !== task.threadId) throw new AppServerUnavailableError();
+    if (isObject(thread.status) && thread.status.type === "notLoaded") this.forget(task);
+    else this.uncertainReleases.delete(key);
+  }
+
+  /** A state stream and the command executor share one profile App Server.
+   * Record the stream's confirmed resume so the immediately following VK
+   * command does not resume the same (potentially very large) task twice. */
+  acceptResumedTask(task: TaskRef, result: JsonObject): LoadedTask {
+    if (!isObject(result.thread) || result.thread.id !== task.threadId) throw new AppServerUnavailableError();
+    const page = isObject(result.initialTurnsPage) && Array.isArray(result.initialTurnsPage.data)
+      ? result.initialTurnsPage.data : [];
+    const active = page.find(turn => isObject(turn) && turn.status === "inProgress");
+    const previous = this.loaded.get(taskKey(task));
+    const loaded = {
+      activeTurnId: isObject(active) ? idOf(active.id)
+        : isObject(result.thread.status) && result.thread.status.type === "active" ? previous?.activeTurnId ?? null : null,
+      model: idOf(result.model), effort: idOf(result.reasoningEffort),
+    };
+    this.loaded.set(taskKey(task), loaded);
+    return loaded;
   }
 
   /** Inspect a task already loaded by this owner without issuing another
@@ -173,7 +226,18 @@ export class AppServerTaskExecutor {
     await this.resume(task);
     this.assertWritable(task.threadId);
     try {
-      await this.rpc.request("thread/settings/update", { threadId: task.threadId, model, effort }, { mutating: true });
+      const update = () => this.rpc.request("thread/settings/update", { threadId: task.threadId, model, effort }, { mutating: true });
+      try { await update(); }
+      catch (error) {
+        // Settings are an idempotent assignment. A confirmed transient rejection
+        // can be retried once, unlike turn/start or an outcome-unknown timeout.
+        // Protocol/parameter errors and a competing writer cannot heal this way.
+        if (!(error instanceof AppServerRejectedError) || error.reason === "active-writer"
+          || error.code === -32601 || error.code === -32602) throw error;
+        await new Promise(resolve => setTimeout(resolve, 300));
+        this.assertWritable(task.threadId);
+        await update();
+      }
       const loaded = this.loaded.get(taskKey(task));
       if (loaded) this.loaded.set(taskKey(task), { ...loaded, model, effort });
     } catch (error) { throw operationError(error); }
@@ -312,7 +376,18 @@ export class AppServerTaskExecutor {
       for (const id of group) {
         const read = await this.rpc.request("thread/read", { threadId: id, includeTurns: false });
         const thread = isObject(read.thread) && read.thread.id === id ? read.thread : null;
-        if (!thread || !isObject(thread.status) || thread.status.type !== "idle") {
+        let idle = !!thread && isObject(thread.status) && ["idle", "systemError"].includes(String(thread.status.type));
+        if (thread && isObject(thread.status) && thread.status.type === "notLoaded") {
+          // A finished descendant need not be open in this owner's App Server.
+          // Resuming it here could steal another client's active turn. Confirm
+          // its persisted terminal boundary without taking a writer lease.
+          const page = await this.rpc.request("thread/turns/list", {
+            threadId: id, limit: 1, sortDirection: "desc", itemsView: "summary",
+          });
+          const last = Array.isArray(page.data) && isObject(page.data[0]) ? page.data[0] : null;
+          idle = !!last && ["completed", "failed", "interrupted"].includes(String(last.status));
+        }
+        if (!idle) {
           throw new ActionRejectedError("Исходная и дочерние задачи должны быть завершены перед архивацией.");
         }
         const response = await this.rpc.request("thread/goal/get", { threadId: id });
@@ -385,23 +460,57 @@ export class AppServerTaskExecutor {
   }
 
   private async resume(task: TaskRef): Promise<LoadedTask> {
-    const cached = this.loaded.get(taskKey(task));
-    if (cached) return cached;
     try {
-      const result = await this.rpc.request("thread/resume", {
-        threadId: task.threadId, excludeTurns: true,
-        initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "full" },
-      });
-      if (!isObject(result.thread) || result.thread.id !== task.threadId) throw new AppServerUnavailableError();
-      const page = isObject(result.initialTurnsPage) && Array.isArray(result.initialTurnsPage.data) ? result.initialTurnsPage.data : [];
-      const active = page.find(turn => isObject(turn) && turn.status === "inProgress");
-      const loaded = {
-        activeTurnId: isObject(active) ? idOf(active.id) : null,
-        model: idOf(result.model), effort: idOf(result.reasoningEffort),
-      };
-      this.loaded.set(taskKey(task), loaded);
-      return loaded;
+      await this.waitForRelease(task);
+      const cached = this.loaded.get(taskKey(task));
+      if (cached) return cached;
+      const result = await this.resumeNative(task);
+      return this.loaded.get(taskKey(task)) ?? this.acceptResumedTask(task, result);
     } catch (error) { throw operationError(error); }
+  }
+
+  /** A stream and a VK command must never resume the same task twice. A
+   * second resume may abort a turn that the first request just started. */
+  private async resumeNative(task: TaskRef): Promise<JsonObject> {
+    const key = taskKey(task);
+    const pending = this.resuming.get(key);
+    if (pending) return pending;
+    const work = this.rpc.request("thread/resume", {
+      threadId: task.threadId, excludeTurns: true,
+      initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "full" },
+    }, { timeoutMs: 180_000 }).then(result => {
+      this.acceptResumedTask(task, result);
+      return result;
+    });
+    this.resuming.set(key, work);
+    try { return await work; }
+    finally { if (this.resuming.get(key) === work) this.resuming.delete(key); }
+  }
+
+  /** A stream starting after a VK command already loaded the task uses reads
+   * on that writer instead of resuming again and interrupting its new turn. */
+  async resumeForStream(task: TaskRef): Promise<JsonObject> {
+    await this.waitForRelease(task);
+    const key = taskKey(task);
+    const pending = this.resuming.get(key);
+    if (pending) return pending;
+    const loaded = this.loaded.get(key);
+    if (!loaded) return this.resumeNative(task);
+    const [read, turns] = await Promise.all([
+      this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false }, { timeoutMs: 120_000 }),
+      this.rpc.request("thread/turns/list", { threadId: task.threadId, limit: 20, sortDirection: "desc", itemsView: "full" }, { timeoutMs: 120_000 }),
+    ]);
+    if (!isObject(read.thread) || read.thread.id !== task.threadId || !Array.isArray(turns.data)) throw new AppServerUnavailableError();
+    // turn/start can be acknowledged before thread/read and turns/list expose
+    // its active state. Keep that accepted ID visible to the new observer.
+    const activeId = this.loaded.get(key)?.activeTurnId;
+    const active = activeId ? turns.data.find(turn => isObject(turn) && turn.id === activeId) : null;
+    const inProgress = !!activeId && (!isObject(active) || active.status === "inProgress");
+    const thread = inProgress ? { ...read.thread, status: { type: "active" } } : read.thread;
+    const page = inProgress && !active
+      ? { ...turns, data: [{ id: activeId, status: "inProgress", startedAt: Date.now() / 1_000, items: [] }, ...turns.data] }
+      : turns;
+    return { thread, initialTurnsPage: page, model: loaded.model, reasoningEffort: loaded.effort, cwd: read.thread.cwd };
   }
 
   private observe(notification: AppServerEnvelope): void {
@@ -454,6 +563,7 @@ export class AppServerTaskExecutor {
 
   private connectionLost(error: Error): void {
     this.loaded.clear();
+    this.uncertainReleases.clear();
     for (const [threadId, pending] of this.questions) {
       pending.reject(error);
       this.questions.delete(threadId); this.notifyQuestions(threadId);
@@ -463,6 +573,6 @@ export class AppServerTaskExecutor {
   close(): void {
     this.unsubscribe(); this.unsubscribeDisconnect(); this.rpc.onServerRequest(null);
     for (const pending of this.questions.values()) pending.reject(new Error("Executor closed"));
-    this.questions.clear(); this.loaded.clear(); this.archiving.clear(); this.archiveGroups.clear(); this.questionListeners.clear();
+    this.questions.clear(); this.loaded.clear(); this.uncertainReleases.clear(); this.archiving.clear(); this.archiveGroups.clear(); this.questionListeners.clear();
   }
 }

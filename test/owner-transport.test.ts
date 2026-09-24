@@ -115,6 +115,18 @@ test("owner archive shares initialization, isolates IDs and preserves native not
   f.transport.close();
 });
 
+test("owner archive accepts a terminal system error but still rejects an active task", async () => {
+  const failed = fixture({ "thread/read": () => ({ thread: { id: threadId, status: { type: "systemError" } } }) });
+  failed.initialize(); await failed.transport.archiveIdle(threadId);
+  assert.equal(failed.requests.filter(request => request.method === "thread/archive").length, 1);
+  failed.transport.close();
+
+  const active = fixture({ "thread/read": () => ({ thread: { id: threadId, status: { type: "active" } } }) });
+  active.initialize(); await assert.rejects(active.transport.archiveIdle(threadId));
+  assert.equal(active.requests.some(request => request.method === "thread/archive"), false);
+  active.transport.close();
+});
+
 test("owner archive rejects uninitialized, unloaded, running, active-goal and descendant tasks", async () => {
   const uninitialized = fixture(); await assert.rejects(uninitialized.transport.archiveIdle(threadId)); uninitialized.transport.close();
   for (const overrides of [
@@ -300,6 +312,23 @@ test("an unavailable registered owner cannot be mistaken for absence or unique o
     await assert.rejects(archiveThroughOwner(root, threadId, root), (e: unknown) => e instanceof OwnerTransportError && e.outcome === "unavailable");
     assert.equal(archives, 0);
   } finally { await ready?.close(); await unavailable.close(); }
+});
+
+test("a missing stale endpoint does not block a live owner after PID reuse", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-stale-pid-")); let archives = 0;
+  const directory = path.join(root, createHash("sha256").update(comparablePath(root)).digest("hex"));
+  await mkdir(directory, { recursive: true });
+  const staleId = randomUUID();
+  await writeFile(path.join(directory, `${process.pid}-${staleId}.json`), JSON.stringify({
+    version: 1, home: comparablePath(root),
+    endpoint: process.platform === "win32" ? `\\\\.\\pipe\\vkodex-owner-${staleId}` : path.join(os.tmpdir(), `vkodex-owner-${staleId}.sock`),
+    token: randomBytes(32).toString("hex"), pid: process.pid,
+  }));
+  const ready = await serveOwnerChannel(root, { ownsTask: async () => true, archiveIdle: async () => { archives++; } }, root);
+  try {
+    assert.equal(await archiveThroughOwner(root, threadId, root), true);
+    assert.equal(archives, 1);
+  } finally { await ready.close(); }
 });
 
 test("owner channel timeout after dispatch is unknown and never retries the mutation", async () => {

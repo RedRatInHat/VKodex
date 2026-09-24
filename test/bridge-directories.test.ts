@@ -55,6 +55,19 @@ test("output file snapshots preserve bytes and reject oversized files, symlinks 
   await assert.rejects(readOutputFiles(other), /Ссылки/u);
 });
 
+test("an oversized output is reported without hiding valid siblings", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
+  await writeFile(path.join(root, "valid.txt"), "ok");
+  await writeFile(path.join(root, "too-large.bin"), "12345");
+  const skipped: string[] = [];
+  const files = await readOutputFiles(root, { ...FILE_LIMITS, maxFileBytes: 2 }, {
+    skipOversizedFiles: true,
+    onSkippedFile: error => skipped.push(error.message),
+  });
+  assert.deepEqual(files.map(file => file.name), ["valid.txt"]);
+  assert.deepEqual(skipped, ["Файл «too-large.bin» занимает 1 МиБ при лимите 1 МиБ."]);
+});
+
 test("output batches keep the VK file-count and total-size limits local to each batch", () => {
   const files = Array.from({ length: 12 }, (_, index) => ({ name: `${index}.txt`, contents: Buffer.alloc(3), kind: "file" as const }));
   const batches = batchOutputFiles(files, { maxFiles: 10, maxFileBytes: 100, maxTotalBytes: 10, timeoutMs: 1 });
