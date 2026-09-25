@@ -72,8 +72,11 @@ test("App Server assembles a large response line from bounded chunks", async () 
     const id = child.messages.find(message => message.method === "thread/read")?.id;
     const value = "x".repeat(8 * 1024 * 1024);
     const line = `${JSON.stringify({ id, result: { value } })}\n`;
-    for (let offset = 0; offset < line.length; offset += 64 * 1024) child.stdout.write(line.slice(offset, offset + 64 * 1024));
+    // Small pipe reads used to make the old whole-buffer byte count quadratic.
+    const startedAt = Date.now();
+    for (let offset = 0; offset < line.length; offset += 1024) child.stdout.write(line.slice(offset, offset + 1024));
     assert.equal((await response).value, value);
+    assert.ok(Date.now() - startedAt < 5_000, "a fragmented response must not stall the bridge event loop");
   } finally { await connection.close(); }
 });
 
