@@ -66,7 +66,7 @@ public static class VKodexWindowIconNative {
     $watchdog = Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList $watchdogArgs -WindowStyle Hidden -PassThru
     Write-SupervisorLog "Health watchdog started (PID $($watchdog.Id))."
   } catch {
-    Write-SupervisorLog "Health watchdog could not start; the bridge will continue without automatic hang recovery."
+    Write-SupervisorLog "Health watchdog could not start; the bridge will continue without external stale-health diagnostics."
   }
   while ($true) {
     $runId = "{0}-{1}" -f (Get-Date).ToString("yyyyMMdd-HHmmssfff"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))

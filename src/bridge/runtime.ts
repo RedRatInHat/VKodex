@@ -451,7 +451,7 @@ export class BridgeRuntime {
     const update = this.ticking;
     // Explicit callers can await the native subscriptions they initiated.
     // The production one-second timer never waits for a huge thread/resume:
-    // otherwise the health watchdog kills the bridge and its active turns.
+    // otherwise the health report can become stale while active turns progress.
     return waitForConnections ? update.then(async () => {
       await Promise.allSettled(this.connecting.values());
       void this.delivery.flush().catch(() => {});

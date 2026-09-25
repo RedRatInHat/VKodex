@@ -35,6 +35,7 @@ $entryPattern = [regex]::Escape($EntryPoint)
 $supervisor = Get-CimInstance Win32_Process -Filter "ProcessId=$SupervisorPid"
 if (-not $supervisor) { exit 0 }
 $supervisorCreatedAt = $supervisor.CreationDate
+$reportedStale = @{}
 while ($true) {
   Start-Sleep -Seconds $PollSeconds
   try {
@@ -43,22 +44,39 @@ while ($true) {
     $now = Get-Date
     $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$SupervisorPid" |
       Where-Object { $_.Name -eq "VKodex.exe" -and $_.CommandLine -match $entryPattern }
+    $currentKeys = @{}
     foreach ($child in $children) {
+      $key = "$($child.ProcessId):$($child.CreationDate.ToFileTimeUtc())"
+      $currentKeys[$key] = $true
       $age = ($now - $child.CreationDate).TotalSeconds
-      if ($age -le $StaleSeconds -or (Is-FreshHealth $child $now)) { continue }
+      if (Is-FreshHealth $child $now) {
+        if ($reportedStale.ContainsKey($key)) {
+          Write-WatchdogLog "VKodex PID $($child.ProcessId) resumed updating health."
+          $reportedStale.Remove($key)
+        }
+        continue
+      }
+      if ($age -le $StaleSeconds) { continue }
       $hasOwnReport = $false
       try {
         $report = Get-Content -LiteralPath $HealthFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $hasOwnReport = [int]$report.pid -eq [int]$child.ProcessId
       } catch { }
       if (-not $hasOwnReport -and $age -le $StartupSeconds) { continue }
-      # Recheck identity immediately before stopping to avoid a reused PID.
+      if ($reportedStale.ContainsKey($key)) { continue }
+      # Recheck identity before reporting to avoid a reused PID.
       $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)"
       if (-not $current -or $current.ParentProcessId -ne $SupervisorPid -or
           $current.CreationDate -ne $child.CreationDate -or $current.Name -ne "VKodex.exe" -or
           $current.CommandLine -notmatch $entryPattern) { continue }
-      Write-WatchdogLog "VKodex PID $($child.ProcessId) stopped updating health; stopping it for supervised recovery."
-      Stop-Process -Id $child.ProcessId -Force
+      # A stale report does not prove that Codex turns have stopped. Killing
+      # the bridge also closes App Server pipes and interrupts active turns.
+      # The supervisor still restarts the bridge when it exits on its own.
+      Write-WatchdogLog "VKodex PID $($child.ProcessId) stopped updating health; leaving it running to preserve active Codex turns. Investigate the stale health report."
+      $reportedStale[$key] = $true
+    }
+    foreach ($key in @($reportedStale.Keys)) {
+      if (-not $currentKeys.ContainsKey($key)) { $reportedStale.Remove($key) }
     }
   } catch {
     Write-WatchdogLog "VKodex watchdog could not complete one poll; it will retry."
