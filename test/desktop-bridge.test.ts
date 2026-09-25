@@ -2935,6 +2935,15 @@ test("late owner input is delivered before already observed commentary", async t
   ]);
 });
 
+test("goal continuation publishes commentary without waiting for a user message", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.mirror.acceptObservation(binding.id, [
+    { type: "progress", id: "goal-progress", turnId: "goal-turn", text: "Autonomous progress" },
+  ], [], ["goal-turn"]);
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Autonomous progress"]);
+});
+
 test("baseline or VK accepted input releases held commentary without echoing a prompt", async t => {
   const s = setup(t); const binding = s.attach();
   s.mirror.acceptObservation(binding.id, [

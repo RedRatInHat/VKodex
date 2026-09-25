@@ -16,8 +16,9 @@ export class TaskMirror {
 
   /** Owner snapshots can publish assistant items before their user item. Keep
    * those items durable until the input is visible, then enqueue in causal order. */
-  acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[]): void {
+  acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[], goalTurnIds: readonly string[] = []): void {
     const knownInputs = new Set(inputTurnIds);
+    const goalTurns = new Set(goalTurnIds);
     const byTurn = new Map<string, TaskEvent[]>();
     for (const event of events) {
       const group = byTurn.get(event.turnId) ?? [];
@@ -29,7 +30,7 @@ export class TaskMirror {
       for (const event of group) if (event.type === "user") this.accept(bindingId, event);
       // A terminal answer with no visible input can be a system-started turn
       // or a truncated recovery snapshot. Never strand its answer forever.
-      const ready = knownInputs.has(turnId) || group.some(event => event.type === "final");
+      const ready = knownInputs.has(turnId) || goalTurns.has(turnId) || group.some(event => event.type === "final");
       if (ready) this.flushDeferred(bindingId, turnId);
       for (const event of group) {
         if (event.type === "user") continue;
@@ -40,6 +41,7 @@ export class TaskMirror {
     }
     // A baseline input may become visible with no new event in this snapshot.
     for (const turnId of inputTurnIds) if (!byTurn.has(turnId)) this.flushDeferred(bindingId, turnId);
+    for (const turnId of goalTurnIds) if (!byTurn.has(turnId)) this.flushDeferred(bindingId, turnId);
   }
 
   private deferredKey(bindingId: string, turnId: string): string {

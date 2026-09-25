@@ -156,7 +156,9 @@ const runtimeAdapters = (states: TaskStateTransport) => ({
 
 function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => Promise<import("../src/bridge/contracts.js").BridgeHealthSnapshot>,
   streamTransport?: TaskStateTransport,
-  inspectExternalOwner?: (task: import("../src/core/codex-tasks.js").TaskRef) => Promise<"idle" | "active" | "systemError" | null>) {
+  inspectExternalOwner?: (task: import("../src/core/codex-tasks.js").TaskRef) => Promise<"idle" | "active" | "systemError" | null>,
+  goals?: import("../src/desktop/contracts.js").DesktopGoals,
+  history?: TaskHistoryRecovery) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -173,10 +175,11 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
     inviteLink: async () => { throw new Error("Unexpected invitation"); },
     uploadDocument: async () => { throw new Error("Unexpected upload"); },
   };
-  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client);
+  const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client,
+    undefined, undefined, goals);
   let now = 100_000;
   const runtime = new DesktopBridgeRuntime(access, desktop, chat, store,
-    { ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)),
+    { ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
       ...(inspectExternalOwner ? { inspectExternalOwner } : {}) },
     () => now, undefined, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
@@ -223,6 +226,61 @@ test("a slow native resume does not stall the bridge update or start duplicate s
   await s.runtime.tick(false);
   assert.equal(subscriptions, 1);
   release();
+});
+
+test("bridge releases goal continuation commentary without inventing a user request", async t => {
+  let publish!: (state: IpcObject, initial: boolean) => void;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      publish = onState;
+      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+    },
+    close() {},
+  };
+  const goal: import("../src/desktop/contracts.js").TaskGoal = {
+    threadId: ref.threadId, objective: "Finish the fixture", status: "active", tokenBudget: null,
+    tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+  };
+  const s = runtimeSetup(t, undefined, transport, undefined, {
+    get: async () => goal,
+    set: async () => goal,
+    clear: async () => true,
+  });
+  await s.runtime.tick();
+  publish(state([{ type: "agentMessage", id: "goal-progress", phase: "commentary", text: "Autonomous progress" }]), false);
+  for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Autonomous progress"); attempt++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await s.runtime.tick(false);
+  }
+  assert.ok(s.sent.some(item => item.view.text === "Autonomous progress"));
+  assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
+});
+
+test("rollout fallback also publishes commentary from a goal continuation", async t => {
+  const turnId = "goal-turn";
+  let polled = false;
+  const history: TaskHistoryRecovery = {
+    enable() {}, disable() {},
+    async poll() {
+      if (polled) return null;
+      polled = true;
+      return { events: [{ type: "progress" as const, id: "goal-progress", turnId, text: "Fallback progress" }],
+        historyRebuilt: false, checkpoint: { since: 100_000, activeAtAttach: [], active: [], seen: {} }, failure: null };
+    },
+  };
+  const goal: import("../src/desktop/contracts.js").TaskGoal = {
+    threadId: ref.threadId, objective: "Finish the fixture", status: "active", tokenBudget: null,
+    tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+  };
+  const s = runtimeSetup(t, undefined, undefined, undefined, { get: async () => goal, set: async () => goal, clear: async () => true }, history);
+  s.store.setValue(`task-details:${s.binding.id}`, { title: "Fixture", status: "running", workspace: "/fixture",
+    model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  await (s.runtime as unknown as { mirrorRolloutFallback(binding: Binding): Promise<void> })
+    .mirrorRolloutFallback(s.store.getBinding(s.binding.id)!);
+  for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Fallback progress"); attempt++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  assert.ok(s.sent.some(item => item.view.text === "Fallback progress"));
 });
 
 const rolloutFinal = (timestamp: number, id: string, turnId: string, text: string) => JSON.stringify({
