@@ -100,6 +100,7 @@ export class TaskManager {
     private readonly loadReport: () => Promise<string> = systemLoadText,
     private readonly projectlessRoot: string = path.join(os.tmpdir(), "VKodex", "workspaces"),
     beforeReveal?: (binding: Binding) => Promise<void>,
+    private readonly watchdogMs = 45_000,
   ) {
     this.inputBatcher = new InputBatcher(input => this.enqueueInput(input), input => input.peerId !== access.ownerId
       && ![access.groupId, -access.groupId].includes(input.senderId) && !!store.byPeer(input.peerId)?.attached,
@@ -148,11 +149,13 @@ export class TaskManager {
 
   private async watch(input: BridgeInput): Promise<void> {
     const timer = setTimeout(() => {
+      const inboxKey = JSON.stringify([input.peerId, input.eventId]);
+      if (this.store.inputSettled(inboxKey)) return;
       const binding = this.store.byPeer(input.peerId);
       this.store.enqueue(`watchdog:${input.peerId}:${input.eventId}`, input.peerId, {
-        text: "VKodex не дождался ответа локального Codex за 45 секунд. Остальные беседы продолжают работать. Результат этой операции неизвестен: проверь десктоп и не повторяй изменяющую команду вслепую.",
+        text: "Запрос всё ещё обрабатывается. Не отправляй его повторно: VKodex продолжает ждать подтверждения Codex и пришлёт итог отдельно. Остальные беседы продолжают работать.",
       }, binding?.id ?? null);
-    }, 45_000);
+    }, this.watchdogMs);
     timer.unref();
     // The watchdog reports latency but cannot cancel a mutation. Retain this
     // peer's lock until dispatch settles; other peers keep their own queues.

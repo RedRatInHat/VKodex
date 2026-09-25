@@ -67,6 +67,19 @@ test("health goal reads are isolated from the long-lived task owner", async () =
   assert.deepEqual({ ownerReads, healthReads }, { ownerReads: 1, healthReads: 1 });
 });
 
+test("an archived goal falls back to its read-only profile store, never for a live task", async () => {
+  const f = fixture(); let archived = false; let baseReads = 0;
+  f.owner.getGoal = async () => { throw new ActionRejectedError("thread not found"); };
+  const base = { ...f.base, isTaskArchived: async () => archived,
+    getGoal: async () => { baseReads++; return null; } };
+  const routed = new RoutedCodexTasks(base, [f.owner]);
+  await assert.rejects(routed.getGoal!(work), /thread not found/u);
+  assert.equal(baseReads, 0);
+  archived = true;
+  assert.equal(await routed.getGoal!(work), null);
+  assert.equal(baseReads, 1);
+});
+
 test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {
   const f = fixture(); await f.routed.ensureOpen!(work); assert.deepEqual(f.calls, []);
   await assert.rejects(f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);

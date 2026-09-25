@@ -7,7 +7,7 @@ import { ChatRateLimitError, FileUploadRejectedError, FileUploadStorageFullError
 import { AccessGate, DeliveryWorker } from "../src/bridge/delivery.js";
 import { TaskManager } from "../src/bridge/manager.js";
 import { TaskTransfers, transferStatus } from "../src/bridge/transfers.js";
-import { ArchiveOwnerRequiredError, TransferConflictError } from "../src/desktop/contracts.js";
+import { ArchiveOwnerRequiredError, DesktopUnavailableError, TransferConflictError } from "../src/desktop/contracts.js";
 import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
@@ -1181,6 +1181,7 @@ test("a changed source snapshot blocks switching and archival instead of hiding 
 test("source archival retries autonomously and ignores absence from a broken display catalog", async t => {
   const s = setup(t); const record = transferFixture(s);
   let failing = true;
+  s.desktop.archiveRetryReady = async () => !failing;
   const archive = s.desktop.archiveTask.bind(s.desktop);
   s.desktop.archiveTransferredSource = async ref => { if (failing) throw new TaskNotOpenError(); await archive(ref); };
   const transfers = new TaskTransfers(s.store, s.desktop, s.now);
@@ -1291,6 +1292,45 @@ test("a returned idle owner resumes only the saved archive stage", async t => {
   assert.equal(archiveCalls, 2);
   assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
   assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("a rejected archive preflight retries the saved stage after the source becomes ready", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let ready = false; let archives = 0;
+  const archive = s.desktop.archiveTransferredSource.bind(s.desktop);
+  s.desktop.archiveRetryReady = async () => ready;
+  s.desktop.archiveTransferredSource = async ref => {
+    archives++;
+    if (!ready) throw new ActionRejectedError("Исходная и дочерние задачи должны быть завершены перед архивацией.");
+    await archive(ref);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, "archiveRejected");
+  assert.equal(archives, 1);
+  ready = true; s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(archives, 2); assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("an old read timeout at archive is reconciled before retrying without another fork", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let ready = false; let archives = 0;
+  const archive = s.desktop.archiveTransferredSource.bind(s.desktop);
+  s.desktop.archiveRetryReady = async () => ready;
+  s.desktop.archiveTransferredSource = async ref => {
+    archives++;
+    if (!ready) throw new DesktopUnavailableError("Процесс переноса Codex не завершился вовремя.");
+    await archive(ref);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.blockedReason, "archiveReadUnavailable");
+  const current = s.store.transfer(record.bindingId)!;
+  s.store.updateTransfer(current, { blockedReason: null }, s.now()); // persisted legacy record
+  ready = true; s.advance(60_000); transfers.tick(); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(archives, 2); assert.equal(s.desktop.transfers.length, 1);
 });
 
 test("transfer cannot discard an accepted VK turn whose completion is still unknown", async t => {
@@ -1822,6 +1862,29 @@ test("a blocked task conversation does not hold the manager or another conversat
   assert.equal(s.desktop.submissions.length, 1);
   assert.match(s.chat.sent.at(-1)!.view.text, /В каком проекте показать задачи/u);
   release(); await taskInput;
+});
+
+test("slow accepted Codex submission gets a progress notice, not a false unknown-result error", async t => {
+  const s = setup(t); const binding = s.attach();
+  let release!: () => void;
+  let started!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const submitted = new Promise<void>(resolve => { started = resolve; });
+  s.desktop.submitHook = () => { started(); return blocked; };
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate,
+    undefined, undefined, undefined, undefined, undefined, 20);
+  const input = s.input("Slow but successful", peerId);
+  const pending = manager.handle(input);
+  await submitted;
+  const operation = s.store.unresolvedPromptOperations(binding.id)[0];
+  assert.ok(operation);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, /Запрос всё ещё обрабатывается/u);
+  assert.doesNotMatch(s.chat.sent.at(-1)!.view.text, /Результат этой операции неизвестен/u);
+  release(); await pending;
+  assert.equal(s.store.operationState(operation.id), "accepted");
+  assert.equal(s.desktop.submissions.length, 1);
 });
 
 test("a legacy privacy pause is cleared and the same message is submitted", async t => {

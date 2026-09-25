@@ -104,7 +104,7 @@ export interface TaskTransferRecord {
   readonly attempt?: number;
   readonly retryAt?: number;
   readonly blocked?: boolean;
-  readonly blockedReason?: "archiveOwner" | "archiveUnknown" | "sourceChanged" | null;
+  readonly blockedReason?: "archiveOwner" | "archiveRejected" | "archiveReadUnavailable" | "archiveUnknown" | "sourceChanged" | null;
   /** Explicit owner decision after both source and target acquired unique work. */
   readonly conflictResolution?: "keptBoth";
   /** A historical record closed from native archive + exact binding evidence,

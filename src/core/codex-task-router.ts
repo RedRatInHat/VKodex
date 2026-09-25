@@ -174,8 +174,18 @@ export class RoutedCodexTasks implements CodexTasks {
   consumeUsageReset(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome> {
     if (!this.base.consumeUsageReset) throw new ActionRejectedError("Сброс лимита недоступен."); return this.base.consumeUsageReset(task, idempotencyKey);
   }
-  getGoal(task: TaskRef): Promise<TaskGoal | null> {
-    const owner = this.owner(task); return owner?.getGoal(task) ?? this.base.getGoal?.(task) ?? Promise.resolve(null);
+  async getGoal(task: TaskRef): Promise<TaskGoal | null> {
+    const owner = this.owner(task);
+    if (!owner) return this.base.getGoal?.(task) ?? null;
+    try { return await owner.getGoal(task); }
+    catch (error) {
+      // Some native versions reject goal/get for an archived thread. Only an
+      // exact archived state authorizes the base adapter's read-only goal DB
+      // fallback; never mask an error for a live task.
+      if (!(error instanceof ActionRejectedError) || !this.base.getGoal || !this.base.isTaskArchived
+        || !await this.base.isTaskArchived(task)) throw error;
+      return this.base.getGoal(task);
+    }
   }
   healthGoal(task: TaskRef): Promise<TaskGoal | null> {
     // Health probes run in the base adapter's short-lived read-only process.

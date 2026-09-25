@@ -201,6 +201,24 @@ test("running, unloaded or active-goal descendants prevent root archival", async
   }
 });
 
+test("owner archive accepts an old unloaded empty child but not a newly spawned one", async () => {
+  const child = "22222222-2222-4222-8222-222222222222";
+  let updatedAt = Math.floor(Date.now() / 1000);
+  const f = fixture({
+    "thread/list": () => ({ data: [{ id: child }], nextCursor: null }),
+    "thread/read": m => ({ thread: { id: m.params.threadId, updatedAt,
+      status: { type: m.params.threadId === child ? "notLoaded" : "idle" } } }),
+    "thread/turns/list": () => ({ data: [], nextCursor: null }),
+  });
+  f.initialize();
+  await assert.rejects(f.transport.archiveIdle(threadId));
+  assert.equal(f.requests.filter(m => m.method === "thread/archive").length, 0);
+  updatedAt -= 600;
+  await f.transport.archiveIdle(threadId);
+  assert.equal(f.requests.filter(m => m.method === "thread/archive").length, 1);
+  f.transport.close();
+});
+
 test("a changed descendant tree or repeated pagination cursor prevents archival", async () => {
   const child = "22222222-2222-4222-8222-222222222222";
   let lists = 0;

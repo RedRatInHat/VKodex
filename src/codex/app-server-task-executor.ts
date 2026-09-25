@@ -78,15 +78,16 @@ export class AppServerTaskExecutor {
     this.releasing.set(key, work);
   }
 
-  private async waitForRelease(task: TaskRef): Promise<void> {
+  private async waitForRelease(task: TaskRef): Promise<boolean> {
     const key = taskKey(task);
     await this.releasing.get(key);
-    if (!this.uncertainReleases.has(key) || !this.loaded.has(key)) return;
+    if (!this.uncertainReleases.has(key) || !this.loaded.has(key)) return false;
     const result = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
     const thread = isObject(result.thread) ? result.thread : null;
     if (!thread || thread.id !== task.threadId) throw new AppServerUnavailableError();
     if (isObject(thread.status) && thread.status.type === "notLoaded") this.forget(task);
     else this.uncertainReleases.delete(key);
+    return true;
   }
 
   /** A state stream and the command executor share one profile App Server.
@@ -386,7 +387,13 @@ export class AppServerTaskExecutor {
             threadId: id, limit: 1, sortDirection: "desc", itemsView: "summary",
           });
           const last = Array.isArray(page.data) && isObject(page.data[0]) ? page.data[0] : null;
-          idle = !!last && ["completed", "failed", "interrupted"].includes(String(last.status));
+          // Spawned children can be left without a first turn. An old,
+          // unloaded, empty child has no work to finish; a newly created one
+          // may still be starting in another client, so keep that blocked.
+          const oldEmptyChild = id !== root && Array.isArray(page.data) && page.data.length === 0
+            && page.nextCursor === null && typeof thread.updatedAt === "number"
+            && Number.isFinite(thread.updatedAt) && thread.updatedAt <= Math.floor(Date.now() / 1000) - 120;
+          idle = (!!last && ["completed", "failed", "interrupted"].includes(String(last.status))) || oldEmptyChild;
         }
         if (!idle) {
           throw new ActionRejectedError("Исходная и дочерние задачи должны быть завершены перед архивацией.");
@@ -462,9 +469,19 @@ export class AppServerTaskExecutor {
 
   private async resume(task: TaskRef): Promise<LoadedTask> {
     try {
-      await this.waitForRelease(task);
+      const verified = await this.waitForRelease(task);
       const cached = this.loaded.get(taskKey(task));
-      if (cached) return cached;
+      if (cached) {
+        if (cached.activeTurnId || verified) return cached;
+        // The native owner may unload an idle task without closing this App
+        // Server connection. A stale local cache then makes turn/start fail
+        // with -32600 even though thread/read and a fresh resume both work.
+        const read = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+        const thread = isObject(read.thread) && read.thread.id === task.threadId ? read.thread : null;
+        if (!thread || !isObject(thread.status)) throw new AppServerUnavailableError();
+        if (thread.status.type !== "notLoaded") return cached;
+        this.forget(task);
+      }
       const result = await this.resumeNative(task);
       return this.loaded.get(taskKey(task)) ?? this.acceptResumedTask(task, result);
     } catch (error) { throw operationError(error, "подключение к задаче"); }

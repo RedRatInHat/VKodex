@@ -196,10 +196,21 @@ export class OwnerTransport {
         const thread = result.thread;
         // `systemError` is terminal and has no running turn. Requiring only
         // `idle` left a safely verified failed source impossible to archive.
-        if (!object(thread) || thread.id !== id || !object(thread.status)
-          || !["idle", "systemError"].includes(String(thread.status.type))) {
+        if (!object(thread) || thread.id !== id || !object(thread.status)) {
           throw new OwnerTransportError("rejected", "Source and descendants must be confirmed terminal before archival.");
         }
+        let terminal = ["idle", "systemError"].includes(String(thread.status.type));
+        if (!terminal && id !== threadId && thread.status.type === "notLoaded") {
+          const page = await this.request("thread/turns/list", {
+            threadId: id, limit: 1, sortDirection: "desc", itemsView: "summary",
+          });
+          const last = Array.isArray(page.data) && object(page.data[0]) ? page.data[0] : null;
+          const oldEmptyChild = Array.isArray(page.data) && page.data.length === 0 && page.nextCursor === null
+            && typeof thread.updatedAt === "number" && Number.isFinite(thread.updatedAt)
+            && thread.updatedAt <= Math.floor(Date.now() / 1000) - 120;
+          terminal = (!!last && ["completed", "failed", "interrupted"].includes(String(last.status))) || oldEmptyChild;
+        }
+        if (!terminal) throw new OwnerTransportError("rejected", "Source and descendants must be confirmed terminal before archival.");
         const goal = await this.request("thread/goal/get", { threadId: id });
         if (goal.goal !== null && (!object(goal.goal) || !["paused", "complete", "blocked", "usageLimited", "budgetLimited"].includes(String(goal.goal.status)))) throw new OwnerTransportError("rejected", "Pause source and descendant goals before archival.");
       }

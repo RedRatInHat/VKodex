@@ -131,7 +131,11 @@ export class TaskTransfers {
     try {
       if (!this.desktop.isTaskArchived || !record.target || !record.checkpoint) return;
       if (!await this.confirmArchivedSource(record)) {
-        if (record.blockedReason === null && this.desktop.verifyTransferSource) {
+        const knownRejected = record.blockedReason === null && !!record.detail
+          && (/^Владелец задачи не разрешил безопасную архивацию\./u.test(record.detail)
+            || /^Исходная и дочерние задачи должны быть завершены перед архивацией\./u.test(record.detail)
+            || /^Процесс переноса Codex не завершился вовремя\./u.test(record.detail));
+        if (record.blockedReason === null && !knownRejected && this.desktop.verifyTransferSource) {
           // Older blocked records did not preserve a typed failure. Read the
           // immutable boundary before even considering an operator retry.
           await this.desktop.verifyTransferSource(record.source, record.checkpoint);
@@ -141,7 +145,9 @@ export class TaskTransfers {
         // A newly connected idle native owner can now accept it. Re-enter the
         // saved archive stage, which rechecks the source boundary and goal
         // before writing; never infer ownership from a timeout alone.
-        if (record.blockedReason === "archiveOwner" && this.desktop.archiveRetryReady
+        if ((record.blockedReason === "archiveOwner" || record.blockedReason === "archiveRejected"
+          || record.blockedReason === "archiveReadUnavailable" || knownRejected)
+          && this.desktop.archiveRetryReady
           && await this.desktop.archiveRetryReady(record.source)) await this.run(record);
         return;
       }
@@ -306,11 +312,17 @@ export class TaskTransfers {
       record = this.store.completeTransfer(record, this.now()); this.publish(record);
     } catch (error) {
       const unknownArchive = record.phase === "switched" && record.step === "archive" && error instanceof UncertainActionError;
-      const blocked = error instanceof TransferConflictError || unknownArchive || (record.attempt ?? 0) >= 8;
+      const rejectedArchive = record.phase === "switched" && record.step === "archive"
+        && error instanceof ActionRejectedError && !(error instanceof TransferConflictError);
+      const readUnavailable = record.phase === "switched" && record.step === "archive"
+        && error instanceof DesktopUnavailableError;
+      const blocked = error instanceof TransferConflictError || unknownArchive || rejectedArchive || readUnavailable || (record.attempt ?? 0) >= 8;
       const detail = error instanceof ActionRejectedError || error instanceof DesktopUnavailableError || error instanceof UncertainActionError
         ? error.message : "Сбой этапа переноса. Состояние сохранено; новая копия не создаётся.";
       try {
-        save({ blocked, detail, blockedReason: error instanceof ArchiveOwnerRequiredError ? "archiveOwner" : unknownArchive ? "archiveUnknown" : null,
+        save({ blocked, detail, blockedReason: error instanceof ArchiveOwnerRequiredError ? "archiveOwner"
+          : unknownArchive ? "archiveUnknown" : rejectedArchive ? "archiveRejected"
+          : readUnavailable ? "archiveReadUnavailable" : null,
           retryAt: blocked ? 0 : this.now() + Math.min(10 * 60_000, 10_000 * 2 ** Math.min(record.attempt ?? 1, 6)) });
         this.publish(record);
       } catch { /* A stale callback must not overwrite a different operation. */ }

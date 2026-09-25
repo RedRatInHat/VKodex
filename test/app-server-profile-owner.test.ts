@@ -58,7 +58,7 @@ test("profile owner shares one connection for commands and task state", async ()
   await stream.start();
   const receipt = await owner.submitWithReceipt({ operationId: "op", task, text: "prompt" });
   assert.equal(initial, true); assert.deepEqual(receipt, { mode: "start", turnId: "turn" });
-  assert.deepEqual(rpc.calls, ["thread/resume", "turn/start"]);
+  assert.deepEqual(rpc.calls, ["thread/resume", "thread/read", "turn/start"]);
   await owner.close(); assert.equal(rpc.closed, 1);
 });
 

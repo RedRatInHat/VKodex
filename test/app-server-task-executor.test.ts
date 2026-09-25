@@ -13,6 +13,7 @@ class FakeRpc implements AppServerRpc {
   private readonly disconnectListeners = new Set<(error: Error) => void>();
   private handler: AppServerServerRequestHandler | null = null;
   activeTurnId: string | null = null;
+  nativeLoaded = true;
   title: string | null = "Task";
   projectId: string | null = null;
   goal: JsonObject | null = null;
@@ -22,7 +23,8 @@ class FakeRpc implements AppServerRpc {
   interruptPlan: ("success" | "reject-running" | "reject-stopped" | "uncertain-running" | "uncertain-stopped")[] = [];
   modelUpdatePlan: Error[] = [];
   descendants: string[] = [];
-  unloadedDescendantStatus: "completed" | "failed" | "interrupted" | "inProgress" | null = null;
+  unloadedDescendantStatus: "completed" | "failed" | "interrupted" | "inProgress" | "empty" | null = null;
+  emptyDescendantUpdatedAt = Math.floor(Date.now() / 1000) - 600;
   private after(method: string): void {
     if (this.failAfterMethod === method) { this.failAfterMethod = null; throw new AppServerUncertainError(); }
   }
@@ -30,12 +32,12 @@ class FakeRpc implements AppServerRpc {
   async request(method: string, params: JsonObject = {}, options: AppServerRequestOptions = {}): Promise<JsonObject> {
     this.requests.push({ method, params, options });
     if (this.fail && (!this.failMethod || this.failMethod === method)) { const error = this.fail; this.fail = null; this.failMethod = null; throw error; }
-    if (method === "thread/resume") return {
+    if (method === "thread/resume") { this.nativeLoaded = true; return {
       thread: { id: params.threadId, status: { type: this.activeTurnId ? "active" : "idle" } },
       initialTurnsPage: { data: this.activeTurnId ? [{ id: this.activeTurnId, status: "inProgress", items: [] }] : [] },
       model: "model-a", reasoningEffort: "high",
-    };
-    if (method === "turn/start") { this.activeTurnId = "started-turn"; return { turn: { id: this.activeTurnId } }; }
+    }; }
+    if (method === "turn/start") { if (!this.nativeLoaded) throw new AppServerRejectedError(-32600); this.activeTurnId = "started-turn"; return { turn: { id: this.activeTurnId } }; }
     if (method === "turn/steer") return { turnId: this.activeTurnId };
     if (method === "turn/interrupt") {
       const action = this.interruptPlan.shift() ?? "success";
@@ -47,12 +49,16 @@ class FakeRpc implements AppServerRpc {
     if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
     if (method === "thread/settings/update" && this.modelUpdatePlan.length) throw this.modelUpdatePlan.shift()!;
     if (method === "thread/list") return { data: this.descendants.map(id => ({ id })), nextCursor: null };
+    if (method === "thread/turns/list" && this.unloadedDescendantStatus === "empty" && params.threadId !== "task") {
+      return { data: [], nextCursor: null };
+    }
     if (method === "thread/turns/list") return { data: [{ id: "started-turn",
       status: this.unloadedDescendantStatus && params.threadId !== "task" ? this.unloadedDescendantStatus
         : this.activeTurnId === "started-turn" ? "inProgress" : "interrupted", items: [] }], nextCursor: null };
     // Native thread/read can briefly lag an acknowledged turn/start.
     if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId,
-      cwd: "D:\\work", status: { type: this.unloadedDescendantStatus && params.threadId !== "task" ? "notLoaded" : "idle" } } };
+      cwd: "D:\\work", updatedAt: this.emptyDescendantUpdatedAt,
+      status: { type: this.unloadedDescendantStatus && params.threadId !== "task" || !this.nativeLoaded ? "notLoaded" : "idle" } } };
     if (method === "thread/name/set") { this.title = String(params.name); this.after(method); return {}; }
     if (method === "thread/metadata/update") { this.projectId = params.projectId ? String(params.projectId) : null; this.after(method); return {}; }
     if (method === "thread/goal/get") return { goal: this.goal };
@@ -128,6 +134,20 @@ test("a disconnected owner drops its loaded-task cache before reconnecting", asy
     assert.equal(await executor.inspectLoadedTask(task), null);
     await executor.submitWithReceipt({ ...request(), operationId: "operation-after-reconnect" });
     assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 2);
+  } finally { executor.close(); }
+});
+
+test("an idle task unloaded behind the owner cache is resumed before the next turn", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.submitWithReceipt(request());
+    rpc.activeTurnId = null;
+    rpc.emit({ method: "turn/completed", params: { threadId: task.threadId, turn: { id: "started-turn", status: "completed" } } });
+    rpc.nativeLoaded = false;
+    assert.deepEqual(await executor.submitWithReceipt({ ...request(), operationId: "operation-after-unload" }),
+      { mode: "start", turnId: "started-turn" });
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 2);
+    assert.equal(rpc.requests.filter(item => item.method === "turn/start").length, 2);
   } finally { executor.close(); }
 });
 
@@ -318,6 +338,19 @@ test("archive rejects an unloaded descendant with an active last turn", async ()
     await assert.rejects(executor.archiveIdle(task), /дочерние задачи должны быть завершены/u);
     assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 0);
     assert.equal(rpc.requests.filter(item => item.method === "thread/resume" && item.params.threadId === "running-child").length, 0);
+  } finally { executor.close(); }
+});
+
+test("archive accepts an old unloaded child with no turns but waits for a newly spawned child", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  rpc.descendants = ["empty-child"]; rpc.unloadedDescendantStatus = "empty";
+  try {
+    rpc.emptyDescendantUpdatedAt = Math.floor(Date.now() / 1000);
+    await assert.rejects(executor.archiveIdle(task), /дочерние задачи должны быть завершены/u);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 0);
+    rpc.emptyDescendantUpdatedAt -= 600;
+    await executor.archiveIdle(task);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/archive").length, 1);
   } finally { executor.close(); }
 });
 
