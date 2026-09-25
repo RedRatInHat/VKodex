@@ -97,6 +97,17 @@ test("App Server executor starts an idle turn and steers only the confirmed acti
   } finally { executor.close(); }
 });
 
+test("native prompt rejections identify the failed stage and safe numeric code", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    rpc.fail = new AppServerRejectedError(-32000); rpc.failMethod = "thread/resume";
+    await assert.rejects(executor.submitWithReceipt(request()), /подключение к задаче \(код -32000\)/u);
+    rpc.fail = new AppServerRejectedError(-32602); rpc.failMethod = "turn/start";
+    await assert.rejects(executor.submitWithReceipt(request()), /запуск нового хода \(код -32602\)/u);
+    assert.equal(rpc.requests.filter(item => item.method === "turn/start").length, 1);
+  } finally { executor.close(); }
+});
+
 test("inspection of an owned active task never resumes and aborts it", async () => {
   const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
   try {

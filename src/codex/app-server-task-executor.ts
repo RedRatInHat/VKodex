@@ -22,9 +22,10 @@ interface PendingQuestion {
   reject(error: Error): void;
 }
 
-const operationError = (error: unknown): Error => error instanceof AppServerUncertainError ? new UncertainActionError()
+const operationError = (error: unknown, action = "команду"): Error => error instanceof AppServerUncertainError ? new UncertainActionError()
   : error instanceof AppServerRejectedError && error.reason === "active-writer" ? new TaskOwnedByClientError()
-  : error instanceof AppServerRejectedError ? new ActionRejectedError("Codex отклонил команду. Состояние задачи не изменено.")
+  : error instanceof AppServerRejectedError ? new ActionRejectedError(
+    `Codex отклонил ${action}${typeof error.code === "number" ? ` (код ${error.code})` : ""}. Состояние задачи не изменено.`)
   // AppServerUnavailableError is produced only by reads or before a mutating
   // request is accepted. Mutating timeouts use AppServerUncertainError. Keep
   // the distinction here so the bridge can mark a broken owner route for
@@ -131,7 +132,7 @@ export class AppServerTaskExecutor {
         nextModel: loaded.model, nextEffort: loaded.effort, context: null,
         ...(status === "failed" ? { failure: "systemError" as const } : {}),
       };
-    } catch (error) { throw operationError(error); }
+    } catch (error) { throw operationError(error, "проверку состояния задачи"); }
   }
 
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
@@ -158,7 +159,7 @@ export class AppServerTaskExecutor {
       if (!turnId) throw new UncertainActionError();
       this.loaded.set(taskKey(request.task), { ...loaded, activeTurnId: turnId });
       return { mode: "start", turnId };
-    } catch (error) { throw operationError(error); }
+    } catch (error) { throw operationError(error, loaded.activeTurnId ? "добавление сообщения в текущий ход" : "запуск нового хода"); }
   }
 
   async interrupt(task: TaskRef): Promise<void> {
@@ -217,7 +218,7 @@ export class AppServerTaskExecutor {
       const id = isObject(result.queuedSubmission) ? idOf(result.queuedSubmission.id) : null;
       if (!id) throw new UncertainActionError();
       return id;
-    } catch (error) { throw operationError(error); }
+    } catch (error) { throw operationError(error, "добавление сообщения в очередь"); }
   }
 
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
@@ -466,7 +467,7 @@ export class AppServerTaskExecutor {
       if (cached) return cached;
       const result = await this.resumeNative(task);
       return this.loaded.get(taskKey(task)) ?? this.acceptResumedTask(task, result);
-    } catch (error) { throw operationError(error); }
+    } catch (error) { throw operationError(error, "подключение к задаче"); }
   }
 
   /** A stream and a VK command must never resume the same task twice. A
