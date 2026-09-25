@@ -66,6 +66,24 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   assert.equal(s.store.pendingDeliveries().length, 0);
 });
 
+test("health records the failing phase and retries after an internal exception", async t => {
+  const s = setup(t);
+  const diagnostics: string[] = [];
+  t.mock.method(process.stderr, "write", (chunk: string) => { diagnostics.push(String(chunk)); return true; });
+  let broken = true;
+  t.mock.method(s.store, "transfers", () => {
+    if (broken) throw Object.assign(new Error("fixture failure"), { code: "E_FIXTURE" });
+    return [];
+  });
+  await assert.rejects(s.monitor.check(true), /fixture failure/);
+  const failure = JSON.parse(diagnostics[0]!) as { phase: string; errorName: string; errorCode: string };
+  assert.equal(failure.phase, "runtime-and-store");
+  assert.equal(failure.errorName, "Error");
+  assert.equal(failure.errorCode, "E_FIXTURE");
+  broken = false;
+  assert.equal((await s.monitor.check(true)).state, "ok");
+});
+
 test("Codex task failures degrade health even with a connected stream", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const now = 100_000;

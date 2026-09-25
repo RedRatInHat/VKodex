@@ -62,6 +62,35 @@ test("one long-lived App Server connection initializes once and multiplexes requ
   } finally { await connection.close(); }
 });
 
+test("App Server assembles a large response line from bounded chunks", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 5_000);
+  try {
+    const response = connection.request("thread/read", { threadId: "large" });
+    await new Promise(resolve => setImmediate(resolve));
+    const id = child.messages.find(message => message.method === "thread/read")?.id;
+    const value = "x".repeat(8 * 1024 * 1024);
+    const line = `${JSON.stringify({ id, result: { value } })}\n`;
+    for (let offset = 0; offset < line.length; offset += 64 * 1024) child.stdout.write(line.slice(offset, offset + 64 * 1024));
+    assert.equal((await response).value, value);
+  } finally { await connection.close(); }
+});
+
+test("App Server rejects an oversized unfinished line before it consumes unbounded memory", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 5_000);
+  const disconnects: Error[] = [];
+  connection.onDisconnect(error => disconnects.push(error));
+  try {
+    await connection.start();
+    const chunk = "x".repeat(1024 * 1024);
+    for (let count = 0; count <= 64 && !disconnects.length; count++) child.stdout.write(chunk);
+    assert.equal(disconnects.length, 1);
+    assert.ok(disconnects[0] instanceof AppServerUnavailableError);
+  } finally { await connection.close(); }
+});
+
 test("App Server requests are answered on the same profile connection", async () => {
   const child = new AppServerChild();
   const connection = new AppServerConnection(() => child.asChild(), undefined, 100);

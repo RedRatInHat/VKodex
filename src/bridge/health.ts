@@ -81,20 +81,41 @@ export class BridgeHealthMonitor {
 
   check(force = false): Promise<BridgeHealthSnapshot> {
     if (this.checking) return this.checking;
-    this.checking = this.run(force).finally(() => { this.checking = null; });
+    const startedAt = Date.now();
+    let phase = "start";
+    let pending: readonly string[] = [];
+    const report = (kind: "slow" | "error" | "recovered", error?: unknown): void => {
+      const failure = error as { name?: unknown; code?: unknown } | null;
+      process.stderr.write(`${JSON.stringify({
+        level: kind === "error" ? 50 : 40, time: new Date().toISOString(), pid: process.pid,
+        phase, pending, elapsedMs: Date.now() - startedAt,
+        ...(failure ? { errorName: typeof failure.name === "string" ? failure.name : "unknown",
+          errorCode: typeof failure.code === "string" ? failure.code : undefined } : {}),
+        msg: `VKodex health check ${kind}`,
+      })}\n`);
+    };
+    let slow = false;
+    const timer = setTimeout(() => { slow = true; report("slow"); }, 30_000);
+    timer.unref();
+    this.checking = this.run(force, next => { phase = next; }, next => { pending = next; })
+      .then(snapshot => { if (slow) report("recovered"); return snapshot; })
+      .catch(error => { report("error", error); throw error; })
+      .finally(() => { clearTimeout(timer); this.checking = null; });
     return this.checking;
   }
 
-  private async run(force: boolean): Promise<BridgeHealthSnapshot> {
+  private async run(force: boolean, setPhase: (phase: string) => void, setPending: (pending: readonly string[]) => void): Promise<BridgeHealthSnapshot> {
     const checkedAt = this.now();
     const checks: HealthCheckResult[] = [];
 
+    setPhase("sqlite");
     try {
       checks.push(this.store.quickCheck()
         ? { name: "sqlite", state: "ok", detail: "База состояния прошла PRAGMA quick_check." }
         : { name: "sqlite", state: "failed", detail: "SQLite не подтвердил целостность базы состояния." });
     } catch { checks.push({ name: "sqlite", state: "failed", detail: "База состояния недоступна для проверки." }); }
 
+    setPhase("runtime-and-store");
     const runtime = this.runtime();
     const tickAge = Math.max(0, checkedAt - runtime.lastTickAt);
     const updateAge = runtime.updateStartedAt === null ? 0 : Math.max(0, checkedAt - runtime.updateStartedAt);
@@ -236,11 +257,22 @@ export class BridgeHealthMonitor {
         detail: `«${record.source.title.slice(0, 120)}»: этап ${record.step ?? record.phase}, последнее изменение ${new Date(record.updatedAt ?? record.startedAt).toISOString()}. ${reason} /menu задачи — подробности.` });
     }
 
+    setPhase("external-checks");
+    const active = new Set(["vk", "catalog", "goals", "compatibility", "owner-adapters"]);
+    setPending([...active]);
+    const checked = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+      try { return await run(); }
+      finally { active.delete(name); setPending([...active]); }
+    };
     const [vkResult, catalogResult, goalsResult, compatibilityResult, ownerAdapters] = await Promise.all([
-      this.checkVk(), this.checkCatalog(), this.checkGoals(), this.checkCompatibility(force, checkedAt), this.checkOwnerAdapters(runtime),
+      checked("vk", () => this.checkVk()), checked("catalog", () => this.checkCatalog()),
+      checked("goals", () => this.checkGoals()), checked("compatibility", () => this.checkCompatibility(force, checkedAt)),
+      checked("owner-adapters", () => this.checkOwnerAdapters(runtime)),
     ]);
     checks.push(...vkResult, ...catalogResult, goalsResult, compatibilityResult, ...ownerAdapters);
 
+    setPhase("persist");
+    setPending([]);
     let snapshot: BridgeHealthSnapshot = {
       state: aggregate(checks), checkedAt, pid: process.pid,
       uptimeSeconds: Math.max(0, (checkedAt - runtime.startedAt) / 1_000), checks,
@@ -254,6 +286,7 @@ export class BridgeHealthMonitor {
         this.store.setValue("health:latest", snapshot);
       }
     }
+    setPhase("notify");
     this.notifyTransition(snapshot);
     return snapshot;
   }

@@ -55,7 +55,8 @@ export class AppServerConnection implements AppServerRpc {
   private child: ChildProcessWithoutNullStreams | null = null;
   private generation = 0;
   private nextId = 1;
-  private buffer = "";
+  private fragments: string[] = [];
+  private fragmentBytes = 0;
   private starting: Promise<void> | null = null;
   private closing: Promise<void> = Promise.resolve();
   private stopped = false;
@@ -102,7 +103,7 @@ export class AppServerConnection implements AppServerRpc {
     let child: ChildProcessWithoutNullStreams;
     try { child = this.launch(); } catch { throw new AppServerUnavailableError(); }
     const generation = ++this.generation;
-    this.child = child; this.buffer = ""; this.nextId = 1;
+    this.child = child; this.fragments = []; this.fragmentBytes = 0; this.nextId = 1;
     child.stdout.setEncoding("utf8"); child.stderr.resume();
     child.stdout.on("data", (chunk: string) => this.receive(child, generation, chunk));
     const failed = () => this.connectionFailed(child, generation);
@@ -152,12 +153,18 @@ export class AppServerConnection implements AppServerRpc {
 
   private receive(child: ChildProcessWithoutNullStreams, generation: number, chunk: string): void {
     if (this.child !== child || this.generation !== generation) return;
-    this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer, "utf8") > MAX_BUFFER_BYTES) {
-      this.failConnection(child, generation, new AppServerUnavailableError("Codex App Server прислал слишком большой пакет.")); return;
-    }
-    while (this.buffer.includes("\n") && this.child === child && this.generation === generation) {
-      const end = this.buffer.indexOf("\n"); const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
+    let start = 0;
+    while (start < chunk.length && this.child === child && this.generation === generation) {
+      const end = chunk.indexOf("\n", start);
+      const fragment = chunk.slice(start, end < 0 ? undefined : end);
+      this.fragmentBytes += Buffer.byteLength(fragment, "utf8");
+      if (this.fragmentBytes > MAX_BUFFER_BYTES) {
+        this.failConnection(child, generation, new AppServerUnavailableError("Codex App Server прислал слишком большой пакет.")); return;
+      }
+      if (fragment) this.fragments.push(fragment);
+      if (end < 0) return;
+      const line = this.fragments.join("");
+      this.fragments = []; this.fragmentBytes = 0; start = end + 1;
       if (!line.trim()) continue;
       let value: unknown;
       try { value = JSON.parse(line); } catch {
@@ -214,7 +221,7 @@ export class AppServerConnection implements AppServerRpc {
 
   private failConnection(child: ChildProcessWithoutNullStreams, generation: number, fallback: Error, skipId?: number): void {
     if (this.child !== child || this.generation !== generation) return;
-    this.child = null; this.buffer = "";
+    this.child = null; this.fragments = []; this.fragmentBytes = 0;
     for (const [id, pending] of this.pending) {
       if (id === skipId) continue;
       this.pending.delete(id); clearTimeout(pending.timer);
@@ -228,7 +235,7 @@ export class AppServerConnection implements AppServerRpc {
 
   async close(): Promise<void> {
     this.stopped = true; this.starting = null;
-    const child = this.child; this.child = null; this.buffer = ""; this.generation++;
+    const child = this.child; this.child = null; this.fragments = []; this.fragmentBytes = 0; this.generation++;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());
