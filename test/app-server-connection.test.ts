@@ -222,6 +222,96 @@ test("server request receipt waits for the handler result to be written on the l
   } finally { release({}); await connection.close(); }
 });
 
+test("matching serverRequest/resolved retires the callback before observers see it", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  let observerSawAborted: boolean | null = null;
+  const observed: string[] = [];
+  connection.onServerRequest((_request, requestContext) => {
+    contexts.push(requestContext);
+    void requestContext.responseWritten.catch(() => {});
+    return answer;
+  });
+  connection.onNotification(notification => {
+    observed.push(notification.method);
+    if (notification.method === "serverRequest/resolved") observerSawAborted = contexts[0]?.signal.aborted ?? false;
+  });
+  try {
+    await connection.start();
+    child.send({ id: 21, method: "item/tool/requestUserInput",
+      params: { threadId: "task-a", turnId: "turn-a", itemId: "item-a" } });
+    const context = contexts[0];
+    assert.ok(context);
+    child.send({ method: "serverRequest/resolved", params: { threadId: "task-a", requestId: 21 } });
+    assert.equal(observerSawAborted, true, "the pending callback is retired before raw notification delivery");
+    assert.equal(context.signal.aborted, true);
+    await assert.rejects(context.responseWritten);
+    release({ answers: { choice: { answers: ["late"] } } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(observed, ["serverRequest/resolved"]);
+    assert.deepEqual(child.messages.filter(message => message.id === 21), [], "no late success or error reply");
+  } finally { release({}); await connection.close(); }
+});
+
+test("serverRequest/resolved does not cancel a different thread or typed request ID", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, requestContext) => { contexts.push(requestContext); return answer; });
+  try {
+    await connection.start();
+    child.send({ id: 22, method: "item/tool/requestUserInput",
+      params: { threadId: "task-a", turnId: "turn-a", itemId: "item-a" } });
+    const context = contexts[0];
+    assert.ok(context);
+    child.send({ method: "serverRequest/resolved", params: { threadId: "task-b", requestId: 22 } });
+    child.send({ method: "serverRequest/resolved", params: { threadId: "task-a", requestId: "22" } });
+    assert.equal(context.signal.aborted, false);
+    release({ answers: {} });
+    await context.responseWritten;
+    assert.deepEqual(child.messages.filter(message => message.id === 22), [{ id: 22, result: { answers: {} } }]);
+  } finally { release({}); await connection.close(); }
+});
+
+test("a reused request ID after serverRequest/resolved survives the retired handler", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const contexts: AppServerServerRequestContext[] = [];
+  const releases: Array<(value: JsonObject) => void> = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    void context.responseWritten.catch(() => {});
+    return new Promise<JsonObject>(resolve => { releases.push(resolve); });
+  });
+  try {
+    await connection.start();
+    child.send({ id: 23, method: "item/tool/requestUserInput",
+      params: { threadId: "task-a", turnId: "turn-a", itemId: "old" } });
+    const oldContext = contexts[0];
+    assert.ok(oldContext);
+    child.send({ method: "serverRequest/resolved", params: { threadId: "task-a", requestId: 23 } });
+    assert.equal(oldContext.signal.aborted, true);
+    await assert.rejects(oldContext.responseWritten);
+    child.send({ id: 23, method: "item/tool/requestUserInput",
+      params: { threadId: "task-a", turnId: "turn-b", itemId: "new" } });
+    const newContext = contexts[1];
+    assert.ok(newContext, "the resolved ID can be reused for a new callback");
+    releases[0]!({ answers: { stale: { answers: ["old"] } } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(newContext.signal.aborted, false, "old handler cleanup cannot retire the new callback");
+    releases[1]!({ answers: { fresh: { answers: ["new"] } } });
+    await newContext.responseWritten;
+    assert.deepEqual(child.messages.filter(message => message.id === 23), [
+      { id: 23, result: { answers: { fresh: { answers: ["new"] } } } },
+    ]);
+  } finally { for (const release of releases) release({}); await connection.close(); }
+});
+
 test("conflicting server request replay aborts and rejects the old response receipt", { timeout: 2_000 }, async () => {
   const child = new AppServerChild();
   const connection = new AppServerConnection(() => child.asChild(), undefined, 100);

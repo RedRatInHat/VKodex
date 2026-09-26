@@ -200,6 +200,18 @@ export class AppServerConnection implements AppServerRpc {
         void this.acceptServerRequest(child, generation, value.id, { method: value.method, params: value.params });
       } else {
         const notification = { method: value.method, params: value.params };
+        // Resolution may come from auto-resolution or another native actor.
+        // Retire the exact pending callback before observers can submit a stale
+        // answer. This is cancellation, never a positive response-write receipt.
+        if (value.method === "serverRequest/resolved" && typeof value.params.threadId === "string"
+          && (typeof value.params.requestId === "string" || typeof value.params.requestId === "number")) {
+          const id = value.params.requestId;
+          const pending = this.pendingServerRequests.get(id);
+          if (pending?.request.params.threadId === value.params.threadId) {
+            this.pendingServerRequests.delete(id);
+            this.invalidateServerRequest(pending);
+          }
+        }
         for (const listener of this.notificationListeners) {
           try { listener(notification); } catch { /* One observer cannot break the profile connection. */ }
         }
