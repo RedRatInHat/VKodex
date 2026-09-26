@@ -600,6 +600,8 @@ Unsubscribing an observer does not discard a pending Codex question: the task ca
 
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
+Incoming IPC broadcasts are accepted when addressed to this client or when no recipient list is supplied: native clients use the latter to announce observation when opening a task. Foreign, empty, and malformed recipient lists are ignored; state handlers additionally validate the owner, source directory, and task.
+
 Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.
 
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:

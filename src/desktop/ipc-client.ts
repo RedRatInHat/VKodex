@@ -228,7 +228,11 @@ export class DesktopIpcClient {
         : new DesktopRequestRejectedError(message.error === "no-client-found" ? "no-client-found" : "request-rejected"));
       return;
     }
-    if (message.type === "broadcast" && Array.isArray(message.targetClientIds) && message.targetClientIds.includes(this.clientId)) {
+    const targets = message.targetClientIds;
+    // The native router leaves the first open/follow broadcast untargeted.
+    const addressedHere = targets === undefined || targets === null
+      || (Array.isArray(targets) && targets.every(target => typeof target === "string" && target.length > 0) && targets.includes(this.clientId));
+    if (message.type === "broadcast" && addressedHere) {
       for (const listener of this.listeners) {
         try { listener(message); } catch { /* One consumer must not close the shared broker connection. */ }
       }

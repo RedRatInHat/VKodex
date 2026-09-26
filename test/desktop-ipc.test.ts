@@ -1147,6 +1147,28 @@ test("IPC observer failures do not close the connection or suppress other consum
   } finally { client.close(); }
 });
 
+test("IPC delivers untargeted broadcasts and ignores empty, foreign, or malformed targets", async () => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  const seen: string[] = [];
+  client.onBroadcast(() => { throw new Error("bad observer"); });
+  client.onBroadcast(message => { seen.push(String(message.method)); });
+  try {
+    await client.connect();
+    server.send({ type: "broadcast", method: "untargeted-omitted" });
+    server.send({ type: "broadcast", method: "untargeted-null", targetClientIds: null });
+    server.send({ type: "broadcast", method: "targeted-self", targetClientIds: ["bridge-client"] });
+    server.send({ type: "broadcast", method: "targeted-empty", targetClientIds: [] });
+    server.send({ type: "broadcast", method: "targeted-other", targetClientIds: ["other-client"] });
+    server.send({ type: "broadcast", method: "targeted-malformed", targetClientIds: "bridge-client" });
+    server.send({ type: "broadcast", method: "targeted-mixed-number", targetClientIds: ["bridge-client", 42] });
+    server.send({ type: "broadcast", method: "targeted-mixed-null", targetClientIds: ["bridge-client", null] });
+    server.send({ type: "broadcast", method: "targeted-empty-id", targetClientIds: ["bridge-client", ""] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(seen, ["untargeted-omitted", "untargeted-null", "targeted-self"]);
+    assert.equal(server.destroyed, false);
+  } finally { client.close(); }
+});
+
 test("native owner errors are redacted and late results never reach a replacement connection", async () => {
   const first = new Server(); const second = new Server(); const servers = [first, second];
   let finish!: (result: IpcObject) => void; let receivedSignal: AbortSignal | null = null;
