@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestions } from "../core/codex-questions.js";
-import { TaskOwnedByClientError, type TaskDetails, type TaskEvent, type TaskRef } from "../core/codex-tasks.js";
+import { TaskOwnedByClientError, taskKey, type TaskDetails, type TaskEvent, type TaskRef } from "../core/codex-tasks.js";
 import type { TaskObservation, TaskObservationCheckpoint, TaskObservationOptions, TaskObservedInput } from "../core/task-observation.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
 import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelope, type AppServerRpc } from "./app-server-connection.js";
@@ -295,9 +295,29 @@ class AppServerTaskStream implements TaskStateStream {
   }
 }
 
-/** Native task streams for one profile-scoped App Server connection. */
+interface StateConsumer {
+  started: boolean;
+  seen: boolean;
+  readonly onState: (state: TaskState, initial: boolean) => void;
+  readonly onError: (error: Error) => void;
+}
+
+interface SharedStateStream {
+  readonly stream: AppServerTaskStream;
+  readonly consumers: Set<StateConsumer>;
+  readonly closed: Promise<void>;
+  readonly beforeStart: Promise<void> | undefined;
+  latest: TaskState | null;
+  error: Error | null;
+  starting: Promise<void> | null;
+}
+
+/** One upstream subscription per task on a profile-scoped App Server connection.
+ * Closing an inspector/consumer must not unsubscribe another live consumer. */
 export class AppServerTaskStateTransport implements TaskStateTransport {
-  private readonly streams = new Set<AppServerTaskStream>();
+  private readonly streams = new Map<string, SharedStateStream>();
+  private readonly retiring = new Map<string, Promise<void>>();
+  private closed = false;
   private readonly startWaiters: Array<() => void> = [];
   private activeStarts = 0;
   constructor(private readonly rpc: AppServerRpc,
@@ -315,13 +335,105 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
     }
   }
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
-    const stream = new AppServerTaskStream(this.rpc, task, onState, onError, this.questions,
-      work => this.gate(work), this.onTaskResume, this.resumeTask,
-      (closed, release) => { this.streams.delete(closed); this.onTaskClose(closed.task, release); });
-    this.streams.add(stream); return stream;
+    if (this.closed) throw new AppServerUnavailableError("Транспорт наблюдения закрыт.");
+    const key = taskKey(task);
+    let joined: SharedStateStream | null = null;
+    const consumer: StateConsumer = { started: false, seen: false, onState, onError };
+    let closed = false;
+    return {
+      task,
+      start: async () => {
+        if (closed || this.closed) throw new AppServerUnavailableError("Подписка наблюдения закрыта.");
+        const entry = joined ??= this.streams.get(key) ?? this.createSharedStream(key, task);
+        entry.consumers.add(consumer);
+        consumer.started = true;
+        if (entry.error) throw entry.error;
+        // Assign the shared promise before start can emit a synchronous snapshot.
+        entry.starting ??= Promise.resolve().then(async () => {
+          await entry.beforeStart;
+          if (!entry.consumers.size) throw new AppServerUnavailableError("Подписка наблюдения закрыта.");
+          await entry.stream.start();
+        });
+        await entry.starting;
+        if (!closed && !this.closed && entry.consumers.has(consumer) && !consumer.seen && entry.latest) this.deliver(consumer, entry.latest);
+      },
+      verifyOwner: async () => {
+        const entry = joined;
+        if (closed || !entry || !consumer.started || entry.error) throw entry?.error ?? new AppServerUnavailableError("Подписка наблюдения не активна.");
+        await entry.stream.verifyOwner();
+        if (closed) throw new AppServerUnavailableError("Подписка наблюдения закрыта.");
+      },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        const entry = joined;
+        if (!entry) return;
+        entry.consumers.delete(consumer);
+        if (!entry.consumers.size) this.retire(key, entry);
+      },
+    };
+  }
+  private deliver(consumer: StateConsumer, state: TaskState): void {
+    if (!consumer.started) return;
+    const initial = !consumer.seen;
+    consumer.seen = true;
+    // A consumer may project/mutate its input. Never let it corrupt another
+    // observer or the upstream snapshot used to apply subsequent deltas.
+    try { consumer.onState(structuredClone(state), initial); }
+    catch (error) { this.report(consumer, error instanceof Error ? error : new Error("State consumer failed")); }
+  }
+  private report(consumer: StateConsumer, error: Error): void {
+    if (consumer.started) try { consumer.onError(error); } catch { /* Isolate subscribers. */ }
+  }
+  private createSharedStream(key: string, task: TaskRef): SharedStateStream {
+    const beforeStart = this.retiring.get(key)?.catch(async () => {
+      // A timed-out unsubscribe is not proof of unload. After a backend
+      // restart, however, a read can positively confirm there is no loaded
+      // thread left to disrupt. Unknown/active states remain fail-closed.
+      const read = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+      if (!isObject(read.thread) || read.thread.id !== task.threadId || !isObject(read.thread.status)
+        || read.thread.status.type !== "notLoaded") {
+        throw new AppServerUnavailableError("Предыдущая подписка не подтверждена как выгруженная; повторное подключение остановлено.");
+      }
+    });
+    if (beforeStart) void beforeStart.catch(() => {});
+    let resolveClosed!: () => void; let rejectClosed!: (error: unknown) => void;
+    const closed = new Promise<void>((resolve, reject) => { resolveClosed = resolve; rejectClosed = reject; });
+    void closed.catch(() => {});
+    const stream = new AppServerTaskStream(this.rpc, task, state => {
+      if (entry.error) return;
+      entry.latest = state;
+      for (const consumer of [...entry.consumers]) if (entry.consumers.has(consumer)) this.deliver(consumer, state);
+    }, error => {
+      entry.error = error;
+      for (const consumer of [...entry.consumers]) if (entry.consumers.has(consumer)) this.report(consumer, error);
+    }, this.questions, work => this.gate(work), this.onTaskResume, this.resumeTask,
+    (upstream, release) => {
+      this.trackRetiring(key, entry);
+      try { this.onTaskClose(upstream.task, release); }
+      finally { void Promise.all([beforeStart, release]).then(() => resolveClosed(), rejectClosed); }
+    });
+    const entry: SharedStateStream = { stream, consumers: new Set(), closed, beforeStart, latest: null, error: null, starting: null };
+    this.streams.set(key, entry);
+    return entry;
+  }
+  private retire(key: string, entry: SharedStateStream): void {
+    this.trackRetiring(key, entry);
+    entry.stream.close();
+  }
+  private trackRetiring(key: string, entry: SharedStateStream): void {
+    if (this.streams.get(key) !== entry) return;
+    this.streams.delete(key);
+    this.retiring.set(key, entry.closed);
+    void entry.closed.then(() => {
+      if (this.retiring.get(key) === entry.closed) this.retiring.delete(key);
+    }, () => { /* Do not race a new resume against an unconfirmed unsubscribe. */ });
   }
   refresh(threadId: string): void {
-    for (const stream of this.streams) if (stream.task.threadId === threadId) stream.refreshQuestions();
+    for (const { stream } of this.streams.values()) if (stream.task.threadId === threadId) stream.refreshQuestions();
   }
-  close(): void { for (const stream of this.streams) stream.close(); this.streams.clear(); }
+  close(): void {
+    this.closed = true;
+    for (const [key, entry] of this.streams) { entry.consumers.clear(); this.retire(key, entry); }
+  }
 }

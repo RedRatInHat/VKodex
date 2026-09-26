@@ -133,6 +133,258 @@ test("native state stream releases only its task lease when closed", async () =>
   assert.deepEqual(rpc.calls[1]?.params, { threadId: "task" });
 });
 
+test("same-task consumers share one upstream lease until the last consumer closes, then can reconnect", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([]), resume([]), resume([])]);
+  rpc.responses.set("thread/unsubscribe", [{}, {}, {}]);
+  const firstStates: TaskState[] = [];
+  const remainingStates: TaskState[] = [];
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, state => firstStates.push(state), () => {});
+  const remaining = transport.subscribe(task, state => remainingStates.push(state), () => {});
+  try {
+    await Promise.all([first.start(), remaining.start()]);
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+
+    first.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 0);
+
+    rpc.notify("thread/status/changed", { threadId: "task", status: { type: "active" } });
+    assert.equal(firstStates.at(-1)?.runtimeStatus, "idle");
+    assert.equal(remainingStates.at(-1)?.runtimeStatus, "active");
+
+    remaining.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 1);
+
+    const reconnectedStates: TaskState[] = [];
+    const reconnected = transport.subscribe(task, state => reconnectedStates.push(state), () => {});
+    await reconnected.start();
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 2);
+    assert.equal(reconnectedStates.length, 1);
+    reconnected.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 2);
+  } finally { transport.close(); }
+});
+
+test("a consumer waits for the previous final unsubscribe before resuming the same task", async () => {
+  const rpc = new FakeRpc();
+  let releaseUnsubscribe!: () => void;
+  const unsubscribePending = new Promise<void>(resolve => { releaseUnsubscribe = resolve; });
+  let unsubscribeCount = 0;
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") return resume([]);
+    assert.equal(method, "thread/unsubscribe");
+    if (++unsubscribeCount === 1) await unsubscribePending;
+    return {};
+  };
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, () => {}, () => {});
+  try {
+    await first.start();
+    first.close();
+    await new Promise(resolve => setImmediate(resolve));
+    const next = transport.subscribe(task, () => {}, () => {});
+    const starting = next.start();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+    releaseUnsubscribe();
+    await starting;
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 2);
+    next.close();
+  } finally { releaseUnsubscribe(); transport.close(); }
+});
+
+test("a rejected final unsubscribe with an idle backend remains fail-closed", async () => {
+  const rpc = new FakeRpc();
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") return resume([]);
+    if (method === "thread/read") return { thread: { id: "task", status: { type: "idle" } } };
+    assert.equal(method, "thread/unsubscribe");
+    throw new Error("unsubscribe rejected");
+  };
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, () => {}, () => {});
+  try {
+    await first.start();
+    first.close();
+    await new Promise(resolve => setImmediate(resolve));
+    const next = transport.subscribe(task, () => {}, () => {});
+    await assert.rejects(next.start(), /Предыдущая подписка не подтверждена как выгруженная/u);
+    assert.equal(rpc.calls.filter(call => call.method === "thread/read").length, 1);
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+    next.close();
+  } finally { transport.close(); }
+});
+
+test("a rejected final unsubscribe can resume only after a read proves the backend unloaded", async () => {
+  const rpc = new FakeRpc();
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") return resume([]);
+    if (method === "thread/read") return { thread: { id: "task", status: { type: "notLoaded" } } };
+    assert.equal(method, "thread/unsubscribe");
+    throw new Error("unsubscribe rejected");
+  };
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, () => {}, () => {});
+  try {
+    await first.start();
+    first.close();
+    await new Promise(resolve => setImmediate(resolve));
+    const next = transport.subscribe(task, () => {}, () => {});
+    await next.start();
+    assert.equal(rpc.calls.filter(call => call.method === "thread/read").length, 1);
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 2);
+    next.close();
+  } finally { transport.close(); }
+});
+
+test("a rejected final unsubscribe never blindly resumes an active or unknown backend", async () => {
+  for (const status of [{ type: "active" }, { type: "futureUnknownStatus" }, null] as const) {
+    const rpc = new FakeRpc();
+    rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+      rpc.calls.push({ method, params });
+      if (method === "thread/resume") return resume([]);
+      if (method === "thread/read") return { thread: { id: "task", ...(status ? { status } : {}) } };
+      assert.equal(method, "thread/unsubscribe");
+      throw new Error("unsubscribe rejected");
+    };
+    const transport = new AppServerTaskStateTransport(rpc);
+    const task = { hostId: "h", threadId: "task" };
+    const first = transport.subscribe(task, () => {}, () => {});
+    try {
+      await first.start();
+      first.close();
+      await new Promise(resolve => setImmediate(resolve));
+      const next = transport.subscribe(task, () => {}, () => {});
+      await assert.rejects(next.start(), /Предыдущая подписка не подтверждена как выгруженная/u);
+      assert.equal(rpc.calls.filter(call => call.method === "thread/read").length, 1);
+      assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+      next.close();
+    } finally { transport.close(); }
+  }
+});
+
+test("a late same-task consumer receives the latest shared snapshot without another resume", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  rpc.responses.set("thread/unsubscribe", [{}]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, () => {}, () => {});
+  const lateStates: Array<{ state: TaskState; initial: boolean }> = [];
+  const late = transport.subscribe(task, (state, initial) => lateStates.push({ state, initial }), () => {});
+  try {
+    await first.start();
+    rpc.notify("thread/status/changed", { threadId: "task", status: { type: "active" } });
+    await late.start();
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+    assert.equal(lateStates.length, 1);
+    assert.equal(lateStates[0]?.initial, true);
+    assert.equal(lateStates[0]?.state.runtimeStatus, "active");
+    first.close(); late.close();
+  } finally { transport.close(); }
+});
+
+test("closing the transport while a shared start is pending cannot revive its consumer", async () => {
+  const rpc = new FakeRpc();
+  let releaseResume!: () => void;
+  const resumePending = new Promise<void>(resolve => { releaseResume = resolve; });
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") { await resumePending; return resume([]); }
+    assert.equal(method, "thread/unsubscribe"); return {};
+  };
+  const states: TaskState[] = [];
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const stream = transport.subscribe(task, state => states.push(state), () => {});
+  try {
+    const starting = stream.start();
+    await new Promise(resolve => setImmediate(resolve));
+    transport.close();
+    releaseResume();
+    await starting;
+    assert.equal(states.length, 0);
+    assert.throws(() => transport.subscribe(task, () => {}, () => {}));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 1);
+  } finally { releaseResume(); transport.close(); }
+});
+
+test("a dormant same-task subscriber holds no lease after the only started consumer closes", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([]), resume([])]);
+  rpc.responses.set("thread/unsubscribe", [{}, {}]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const started = transport.subscribe(task, () => {}, () => {});
+  const dormant = transport.subscribe(task, () => {}, () => {});
+  try {
+    await started.start();
+    started.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 1);
+
+    await dormant.start();
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 2);
+    dormant.close();
+  } finally { transport.close(); }
+});
+
+test("closing the only starting consumer before its microtask does not resume for a dormant subscriber", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const started = transport.subscribe(task, () => {}, () => {});
+  transport.subscribe(task, () => {}, () => {}); // Never starts and must hold no upstream reference.
+  try {
+    const starting = started.start();
+    started.close();
+    await assert.rejects(starting);
+    assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 0);
+  } finally { transport.close(); }
+});
+
+test("a mutating consumer cannot corrupt live or later same-task consumer snapshots", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  rpc.responses.set("thread/unsubscribe", [{}]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const mutating = transport.subscribe(task, state => {
+    state.runtimeStatus = "corrupted";
+    (state.turns as JsonObject[]).push(turn("injected", "completed", []));
+  }, () => {});
+  const liveStates: TaskState[] = [];
+  const live = transport.subscribe(task, state => liveStates.push(state), () => {});
+  const futureStates: TaskState[] = [];
+  const future = transport.subscribe(task, state => futureStates.push(state), () => {});
+  try {
+    await mutating.start();
+    await live.start();
+    assert.equal(liveStates.at(-1)?.runtimeStatus, "idle");
+    assert.equal((liveStates.at(-1)?.turns as JsonObject[]).some(value => value.id === "injected"), false);
+
+    rpc.notify("thread/status/changed", { threadId: "task", status: { type: "active" } });
+    assert.equal(liveStates.at(-1)?.runtimeStatus, "active");
+    await future.start();
+    assert.equal(futureStates.at(-1)?.runtimeStatus, "active");
+    assert.equal((futureStates.at(-1)?.turns as JsonObject[]).some(value => value.id === "injected"), false);
+    mutating.close(); live.close(); future.close();
+  } finally { transport.close(); }
+});
+
 test("native state stream keeps a live turn eligible when notifications omit timestamps", async () => {
   const rpc = new FakeRpc(); rpc.responses.set("thread/resume", [resume([])]);
   const states: TaskState[] = [];
