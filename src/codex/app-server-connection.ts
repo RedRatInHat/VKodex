@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { closeAppServer } from "./app-server-process.js";
 
 type JsonObject = Record<string, unknown>;
@@ -47,6 +48,11 @@ interface PendingRequest {
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingServerRequest {
+  readonly request: AppServerEnvelope;
+  invalidated: boolean;
+}
+
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
@@ -61,6 +67,7 @@ export class AppServerConnection implements AppServerRpc {
   private closing: Promise<void> = Promise.resolve();
   private stopped = false;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly pendingServerRequests = new Map<string | number, PendingServerRequest>();
   private readonly notificationListeners = new Set<(notification: AppServerEnvelope) => void>();
   private readonly disconnectListeners = new Set<(error: Error) => void>();
   private serverRequestHandler: AppServerServerRequestHandler | null = null;
@@ -202,16 +209,39 @@ export class AppServerConnection implements AppServerRpc {
 
   private async acceptServerRequest(child: ChildProcessWithoutNullStreams, generation: number, id: string | number,
     request: AppServerEnvelope): Promise<void> {
-    if (!this.serverRequestHandler) {
-      if (this.child === child && this.generation === generation) this.write(child, { id, error: { code: -32601, message: "Unsupported server request" } });
+    const previous = this.pendingServerRequests.get(id);
+    if (previous) {
+      // Resume can redeliver the same unresolved RPC. Do not replace a pending
+      // question or execute an in-flight tool twice. Keep typed IDs distinct.
+      if (!previous.invalidated && !isDeepStrictEqual(previous.request, request)) {
+        previous.invalidated = true;
+        this.replyToServer(child, generation, { id, error: { code: -32600, message: "Conflicting pending server request" } });
+      }
       return;
     }
-    try {
-      const result = await this.serverRequestHandler(request);
-      if (this.child === child && this.generation === generation) this.write(child, { id, result });
-    } catch {
-      if (this.child === child && this.generation === generation) this.write(child, { id, error: { code: -32000, message: "Server request rejected" } });
+    const handler = this.serverRequestHandler;
+    if (!handler) {
+      this.replyToServer(child, generation, { id, error: { code: -32601, message: "Unsupported server request" } });
+      return;
     }
+    // The handler owns its argument; retain an independent comparison snapshot.
+    const pending: PendingServerRequest = { request: structuredClone(request), invalidated: false };
+    this.pendingServerRequests.set(id, pending);
+    const current = () => this.pendingServerRequests.get(id) === pending && !pending.invalidated;
+    try {
+      const result = await handler(request);
+      if (current()) this.replyToServer(child, generation, { id, result });
+    } catch {
+      if (current()) this.replyToServer(child, generation, { id, error: { code: -32000, message: "Server request rejected" } });
+    } finally {
+      if (this.pendingServerRequests.get(id) === pending) this.pendingServerRequests.delete(id);
+    }
+  }
+
+  private replyToServer(child: ChildProcessWithoutNullStreams, generation: number, reply: JsonObject): void {
+    if (this.child !== child || this.generation !== generation) return;
+    try { this.write(child, reply); }
+    catch { this.connectionFailed(child, generation); }
   }
 
   private connectionFailed(child: ChildProcessWithoutNullStreams, generation: number): void {
@@ -221,6 +251,7 @@ export class AppServerConnection implements AppServerRpc {
   private failConnection(child: ChildProcessWithoutNullStreams, generation: number, fallback: Error, skipId?: number): void {
     if (this.child !== child || this.generation !== generation) return;
     this.child = null; this.fragments = []; this.fragmentBytes = 0;
+    this.pendingServerRequests.clear();
     for (const [id, pending] of this.pending) {
       if (id === skipId) continue;
       this.pending.delete(id); clearTimeout(pending.timer);
@@ -235,6 +266,7 @@ export class AppServerConnection implements AppServerRpc {
   async close(): Promise<void> {
     this.stopped = true; this.starting = null;
     const child = this.child; this.child = null; this.fragments = []; this.fragmentBytes = 0; this.generation++;
+    this.pendingServerRequests.clear();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());

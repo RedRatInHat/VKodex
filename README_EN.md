@@ -594,6 +594,8 @@ Prompt input is saved to the durable inbox before waiting for its own task conne
 
 Background observation is also task-scoped: a slow history read, task-creation inspection, or panel refresh does not hold the global connection loop. A pending job is not started again on every tick. Health reports the delayed stage and its age (`history`, `catalog`, `creator-inspect`, `panels`) even while the scheduler timer is healthy. Background discovery of disconnected tasks still needs the shared catalog; that wait does not block maintenance of existing subscriptions.
 
+Within one App Server connection, replaying an identical unresolved server request does not invoke its question/tool handler again. Conflicting payloads for the same pending RPC ID are rejected without closing other tasks; a late handler response cannot cross into a new connection. This protection covers pending requests only, not durable recovery of completed operations.
+
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
 Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.

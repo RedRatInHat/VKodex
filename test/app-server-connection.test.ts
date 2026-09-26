@@ -106,6 +106,106 @@ test("App Server requests are answered on the same profile connection", async ()
   } finally { await connection.close(); }
 });
 
+test("pending server request replay invokes its handler and sends its answer only once", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  let calls = 0;
+  connection.onServerRequest(request => {
+    calls++;
+    request.params.itemId = "handler-local-mutation";
+    return answer;
+  });
+  try {
+    await connection.start();
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { threadId: "task", itemId: "question" } });
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "question", threadId: "task" } });
+    assert.equal(calls, 1, "resume replay is not a new question");
+    release({ answers: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 0), [{ id: 0, result: { answers: {} } }]);
+  } finally { release({}); await connection.close(); }
+});
+
+test("conflicting replay of a pending server request rejects once without answering from the old handler", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  let calls = 0;
+  connection.onServerRequest(() => { calls++; return answer; });
+  try {
+    await connection.start();
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "first" } });
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "different" } });
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "first" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls, 1);
+    const replies = () => child.messages.filter(message => message.id === 0);
+    assert.equal(replies().length, 1, "a conflicting replay receives one generic refusal");
+    const refusal = replies()[0]!.error as JsonObject;
+    assert.equal(refusal.code, -32600);
+    assert.doesNotMatch(String(refusal.message), /first|different/u);
+    assert.equal(replies()[0]!.result, undefined);
+    release({ answers: { choice: "old answer" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(replies().length, 1, "the invalidated handler cannot answer the conflicting request");
+    assert.deepEqual(await connection.request("model/list"), { ok: true }, "unrelated requests keep using the connection");
+  } finally { release({}); await connection.close(); }
+});
+
+test("numeric and string server request IDs remain distinct while both are pending", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const releases: Array<(value: JsonObject) => void> = [];
+  let calls = 0;
+  connection.onServerRequest(() => {
+    calls++;
+    return new Promise<JsonObject>(resolve => { releases.push(resolve); });
+  });
+  try {
+    await connection.start();
+    child.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "same" } });
+    child.send({ id: "0", method: "item/tool/requestUserInput", params: { itemId: "same" } });
+    assert.equal(calls, 2);
+    releases[0]!({ answers: { choice: "numeric" } });
+    releases[1]!({ answers: { choice: "string" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 0), [{ id: 0, result: { answers: { choice: "numeric" } } }]);
+    assert.deepEqual(child.messages.filter(message => message.id === "0"), [{ id: "0", result: { answers: { choice: "string" } } }]);
+  } finally { for (const release of releases) release({}); await connection.close(); }
+});
+
+test("a previous child handler cannot answer or retire a reused server request ID", async () => {
+  const first = new AppServerChild(); const second = new AppServerChild();
+  const children = [first, second];
+  const connection = new AppServerConnection(() => children.shift()!.asChild(), undefined, 100);
+  let releaseOld!: (value: JsonObject) => void; let releaseNew!: (value: JsonObject) => void;
+  const oldAnswer = new Promise<JsonObject>(resolve => { releaseOld = resolve; });
+  const newAnswer = new Promise<JsonObject>(resolve => { releaseNew = resolve; });
+  let calls = 0;
+  connection.onServerRequest(request => { calls++; return request.params.itemId === "old" ? oldAnswer : newAnswer; });
+  try {
+    await connection.start();
+    first.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "old" } });
+    assert.equal(calls, 1);
+    first.disconnect();
+    assert.deepEqual(await connection.request("model/list"), { ok: true });
+    second.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "new" } });
+    assert.equal(calls, 2, "ID reuse on a new child is a fresh request");
+    releaseOld({ answers: { choice: "stale" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(second.messages.filter(message => message.id === 0), [], "old handler cannot reply into the new child");
+    second.send({ id: 0, method: "item/tool/requestUserInput", params: { itemId: "new" } });
+    assert.equal(calls, 2, "old handler completion cannot retire the new pending request");
+    releaseNew({ answers: { choice: "fresh" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(second.messages.filter(message => message.id === 0), [{ id: 0, result: { answers: { choice: "fresh" } } }]);
+    assert.deepEqual(first.messages.filter(message => message.id === 0), []);
+  } finally { releaseOld({}); releaseNew({}); await connection.close(); }
+});
+
 test("known App Server rejections remain rejected without exposing server text", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
