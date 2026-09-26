@@ -177,6 +177,23 @@ test("numeric and string server request IDs remain distinct while both are pendi
   } finally { for (const release of releases) release({}); await connection.close(); }
 });
 
+test("server request handlers receive the original typed request ID", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const seenIds: unknown[] = [];
+  connection.onServerRequest(request => {
+    seenIds.push("id" in request ? request.id : undefined);
+    return { answers: {} };
+  });
+  try {
+    await connection.start();
+    child.send({ id: 7, method: "item/tool/requestUserInput", params: { itemId: "numeric" } });
+    child.send({ id: "7", method: "item/tool/requestUserInput", params: { itemId: "string" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(seenIds, [7, "7"]);
+  } finally { await connection.close(); }
+});
+
 test("a previous child handler cannot answer or retire a reused server request ID", async () => {
   const first = new AppServerChild(); const second = new AppServerChild();
   const children = [first, second];

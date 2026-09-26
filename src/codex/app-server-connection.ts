@@ -30,7 +30,12 @@ export interface AppServerEnvelope {
   readonly params: JsonObject;
 }
 
-export type AppServerServerRequestHandler = (request: AppServerEnvelope) => Promise<JsonObject> | JsonObject;
+export interface AppServerServerRequest extends AppServerEnvelope {
+  /** Original worker request identity; numeric and string IDs are distinct. */
+  readonly id: string | number;
+}
+
+export type AppServerServerRequestHandler = (request: AppServerServerRequest) => Promise<JsonObject> | JsonObject;
 
 export interface AppServerRpc {
   start(): Promise<void>;
@@ -229,7 +234,7 @@ export class AppServerConnection implements AppServerRpc {
     this.pendingServerRequests.set(id, pending);
     const current = () => this.pendingServerRequests.get(id) === pending && !pending.invalidated;
     try {
-      const result = await handler(request);
+      const result = await handler({ ...request, id });
       if (current()) this.replyToServer(child, generation, { id, result });
     } catch {
       if (current()) this.replyToServer(child, generation, { id, error: { code: -32000, message: "Server request rejected" } });

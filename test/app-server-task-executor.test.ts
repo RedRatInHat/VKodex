@@ -80,7 +80,8 @@ class FakeRpc implements AppServerRpc {
   onServerRequest(handler: AppServerServerRequestHandler | null): void { this.handler = handler; }
   emit(notification: AppServerEnvelope): void { for (const listener of this.listeners) listener(notification); }
   disconnect(): void { for (const listener of this.disconnectListeners) listener(new Error("Disconnected")); }
-  ask(request: AppServerEnvelope): Promise<JsonObject> { return Promise.resolve(this.handler!(request)); }
+  private nextServerRequestId = 1;
+  ask(request: AppServerEnvelope): Promise<JsonObject> { return Promise.resolve(this.handler!({ ...request, id: this.nextServerRequestId++ })); }
   async close(): Promise<void> {}
 }
 
