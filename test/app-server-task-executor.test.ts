@@ -323,6 +323,108 @@ test("App Server executor exposes a native structured question and returns one c
   } finally { executor.close(); }
 });
 
+test("releasing an observation preserves a pending native question until it is answered once", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  const response = rpc.ask({ method: "item/tool/requestUserInput", params: {
+    threadId: task.threadId, turnId: "turn", itemId: "question-item", isBlocking: true,
+    questions: [{ id: "choice", question: "Choose", options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } });
+  void response.catch(() => {});
+  try {
+    const [question] = await executor.pendingQuestions(task);
+    assert.ok(question);
+    executor.release(task, Promise.resolve());
+    await executor.resumeForStream(task); // Also waits for the release acknowledgment.
+    assert.deepEqual(await executor.pendingQuestions(task), [question], "unsubscribing did not unload the native question");
+    await executor.answerQuestions(task, question, { choice: "Beta" }, "answer-after-release", async () => {});
+    assert.deepEqual(await response, { answers: { choice: { answers: ["Beta"] } } });
+    await assert.rejects(executor.answerQuestions(task, question, { choice: "Alpha" }, "duplicate-answer", async () => {}), ActionRejectedError);
+  } finally { executor.close(); }
+});
+
+test("answer preparation cannot erase a replacement native question", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  const ask = (itemId: string) => rpc.ask({ method: "item/tool/requestUserInput", params: {
+    threadId: task.threadId, turnId: "turn", itemId, isBlocking: true,
+    questions: [{ id: "choice", question: `Choose for ${itemId}`, options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } });
+  const oldResponse = ask("old-item");
+  const oldResult = oldResponse.then(value => ({ value }), error => ({ error }));
+  let newResponse: Promise<JsonObject> | null = null;
+  try {
+    const [oldQuestion] = await executor.pendingQuestions(task);
+    assert.ok(oldQuestion);
+    await assert.rejects(executor.answerQuestions(task, oldQuestion, { choice: "Alpha" }, "stale-answer", async () => {
+      newResponse = ask("new-item");
+      void newResponse.catch(() => {});
+    }), ActionRejectedError);
+    const oldOutcome = await oldResult;
+    assert.ok("error" in oldOutcome && oldOutcome.error instanceof Error);
+    const [replacement] = await executor.pendingQuestions(task);
+    assert.ok(replacement);
+    assert.notEqual(replacement.fingerprint, oldQuestion.fingerprint);
+    await executor.answerQuestions(task, replacement, { choice: "Beta" }, "fresh-answer", async () => {});
+    assert.deepEqual(await newResponse, { answers: { choice: { answers: ["Beta"] } } });
+  } finally { executor.close(); }
+});
+
+test("a throwing question observer cannot reject the native request or stop other observers", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  const observed: string[] = [];
+  executor.onQuestionsChanged(() => { throw new Error("display failed"); });
+  executor.onQuestionsChanged(threadId => observed.push(threadId));
+  const response = rpc.ask({ method: "item/tool/requestUserInput", params: {
+    threadId: task.threadId, turnId: "turn", itemId: "question-item",
+    questions: [{ id: "choice", question: "Choose", options: [{ label: "Alpha" }] }],
+  } });
+  void response.catch(() => {});
+  try {
+    const [question] = await executor.pendingQuestions(task);
+    assert.ok(question);
+    await executor.answerQuestions(task, question, { choice: "Alpha" }, "answer-with-faulty-observer", async () => {});
+    assert.deepEqual(await response, { answers: { choice: { answers: ["Alpha"] } } });
+    assert.deepEqual(observed, [task.threadId, task.threadId]);
+  } finally { executor.close(); }
+});
+
+test("confirmed native thread close rejects and removes its pending question", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  const response = rpc.ask({ method: "item/tool/requestUserInput", params: {
+    threadId: task.threadId, turnId: "turn", itemId: "question-item",
+    questions: [{ id: "choice", question: "Choose", options: [{ label: "Alpha" }] }],
+  } });
+  const outcome = response.then(value => ({ value }), error => ({ error }));
+  try {
+    const [question] = await executor.pendingQuestions(task);
+    assert.ok(question);
+    rpc.emit({ method: "thread/closed", params: { threadId: task.threadId } });
+    assert.deepEqual(await executor.pendingQuestions(task), []);
+    assert.deepEqual(executor.questionSnapshot(task.threadId), []);
+    const result = await outcome;
+    assert.ok("error" in result && result.error instanceof Error);
+    await assert.rejects(executor.answerQuestions(task, question, { choice: "Alpha" }, "late-answer", async () => {}), ActionRejectedError);
+  } finally { executor.close(); }
+});
+
+test("disconnect during answer preparation rejects the stale native answer", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  const response = rpc.ask({ method: "item/tool/requestUserInput", params: {
+    threadId: task.threadId, turnId: "turn", itemId: "question-item",
+    questions: [{ id: "choice", question: "Choose", options: [{ label: "Alpha" }] }],
+  } });
+  const outcome = response.then(value => ({ value }), error => ({ error }));
+  try {
+    const [question] = await executor.pendingQuestions(task);
+    assert.ok(question);
+    await assert.rejects(executor.answerQuestions(task, question, { choice: "Alpha" }, "answer-before-disconnect", async () => {
+      rpc.disconnect();
+    }), ActionRejectedError);
+    assert.deepEqual(await executor.pendingQuestions(task), []);
+    const result = await outcome;
+    assert.ok("error" in result && result.error instanceof Error);
+  } finally { executor.close(); }
+});
+
 test("App Server executor never hides an uncertain mutation behind a retry", async () => {
   const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
   try {

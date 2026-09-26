@@ -596,6 +596,8 @@ Background observation is also task-scoped: a slow history read, task-creation i
 
 Within one App Server connection, replaying an identical unresolved server request does not invoke its question/tool handler again. Conflicting payloads for the same pending RPC ID are rejected without closing other tasks; a late handler response cannot cross into a new connection. This protection covers pending requests only, not durable recovery of completed operations.
 
+Unsubscribing an observer does not discard a pending Codex question: the task can keep running without a subscriber. A question is retired when answered, replaced, when task unload is confirmed, or when its connection is lost. Answer dispatch rechecks that preparation has not raced with a replacement; one failing question observer does not block the others.
+
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
 Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.

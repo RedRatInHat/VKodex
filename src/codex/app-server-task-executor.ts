@@ -54,12 +54,11 @@ export class AppServerTaskExecutor {
     rpc.onServerRequest(request => this.serverRequest(request));
   }
 
-  /** Forget one task after its native stream lease is released. The next
-   * command must resume it again instead of using a stale loaded-task cache. */
+  /** Invalidate the command subscription cache after observation is released.
+   * Unsubscribe does not unload the writer or cancel its pending questions. */
   forget(task: TaskRef): void {
     this.loaded.delete(taskKey(task));
     this.uncertainReleases.delete(taskKey(task));
-    this.questions.delete(task.threadId);
   }
 
   /** Keep a possibly still-owned writer usable until unsubscribe is confirmed.
@@ -85,7 +84,9 @@ export class AppServerTaskExecutor {
     const result = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
     const thread = isObject(result.thread) ? result.thread : null;
     if (!thread || thread.id !== task.threadId) throw new AppServerUnavailableError();
-    if (isObject(thread.status) && thread.status.type === "notLoaded") this.forget(task);
+    if (isObject(thread.status) && thread.status.type === "notLoaded") {
+      this.forget(task); this.retireQuestion(task.threadId, new Error("Task unloaded"));
+    }
     else this.uncertainReleases.delete(key);
     return true;
   }
@@ -108,10 +109,9 @@ export class AppServerTaskExecutor {
     return loaded;
   }
 
-  /** Inspect a task already loaded by this owner without issuing another
-   * thread/resume. Resuming an active thread on the same App Server aborts its
-   * current turn, so every command and diagnostic must share this ownership
-   * cache. */
+  /** Inspect an already subscribed task without another thread/resume.
+   * Resume may replay pending requests; read-only diagnostics must not change
+   * the subscription lifecycle or rely on reacquisition being harmless. */
   async inspectLoadedTask(task: TaskRef): Promise<TaskDetails | null> {
     if (!this.loaded.has(taskKey(task))) return null;
     return this.inspectTask(task);
@@ -350,6 +350,7 @@ export class AppServerTaskExecutor {
     }
     await beforeSend();
     this.assertWritable(task.threadId);
+    if (this.questions.get(key) !== pending) throw new ActionRejectedError("Вопрос уже закрыт или изменился. Ответ не отправлен.");
     this.questions.delete(key);
     this.notifyQuestions(key);
     pending.resolve({ answers: result });
@@ -490,6 +491,7 @@ export class AppServerTaskExecutor {
         if (!thread || !isObject(thread.status)) throw new AppServerUnavailableError();
         if (thread.status.type !== "notLoaded") return cached;
         this.forget(task);
+        this.retireQuestion(task.threadId, new Error("Task unloaded"));
       }
       const result = await this.resumeNative(task);
       return this.loaded.get(taskKey(task)) ?? this.acceptResumedTask(task, result);
@@ -545,6 +547,7 @@ export class AppServerTaskExecutor {
     if (!threadId) return;
     if (notification.method === "thread/archived" || notification.method === "thread/closed" || notification.method === "thread/deleted") {
       this.releaseArchive(threadId);
+      this.retireQuestion(threadId, new Error("Task closed"));
       for (const key of this.loaded.keys()) {
         try { if ((JSON.parse(key) as unknown[])[1] === threadId) this.loaded.delete(key); } catch { /* Ignore malformed private cache keys. */ }
       }
@@ -585,16 +588,23 @@ export class AppServerTaskExecutor {
   }
 
   private notifyQuestions(threadId: string): void {
-    for (const listener of this.questionListeners) listener(threadId);
+    for (const listener of this.questionListeners) {
+      try { listener(threadId); } catch { /* A display failure cannot reject or orphan a native question. */ }
+    }
+  }
+
+  private retireQuestion(threadId: string, error: Error): void {
+    const pending = this.questions.get(threadId);
+    if (!pending) return;
+    this.questions.delete(threadId);
+    pending.reject(error);
+    this.notifyQuestions(threadId);
   }
 
   private connectionLost(error: Error): void {
     this.loaded.clear();
     this.uncertainReleases.clear();
-    for (const [threadId, pending] of this.questions) {
-      pending.reject(error);
-      this.questions.delete(threadId); this.notifyQuestions(threadId);
-    }
+    for (const threadId of this.questions.keys()) this.retireQuestion(threadId, error);
   }
 
   close(): void {
