@@ -11,13 +11,14 @@ export function taskDetails(state: IpcObject): TaskDetails {
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
   const systemError = runtimeStatus === "systemError";
   const progressState = inProgressState(state);
-  const running = runtimeStatus === "active" || progressState === "live";
+  const running = progressState === "live" || (runtimeStatus === "active" && progressState !== "orphaned");
   const turn = (running ? activeTurns.at(-1) : undefined) ?? turns.at(-1);
   const params = isObject(turn?.params) ? turn.params : {};
   const settings = isObject(state.latestThreadSettings) ? state.latestThreadSettings : {};
   const mode = isObject(params.collaborationMode) && isObject(params.collaborationMode.settings) ? params.collaborationMode.settings : {};
   const idleKnown = progressState !== "ambiguous" && (state.resumeState === undefined || state.resumeState === "resumed")
-    && (runtimeStatus === "idle" || !!turn && ["completed", "failed", "interrupted"].includes(String(turn.status)));
+    && (runtimeStatus === "idle" || progressState === "orphaned"
+      || !!turn && ["completed", "failed", "interrupted"].includes(String(turn.status)));
   const usage = isObject(state.latestTokenUsageInfo) ? state.latestTokenUsageInfo : {};
   const last = isObject(usage.last) ? usage.last : {};
   const window = usage.modelContextWindow;

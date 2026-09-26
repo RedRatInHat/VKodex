@@ -34,13 +34,15 @@ export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" 
   // A runtime error terminates activity even if restored history still contains
   // an old inProgress entry. It must never route a new prompt as a steer.
   if (runtimeStatus === "systemError") return "orphaned";
-  if (runtimeStatus === undefined || runtimeStatus === "active") return "live";
-  if (runtimeStatus !== "idle" && runtimeStatus !== "notLoaded") return "ambiguous";
   const started = inProgress.map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
   const terminal = rawTurns.filter(turn => ["completed", "failed", "interrupted"].includes(String(turn.status)))
     .map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
-  return started.length === inProgress.length && terminal.length > 0 && Math.max(...terminal) > Math.max(...started)
-    ? "orphaned" : "ambiguous";
+  // A renderer may keep reporting an active runtime after a newer turn has
+  // already failed. Its older in-progress history is no longer a live turn.
+  if (started.length === inProgress.length && terminal.length > 0 && Math.max(...terminal) > Math.max(...started))
+    return "orphaned";
+  if (runtimeStatus === undefined || runtimeStatus === "active") return "live";
+  return "ambiguous";
 }
 
 /**

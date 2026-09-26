@@ -2475,6 +2475,24 @@ test("a reconnect recovers only the undelivered final of a turn accepted from VK
   }).events.length, 0);
 });
 
+test("a newer failed turn stops an older thinking indicator despite a stale active runtime", async t => {
+  const s = runtimeSetup(t); await s.runtime.tick();
+  s.server.dataState = {
+    id: ref.threadId, hostId: ref.hostId, resumeState: "resumed", threadRuntimeStatus: { type: "active" },
+    turns: [
+      { turnId: "orphan", turnStartedAtMs: 100, status: "inProgress", items: [] },
+      { turnId: "latest", turnStartedAtMs: 200, status: "failed", items: [{ type: "error", errorInfo: "internal" }] },
+    ],
+  };
+  s.server.snapshot(); await new Promise(resolve => setImmediate(resolve)); await s.runtime.tick();
+  assert.equal(taskDetails(s.server.dataState).status, "failed");
+  assert.deepEqual(projectSnapshot(s.server.dataState, null, 300).checkpoint.active, []);
+  assert.equal(s.store.getValue<{ status: string }>(`activity:${s.binding.id}`)?.status, "failed");
+  const edits = s.edits.length;
+  s.advance(20_000); await s.runtime.tick();
+  assert.equal(s.edits.length, edits);
+});
+
 test("snapshot projection does not mirror quiet scheduler heartbeats", () => {
   const initial = projectSnapshot(state([], "completed"), null, 100);
   const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
