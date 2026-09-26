@@ -8,6 +8,7 @@ export interface RuntimeHealthState {
   readonly startedAt: number;
   readonly lastTickAt: number;
   readonly updateStartedAt: number | null;
+  readonly maintenance?: readonly { readonly phase: string; readonly bindingId?: string; readonly startedAt: number }[];
   readonly stopped: boolean;
   readonly activeBindings: number;
   readonly connectedBindings: number;
@@ -124,6 +125,16 @@ export class BridgeHealthMonitor {
       : updateAge > 15_000
         ? { name: "runtime", state: "degraded", detail: `Обновление выполняется уже ${Math.round(updateAge / 1_000)} с.` }
         : { name: "runtime", state: "ok", detail: `Цикл активен; последний tick ${Math.round(tickAge / 1_000)} с назад.` });
+
+    if (runtime.maintenance) {
+      const pending = [...runtime.maintenance].sort((a, b) => a.startedAt - b.startedAt);
+      const oldest = pending[0];
+      const age = oldest ? Math.max(0, checkedAt - oldest.startedAt) : 0;
+      checks.push({ name: "runtime_maintenance", state: age > 60_000 ? "failed" : age > 15_000 ? "degraded" : "ok",
+        detail: age > 15_000 && oldest
+          ? `Ожидает фоновый этап ${oldest.phase}${oldest.bindingId ? ` задачи ${oldest.bindingId}` : ""}: ${Math.round(age / 1_000)} с. Проверь доступность источника этого этапа; независимые задачи продолжают обслуживаться, повторная операция не запускается.`
+          : `Фоновые этапы без просроченных ожиданий; выполняется ${pending.length}.` });
+    }
 
     const delivery = this.store.deliveryHealth(checkedAt);
     if (delivery.criticalPending === 0) {

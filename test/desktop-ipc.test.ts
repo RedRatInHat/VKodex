@@ -205,10 +205,13 @@ test("restart recovery does not resume a turn still active in a UI owner", async
 test("a slow native resume does not stall the bridge update or start duplicate subscriptions", async t => {
   let release!: () => void;
   const resumed = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const startEntered = new Promise<void>(resolve => { entered = resolve; });
   let subscriptions = 0;
   const transport: TaskStateTransport = {
     subscribe(task, onState) {
       subscriptions++;
+      entered();
       let closed = false;
       return {
         task,
@@ -220,12 +223,20 @@ test("a slow native resume does not stall the bridge update or start duplicate s
     close() {},
   };
   const s = runtimeSetup(t, undefined, transport);
-  t.after(release);
-  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("bridge tick waited for native resume")), 250));
-  await Promise.race([s.runtime.tick(false), timeout]);
-  await s.runtime.tick(false);
-  assert.equal(subscriptions, 1);
-  release();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([s.runtime.tick(false), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("bridge tick waited for native resume")), 250);
+    })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([startEntered, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("native resume was not scheduled")), 250);
+    })]);
+    clearTimeout(timer); timer = undefined;
+    await s.runtime.tick(false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(subscriptions, 1);
+  } finally { clearTimeout(timer); release(); }
 });
 
 test("bridge publishes agent-initiated commentary without a user item or goal lookup", async t => {
@@ -297,7 +308,10 @@ test("bridge publishes direct app progress with no accessible rollout and explai
   assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
   publish(state([{ type: "userMessage", id: "different-native-id", content: [{ type: "text", text: "Continue the task" }] },
     { type: "agentMessage", id: "app-progress", phase: "commentary", text: "Direct app progress" }]), false);
-  await s.runtime.tick(false);
+  for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Вход этого хода:\n\nContinue the task"); attempt++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await s.runtime.tick(false);
+  }
   assert.equal(s.sent.filter(item => item.view.text === "Вход этого хода:\n\nContinue the task").length, 1);
 });
 
@@ -722,6 +736,129 @@ test("a cold VK target connects and dispatches while another binding's history p
     await Promise.race([s.runtime.handle({ eventId: "cold-target", peerId: s.peerId, senderId: 101, text: "Continue" }),
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("VK input waited for unrelated history recovery")), 250); })]);
     assert.equal(submitted, true);
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a stalled fallback does not block another binding's background attach and later poll", async t => {
+  let release!: () => void; let entered!: () => void; let started!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const pollEntered = new Promise<void>(resolve => { entered = resolve; });
+  const attachStarted = new Promise<void>(resolve => { started = resolve; });
+  const enabled = new Set<string>(); let stalledPolls = 0; let survivorPolls = 0;
+  let stalledId = ""; let survivorId = "";
+  const history: TaskHistoryRecovery = {
+    enable(id) { enabled.add(id); }, disable(id) { enabled.delete(id); },
+    async poll(id) {
+      if (!enabled.has(id)) return null;
+      if (id === stalledId) { stalledPolls++; entered(); await stalled; }
+      if (id === survivorId) survivorPolls++;
+      return null;
+    },
+  };
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { if (task.threadId === ref.threadId) started(); onState({ ...state([], "completed"), id: task.threadId }, true); },
+        verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
+  survivorId = s.binding.id;
+  const survivor = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: "C:/profiles/work/sessions/survivor.jsonl" };
+  s.store.ensureBinding(survivor);
+  const otherTask = { ...survivor, threadId: "stalled-fallback", title: "Stalled fallback",
+    rolloutPath: "C:/profiles/work/sessions/stalled.jsonl" };
+  const other = s.store.ensureBinding(otherTask); stalledId = other.id;
+  s.store.setChat(other.id, s.peerId + 1, 18);
+  s.store.setValue(`task-stream-mode:${other.id}`, "detached");
+  s.desktop.listTasks = async () => [survivor, otherTask];
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const within = async (signal: Promise<void>, reason: string) => {
+    await Promise.race([signal, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(reason)), 250); })]);
+    clearTimeout(timer); timer = undefined;
+  };
+  try {
+    await within(pollEntered, "detached fallback poll did not start");
+    await within(attachStarted, "unrelated background observer waited for fallback poll");
+    await within(s.runtime.tick(false), "second update waited for stalled fallback");
+    assert.equal(stalledPolls, 1, "the stalled fallback must remain single-flight");
+    assert.ok(survivorPolls >= 1, "released survivor must keep polling independently");
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a stalled panel refresh does not block background attach or terminal release", async t => {
+  let release!: () => void; let entered!: () => void; let started!: () => void; let released!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const panelEntered = new Promise<void>(resolve => { entered = resolve; });
+  const attachStarted = new Promise<void>(resolve => { started = resolve; });
+  const oldReleased = new Promise<void>(resolve => { released = resolve; });
+  const starts: string[] = []; const closes: string[] = [];
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { starts.push(task.threadId); if (task.threadId === "new-observer") started();
+        onState({ ...state(), id: task.threadId }, true); }, verifyOwner: async () => {}, close: () => {
+          closes.push(task.threadId); if (task.threadId === ref.threadId) released();
+        } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  await s.runtime.tick();
+  const previous = s.store.getValue<import("../src/core/codex-tasks.js").TaskDetails>(`task-details:${s.binding.id}`)!;
+  s.store.setValue(`task-details:${s.binding.id}`, { ...previous, status: "idle" });
+  const next = { ...ref, threadId: "new-observer", title: "New observer", workspace: "/fixture", updatedAt: 1 };
+  const binding = s.store.ensureBinding(next); s.store.setChat(binding.id, s.peerId + 1, 18);
+  s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }, next];
+  const panels = (s.runtime as unknown as { manager: { panels: { tick: () => Promise<void> } } }).manager.panels;
+  const originalTick = panels.tick.bind(panels);
+  panels.tick = async () => { entered(); await stalled; await originalTick(); };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([panelEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("panel refresh did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([attachStarted, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("background attach waited for panel refresh")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([oldReleased, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("terminal release waited for panel refresh")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    assert.ok(closes.includes(ref.threadId), "terminal observer release must also pass the stalled panel");
+    assert.deepEqual(starts, [ref.threadId, next.threadId]);
+    await Promise.race([s.runtime.tick(true, binding.id), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("scoped tick waited for unrelated panel refresh")), 250);
+    })]);
+    clearTimeout(timer); timer = undefined;
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a stalled creator inspection does not block another binding's background observer", async t => {
+  let release!: () => void; let entered!: () => void; let started!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const inspectEntered = new Promise<void>(resolve => { entered = resolve; });
+  const attachStarted = new Promise<void>(resolve => { started = resolve; });
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { if (task.threadId === "other-observer") started();
+        onState({ ...state(), id: task.threadId }, true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  const otherTask = { ...ref, threadId: "other-observer", title: "Other observer", workspace: "/fixture", updatedAt: 1 };
+  const other = s.store.ensureBinding(otherTask); s.store.setChat(other.id, s.peerId + 1, 18);
+  s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }, otherTask];
+  s.desktop.isCreationActive = task => task.threadId === ref.threadId;
+  s.desktop.inspectTask = async () => { entered(); await stalled; throw new Error("fixture creator inspection finished"); };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([inspectEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("creator inspection did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([attachStarted, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("unrelated observer waited for creator inspection")), 250); })]);
   } finally {
     clearTimeout(timer); release(); await background;
   }

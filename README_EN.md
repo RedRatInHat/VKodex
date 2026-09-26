@@ -592,6 +592,8 @@ If local initialization fails after Codex confirms a subscription, VKodex still 
 
 Prompt input is saved to the durable inbox before waiting for its own task connection. That wait does not depend on background history scans, panel refreshes, or catalog reads. A failed connection or a changed binding rejects the prompt before dispatch; local recovery commands such as `/detach` remain available. Late catalog and history results cannot replace the newly attached stream or its observation checkpoint. Clearing a history reader also invalidates any read still in flight.
 
+Background observation is also task-scoped: a slow history read, task-creation inspection, or panel refresh does not hold the global connection loop. A pending job is not started again on every tick. Health reports the delayed stage and its age (`history`, `catalog`, `creator-inspect`, `panels`) even while the scheduler timer is healthy. Background discovery of disconnected tasks still needs the shared catalog; that wait does not block maintenance of existing subscriptions.
+
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
 Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.

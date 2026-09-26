@@ -23,6 +23,13 @@ export interface BridgeRuntimeAdapters {
   readonly inspectExternalOwner?: (task: TaskRef) => Promise<"idle" | "active" | "systemError" | null>;
 }
 
+interface MaintenanceJob {
+  phase: string;
+  readonly bindingId?: string;
+  readonly startedAt: number;
+  readonly work: Promise<void>;
+}
+
 export class BridgeRuntime {
   private readonly gate: AccessGate;
   private readonly delivery: DeliveryWorker;
@@ -33,7 +40,8 @@ export class BridgeRuntime {
   private readonly health: BridgeHealthMonitor;
   private readonly connections: TaskStateConnections;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private ticking: Promise<void> | null = null;
+  private readonly maintenance = new Map<string, MaintenanceJob>();
+  private catalogRead: Promise<Awaited<ReturnType<CodexTasks["listTasks"]>>> | null = null;
   private stopped = false;
   private unsubscribeCreation: (() => void) | null = null;
   private readonly startedAt: number;
@@ -175,6 +183,7 @@ export class BridgeRuntime {
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
+      maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
       failedBindings: bindings.filter(actionableFailure).length, bindings };
   }
@@ -249,8 +258,11 @@ export class BridgeRuntime {
         if (!matches()) throw new ActionRejectedError("Привязка задачи изменилась во время подключения. Сообщение не отправлено; проверь /menu и повтори запрос.");
         if (!this.matchesConnection(binding)) {
           if (this.connections.has(binding.id)) this.closeSubscription(binding.id);
-          await this.connectBinding(binding, binding);
         }
+        // Background discovery may allocate a matching stream while the first
+        // await yields. A matching slot is not yet a ready subscription: join
+        // its pending start as well as starting an absent stream.
+        await this.connectBinding(binding, binding);
         if (!matches()) throw new ActionRejectedError("Привязка задачи изменилась во время подключения. Сообщение не отправлено; проверь /menu и повтори запрос.");
         // Observation age is a health signal, not a reason to resume an
         // existing writer. Command adapters verify ownership before writes.
@@ -487,21 +499,38 @@ export class BridgeRuntime {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
     if (!this.stopped && this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth().catch(() => {});
-    if (!this.ticking) {
-      this.updateStartedAt = this.now();
-      this.ticking = this.update().finally(() => { this.ticking = null; this.updateStartedAt = null; });
-    }
-    const update = this.ticking;
-    // A VK input must wait for its own native subscription before dispatch,
-    // never for an unrelated conversation's slow resume. Batch callers may
-    // still explicitly wait for all subscriptions (e.g. tests/diagnostics).
-    // The production one-second timer never waits for a huge thread/resume:
-    // otherwise the health report can become stale while active turns progress.
-    return waitForConnections ? update.then(async () => {
+    if (this.stopped) return Promise.resolve();
+    this.updateStartedAt = this.now();
+    try { this.update(); }
+    catch (error) { return Promise.reject(error); }
+    finally { this.updateStartedAt = null; }
+    // Production ticks only schedule single-flight jobs. Explicit diagnostic
+    // batches may wait for this snapshot without holding subsequent ticks.
+    const jobs = [...this.maintenance.values()].filter(job => !bindingId || job.bindingId === bindingId);
+    return waitForConnections ? Promise.allSettled(jobs.map(job => job.work)).then(async () => {
       const connection = bindingId ? this.connecting.get(bindingId) : null;
       await Promise.allSettled(bindingId ? connection ? [connection] : [] : this.connecting.values());
       void this.delivery.flush().catch(() => {});
-    }) : update;
+    }) : Promise.resolve();
+  }
+
+  private background(key: string, phase: string, work: (setPhase: (phase: string) => void) => Promise<void>, bindingId?: string): void {
+    if (this.stopped || this.maintenance.has(key)) return;
+    const pending = Promise.resolve().then(async () => { if (!this.stopped) await work(phase => { job.phase = phase; }); });
+    const job: MaintenanceJob = { phase, ...(bindingId ? { bindingId } : {}), startedAt: this.now(), work: pending };
+    this.maintenance.set(key, job);
+    const settled = () => { if (this.maintenance.get(key) === job) this.maintenance.delete(key); };
+    void pending.then(settled, settled);
+  }
+
+  private listConnectionTasks(): Promise<Awaited<ReturnType<CodexTasks["listTasks"]>>> {
+    if (!this.catalogRead) {
+      const pending = Promise.resolve().then(() => this.desktop.listTasks());
+      this.catalogRead = pending;
+      const settled = () => { if (this.catalogRead === pending) this.catalogRead = null; };
+      void pending.then(settled, settled);
+    }
+    return this.catalogRead;
   }
 
   private prepareBindingObservation(binding: Binding): void {
@@ -526,100 +555,108 @@ export class BridgeRuntime {
     }
   }
 
-  private async update(): Promise<void> {
+  private update(): void {
     if (this.stopped) return;
     this.mirror.tick();
     this.manager.panels.transfers.tick();
     this.closeInactiveSubscriptions();
     this.activity.tick();
-    await Promise.allSettled(this.store.bindings().map(binding => {
+    for (const binding of this.store.bindings()) {
       this.prepareBindingObservation(binding);
-      return this.mirrorRolloutFallback(binding);
-    }));
-    await this.manager.panels.tick();
+      const generation = this.store.streamGeneration(binding.id);
+      const suffix = JSON.stringify([binding.id, taskKey(binding), generation]);
+      this.background(`history:${suffix}`, "history", () => this.mirrorRolloutFallback(binding), binding.id);
+      this.background(`connection:${suffix}`, "connection", setPhase => this.maintainBinding(binding, generation, setPhase), binding.id);
+    }
+    this.background("panels", "panels", () => this.manager.panels.tick());
+    void this.delivery.flush().catch(() => {});
+  }
+
+  private async maintainBinding(listed: Binding, generation: number, setPhase: (phase: string) => void): Promise<void> {
+    const matches = (): boolean => {
+      const current = this.store.getBinding(listed.id);
+      return !this.stopped && !!current?.attached && sameTask(current, listed)
+        && this.store.streamGeneration(listed.id) === generation;
+    };
+    if (!matches()) return;
     // Re-reading every profile catalog for each conversation made a full
     // reconnect proportional to the number of bindings. During a renderer
     // outage, serial five-second subscription attempts could hold one update
     // for minutes and make the health report itself stale.
-    let listedTasks: Awaited<ReturnType<CodexTasks["listTasks"]>> | null = null;
-    for (const listed of this.store.bindings()) {
-      let binding = listed;
-      let existing = this.connections.has(binding.id);
-      if (existing && !this.matchesConnection(binding)) {
-        this.closeSubscription(binding.id); existing = false;
-      }
-      // A subscription already being resumed is owned by its original task.
-      // Wait for that attempt to settle before trying this binding again, but
-      // keep the rest of the bridge update and health checks running.
-      if (this.connecting.has(binding.id)) continue;
-      if (!binding.attached || binding.peerId === null) {
-        this.closeSubscription(binding.id); this.disableRolloutFallback(binding); continue;
-      }
-      if (binding.paused) {
-        // Clear privacy pauses left by versions that treated conversation
-        // membership as an authorization boundary.
-        this.store.setPaused(binding.id, false);
-        binding = this.store.getBinding(binding.id)!;
-      }
-      // A command that was rejected before dispatch because neither the
-      // profile owner nor the active UI owner was reachable remains safe to
-      // probe. Reacquire it in the background until one route becomes
-      // available; never replay the rejected user input itself.
-      if (this.store.getValue<{ kind?: string }>(`route-failure:${binding.id}`)?.kind === "no-active-owner") {
-        this.releasedIdle.delete(binding.id);
-        this.demanded.add(binding.id);
-      }
-      // A final answer is persisted before delivery is attempted. Closing a
-      // terminal subscription must not depend on VK upload/send latency; the
-      // durable outbox remains independently deliverable.
-      if (this.connections.has(binding.id)) {
-        const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
-        if (details && ["idle", "failed", "interrupted"].includes(details.status)
-          && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
-          this.releaseIdleSubscription(binding);
-        }
-      }
-      this.flushCreation(binding);
-      if (this.desktop.isCreationActive?.(binding)) {
-        if (existing) this.closeSubscription(binding.id);
-        try {
-          const details = await this.desktop.inspectTask(binding);
-          this.manager.panels.observe(binding.id, details);
-          this.files?.observe(binding.id, details.status);
-        } catch { /* The creation owner may have handed off between both checks. */ }
-        continue;
-      }
-      const storedDetails = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
-      const terminal = !storedDetails || ["idle", "failed", "interrupted", "unavailable"].includes(storedDetails.status);
-      if (!existing && (this.releasedIdle.has(binding.id) || this.streamMode(binding.id) === "detached") && !this.demanded.has(binding.id)
-        && terminal && !this.hasPendingTaskWork(binding.id)) continue;
-      if (!existing && !this.connections.canAttempt(binding.id)) continue;
-      if (existing) { this.connections.maintain(binding.id); continue; }
-      if (this.connecting.size >= 6) continue;
-      listedTasks ??= await this.desktop.listTasks();
-      const task = listedTasks.find(task => sameTask(task, binding));
-      const current = this.store.getBinding(binding.id);
-      if (this.stopped || !current?.attached) { this.closeSubscription(binding.id); continue; }
-      // Catalog I/O can overlap a foreground attach or a transfer. Never
-      // replace its newer stream or restore source metadata from an old list.
-      if (!sameTask(current, binding) || this.connecting.has(binding.id)
-        || this.matchesConnection(binding)) continue;
-      if (!task) {
-        this.connections.postpone(binding.id, 30_000);
-        this.manager.panels.disconnected(binding.id, true);
-        this.activity.disconnected(binding.id);
-        this.files?.observe(binding.id, "unavailable");
-        continue;
-      }
-      this.store.ensureBinding(task);
-      this.connectBinding(binding, task);
-      if (this.stopped) break;
-      this.closeInactiveSubscriptions();
+    let binding = listed;
+    let existing = this.connections.has(binding.id);
+    if (existing && !this.matchesConnection(binding)) {
+      this.closeSubscription(binding.id); existing = false;
     }
-    // VK writes have their own serialized worker and may take many seconds.
-    // Keep task reconciliation independent from that queue; the one-second
-    // timer also flushes it, and stop() waits for its in-flight operation.
-    void this.delivery.flush().catch(() => {});
+    // A subscription already being resumed is owned by its original task.
+    // Wait for that attempt to settle before trying this binding again, but
+    // keep the rest of the bridge update and health checks running.
+    if (this.connecting.has(binding.id)) return;
+    if (!binding.attached || binding.peerId === null) {
+      this.closeSubscription(binding.id); this.disableRolloutFallback(binding); return;
+    }
+    if (binding.paused) {
+      // Clear privacy pauses left by versions that treated conversation
+      // membership as an authorization boundary.
+      this.store.setPaused(binding.id, false);
+      binding = this.store.getBinding(binding.id)!;
+    }
+    // A command that was rejected before dispatch because neither the
+    // profile owner nor the active UI owner was reachable remains safe to
+    // probe. Reacquire it in the background until one route becomes
+    // available; never replay the rejected user input itself.
+    if (this.store.getValue<{ kind?: string }>(`route-failure:${binding.id}`)?.kind === "no-active-owner") {
+      this.releasedIdle.delete(binding.id);
+      this.demanded.add(binding.id);
+    }
+    // A final answer is persisted before delivery is attempted. Closing a
+    // terminal subscription must not depend on VK upload/send latency; the
+    // durable outbox remains independently deliverable.
+    if (this.connections.has(binding.id)) {
+      const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+      if (details && ["idle", "failed", "interrupted"].includes(details.status)
+        && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
+        this.releaseIdleSubscription(binding);
+      }
+    }
+    this.flushCreation(binding);
+    if (this.desktop.isCreationActive?.(binding)) {
+      if (existing) this.closeSubscription(binding.id);
+      try {
+        setPhase("creator-inspect");
+        const details = await this.desktop.inspectTask(binding);
+        if (!matches() || !this.desktop.isCreationActive?.(binding)) return;
+        this.manager.panels.observe(binding.id, details);
+        this.files?.observe(binding.id, details.status);
+      } catch { /* The creation owner may have handed off between both checks. */ }
+      return;
+    }
+    const storedDetails = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
+    const terminal = !storedDetails || ["idle", "failed", "interrupted", "unavailable"].includes(storedDetails.status);
+    if (!existing && (this.releasedIdle.has(binding.id) || this.streamMode(binding.id) === "detached") && !this.demanded.has(binding.id)
+      && terminal && !this.hasPendingTaskWork(binding.id)) return;
+    if (!existing && !this.connections.canAttempt(binding.id)) return;
+    if (existing) { this.connections.maintain(binding.id); return; }
+    if (this.connecting.size >= 6) return;
+    setPhase("catalog");
+    const listedTasks = await this.listConnectionTasks();
+    const task = listedTasks.find(task => sameTask(task, binding));
+    const current = this.store.getBinding(binding.id);
+    if (!matches() || !current?.attached) return;
+    // Catalog I/O can overlap a foreground attach or a transfer. Never
+    // replace its newer stream or restore source metadata from an old list.
+    if (!sameTask(current, binding) || this.connecting.has(binding.id)
+      || this.matchesConnection(binding) || this.connecting.size >= 6) return;
+    if (!task) {
+      this.connections.postpone(binding.id, 30_000);
+      this.manager.panels.disconnected(binding.id, true);
+      this.activity.disconnected(binding.id);
+      this.files?.observe(binding.id, "unavailable");
+      return;
+    }
+    this.store.ensureBinding(task);
+    this.connectBinding(binding, task);
+    this.closeInactiveSubscriptions();
   }
 
   private connectBinding(binding: Binding, task: TaskRef): Promise<void> {
@@ -748,7 +785,7 @@ export class BridgeRuntime {
     await this.connections.stop();
     await Promise.allSettled(this.connecting.values());
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
-    await this.ticking?.catch(() => {});
+    await Promise.allSettled([...this.maintenance.values()].map(job => job.work));
     await this.manager.idle();
     await transfersStopped;
     await this.files?.stop();

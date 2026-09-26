@@ -82,6 +82,25 @@ test("health detects commentary stuck before the VK queue and clears after mirro
   assert.equal((await s.monitor.check()).checks.find(item => item.name === "codex_mirror")?.state, "ok");
 });
 
+test("health retains the age and stage of isolated maintenance while scheduler ticks stay healthy", async t => {
+  const s = setup(t); let now = 100_000;
+  let maintenance = [{ phase: "history" as const, bindingId: "slow-binding", startedAt: 90_000 }];
+  const monitor = new BridgeHealthMonitor(access, s.desktop, s.chat, s.store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0, maintenance,
+  }), undefined, () => now);
+  assert.equal((await monitor.check()).checks.find(item => item.name === "runtime_maintenance")?.state, "ok");
+  now += 10_000;
+  const delayed = await monitor.check();
+  assert.equal(delayed.checks.find(item => item.name === "runtime")?.state, "ok");
+  assert.equal(delayed.checks.find(item => item.name === "runtime_maintenance")?.state, "degraded");
+  assert.match(delayed.checks.find(item => item.name === "runtime_maintenance")!.detail, /history.*slow-binding.*20/u);
+  now += 50_000;
+  assert.equal((await monitor.check()).checks.find(item => item.name === "runtime_maintenance")?.state, "failed");
+  maintenance = [];
+  assert.equal((await monitor.check()).checks.find(item => item.name === "runtime_maintenance")?.state, "ok");
+});
+
 test("health records the failing phase and retries after an internal exception", async t => {
   const s = setup(t);
   const diagnostics: string[] = [];
