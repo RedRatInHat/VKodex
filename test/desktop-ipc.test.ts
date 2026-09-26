@@ -18,7 +18,7 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject }
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
-import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
+import { hasRolloutUserTurn, RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/desktop/history-recovery.js";
 import { comparablePath } from "../src/desktop/paths.js";
 import { observeTaskState } from "../src/desktop/task-observation.js";
@@ -254,6 +254,58 @@ test("bridge releases goal continuation commentary without inventing a user requ
   }
   assert.ok(s.sent.some(item => item.view.text === "Autonomous progress"));
   assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
+});
+
+test("bridge releases direct app turn commentary when its user input exists only in rollout", async t => {
+  let publish!: (state: IpcObject, initial: boolean) => void;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      publish = onState;
+      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+    },
+    close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-user-turn-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  await writeFile(rolloutPath, JSON.stringify({ type: "response_item", payload: {
+    type: "message", role: "user", content: [{ type: "input_text", text: "Continue the task" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "fixture-turn" },
+  } }) + "\n");
+  s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  await s.runtime.tick();
+  publish(state([{ type: "agentMessage", id: "app-progress", phase: "commentary", text: "Direct app progress" }]), false);
+  for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Direct app progress"); attempt++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await s.runtime.tick(false);
+  }
+  assert.ok(s.sent.some(item => item.view.text === "Direct app progress"));
+  assert.equal(s.sent.filter(item => item.view.text === "## user request\n\nContinue the task").length, 1);
+  assert.ok(s.sent.findIndex(item => item.view.text === "## user request\n\nContinue the task")
+    < s.sent.findIndex(item => item.view.text === "Direct app progress"));
+  publish(state([{ type: "userMessage", id: "different-native-id", content: [{ type: "text", text: "Continue the task" }] },
+    { type: "agentMessage", id: "app-progress", phase: "commentary", text: "Direct app progress" }]), false);
+  await s.runtime.tick(false);
+  assert.equal(s.sent.filter(item => item.view.text === "## user request\n\nContinue the task").length, 1);
+});
+
+test("rollout user turn proof excludes other turns and scheduler inputs", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-turn-proof-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  const record = (turnId: string, text: string) => JSON.stringify({ type: "response_item", payload: {
+    type: "message", role: "user", content: [{ type: "input_text", text }],
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  } }) + "\n";
+  await writeFile(rolloutPath, record("other-turn", "Other prompt") + record("heartbeat-turn",
+    "<heartbeat><automation_id>daily</automation_id><current_time_iso>2026-09-26T08:00:00Z</current_time_iso><instructions>Check</instructions></heartbeat>"));
+  const task = { ...ref, rolloutPath };
+  assert.equal(await hasRolloutUserTurn(task, "fixture-turn"), false);
+  assert.equal(await hasRolloutUserTurn(task, "heartbeat-turn"), false);
+  await appendFile(rolloutPath, record("fixture-turn", "Direct app prompt"));
+  assert.equal(await hasRolloutUserTurn(task, "fixture-turn"), true);
+  assert.equal(await hasRolloutUserTurn(task, "fixture-turn", 12), false);
 });
 
 test("rollout fallback also publishes commentary from a goal continuation", async t => {

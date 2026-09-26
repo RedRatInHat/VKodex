@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../core/task-state.js";
 import type { TaskHistoryRecovery } from "../core/task-history.js";
 import type { TaskObservationCheckpoint, TaskStateObserver } from "../core/task-observation.js";
@@ -15,6 +16,7 @@ import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
+import { readRolloutUserTurn } from "../desktop/rollout-tailer.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -52,46 +54,64 @@ export class BridgeRuntime {
   /** Native resume of a large task may take minutes; it must not hold the health/update loop. */
   private readonly connecting = new Map<string, Promise<void>>();
   private readonly goalProgressProbes = new Map<string, {
-    taskKey: string; turnId: string; checkedAt: number; pending: boolean; confirmed: boolean;
+    taskKey: string; turnId: string; rolloutPath: string | undefined; generation: number;
+    checkedAt: number; pending: boolean; confirmed: boolean;
   }>();
 
   private confirmedGoalTurn(binding: Binding, turnId: string | null): readonly string[] {
     const probe = this.goalProgressProbes.get(binding.id);
-    return turnId && probe?.confirmed && probe.turnId === turnId && probe.taskKey === taskKey(binding) ? [turnId] : [];
+    if (!turnId) return [];
+    const identity = taskKey(binding);
+    const generation = this.store.streamGeneration(binding.id);
+    if (probe?.confirmed && probe.turnId === turnId && probe.taskKey === identity
+      && probe.rolloutPath === binding.rolloutPath && probe.generation === generation) return [turnId];
+    const proof = this.store.getValue<{ taskKey: string; rolloutPath?: string; generation: number }>(
+      `native-input-confirmation:${binding.id}:${turnId}`);
+    return proof?.taskKey === identity && proof.rolloutPath === binding.rolloutPath && proof.generation === generation ? [turnId] : [];
   }
 
   private probeGoalProgress(binding: Binding, turnId: string | null, inputTurnIds: readonly string[], fallback = false): void {
-    // Native goal continuations have no user item. Verify the active goal
-    // before releasing commentary held for causal ordering; ordinary turns
-    // must still wait for their user item, which can arrive in a later snapshot.
-    if (!turnId || inputTurnIds.includes(turnId) || !this.desktop.capabilities.goals || !this.desktop.getGoal) return;
+    // A direct app turn can have its user input in the rollout but not the
+    // owner's projected stream. Goal continuations have no user item at all.
+    // Verify either origin before releasing deferred commentary.
+    if (!turnId || inputTurnIds.includes(turnId)) return;
     const deferred = this.store.getValue<TaskEvent[]>(`deferred-mirror:${binding.id}:${turnId}`);
     if (!deferred?.some(event => event.type === "progress")) return;
     const identity = taskKey(binding);
+    const generation = this.store.streamGeneration(binding.id);
     const previous = this.goalProgressProbes.get(binding.id);
     if (previous?.taskKey === identity && previous.turnId === turnId
+      && previous.rolloutPath === binding.rolloutPath && previous.generation === generation
       && (previous.confirmed || previous.pending || this.now() - previous.checkedAt < 30_000)) return;
-    const probe = { taskKey: identity, turnId, checkedAt: this.now(), pending: true, confirmed: false };
+    const probe = { taskKey: identity, turnId, rolloutPath: binding.rolloutPath, generation,
+      checkedAt: this.now(), pending: true, confirmed: false };
     this.goalProgressProbes.set(binding.id, probe);
-    void this.desktop.getGoal(binding).then(goal => {
-      if (goal?.status !== "active" || goal.threadId !== binding.threadId || this.stopped
+    void (async () => {
+      const nativeInput = await readRolloutUserTurn(binding, turnId);
+      const goal = !nativeInput && this.desktop.capabilities.goals && this.desktop.getGoal
+        ? await this.desktop.getGoal(binding) : null;
+      if ((!nativeInput && (goal?.status !== "active" || goal.threadId !== binding.threadId)) || this.stopped
         || this.goalProgressProbes.get(binding.id) !== probe) return;
       this.store.atomic(() => {
         const current = this.store.getBinding(binding.id);
         const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
         const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
         if (!current?.attached || !sameTask(current, binding) || details?.status !== "running"
+          || current.rolloutPath !== binding.rolloutPath || this.store.streamGeneration(binding.id) !== generation
           || (!fallback && !checkpoint?.active?.includes(turnId))
           || this.store.acceptedTurns(binding.id).some(turn => turn.turnId === turnId)
           || Object.keys(checkpoint?.seen ?? {}).some(key => {
             try { const [seenTurn, type] = JSON.parse(key) as [string, string]; return seenTurn === turnId && type === "user"; }
             catch { return false; }
           })) return;
-        this.mirror.acceptObservation(binding.id, [], [], [turnId]);
+        if (nativeInput) this.store.setValue(`native-input-confirmation:${binding.id}:${turnId}`,
+          { taskKey: identity, rolloutPath: binding.rolloutPath, generation, userId: nativeInput.id,
+            digest: createHash("sha256").update(nativeInput.text.replace(/\r\n?/gu, "\n").trimEnd()).digest("hex") });
+        this.mirror.acceptObservation(binding.id, nativeInput ? [nativeInput] : [], [], [turnId]);
         probe.confirmed = true;
       });
       if (probe.confirmed) void this.delivery.flush().catch(() => {});
-    }).catch(() => {}).finally(() => { probe.pending = false; probe.checkedAt = this.now(); });
+    })().catch(() => {}).finally(() => { probe.pending = false; probe.checkedAt = this.now(); });
   }
 
   private streamMode(bindingId: string): "attached" | "detached" | null {

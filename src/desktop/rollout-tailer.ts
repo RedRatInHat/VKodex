@@ -1,13 +1,53 @@
 import { open, stat } from "node:fs/promises";
 import { normalize } from "node:path";
 import type { TaskEvent, TaskRef } from "./contracts.js";
-import { visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
+import { isAutomationHeartbeatInput, visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
 
 interface Cursor { readonly offset: number; readonly pending: Buffer; readonly anchor: Buffer; }
 
 interface RolloutRecord {
   readonly timestamp: number;
   readonly event: TaskEvent;
+}
+
+/** The live owner can omit userMessage from its projected stream even when
+ * Codex recorded a direct app input. Check a bounded rollout tail for the
+ * exact turn before releasing causally deferred assistant commentary. */
+export async function readRolloutUserTurn(task: TaskRef, turnId: string, maxBytes = 32 * 1024 * 1024): Promise<Extract<TaskEvent, { type: "user" }> | null> {
+  if (!task.rolloutPath || !turnId || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) return null;
+  const file = rolloutPath(task.rolloutPath);
+  let info;
+  try { info = await stat(file); } catch { return null; }
+  if (!info.isFile() || info.size <= 0) return null;
+  const start = Math.max(0, info.size - maxBytes);
+  const buffer = Buffer.allocUnsafe(info.size - start);
+  const handle = await open(file, "r");
+  let bytesRead = 0;
+  try { ({ bytesRead } = await handle.read(buffer, 0, buffer.length, start)); } finally { await handle.close(); }
+  if (!bytesRead) return null;
+  const data = buffer.subarray(0, bytesRead);
+  const first = start === 0 ? 0 : data.indexOf(0x0a) + 1;
+  if (first === 0 && start > 0) return null;
+  const last = data.lastIndexOf(0x0a);
+  if (last < first) return null;
+  for (const line of data.subarray(first, last).toString("utf8").split("\n")) {
+    if (!line.includes(turnId)) continue;
+    let record: unknown;
+    try { record = JSON.parse(line) as unknown; } catch { continue; }
+    if (!isObject(record) || record.type !== "response_item" || !isObject(record.payload)) continue;
+    const item = record.payload;
+    if (item.type !== "message" || item.role !== "user" || turnIdFrom(item) !== turnId || !Array.isArray(item.content)) continue;
+    const inputs = item.content.filter(isObject).filter(part => part.type === "input_text" && typeof part.text === "string")
+      .map(part => part.text as string);
+    const text = inputs.join("\n");
+    if (text && !isAutomationHeartbeatInput(text)) return { type: "user", id: typeof item.id === "string" ? item.id : `rollout-user:${turnId}`,
+      turnId, text };
+  }
+  return null;
+}
+
+export async function hasRolloutUserTurn(task: TaskRef, turnId: string, maxBytes?: number): Promise<boolean> {
+  return !!await readRolloutUserTurn(task, turnId, maxBytes);
 }
 
 /**

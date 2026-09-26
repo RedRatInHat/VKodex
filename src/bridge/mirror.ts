@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { TaskEvent } from "../core/codex-tasks.js";
+import { taskKey, type TaskEvent } from "../core/codex-tasks.js";
 import { chunkText } from "../lib/text.js";
 import { BridgeStore } from "./store.js";
 import { MENU_BUTTON } from "./contracts.js";
@@ -114,6 +114,16 @@ export class TaskMirror {
       }
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
       if (event.type === "user" && this.store.consumeExpectedEditedUser(binding.id, event.text)) return;
+      // A direct app input recovered from the rollout may later appear with a
+      // different item ID in the owner's projected stream. This is scoped to
+      // the verified turn; ordinary repeated user text is left untouched.
+      if (event.type === "user") {
+        const proof = this.store.getValue<{ taskKey: string; rolloutPath?: string; generation: number;
+          userId: string; digest: string }>(`native-input-confirmation:${binding.id}:${event.turnId}`);
+        if (proof?.taskKey === taskKey(binding) && proof.rolloutPath === binding.rolloutPath
+          && proof.generation === this.store.streamGeneration(binding.id) && proof.userId !== event.id
+          && proof.digest === createHash("sha256").update(event.text.replace(/\r\n?/gu, "\n").trimEnd()).digest("hex")) return;
+      }
       const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";
       const showMenu = event.type === "final" && event.showMenu !== false;
       const footer = showMenu ? MENU_FOOTER : "";
