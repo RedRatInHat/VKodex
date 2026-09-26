@@ -81,7 +81,13 @@ class FakeRpc implements AppServerRpc {
   emit(notification: AppServerEnvelope): void { for (const listener of this.listeners) listener(notification); }
   disconnect(): void { for (const listener of this.disconnectListeners) listener(new Error("Disconnected")); }
   private nextServerRequestId = 1;
-  ask(request: AppServerEnvelope): Promise<JsonObject> { return Promise.resolve(this.handler!({ ...request, id: this.nextServerRequestId++ })); }
+  async ask(request: AppServerEnvelope): Promise<JsonObject> {
+    let resolveWritten!: () => void;
+    const responseWritten = new Promise<void>(resolve => { resolveWritten = resolve; });
+    const result = await this.handler!({ ...request, id: this.nextServerRequestId++ },
+      { signal: new AbortController().signal, responseWritten });
+    resolveWritten(); return result;
+  }
   async close(): Promise<void> {}
 }
 

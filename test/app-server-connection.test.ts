@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { AppServerConnection, AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
+import type { AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -191,6 +192,212 @@ test("server request handlers receive the original typed request ID", async () =
     child.send({ id: "7", method: "item/tool/requestUserInput", params: { itemId: "string" } });
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(seenIds, [7, "7"]);
+  } finally { await connection.close(); }
+});
+
+test("server request receipt waits for the handler result to be written on the live child", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => { contexts.push(context); return answer; });
+  try {
+    await connection.start();
+    child.send({ id: 11, method: "item/tool/requestUserInput", params: { itemId: "deferred" } });
+    const context = contexts[0];
+    assert.ok(context, "the handler receives a receipt and cancellation signal");
+    assert.equal(context.signal.aborted, false);
+    let settled = false;
+    void context.responseWritten.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.deepEqual(child.messages.filter(message => message.id === 11), []);
+    release({ answers: { choice: { answers: ["yes"] } } });
+    await context.responseWritten;
+    assert.deepEqual(child.messages.filter(message => message.id === 11), [
+      { id: 11, result: { answers: { choice: { answers: ["yes"] } } } },
+    ]);
+    assert.equal(settled, true);
+  } finally { release({}); await connection.close(); }
+});
+
+test("conflicting server request replay aborts and rejects the old response receipt", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    if (context) void context.responseWritten.catch(() => {});
+    return answer;
+  });
+  try {
+    await connection.start();
+    child.send({ id: 12, method: "item/tool/requestUserInput", params: { itemId: "first" } });
+    const context = contexts[0];
+    assert.ok(context);
+    child.send({ id: 12, method: "item/tool/requestUserInput", params: { itemId: "different" } });
+    assert.equal(context.signal.aborted, true);
+    await assert.rejects(context.responseWritten);
+    release({ answers: { choice: { answers: ["stale"] } } });
+    await new Promise(resolve => setImmediate(resolve));
+    const replies = child.messages.filter(message => message.id === 12);
+    assert.equal(replies.length, 1);
+    assert.equal((replies[0]!.error as JsonObject).code, -32600);
+  } finally { release({}); await connection.close(); }
+});
+
+test("disconnect aborts and rejects the pending server response receipt", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    if (context) void context.responseWritten.catch(() => {});
+    return answer;
+  });
+  try {
+    await connection.start();
+    child.send({ id: 13, method: "item/tool/requestUserInput", params: { itemId: "pending" } });
+    const context = contexts[0];
+    assert.ok(context);
+    child.disconnect();
+    assert.equal(context.signal.aborted, true);
+    await assert.rejects(context.responseWritten);
+    release({ answers: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 13), []);
+  } finally { release({}); await connection.close(); }
+});
+
+test("abort-listener reconnect waits until the previous child is closed", { timeout: 2_000 }, async () => {
+  const first = new AppServerChild();
+  const second = new AppServerChild();
+  let launches = 0;
+  let oldStdinEndedAtSecondLaunch = false;
+  const connection = new AppServerConnection(() => {
+    if (launches++ === 0) return first.asChild();
+    oldStdinEndedAtSecondLaunch = first.stdin.writableEnded;
+    return second.asChild();
+  }, undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  let reentrant: Promise<JsonObject> | null = null;
+  connection.onServerRequest((_request, context) => {
+    void context.responseWritten.catch(() => {});
+    context.signal.addEventListener("abort", () => { reentrant = connection.request("model/list"); }, { once: true });
+    return answer;
+  });
+  try {
+    await connection.start();
+    first.send({ id: 18, method: "item/tool/requestUserInput", params: { itemId: "pending" } });
+    first.disconnect();
+    assert.ok(reentrant, "the abort listener starts recovery immediately");
+    assert.deepEqual(await reentrant, { ok: true });
+    assert.equal(oldStdinEndedAtSecondLaunch, true, "old child stdin must be closed before launching a new child");
+  } finally { release({}); await connection.close(); }
+});
+
+test("explicit close aborts and rejects a pending server response receipt", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    void context.responseWritten.catch(() => {});
+    return answer;
+  });
+  try {
+    await connection.start();
+    child.send({ id: 15, method: "item/tool/requestUserInput", params: { itemId: "pending" } });
+    const context = contexts[0];
+    assert.ok(context);
+    await connection.close();
+    assert.equal(context.signal.aborted, true);
+    await assert.rejects(context.responseWritten);
+    release({ answers: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 15), []);
+  } finally { release({}); await connection.close(); }
+});
+
+test("a synchronous result write failure cannot resolve the server response receipt", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    void context.responseWritten.catch(() => {});
+    return { answers: {} };
+  });
+  try {
+    await connection.start();
+    const write = child.stdin.write.bind(child.stdin);
+    Object.defineProperty(child.stdin, "write", { configurable: true, value: (chunk: string) => {
+      if (chunk.includes('"id":16,"result"')) throw new Error("fixture result write failure");
+      return write(chunk);
+    } });
+    child.send({ id: 16, method: "item/tool/requestUserInput", params: { itemId: "write-failure" } });
+    await new Promise(resolve => setImmediate(resolve));
+    const context = contexts[0];
+    assert.ok(context);
+    assert.equal(context.signal.aborted, true);
+    await assert.rejects(context.responseWritten);
+    assert.deepEqual(child.messages.filter(message => message.id === 16), []);
+  } finally { await connection.close(); }
+});
+
+test("ended child stdin cannot count as a written server response", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let release!: (value: JsonObject) => void;
+  const answer = new Promise<JsonObject>(resolve => { release = resolve; });
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    void context.responseWritten.catch(() => {});
+    return answer;
+  });
+  child.stdin.on("error", () => { /* A write-after-end fixture error is expected. */ });
+  try {
+    await connection.start();
+    child.send({ id: 17, method: "item/tool/requestUserInput", params: { itemId: "ended-stdin" } });
+    const context = contexts[0];
+    assert.ok(context);
+    child.stdin.end();
+    assert.equal(child.stdin.writableEnded, true);
+    release({ answers: {} });
+    await assert.rejects(context.responseWritten);
+    assert.equal(context.signal.aborted, true);
+    assert.deepEqual(child.messages.filter(message => message.id === 17), []);
+  } finally { release({}); await connection.close(); }
+});
+
+test("handler failure rejects its response receipt even when a generic error reply is written", { timeout: 2_000 }, async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((_request, context) => {
+    contexts.push(context);
+    if (context) void context.responseWritten.catch(() => {});
+    throw new Error("private handler detail");
+  });
+  try {
+    await connection.start();
+    child.send({ id: 14, method: "item/tool/requestUserInput", params: { itemId: "failure" } });
+    await new Promise(resolve => setImmediate(resolve));
+    const context = contexts[0];
+    assert.ok(context);
+    await assert.rejects(context.responseWritten);
+    const replies = child.messages.filter(message => message.id === 14);
+    assert.equal(replies.length, 1);
+    assert.equal((replies[0]!.error as JsonObject).code, -32000);
   } finally { await connection.close(); }
 });
 
