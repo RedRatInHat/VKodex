@@ -213,7 +213,7 @@ export class BridgeRuntime {
       // Acquire the task stream before the manager can call turn/start. A
       // resume after turn/start may abort that active turn in Codex, so this
       // ordering is deliberately awaited for an idle, detached task.
-      await this.tick();
+      await this.tick(true, binding.id);
     }
     try {
       await this.manager.handle(input);
@@ -226,7 +226,7 @@ export class BridgeRuntime {
         // A known rejection did not create work. Unknown/sending operations
         // remain in hasPendingTaskWork and keep the lease for reconciliation.
         this.demanded.delete(binding.id);
-        await this.tick();
+        await this.tick(true, binding.id);
       }
     }
     this.closeInactiveSubscriptions();
@@ -415,9 +415,6 @@ export class BridgeRuntime {
     if (details && (details.status === "running" || details.status === "approval") || this.hasPendingTaskWork(binding.id)) {
       throw new ActionRejectedError("Задача ещё выполняется, ожидает ответа или сверки результата. Дождись завершения либо используй /stop; управление не передано приложению Codex.");
     }
-    if (this.hasPendingCriticalDelivery(binding.id)) {
-      throw new ActionRejectedError("Финальный ответ задачи ещё отправляется в VK. Повтори /open после завершения доставки.");
-    }
     this.demanded.delete(binding.id);
     this.pendingReacquire.delete(binding.id);
     this.releasedIdle.add(binding.id);
@@ -436,12 +433,7 @@ export class BridgeRuntime {
       || this.store.unresolvedPromptOperations(bindingId).length > 0;
   }
 
-  private hasPendingCriticalDelivery(bindingId: string): boolean {
-    return this.store.pendingDeliveries().some(delivery => delivery.bindingId === bindingId
-      && (delivery.kind === "send" || delivery.kind === "panel"));
-  }
-
-  tick(waitForConnections = true): Promise<void> {
+  tick(waitForConnections = true, bindingId?: string): Promise<void> {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
     if (!this.stopped && this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth().catch(() => {});
@@ -450,11 +442,14 @@ export class BridgeRuntime {
       this.ticking = this.update().finally(() => { this.ticking = null; this.updateStartedAt = null; });
     }
     const update = this.ticking;
-    // Explicit callers can await the native subscriptions they initiated.
+    // A VK input must wait for its own native subscription before dispatch,
+    // never for an unrelated conversation's slow resume. Batch callers may
+    // still explicitly wait for all subscriptions (e.g. tests/diagnostics).
     // The production one-second timer never waits for a huge thread/resume:
     // otherwise the health report can become stale while active turns progress.
     return waitForConnections ? update.then(async () => {
-      await Promise.allSettled(this.connecting.values());
+      const connection = bindingId ? this.connecting.get(bindingId) : null;
+      await Promise.allSettled(bindingId ? connection ? [connection] : [] : this.connecting.values());
       void this.delivery.flush().catch(() => {});
     }) : update;
   }
@@ -519,14 +514,13 @@ export class BridgeRuntime {
         this.releasedIdle.delete(binding.id);
         this.demanded.add(binding.id);
       }
-      // A final answer is persisted before delivery is attempted. Once the
-      // critical VK queue drains, release a still-open stream on the next
-      // tick; this also covers the case where the answer was queued while the
-      // first terminal snapshot was being handled.
+      // A final answer is persisted before delivery is attempted. Closing a
+      // terminal subscription must not depend on VK upload/send latency; the
+      // durable outbox remains independently deliverable.
       if (this.connections.has(binding.id)) {
         const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
         if (details && ["idle", "failed", "interrupted"].includes(details.status)
-          && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id) && !this.hasPendingCriticalDelivery(binding.id)) {
+          && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
           this.releaseIdleSubscription(binding);
         }
       }
@@ -631,7 +625,7 @@ export class BridgeRuntime {
             });
             const latest = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
             if (latest && ["idle", "failed", "interrupted"].includes(latest.status)
-              && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id) && !this.hasPendingCriticalDelivery(binding.id)) {
+              && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
               this.releaseIdleSubscription(binding);
             }
           }, failure => this.subscriptionFailed(binding.id, failure));

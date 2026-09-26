@@ -586,6 +586,10 @@ npm run desktop:start
 
 Profile App Server diagnostics use only `thread/read`: inspecting a task does not issue `thread/resume` or change the live observer's subscription. A `notLoaded`, unknown, or missing runtime status does not confirm a working connection. A mutating request timeout leaves that operation's outcome unknown, but no longer terminates the shared App Server by itself: unrelated tasks and notifications remain connected. Do not blindly repeat such a command; a timeout does not prove Codex rejected it.
 
+Local observers of one task share one upstream subscription: closing one observer does not unsubscribe the others. Reconnection waits for the previous `unsubscribe`; an unknown result does not authorize a blind `resume`. A VK input waits for its own task's connection rather than every background connection. Closing a terminal subscription no longer waits for final-answer delivery to VK: the persisted delivery queue proceeds independently. This is not proof of writer handoff to another client.
+
+The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
+
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:
 
 - SQLite integrity through `PRAGMA quick_check`;

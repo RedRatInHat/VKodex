@@ -631,6 +631,159 @@ test("a stalled VK send does not hold up task reconciliation", async t => {
   } finally { release(); }
 });
 
+test("a VK prompt waits only for its own subscription, not another task's resume", async t => {
+  let release!: () => void;
+  const slow = new Promise<void>(resolve => { release = resolve; });
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      let closed = false;
+      return { task, start: async () => {
+        if (task.threadId === "slow-task") await slow;
+        if (!closed) onState({ ...state(), id: task.threadId }, true);
+      }, verifyOwner: async () => {}, close: () => { closed = true; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  const other = { ...ref, threadId: "slow-task", title: "Slow", workspace: "/fixture", updatedAt: 1 };
+  const binding = s.store.ensureBinding(other); s.store.setChat(binding.id, s.peerId + 1, 18);
+  s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }, other];
+  let submitted = false;
+  s.desktop.submitWithReceipt = async () => { submitted = true; return { mode: "start", turnId: "accepted" }; };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const handling = s.runtime.handle({ eventId: "independent-prompt", peerId: s.peerId, senderId: 101, text: "Continue" });
+  try {
+    await Promise.race([handling, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("VK input waited for an unrelated task")), 1_000);
+    })]);
+    assert.equal(submitted, true);
+  } finally { clearTimeout(timer); release(); await handling; }
+});
+
+test("terminal observation closes its subscription even while final VK delivery is stalled", async t => {
+  let publish!: (snapshot: IpcObject, initial: boolean) => void; let closes = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      publish = onState;
+      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => { closes++; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  await s.runtime.tick();
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  s.chat.send = async peerId => { await pending; return { peerId, conversationMessageId: 100 }; };
+  s.store.enqueue("final-durable", s.peerId, { text: "Durable final" }, s.binding.id);
+  try {
+    await s.runtime.tick(false);
+    publish(state([], "completed"), false);
+    assert.equal(closes, 1);
+    assert.ok(s.store.pendingDeliveries().some(value => value.view.text === "Durable final"));
+  } finally { release(); }
+});
+
+test("native owner request handling is opt-in and declines requests by default", async () => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  const request = { type: "request", requestId: "owner-read", sourceClientId: "follower", method: "thread-owner-discovery",
+    version: 1, params: { hostId: "local", conversationId: "isolated" } };
+  try {
+    await client.connect();
+    server.send({ type: "client-discovery-request", requestId: "discover", request });
+    server.send(request);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(server.received.find(message => message.type === "client-discovery-response"), {
+      type: "client-discovery-response", requestId: "discover", response: { canHandle: false },
+    });
+    assert.equal(server.received.find(message => message.requestId === "owner-read")?.error, "no-handler-for-request");
+  } finally { client.close(); }
+});
+
+test("opt-in native owner rechecks scope/version and returns the native response envelope", async () => {
+  const server = new Server(); let allowed = true; let handled = 0;
+  const client = new DesktopIpcClient(() => server, 100, {
+    canHandle: request => allowed && (request.hostId === undefined || request.hostId === "local")
+      && request.method === "thread-owner-discovery" && request.version === 1
+      && request.params.hostId === "local" && request.params.conversationId === "isolated",
+    handle: async () => { handled++; return { supportsUntrustedAppInput: false }; },
+  });
+  const request = { type: "request", requestId: "owner-read", sourceClientId: "follower", method: "thread-owner-discovery",
+    version: 1, params: { hostId: "local", conversationId: "isolated" } };
+  try {
+    await client.connect();
+    for (const [index, value] of [request, { ...request, version: 2 },
+      { ...request, params: { hostId: "local", conversationId: "production" } },
+      { ...request, hostId: "remote-host" }, { ...request, hostId: 1 },
+      { ...request, sourceClientId: null }].entries()) {
+      server.send({ type: "client-discovery-request", requestId: `discover-${index}`, request: value });
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(server.received.filter(message => message.type === "client-discovery-response")
+      .map(message => (message.response as IpcObject).canHandle), [true, false, false, false, false, false]);
+    server.send(request);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(server.received.find(message => message.requestId === "owner-read"), {
+      type: "response", requestId: "owner-read", resultType: "success", method: "thread-owner-discovery",
+      handledByClientId: "bridge-client", result: { supportsUntrustedAppInput: false },
+    });
+    server.send({ ...request, requestId: "other-target", targetClientId: "other-client" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(server.received.find(message => message.requestId === "other-target")?.error, "no-handler-for-request");
+    allowed = false;
+    server.send({ ...request, requestId: "revoked" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(handled, 1);
+    assert.equal(server.received.find(message => message.requestId === "revoked")?.error, "no-handler-for-request");
+  } finally { client.close(); }
+});
+
+test("IPC observer failures do not close the connection or suppress other consumers", async () => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  let events = 0; let disconnects = 0;
+  client.onBroadcast(() => { throw new Error("bad observer"); });
+  client.onBroadcast(() => { events++; });
+  client.onDisconnect(() => { throw new Error("bad cleanup"); });
+  client.onDisconnect(() => { disconnects++; });
+  try {
+    await client.connect();
+    const pending = client.request("thread-owner-discovery", 1, { conversationId: "fixture-task" });
+    server.send({ type: "broadcast", method: "fixture-event", targetClientIds: ["bridge-client"] });
+    await pending;
+    assert.equal(events, 1);
+    assert.equal(server.destroyed, false);
+    assert.equal(disconnects, 0);
+    client.close();
+    assert.equal(disconnects, 1);
+  } finally { client.close(); }
+});
+
+test("native owner errors are redacted and late results never reach a replacement connection", async () => {
+  const first = new Server(); const second = new Server(); const servers = [first, second];
+  let finish!: (result: IpcObject) => void; let receivedSignal: AbortSignal | null = null;
+  const client = new DesktopIpcClient(() => servers.shift()!, 100, {
+    canHandle: () => true,
+    handle: async (request, signal) => {
+      if (request.params.fail) throw new Error("PRIVATE BACKEND DETAILS");
+      receivedSignal = signal;
+      return new Promise<IpcObject>(resolve => { finish = resolve; });
+    },
+  });
+  const request = { type: "request", requestId: "error", sourceClientId: "follower", method: "read", version: 1, params: { fail: true } };
+  try {
+    await client.connect(); first.send(request);
+    await new Promise(resolve => setImmediate(resolve));
+    const error = first.received.find(message => message.requestId === "error");
+    assert.equal(error?.error, "error-handling-request");
+    assert.equal(JSON.stringify(error).includes("PRIVATE"), false);
+    first.send({ ...request, requestId: "late", params: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    client.close();
+    assert.equal((receivedSignal as AbortSignal | null)?.aborted, true);
+    await client.connect(); finish({ ok: true });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(first.received.some(message => message.requestId === "late"), false);
+    assert.equal(second.received.some(message => message.requestId === "late"), false);
+  } finally { client.close(); }
+});
+
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
   const decoder = new FrameDecoder(); const one = encodeFrame({ type: "one" }); const two = encodeFrame({ type: "two" });
   assert.deepEqual(decoder.push(one.subarray(0, 2)), []);

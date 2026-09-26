@@ -75,6 +75,38 @@ export interface IpcRequestOptions {
   readonly timeoutMs?: number;
 }
 
+export interface IpcIncomingRequest {
+  readonly requestId: string;
+  readonly sourceClientId: string;
+  readonly hostId?: string;
+  readonly method: string;
+  readonly version: number;
+  readonly params: IpcObject;
+}
+
+/** Explicit opt-in for a native owner endpoint. Scope/version checks belong to
+ * canHandle and are repeated on dispatch; discovery alone never grants access.
+ * Mutating handlers must reconcile operations in their own durable ledger.
+ * The signal cancels this connection's response delivery, not a Codex turn:
+ * handlers must not interrupt accepted work merely because the UI detached.
+ * sourceClientId is routing data supplied by the broker, not an authenticated
+ * identity. Host/task/owner-epoch authorization belongs to the handler. */
+export interface IpcRequestHandler {
+  canHandle(request: IpcIncomingRequest): boolean;
+  handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject>;
+}
+
+function incomingRequest(value: unknown): IpcIncomingRequest | null {
+  if (!isObject(value) || value.type !== "request" || typeof value.requestId !== "string" || !value.requestId
+    || typeof value.sourceClientId !== "string" || !value.sourceClientId
+    || (value.hostId !== undefined && (typeof value.hostId !== "string" || !value.hostId))
+    || typeof value.method !== "string" || !value.method || !Number.isSafeInteger(value.version)
+    || (value.version as number) < 0 || !isObject(value.params)) return null;
+  return { requestId: value.requestId, sourceClientId: value.sourceClientId,
+    ...(typeof value.hostId === "string" ? { hostId: value.hostId } : {}),
+    method: value.method, version: value.version as number, params: value.params };
+}
+
 export class DesktopIpcClient {
   private stream: Duplex | null = null;
   private clientId: string | null = null;
@@ -82,10 +114,12 @@ export class DesktopIpcClient {
   private readonly listeners = new Set<(message: IpcObject) => void>();
   private readonly disconnectListeners = new Set<(error: DesktopUnavailableError) => void>();
   private connecting: Promise<void> | null = null;
+  private incomingAbort = new AbortController();
 
   constructor(
     private readonly connectStream: () => Duplex = () => createConnection("\\\\.\\pipe\\codex-ipc"),
     private readonly requestTimeoutMs = 5_000,
+    private readonly requestHandler: IpcRequestHandler | null = null,
   ) {}
 
   async connect(): Promise<void> {
@@ -98,6 +132,7 @@ export class DesktopIpcClient {
   private async initialize(): Promise<void> {
     const stream = this.connectStream();
     this.stream = stream;
+    this.incomingAbort = new AbortController();
     const decoder = new FrameDecoder();
     stream.on("data", (chunk: Buffer) => {
       if (this.stream !== stream) return;
@@ -171,7 +206,13 @@ export class DesktopIpcClient {
 
   private receive(message: IpcObject): void {
     if (message.type === "client-discovery-request" && typeof message.requestId === "string") {
-      this.write({ type: "client-discovery-response", requestId: message.requestId, response: { canHandle: false } });
+      const request = incomingRequest(message.request);
+      this.write({ type: "client-discovery-response", requestId: message.requestId,
+        response: { canHandle: request !== null && this.acceptsIncoming(request) } });
+      return;
+    }
+    if (message.type === "request" && typeof message.requestId === "string") {
+      void this.handleIncoming(message);
       return;
     }
     if (message.type === "response" && typeof message.requestId === "string") {
@@ -188,8 +229,39 @@ export class DesktopIpcClient {
       return;
     }
     if (message.type === "broadcast" && Array.isArray(message.targetClientIds) && message.targetClientIds.includes(this.clientId)) {
-      for (const listener of this.listeners) listener(message);
+      for (const listener of this.listeners) {
+        try { listener(message); } catch { /* One consumer must not close the shared broker connection. */ }
+      }
     }
+  }
+
+  private acceptsIncoming(request: IpcIncomingRequest): boolean {
+    if (!this.clientId || !this.requestHandler) return false;
+    try { return this.requestHandler.canHandle(request) === true; }
+    catch { return false; }
+  }
+
+  private async handleIncoming(message: IpcObject): Promise<void> {
+    const stream = this.stream; const clientId = this.clientId;
+    const signal = this.incomingAbort.signal;
+    const request = incomingRequest(message);
+    let response: IpcObject = { type: "response", requestId: message.requestId,
+      resultType: "error", error: "no-handler-for-request" };
+    try {
+      const targetMatches = message.targetClientId === undefined || message.targetClientId === clientId;
+      if (request && targetMatches && this.acceptsIncoming(request) && this.requestHandler) {
+        const result = await this.requestHandler.handle(request, signal);
+        if (!isObject(result)) throw new Error("Invalid owner response");
+        response = { type: "response", requestId: request.requestId, resultType: "success",
+          method: request.method, handledByClientId: clientId, result };
+      }
+    } catch {
+      // Never forward raw backend errors: these can contain private task text.
+      response = { type: "response", requestId: message.requestId, resultType: "error", error: "error-handling-request" };
+    }
+    // A result from the old owner session must never reach a replacement pipe.
+    if (signal.aborted || this.stream !== stream || this.clientId !== clientId || !clientId) return;
+    try { this.write(response); } catch { /* The requester will reconcile its unknown outcome. */ }
   }
 
   close(error = new DesktopUnavailableError()): void {
@@ -201,6 +273,7 @@ export class DesktopIpcClient {
 
   private disconnected(stream: Duplex, error = new DesktopUnavailableError()): void {
     if (this.stream !== stream) return;
+    this.incomingAbort.abort();
     this.stream = null;
     this.clientId = null;
     for (const request of this.pending.values()) {
@@ -208,6 +281,8 @@ export class DesktopIpcClient {
       request.reject(request.mutating ? new UncertainActionError() : error);
     }
     this.pending.clear();
-    for (const listener of this.disconnectListeners) listener(error);
+    for (const listener of this.disconnectListeners) {
+      try { listener(error); } catch { /* Other consumers still need their disconnect notification. */ }
+    }
   }
 }
