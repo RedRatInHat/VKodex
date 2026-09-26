@@ -82,6 +82,11 @@ function enteredPath(text: string): string {
   return path.normalize(unquoted);
 }
 
+export interface TaskInputScope {
+  assertReady(): void;
+  close(): void;
+}
+
 export class TaskManager {
   private readonly inputBatcher: InputBatcher;
   private readonly activeInputs = new Set<string>();
@@ -101,6 +106,7 @@ export class TaskManager {
     private readonly projectlessRoot: string = path.join(os.tmpdir(), "VKodex", "workspaces"),
     beforeReveal?: (binding: Binding) => Promise<void>,
     private readonly watchdogMs = 45_000,
+    private readonly beforeTaskInput?: (binding: Binding) => Promise<TaskInputScope>,
   ) {
     this.inputBatcher = new InputBatcher(input => this.enqueueInput(input), input => input.peerId !== access.ownerId
       && ![access.groupId, -access.groupId].includes(input.senderId) && !!store.byPeer(input.peerId)?.attached,
@@ -191,6 +197,19 @@ export class TaskManager {
     for (const key of mergedKeys) this.store.claimInput(key);
     const finish = (uncertain = false) => this.store.finishInputs([inboxKey, ...mergedKeys], uncertain);
     let panelAction = false;
+    let taskInputScope: TaskInputScope | undefined;
+    let preparedTask: { binding: Binding; generation: number } | undefined;
+    const handleTask = (): Promise<void> => {
+      if (preparedTask) {
+        const current = this.store.byPeer(input.peerId);
+        if (!current?.attached || current.id !== preparedTask.binding.id || !sameTask(current, preparedTask.binding)
+          || this.store.streamGeneration(current.id) !== preparedTask.generation) {
+          throw new ActionRejectedError("Привязка задачи изменилась во время подготовки. Сообщение не отправлено; проверь /menu и повтори запрос.");
+        }
+      }
+      taskInputScope?.assertReady();
+      return this.handleTask(input, () => taskInputScope?.assertReady());
+    };
     try {
       if (!managerPeer) {
         let binding = this.store.byPeer(input.peerId);
@@ -202,6 +221,16 @@ export class TaskManager {
           this.inactiveInput(input, binding); finish(); return;
         }
         if (!await this.gate.check(input.peerId)) { finish(); return; }
+        // Local/help/recovery commands must remain usable when the owner is
+        // unavailable. Only prompt-bearing input requires an observed writer.
+        const needsTaskInput = !input.action && input.conversationTitle === undefined
+          && (input.editOfMessageId !== undefined || !!input.attachments?.length
+            || input.senderId !== this.access.ownerId || !input.text.trimStart().startsWith("/")
+            || /^\/queue(?:\s|$)/u.test(input.text.trim()));
+        if (needsTaskInput && this.beforeTaskInput) {
+          preparedTask = { binding, generation: this.store.streamGeneration(binding.id) };
+          taskInputScope = await this.beforeTaskInput(binding);
+        }
       }
       if (!managerPeer && input.conversationTitle !== undefined) {
         // A native VK title edit is an explicit owner action. Group members
@@ -249,10 +278,10 @@ export class TaskManager {
         else if (managerPeer) await this.handleAction(input, action);
         else throw new ActionRejectedError("Эта кнопка доступна только в менеджере.");
       } else if (!managerPeer && input.senderId !== this.access.ownerId) {
-        await this.handleTask(input);
+        await handleTask();
       } else if (input.attachments?.length || !await this.panels.text(input)) {
         if (managerPeer) await this.handleManager(input);
-        else await this.handleTask(input);
+        else await handleTask();
       }
       finish();
     } catch (error) {
@@ -269,7 +298,7 @@ export class TaskManager {
         const binding = this.store.byPeer(input.peerId);
         if (binding?.attached) this.store.enqueue(`reply:${input.peerId}:${input.eventId}`, input.peerId, view, binding.id);
       }
-    }
+    } finally { taskInputScope?.close(); }
   }
 
   private async handleManager(input: BridgeInput): Promise<void> {
@@ -685,7 +714,7 @@ export class TaskManager {
     this.reply(input, { text: `${task.title}\n${url}${handoffNote}`, buttons: [this.button("Отключить трансляцию", { type: "detach", bindingId: binding.id })] });
   }
 
-  private async handleTask(input: BridgeInput): Promise<void> {
+  private async handleTask(input: BridgeInput, assertReady: () => void = () => {}): Promise<void> {
     const binding: Binding | null = this.store.byPeer(input.peerId);
     if (!binding || input.action) return;
     const queued = /^\/queue(?:\s|$)/u.test(input.text.trim());
@@ -750,7 +779,9 @@ export class TaskManager {
     try {
       const author = this.sharedAuthor(binding, input);
       const request = { task: binding, operationId, text, ...(author ? { author } : {}), ...prepared, beforeSend: async () => {
+        assertReady();
         if (this.store.transferBlocksInput(binding.id) || generation !== this.store.streamGeneration(binding.id) || !await this.gate.check(input.peerId, true) || generation !== this.store.streamGeneration(binding.id)) throw new ActionRejectedError("Беседа отключена или начат перенос во время подготовки запроса. Сообщение не отправлено.");
+        assertReady();
       } };
       // A single edited VK fragment must never replace the complete merged turn.
       if (input.mergedEventIds) this.store.clearEditableRequest(binding.id);

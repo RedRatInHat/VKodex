@@ -263,6 +263,34 @@ test("split VK prompt reaches Codex once and original fragments cannot replay or
   assert.equal(s.store.editableRequest(binding.id), null);
 });
 
+test("manager blocks a prepared prompt if its task stream disappears during the access check", async t => {
+  const s = setup(t); s.attach();
+  let ready = true; let checks = 0; let closes = 0;
+  const originalCheck = s.gate.check.bind(s.gate);
+  s.gate.check = async (peer, fresh = false) => {
+    const allowed = await originalCheck(peer, fresh);
+    if (fresh) ready = false;
+    return allowed;
+  };
+  s.desktop.submitWithReceipt = async request => {
+    await request.beforeSend?.();
+    s.desktop.submissions.push(request);
+    return s.desktop.submitReceipt;
+  };
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate,
+    undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => ({
+      assertReady() { checks++; if (!ready) throw new TaskNotOpenError(); },
+      close() { closes++; },
+    }));
+  const input = s.input("Continue", peerId);
+  await manager.handle(input);
+  assert.equal(checks, 3);
+  assert.equal(closes, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.store.inputSettled(JSON.stringify([peerId, input.eventId])), true);
+});
+
 function panelView(s: ReturnType<typeof setup>, peer = peerId): View {
   const sent = s.chat.sent.filter(message => message.peerId === peer && message.view.buttons?.length).at(-1)!;
   return s.chat.edits.filter(edit => edit.handle.peerId === peer && edit.handle.conversationMessageId === sent.handle.conversationMessageId).at(-1)?.view ?? sent.view;

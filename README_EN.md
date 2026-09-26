@@ -590,6 +590,8 @@ Local observers of one task share one upstream subscription: closing one observe
 
 If local initialization fails after Codex confirms a subscription, VKodex still attempts to unsubscribe that task without closing the shared server. A late resume response from a disconnected connection cannot publish a new ownership claim or initial state.
 
+Prompt input is saved to the durable inbox before waiting for its own task connection. That wait does not depend on background history scans, panel refreshes, or catalog reads. A failed connection or a changed binding rejects the prompt before dispatch; local recovery commands such as `/detach` remain available. Late catalog and history results cannot replace the newly attached stream or its observation checkpoint. Clearing a history reader also invalidates any read still in flight.
+
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:

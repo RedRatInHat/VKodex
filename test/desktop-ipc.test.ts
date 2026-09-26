@@ -28,7 +28,7 @@ import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateTransport } from "../src/desktop/state-transport.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { captureRestartIntent, readRestartIntent } from "../src/desktop/restart-intent.js";
-import type { Binding, BridgeChat, MessageHandle, View } from "../src/bridge/contracts.js";
+import type { Binding, BridgeChat, MessageHandle, TaskTransferRecord, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
 const questionRequest = { id: 42, method: "item/tool/requestUserInput", params: { threadId: "fixture-task", turnId: "fixture-turn", itemId: "call-question",
@@ -657,6 +657,261 @@ test("a VK prompt waits only for its own subscription, not another task's resume
     })]);
     assert.equal(submitted, true);
   } finally { clearTimeout(timer); release(); await handling; }
+});
+
+test("a cold VK input does not wait for a stalled global panel tick", async t => {
+  let release!: () => void; let entered!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const panelEntered = new Promise<void>(resolve => { entered = resolve; });
+  let started = false; let submitted = false;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { started = true; onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  const panels = (s.runtime as unknown as { manager: { panels: { tick: () => Promise<void> } } }).manager.panels;
+  const originalTick = panels.tick.bind(panels);
+  panels.tick = async () => { entered(); await stalled; await originalTick(); };
+  s.desktop.submitWithReceipt = async () => {
+    assert.equal(started, true, "target stream must start before submit");
+    submitted = true; return { mode: "start", turnId: "accepted" };
+  };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([panelEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("panel tick did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([s.runtime.handle({ eventId: "stalled-panels", peerId: s.peerId, senderId: 101, text: "Continue" }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("VK input waited for global panel maintenance")), 250); })]);
+    assert.equal(submitted, true);
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a cold VK target connects and dispatches while another binding's history poll is stalled", async t => {
+  let release!: () => void; let entered!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const pollEntered = new Promise<void>(resolve => { entered = resolve; });
+  const starts: string[] = [];
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { starts.push(task.threadId); onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  let unrelatedId = "";
+  const history: TaskHistoryRecovery = {
+    enable() {}, disable() {},
+    async poll(id) { if (id === unrelatedId) { entered(); await stalled; } return null; },
+  };
+  const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
+  const unrelated = { ...ref, threadId: "stalled-history", title: "Stalled history", workspace: "/fixture", updatedAt: 1 };
+  const other = s.store.ensureBinding(unrelated); unrelatedId = other.id; s.store.setChat(other.id, s.peerId + 1, 18);
+  s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }, unrelated];
+  let submitted = false;
+  s.desktop.submitWithReceipt = async () => {
+    assert.ok(starts.includes(ref.threadId), "target stream must start before dispatch");
+    submitted = true; return { mode: "start", turnId: "accepted" };
+  };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([pollEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("history poll did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([s.runtime.handle({ eventId: "cold-target", peerId: s.peerId, senderId: 101, text: "Continue" }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("VK input waited for unrelated history recovery")), 250); })]);
+    assert.equal(submitted, true);
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a foreground target attach prevents a delayed catalog refresh from creating a second stream", async t => {
+  let release!: () => void; let entered!: () => void;
+  const listed = new Promise<void>(resolve => { release = resolve; });
+  const listEntered = new Promise<void>(resolve => { entered = resolve; });
+  let signalStart!: () => void;
+  const startEntered = new Promise<void>(resolve => { signalStart = resolve; });
+  const starts: string[] = [];
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { starts.push(task.threadId); signalStart(); onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  let reads = 0;
+  s.desktop.listTasks = async () => { reads++; if (reads === 1) { entered(); await listed; } return [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }]; };
+  s.desktop.submitWithReceipt = async () => {
+    assert.deepEqual(starts, [ref.threadId], "foreground must own exactly one target stream before dispatch");
+    return { mode: "start", turnId: "accepted" };
+  };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([listEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("catalog refresh did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    const handling = s.runtime.handle({ eventId: "catalog-race", peerId: s.peerId, senderId: 101, text: "Continue" });
+    await Promise.race([startEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("foreground target waited for catalog refresh")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    release(); await handling;
+    assert.equal(starts.filter(id => id === ref.threadId).length, 1);
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+  assert.equal(starts.filter(id => id === ref.threadId).length, 1);
+});
+
+test("a VK input never dispatches after its binding transfers while target connection is pending", async t => {
+  let release!: () => void; let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { entered(); await pending; onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  const source = s.store.getBinding(s.binding.id)!;
+  const target = { ...ref, threadId: "transferred-target", title: "Transferred", workspace: "/target", sourceId: "work", updatedAt: 2 };
+  let catalog: readonly DesktopTask[] = [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }];
+  s.desktop.listTasks = async () => catalog;
+  const submitted: string[] = [];
+  s.desktop.submitWithReceipt = async request => { submitted.push(request.task.threadId); return { mode: "start", turnId: "accepted" }; };
+  const handling = s.runtime.handle({ eventId: "transfer-during-connect", peerId: s.peerId, senderId: 101, text: "Continue" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([started, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("target connection did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    const transfer: TaskTransferRecord = { id: "transfer-during-connect", bindingId: source.id, startedAt: 100_000,
+      source, targetSourceId: "work", targetProjectId: null, phase: "targetCreated", version: 2 };
+    s.store.beginTransfer(transfer); s.store.switchTransfer(transfer, target, 100_001); catalog = [target];
+    release(); await handling;
+    assert.deepEqual(submitted, []);
+  } finally {
+    clearTimeout(timer); release(); await handling;
+  }
+});
+
+test("a late fallback poll cannot overwrite the live checkpoint acquired for a VK input", async t => {
+  let release!: () => void; let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const pollEntered = new Promise<void>(resolve => { entered = resolve; });
+  const staleCheckpoint = { since: 1, lastObservedAt: 1, activeAtAttach: [], active: [], seen: {} };
+  const history: TaskHistoryRecovery = {
+    enable() {}, disable() {},
+    async poll() {
+      entered(); await pending;
+      return { events: [{ type: "final" as const, id: "stale-final", turnId: "stale-turn", text: "Stale fallback answer" }],
+        historyRebuilt: false, checkpoint: staleCheckpoint, failure: null };
+    },
+  };
+  let started = false;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { started = true; onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
+  s.desktop.submitWithReceipt = async () => {
+    assert.equal(started, true); return { mode: "start", turnId: "accepted-turn" };
+  };
+  const background = s.runtime.tick(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([pollEntered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("fallback poll did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    await Promise.race([s.runtime.handle({ eventId: "fresh-connection", peerId: s.peerId, senderId: 101, text: "Continue" }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("foreground connection waited for fallback poll")), 250); })]);
+    const liveCheckpoint = s.store.getValue<import("../src/core/task-observation.js").TaskObservationCheckpoint>(`projection:${s.binding.id}`);
+    assert.ok(liveCheckpoint);
+    release(); await background;
+    assert.deepEqual(s.store.getValue(`projection:${s.binding.id}`), liveCheckpoint);
+    assert.equal(s.store.pendingDeliveries().some(item => item.view.text.includes("Stale fallback answer")), false);
+    assert.equal(s.sent.some(item => item.view.text.includes("Stale fallback answer")), false);
+  } finally {
+    clearTimeout(timer); release(); await background;
+  }
+});
+
+test("a rejected target stream start sends no prompt and releases the reacquire gate", async t => {
+  let attempts = 0; let submitted = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => {
+        attempts++;
+        if (attempts === 1) throw new TaskNotOpenError();
+        onState(state(), true);
+      }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  s.desktop.submitWithReceipt = async () => { submitted++; return { mode: "start", turnId: "accepted" }; };
+  const pending = (s.runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire;
+  await s.runtime.handle({ eventId: "rejected-stream", peerId: s.peerId, senderId: 101, text: "Continue" });
+  assert.equal(submitted, 0);
+  assert.equal(pending.has(s.binding.id), false);
+  await s.runtime.handle({ eventId: "rejected-stream-retry", peerId: s.peerId, senderId: 101, text: "Continue" });
+  assert.equal(submitted, 1);
+  assert.equal(pending.has(s.binding.id), false);
+});
+
+test("detach remains available without acquiring an unavailable target stream", async t => {
+  let subscriptions = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task) {
+      subscriptions++;
+      return { task, start: async () => { throw new Error("target stream must not be acquired for /detach"); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  await s.runtime.handle({ eventId: "detach-without-owner", peerId: s.peerId, senderId: 101, text: "/detach" });
+  assert.equal(subscriptions, 0);
+  assert.equal(s.store.getBinding(s.binding.id)!.attached, false);
+});
+
+test("an active creator accepts its protected input without a competing task stream", async t => {
+  let subscriptions = 0; let submitted = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task) {
+      subscriptions++;
+      return { task, start: async () => { throw new Error("active creator must not acquire a competing stream"); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  s.desktop.isCreationActive = () => true;
+  s.desktop.submitWithReceipt = async () => { submitted++; return { mode: "start", turnId: "creator-turn" }; };
+  await s.runtime.handle({ eventId: "creator-protected", peerId: s.peerId, senderId: 101, text: "Continue" });
+  assert.equal(subscriptions, 0);
+  assert.equal(submitted, 1);
+});
+
+test("the durable VK inbox claim exists before a target stream finishes acquiring", async t => {
+  let release!: () => void; let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let submitted = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { entered(); await pending; onState(state(), true); }, verifyOwner: async () => {}, close: () => {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  s.desktop.submitWithReceipt = async () => { submitted++; return { mode: "start", turnId: "accepted" }; };
+  const input = { eventId: "durable-before-stream", peerId: s.peerId, senderId: 303, text: "/continue-from-member" };
+  const inboxKey = JSON.stringify([input.peerId, input.eventId]);
+  const handling = s.runtime.handle(input);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([started, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("target stream did not start")), 250); })]);
+    clearTimeout(timer); timer = undefined;
+    assert.equal(s.store.inputState(inboxKey), "processing");
+    assert.equal(submitted, 0);
+    release(); await handling;
+    assert.equal(submitted, 1);
+  } finally {
+    clearTimeout(timer); release(); await handling;
+  }
 });
 
 test("terminal observation closes its subscription even while final VK delivery is stalled", async t => {
