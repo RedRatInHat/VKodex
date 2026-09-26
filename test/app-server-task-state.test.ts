@@ -38,6 +38,39 @@ const resume = (turns: JsonObject[], nextCursor: string | null = null) => ({
   initialTurnsPage: { data: turns, nextCursor },
 });
 
+test("accepted resume is unsubscribed even if local initialization fails", async () => {
+  for (const failure of ["ownership-callback", "questions"] as const) {
+    const rpc = new FakeRpc();
+    rpc.responses.set("thread/resume", [resume([])]);
+    rpc.responses.set("thread/unsubscribe", [{ status: "unsubscribed" }]);
+    const fail = (): never => { throw new Error("local initialization failed"); };
+    const transport = new AppServerTaskStateTransport(rpc,
+      failure === "questions" ? fail : () => [], () => {},
+      failure === "ownership-callback" ? fail : () => {});
+    const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+    try {
+      await assert.rejects(stream.start(), /local initialization failed/);
+      stream.close(); transport.close();
+      assert.equal(rpc.calls.filter(call => call.method === "thread/unsubscribe").length, 1, failure);
+    } finally { transport.close(); }
+  }
+});
+
+test("a resume response from a disconnected connection cannot publish ownership or state", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  rpc.onRequest = method => { if (method === "thread/resume") rpc.disconnect(); };
+  let ownership = 0; let snapshots = 0;
+  const transport = new AppServerTaskStateTransport(rpc, () => [], () => {}, () => { ownership++; });
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => { snapshots++; }, () => {});
+  try {
+    await assert.rejects(stream.start());
+    assert.equal(ownership, 0);
+    assert.equal(snapshots, 0);
+    assert.equal(rpc.calls.some(call => call.method === "thread/unsubscribe"), false);
+  } finally { transport.close(); }
+});
+
 test("native ownership verification rejects unloaded or unrecognized runtime state", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([])]);

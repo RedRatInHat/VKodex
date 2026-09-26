@@ -588,6 +588,8 @@ Profile App Server diagnostics use only `thread/read`: inspecting a task does no
 
 Local observers of one task share one upstream subscription: closing one observer does not unsubscribe the others. Reconnection waits for the previous `unsubscribe`; an unknown result does not authorize a blind `resume`. A VK input waits for its own task's connection rather than every background connection. Closing a terminal subscription no longer waits for final-answer delivery to VK: the persisted delivery queue proceeds independently. This is not proof of writer handoff to another client.
 
+If local initialization fails after Codex confirms a subscription, VKodex still attempts to unsubscribe that task without closing the shared server. A late resume response from a disconnected connection cannot publish a new ownership claim or initial state.
+
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:

@@ -145,6 +145,7 @@ class AppServerTaskStream implements TaskStateStream {
   private starting = false;
   private closeNotified = false;
   private started = false;
+  private resumeConfirmed = false;
   private disconnected = false;
 
   constructor(private readonly rpc: AppServerRpc, readonly task: TaskRef,
@@ -176,6 +177,10 @@ class AppServerTaskStream implements TaskStateStream {
       });
       const thread = isObject(result.thread) ? result.thread : null;
       if (!thread || thread.id !== this.task.threadId) throw new AppServerUnavailableError("Codex открыл другую задачу.");
+      if (this.disconnected) throw new AppServerUnavailableError("Соединение потеряно во время подключения к задаче.");
+      // A matching response has already acquired the upstream subscription.
+      // Cleanup must not depend on local callbacks/projection also succeeding.
+      this.resumeConfirmed = true;
       // The profile command executor uses this exact App Server connection.
       // Publish ownership before the initial state callback so a VK prompt
       // can go straight to turn/start instead of issuing a second resume.
@@ -279,18 +284,16 @@ class AppServerTaskStream implements TaskStateStream {
   private finishClose(): void {
     if (this.closeNotified) return;
     this.closeNotified = true;
-    // Codex keeps a resumed thread owned by this App Server until the client
-    // explicitly unsubscribes. Release only this thread; closing the profile
-    // connection would disrupt unrelated VK conversations.
-    const release = this.started && !this.disconnected
+    // Stop only this thread's subscription. A successful unsubscribe is not
+    // proof that its writer was unloaded; never close the shared connection
+    // as cleanup, since that would disrupt unrelated VK conversations.
+    const release = this.resumeConfirmed && !this.disconnected
       ? this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 30_000 }).then(() => {})
       : null;
     // The transport may be used without a command executor; never leave an
     // unhandled rejection if its release callback does not observe the result.
     if (release) void release.catch(() => {});
-    // Do not discard the command-side writer until Codex confirms release.
-    // A slow unsubscribe on a large thread otherwise makes the next resume
-    // collide with this very App Server's still-held writer lock.
+    // Pass the subscription outcome to the command-side lifecycle policy.
     this.onClose(this, release);
   }
 }
