@@ -20,6 +20,7 @@ interface RolloutRecord {
 export class RolloutTailer {
   private readonly cursors = new Map<string, Cursor>();
   private readonly quiet = new Map<string, readonly string[]>();
+  private readonly generations = new Map<string, number>();
 
   constructor(private readonly initialWindowBytes = 8 * 1024 * 1024, private readonly maxReadBytes = 16 * 1024 * 1024,
     private readonly maxRecordBytes = 32 * 1024 * 1024) {
@@ -28,28 +29,39 @@ export class RolloutTailer {
     if (!Number.isInteger(maxRecordBytes) || maxRecordBytes <= 0) throw new RangeError("Maximum rollout record must be positive");
   }
 
-  clear(task: TaskRef): void { this.cursors.delete(this.key(task)); this.quiet.delete(this.key(task)); }
+  clear(task: TaskRef): void {
+    const key = this.key(task);
+    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+    this.cursors.delete(key);
+    this.quiet.delete(key);
+  }
   quietTurnIds(task: TaskRef): readonly string[] { return this.quiet.get(this.key(task)) ?? []; }
 
   async poll(task: TaskRef, since: number, knownQuietTurns: readonly string[] = []): Promise<readonly TaskEvent[]> {
     const key = this.key(task);
+    const generation = this.generations.get(key) ?? 0;
+    const current = (): boolean => (this.generations.get(key) ?? 0) === generation;
     const quietTurns = new Set([...this.quietTurnIds(task), ...knownQuietTurns]);
     this.quiet.set(key, [...quietTurns].slice(-256));
     if (!task.rolloutPath || !Number.isFinite(since)) return [];
     const path = rolloutPath(task.rolloutPath);
     let info;
     try { info = await stat(path); } catch { return []; }
+    if (!current()) return [];
     if (!info.isFile() || info.size <= 0) return [];
 
     const saved = this.cursors.get(key);
     const fresh = !saved || saved.offset > info.size || !await this.matchesAnchor(path, saved);
+    if (!current()) return [];
     const start = fresh ? await this.initialOffset(path, info.size, since) : saved.offset;
+    if (!current()) return [];
     if (start >= info.size) return [];
     const length = Math.min(this.maxReadBytes, info.size - start);
     const buffer = Buffer.allocUnsafe(length);
     const handle = await open(path, "r");
     let bytesRead = 0;
     try { ({ bytesRead } = await handle.read(buffer, 0, length, start)); } finally { await handle.close(); }
+    if (!current()) return [];
     if (bytesRead === 0) return [];
     const data = saved && !fresh && saved.pending.length
       ? Buffer.concat([saved.pending, buffer.subarray(0, bytesRead)]) : buffer.subarray(0, bytesRead);

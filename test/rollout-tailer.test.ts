@@ -95,3 +95,30 @@ test("oversized rollout records fail explicitly instead of leaving the recovery 
   await assert.rejects(tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), RolloutRecordTooLargeError);
   await assert.rejects(tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), RolloutRecordTooLargeError);
 });
+
+test("clearing a task during a pending read prevents its old cursor and quiet policy from returning", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  await writeFile(rollout,
+    line("2026-09-03T09:59:00.000Z", { type: "message", role: "user",
+      content: [{ type: "input_text", text: "<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-03T09:59:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "quiet-turn" } })
+    + line("2026-09-03T10:00:00.000Z", message("final", "visible-turn", "final_answer", "Visible answer")));
+  const tailer = new RolloutTailer();
+  const delayed = tailer as unknown as { initialOffset(path: string, size: number, since: number): Promise<number> };
+  const original = delayed.initialOffset.bind(tailer);
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  delayed.initialOffset = async (...args) => { entered(); await blocked; return original(...args); };
+  const ref = task(rollout);
+  const oldPoll = tailer.poll(ref, 0);
+  await started;
+  tailer.clear(ref);
+  release();
+  assert.deepEqual(await oldPoll, []);
+  assert.deepEqual(tailer.quietTurnIds(ref), []);
+  assert.deepEqual(await tailer.poll(ref, 0), [
+    { type: "final", id: "final", turnId: "visible-turn", text: "Visible answer" },
+  ]);
+  assert.deepEqual(tailer.quietTurnIds(ref), ["quiet-turn"]);
+});
