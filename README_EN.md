@@ -584,6 +584,8 @@ npm run desktop:start
 
 ### Health check
 
+Profile App Server diagnostics use only `thread/read`: inspecting a task does not issue `thread/resume` or change the live observer's subscription. A `notLoaded`, unknown, or missing runtime status does not confirm a working connection. A mutating request timeout leaves that operation's outcome unknown, but no longer terminates the shared App Server by itself: unrelated tasks and notifications remain connected. Do not blindly repeat such a command; a timeout does not prove Codex rejected it.
+
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:
 
 - SQLite integrity through `PRAGMA quick_check`;

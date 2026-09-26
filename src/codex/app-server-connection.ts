@@ -129,11 +129,10 @@ export class AppServerConnection implements AppServerRpc {
         this.pending.delete(id);
         const error = pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError("Codex App Server не ответил вовремя.");
         pending.reject(error);
-        // A single slow read is not evidence that the profile writer died.
-        // Keep unrelated streams and commands connected; a later response for
-        // this retired request is ignored by acceptResponse. Mutations remain
-        // conservative because a lost outcome invalidates the writer session.
-        if (pending.mutating) this.failConnection(child, this.generation, error, id);
+        // A timeout describes this operation, not the health of the writer.
+        // A mutation may already be running: keep its notifications and other
+        // tasks alive, and let the caller reconcile the uncertain outcome.
+        // A late response for this retired request is ignored by acceptResponse.
       }, options.timeoutMs ?? this.defaultTimeoutMs);
       timer.unref();
       this.pending.set(id, { mutating: options.mutating === true, resolve, reject, timer });

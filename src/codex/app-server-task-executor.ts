@@ -113,8 +113,14 @@ export class AppServerTaskExecutor {
    * current turn, so every command and diagnostic must share this ownership
    * cache. */
   async inspectLoadedTask(task: TaskRef): Promise<TaskDetails | null> {
+    if (!this.loaded.has(taskKey(task))) return null;
+    return this.inspectTask(task);
+  }
+
+  /** Read-only inspection also works without our own writer/subscription.
+   * A stored thread is not proof that this connection owns its execution. */
+  async inspectTask(task: TaskRef): Promise<TaskDetails> {
     const loaded = this.loaded.get(taskKey(task));
-    if (!loaded) return null;
     try {
       const response = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
       const thread = isObject(response.thread) && response.thread.id === task.threadId ? response.thread : null;
@@ -122,15 +128,18 @@ export class AppServerTaskExecutor {
       const nativeStatus = String(thread.status.type ?? "");
       // turn/start is acknowledged before thread/read is guaranteed to expose
       // the new active status. The accepted turn ID is stronger evidence and
-      // remains authoritative until turn/completed clears it via notification.
-      const status = loaded.activeTurnId || nativeStatus === "active" ? "running" as const
-        : nativeStatus === "idle" ? "idle" as const
-        : nativeStatus === "systemError" ? "failed" as const : "unavailable" as const;
+      // remains authoritative while the runtime is healthy. Native unload or
+      // system failure is stronger evidence than this cached acceptance.
+      const knownLoadedStatus = ["idle", "active", "systemError"].includes(nativeStatus);
+      const status = !knownLoadedStatus ? "unavailable" as const
+        : nativeStatus === "systemError" ? "failed" as const
+        : loaded?.activeTurnId || nativeStatus === "active" ? "running" as const
+        : "idle" as const;
       return {
         title: typeof thread.name === "string" && thread.name ? thread.name : null,
         status, workspace: typeof thread.cwd === "string" && thread.cwd ? thread.cwd : null,
-        model: loaded.model, effort: loaded.effort,
-        nextModel: loaded.model, nextEffort: loaded.effort, context: null,
+        model: loaded?.model ?? null, effort: loaded?.effort ?? null,
+        nextModel: loaded?.model ?? null, nextEffort: loaded?.effort ?? null, context: null,
         ...(status === "failed" ? { failure: "systemError" as const } : {}),
       };
     } catch (error) { throw operationError(error, "проверку состояния задачи"); }

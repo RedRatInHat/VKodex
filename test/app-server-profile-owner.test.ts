@@ -51,6 +51,34 @@ test("profile owner rejects another source before touching its App Server", asyn
   assert.deepEqual(rpc.calls, []); await owner.close();
 });
 
+test("inspecting a cold task never resumes it or changes native subscriptions", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const task = { hostId: "local", threadId: "task", sourceId: "work" };
+  try {
+    rpc.threadStatus = "notLoaded";
+    const details = await owner.inspectTask(task);
+    assert.equal(details.status, "unavailable");
+    assert.deepEqual(rpc.calls, ["thread/read"]);
+  } finally { await owner.close(); }
+});
+
+test("inspection during a slow stream start cannot unsubscribe the live observer", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const task = { hostId: "local", threadId: "task", sourceId: "work" };
+  let release!: () => void;
+  rpc.waitResume = new Promise<void>(resolve => { release = resolve; });
+  const stream = owner.states.subscribe(task, () => {}, () => {});
+  try {
+    const starting = stream.start();
+    await new Promise(resolve => setImmediate(resolve));
+    const inspecting = owner.inspectTask(task);
+    release();
+    await Promise.all([starting, inspecting]);
+    assert.equal(rpc.calls.filter(method => method === "thread/resume").length, 1);
+    assert.equal(rpc.calls.includes("thread/unsubscribe"), false);
+  } finally { release(); stream.close(); await owner.close(); }
+});
+
 test("profile owner shares one connection for commands and task state", async () => {
   const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
   const task = { hostId: "local", threadId: "task", sourceId: "work" };

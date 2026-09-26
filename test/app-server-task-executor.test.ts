@@ -8,6 +8,7 @@ import { ActionRejectedError, TaskNotOpenError, UncertainActionError, type Submi
 type JsonObject = Record<string, unknown>;
 
 class FakeRpc implements AppServerRpc {
+  runtimeStatus: string | null = null;
   readonly requests: { method: string; params: JsonObject; options: AppServerRequestOptions }[] = [];
   private readonly listeners = new Set<(notification: AppServerEnvelope) => void>();
   private readonly disconnectListeners = new Set<(error: Error) => void>();
@@ -58,7 +59,7 @@ class FakeRpc implements AppServerRpc {
     // Native thread/read can briefly lag an acknowledged turn/start.
     if (method === "thread/read") return { thread: { id: params.threadId, name: this.title, projectId: this.projectId,
       cwd: "D:\\work", updatedAt: this.emptyDescendantUpdatedAt,
-      status: { type: this.unloadedDescendantStatus && params.threadId !== "task" || !this.nativeLoaded ? "notLoaded" : "idle" } } };
+      status: { type: this.runtimeStatus ?? (this.unloadedDescendantStatus && params.threadId !== "task" || !this.nativeLoaded ? "notLoaded" : "idle") } } };
     if (method === "thread/name/set") { this.title = String(params.name); this.after(method); return {}; }
     if (method === "thread/metadata/update") { this.projectId = params.projectId ? String(params.projectId) : null; this.after(method); return {}; }
     if (method === "thread/goal/get") return { goal: this.goal };
@@ -134,6 +135,27 @@ test("a disconnected owner drops its loaded-task cache before reconnecting", asy
     assert.equal(await executor.inspectLoadedTask(task), null);
     await executor.submitWithReceipt({ ...request(), operationId: "operation-after-reconnect" });
     assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 2);
+  } finally { executor.close(); }
+});
+
+test("inspection does not report a cached active turn as running after native unload", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.submitWithReceipt(request());
+    rpc.nativeLoaded = false;
+    assert.equal((await executor.inspectLoadedTask(task))?.status, "unavailable");
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 1);
+  } finally { executor.close(); }
+});
+
+test("a native system error overrides the cached active turn during inspection", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.submitWithReceipt(request());
+    rpc.runtimeStatus = "systemError";
+    const details = await executor.inspectLoadedTask(task);
+    assert.equal(details?.status, "failed");
+    assert.equal(details?.failure, "systemError");
   } finally { executor.close(); }
 });
 

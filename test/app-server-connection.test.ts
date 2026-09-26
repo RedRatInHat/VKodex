@@ -157,8 +157,40 @@ test("a timed-out mutation is never replayed when the profile connection recover
   try {
     await assert.rejects(connection.request("turn/start", { threadId: "task" }, { mutating: true }), AppServerUncertainError);
     assert.equal(first.messages.filter(message => message.method === "turn/start").length, 1);
+    first.disconnect();
     assert.deepEqual(await connection.request("thread/read", { threadId: "task" }), { ok: true });
     assert.equal(second.messages.some(message => message.method === "turn/start"), false);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("a timed-out mutation preserves the writer, pending reads and late turn notifications", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const keepAlive = setInterval(() => {}, 1_000);
+  const disconnects: Error[] = []; const notifications: string[] = [];
+  connection.onDisconnect(error => disconnects.push(error));
+  connection.onNotification(event => notifications.push(event.method));
+  try {
+    await connection.start();
+    const read = connection.request("thread/read", { threadId: "other-task" });
+    // Attach a rejection handler immediately: the old implementation aborts
+    // this unrelated request when the mutation's response times out.
+    const readResult = read.then(value => ({ value }), error => ({ error }));
+    await assert.rejects(connection.request("turn/start", { threadId: "task" },
+      { mutating: true, timeoutMs: 20 }), AppServerUncertainError);
+    assert.equal(disconnects.length, 0);
+    const mutationId = child.messages.find(message => message.method === "turn/start")?.id;
+    const readId = child.messages.find(message => message.method === "thread/read")?.id;
+    child.send({ id: mutationId, result: { turn: { id: "accepted-late" } } });
+    child.send({ method: "turn/started", params: { threadId: "task", turn: { id: "accepted-late" } } });
+    child.send({ id: readId, result: { thread: { id: "other-task" } } });
+    assert.deepEqual(await readResult, { value: { thread: { id: "other-task" } } });
+    assert.deepEqual(notifications, ["turn/started"]);
+    assert.equal(child.messages.filter(message => message.method === "turn/start").length, 1);
+    child.respond = message => ({ id: message.id, result: { ok: true } });
+    assert.deepEqual(await connection.request("model/list"), { ok: true });
+    assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
   } finally { clearInterval(keepAlive); await connection.close(); }
 });
 

@@ -198,8 +198,13 @@ class AppServerTaskStream implements TaskStateStream {
   }
 
   async verifyOwner(): Promise<void> {
+    const unavailable = (): boolean => !this.started || this.closed || this.disconnected;
+    if (unavailable()) throw new AppServerUnavailableError("Подключение к задаче не активно.");
     const result = await this.rpc.request("thread/read", { threadId: this.task.threadId, includeTurns: false });
-    if (!isObject(result.thread) || result.thread.id !== this.task.threadId) throw new AppServerUnavailableError("Codex больше не владеет задачей.");
+    if (unavailable() || !isObject(result.thread) || result.thread.id !== this.task.threadId
+      || !isObject(result.thread.status) || !["idle", "active", "systemError"].includes(String(result.thread.status.type))) {
+      throw new AppServerUnavailableError("Codex больше не подтверждает загруженное состояние задачи.");
+    }
   }
 
   private makeSnapshot(thread: JsonObject, result: JsonObject, values: NativeTurn[]): NativeSnapshot {

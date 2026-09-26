@@ -102,15 +102,8 @@ export class AppServerProfileOwner {
 
   async inspectTask(task: TaskRef): Promise<TaskDetails> {
     this.assertOwner(task);
-    const loaded = await this.executor.inspectLoadedTask(task);
-    if (loaded) return loaded;
-    let state: TaskState | null = null;
-    const stream = this.nativeStates.subscribe(task, value => { state = value; }, () => {});
-    try {
-      await stream.start();
-      if (!state) throw new ActionRejectedError("Codex не вернул состояние задачи.");
-      return this.observe(state, null).details;
-    } finally { stream.close(); }
+    // Diagnostics must not acquire a writer or alter the shared subscription.
+    return this.executor.inspectTask(task);
   }
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void> {

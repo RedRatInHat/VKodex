@@ -38,6 +38,36 @@ const resume = (turns: JsonObject[], nextCursor: string | null = null) => ({
   initialTurnsPage: { data: turns, nextCursor },
 });
 
+test("native ownership verification rejects unloaded or unrecognized runtime state", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  rpc.responses.set("thread/read", [
+    { thread: { id: "task", status: { type: "notLoaded" } } },
+    { thread: { id: "task" } },
+    { thread: { id: "task", status: { type: "futureUnknownStatus" } } },
+  ]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  try {
+    await stream.start();
+    for (let i = 0; i < 3; i++) await assert.rejects(stream.verifyOwner());
+  } finally { transport.close(); }
+});
+
+test("ownership verification cannot revive an unstarted or closed subscription", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  try {
+    await assert.rejects(stream.verifyOwner());
+    await stream.start();
+    stream.close();
+    await assert.rejects(stream.verifyOwner());
+    assert.equal(rpc.calls.some(call => call.method === "thread/read"), false);
+  } finally { transport.close(); }
+});
+
 test("native state stream bounds history, drops tool output, buffers races and filters other tasks", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([turn("two", "completed", [
@@ -63,7 +93,7 @@ test("native state stream bounds history, drops tool output, buffers races and f
   const latestTurns = states.at(-1)?.state.turns as JsonObject[];
   const latestItems = latestTurns.at(-1)?.items as JsonObject[];
   assert.equal(latestItems[0]?.text, "ab");
-  rpc.responses.set("thread/read", [{ thread: { id: "task" } }]); await stream.verifyOwner();
+  rpc.responses.set("thread/read", [{ thread: { id: "task", status: { type: "idle" } } }]); await stream.verifyOwner();
   rpc.disconnect(); assert.equal(errors.length, 1);
   transport.close();
 });
