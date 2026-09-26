@@ -7,47 +7,8 @@ interface Cursor { readonly offset: number; readonly pending: Buffer; readonly a
 
 interface RolloutRecord {
   readonly timestamp: number;
-  readonly event: TaskEvent;
-}
-
-/** The live owner can omit userMessage from its projected stream even when
- * Codex recorded a direct app input. Check a bounded rollout tail for the
- * exact turn before releasing causally deferred assistant commentary. */
-export async function readRolloutUserTurn(task: TaskRef, turnId: string, maxBytes = 32 * 1024 * 1024): Promise<Extract<TaskEvent, { type: "user" }> | null> {
-  if (!task.rolloutPath || !turnId || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) return null;
-  const file = rolloutPath(task.rolloutPath);
-  let info;
-  try { info = await stat(file); } catch { return null; }
-  if (!info.isFile() || info.size <= 0) return null;
-  const start = Math.max(0, info.size - maxBytes);
-  const buffer = Buffer.allocUnsafe(info.size - start);
-  const handle = await open(file, "r");
-  let bytesRead = 0;
-  try { ({ bytesRead } = await handle.read(buffer, 0, buffer.length, start)); } finally { await handle.close(); }
-  if (!bytesRead) return null;
-  const data = buffer.subarray(0, bytesRead);
-  const first = start === 0 ? 0 : data.indexOf(0x0a) + 1;
-  if (first === 0 && start > 0) return null;
-  const last = data.lastIndexOf(0x0a);
-  if (last < first) return null;
-  for (const line of data.subarray(first, last).toString("utf8").split("\n")) {
-    if (!line.includes(turnId)) continue;
-    let record: unknown;
-    try { record = JSON.parse(line) as unknown; } catch { continue; }
-    if (!isObject(record) || record.type !== "response_item" || !isObject(record.payload)) continue;
-    const item = record.payload;
-    if (item.type !== "message" || item.role !== "user" || turnIdFrom(item) !== turnId || !Array.isArray(item.content)) continue;
-    const inputs = item.content.filter(isObject).filter(part => part.type === "input_text" && typeof part.text === "string")
-      .map(part => part.text as string);
-    const text = inputs.join("\n");
-    if (text && !isAutomationHeartbeatInput(text)) return { type: "user", id: typeof item.id === "string" ? item.id : `rollout-user:${turnId}`,
-      turnId, text };
-  }
-  return null;
-}
-
-export async function hasRolloutUserTurn(task: TaskRef, turnId: string, maxBytes?: number): Promise<boolean> {
-  return !!await readRolloutUserTurn(task, turnId, maxBytes);
+  readonly event?: TaskEvent;
+  readonly quietTurnId?: string;
 }
 
 /**
@@ -58,6 +19,7 @@ export async function hasRolloutUserTurn(task: TaskRef, turnId: string, maxBytes
  */
 export class RolloutTailer {
   private readonly cursors = new Map<string, Cursor>();
+  private readonly quiet = new Map<string, readonly string[]>();
 
   constructor(private readonly initialWindowBytes = 8 * 1024 * 1024, private readonly maxReadBytes = 16 * 1024 * 1024,
     private readonly maxRecordBytes = 32 * 1024 * 1024) {
@@ -66,16 +28,19 @@ export class RolloutTailer {
     if (!Number.isInteger(maxRecordBytes) || maxRecordBytes <= 0) throw new RangeError("Maximum rollout record must be positive");
   }
 
-  clear(task: TaskRef): void { this.cursors.delete(this.key(task)); }
+  clear(task: TaskRef): void { this.cursors.delete(this.key(task)); this.quiet.delete(this.key(task)); }
+  quietTurnIds(task: TaskRef): readonly string[] { return this.quiet.get(this.key(task)) ?? []; }
 
-  async poll(task: TaskRef, since: number): Promise<readonly TaskEvent[]> {
+  async poll(task: TaskRef, since: number, knownQuietTurns: readonly string[] = []): Promise<readonly TaskEvent[]> {
+    const key = this.key(task);
+    const quietTurns = new Set([...this.quietTurnIds(task), ...knownQuietTurns]);
+    this.quiet.set(key, [...quietTurns].slice(-256));
     if (!task.rolloutPath || !Number.isFinite(since)) return [];
     const path = rolloutPath(task.rolloutPath);
     let info;
     try { info = await stat(path); } catch { return []; }
     if (!info.isFile() || info.size <= 0) return [];
 
-    const key = this.key(task);
     const saved = this.cursors.get(key);
     const fresh = !saved || saved.offset > info.size || !await this.matchesAnchor(path, saved);
     const start = fresh ? await this.initialOffset(path, info.size, since) : saved.offset;
@@ -101,14 +66,17 @@ export class RolloutTailer {
       return [];
     }
     const lines = complete.toString("utf8").split("\n");
-    const records: RolloutRecord[] = [];
+    const events: TaskEvent[] = [];
     for (const line of lines) {
       if (Buffer.byteLength(line) > this.maxRecordBytes) throw new RolloutRecordTooLargeError();
       const record = parseRecord(line);
-      if (record && record.timestamp >= since) records.push(record);
+      if (record?.quietTurnId) quietTurns.add(record.quietTurnId);
+      if (record?.event && record.timestamp >= since
+        && !(record.event.type === "progress" && quietTurns.has(record.event.turnId))) events.push(record.event);
     }
+    this.quiet.set(key, [...quietTurns].slice(-256));
     this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending), anchor: this.anchor(buffer, bytesRead) });
-    return records.map(record => record.event);
+    return events;
   }
 
   private anchor(buffer: Buffer, length: number): Buffer { return Buffer.from(buffer.subarray(Math.max(0, length - 64), length)); }
@@ -176,6 +144,12 @@ function parseRecord(line: string): RolloutRecord | null {
   const payload = record.payload;
   if (record.type === "response_item") {
     const item = payload;
+    if (item.type === "message" && item.role === "user" && Array.isArray(item.content)) {
+      const text = item.content.filter(isObject).filter(part => part.type === "input_text" && typeof part.text === "string")
+        .map(part => part.text as string).join("\n");
+      const turnId = turnIdFrom(item);
+      return turnId && isAutomationHeartbeatInput(text) ? { timestamp, quietTurnId: turnId } : null;
+    }
     if (item.type !== "message" || item.role !== "assistant" || typeof item.id !== "string") return null;
     const phase = typeof item.phase === "string" ? item.phase : undefined;
     const text = outputText(item.content);

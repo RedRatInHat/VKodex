@@ -68,6 +68,7 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   const rebaseline = previous !== null && options.rebaseline === true;
   const seen: Record<string, string> = { ...previous?.seen };
   const events: TaskEvent[] = [];
+  const quietTurns = new Set(previous?.quietTurnIds ?? []);
   const recoverFinal = new Set(options.recoverFinalTurnIds ?? []);
   const emit = (event: TaskEvent, recover = false): void => {
     const key = eventKey(event); const hash = digest(event);
@@ -82,7 +83,9 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
-    const automationHeartbeat = turn.items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(textInput(item.content)));
+    const automationHeartbeat = quietTurns.has(turn.id)
+      || turn.items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(textInput(item.content)));
+    if (automationHeartbeat) quietTurns.add(turn.id);
     const lastAgentId = string(agentItems.at(-1)?.id);
     for (const item of turn.items) {
       const id = string(item.id); if (!id) continue;
@@ -126,7 +129,8 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     nextModel: snapshot.model, nextEffort: snapshot.effort, context: snapshot.context,
   };
   return {
-    checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen }, events, details,
+    checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen,
+      ...(quietTurns.size ? { quietTurnIds: [...quietTurns].slice(-256) } : {}) }, events, details,
     questions: Array.isArray(snapshot.questions) ? snapshot.questions : [], inputs, inputTurnIds,
     latestTurnId: latest?.id ?? "runtime", activeTurnId: active.at(-1) ?? null,
   };

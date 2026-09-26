@@ -102,6 +102,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const rolloutPath = typeof state.rolloutPath === "string" ? comparablePath(state.rolloutPath) : previous?.rolloutPath;
   const historyRebuilt = previous?.rolloutPath !== undefined && rolloutPath !== undefined && previous.rolloutPath !== rolloutPath;
   const events: TaskEvent[] = [];
+  const quietTurns = new Set(previous?.quietTurnIds ?? []);
   const eligible = (turn: IpcObject): boolean => activeAtAttach.includes(String(turn.turnId)) || Number(turn.turnStartedAtMs ?? 0) >= since;
   const emitStatus = (event: Extract<TaskEvent, { readonly type: "status" }>, allowInitial = false, recover = false): void => {
     const key = identityKey(event);
@@ -137,7 +138,9 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
     const startedWhileDisconnected = rebaseline && lastObservedAt !== undefined
       && Number(turn.turnStartedAtMs) > lastObservedAt;
     const items = (turn.items as unknown[]).filter(isObject);
-    const automationHeartbeat = items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(userText(item.content)));
+    const automationHeartbeat = quietTurns.has(turnId)
+      || items.some(item => item.type === "userMessage" && isAutomationHeartbeatInput(userText(item.content)));
+    if (automationHeartbeat) quietTurns.add(turnId);
     const origins = new Map<string, string>();
     for (const item of items) {
       if (item.type === "steeringUserMessage" && item.status === "accepted" && typeof item.serverUserMessageId === "string" && typeof item.clientUserMessageId === "string") {
@@ -174,5 +177,6 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   }
   const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
-  return { checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen, semanticByIdentity, ...(rolloutPath ? { rolloutPath } : {}) }, events };
+  return { checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen, semanticByIdentity,
+    ...(quietTurns.size ? { quietTurnIds: [...quietTurns].slice(-256) } : {}), ...(rolloutPath ? { rolloutPath } : {}) }, events };
 }

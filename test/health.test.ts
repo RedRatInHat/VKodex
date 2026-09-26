@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { BridgeHealthMonitor } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
+import { TaskMirror } from "../src/bridge/mirror.js";
 import type { BridgeChat, HealthCheckResult, MessageHandle, View } from "../src/bridge/contracts.js";
 import type { CreateTaskRequest, DesktopCompatibility, DesktopModel, DesktopProject, DesktopTask, DesktopTasks, SubmitTaskRequest, TaskDetails, TaskGoalUpdate, TaskRef, TaskRenameResult } from "../src/desktop/contracts.js";
 
@@ -59,11 +60,26 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("health detects commentary stuck before the VK queue and clears after mirror recovery", async t => {
+  const s = setup(t);
+  const binding = s.store.ensureBinding((await s.desktop.listTasks())[0]!);
+  s.store.setChat(binding.id, 2_000_000_001, 1);
+  const mirror = new TaskMirror(s.store, 3_500, () => 100_000);
+  mirror.acceptObservation(binding.id, [{ type: "progress", id: "held", turnId: "turn", text: "PRIVATE COMMENTARY" }], []);
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "codex_mirror")?.state, "ok");
+  s.advance(11_000);
+  const delayed = (await s.monitor.check()).checks.find(item => item.name === "codex_mirror")!;
+  assert.equal(delayed.state, "degraded");
+  assert.doesNotMatch(delayed.detail, /PRIVATE COMMENTARY/u);
+  new TaskMirror(s.store, 3_500, () => 111_000).tick();
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "codex_mirror")?.state, "ok");
 });
 
 test("health records the failing phase and retries after an internal exception", async t => {

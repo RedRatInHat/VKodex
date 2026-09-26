@@ -1,24 +1,37 @@
 import { createHash } from "node:crypto";
 import { taskKey, type TaskEvent } from "../core/codex-tasks.js";
+import { comparablePath } from "../core/paths.js";
 import { chunkText } from "../lib/text.js";
 import { BridgeStore } from "./store.js";
-import { MENU_BUTTON } from "./contracts.js";
+import { MENU_BUTTON, type Binding } from "./contracts.js";
 
 const USER_REQUEST_PREFIX = "## user request\n\n";
+const LATE_USER_REQUEST_PREFIX = "Вход этого хода:\n\n";
 const MENU_FOOTER = "\n\nМеню задачи:";
+export const MIRROR_ORDERING_GRACE_MS = 2_000;
+interface MirrorEpoch { taskKey: string; generation: number; rolloutPath?: string; }
+interface DeferredMirror extends MirrorEpoch { firstSeenAt: number; events: TaskEvent[]; }
+interface ReadyMirror extends MirrorEpoch { withoutInput: boolean; }
 
 export class TaskMirror {
-  constructor(private readonly store: BridgeStore, private readonly chunkSize = 3_500) {
-    if (!Number.isInteger(chunkSize) || chunkSize <= USER_REQUEST_PREFIX.length) {
+  constructor(private readonly store: BridgeStore, private readonly chunkSize = 3_500, private readonly now: () => number = Date.now) {
+    if (!Number.isInteger(chunkSize) || chunkSize <= Math.max(USER_REQUEST_PREFIX.length, LATE_USER_REQUEST_PREFIX.length)) {
       throw new RangeError("Mirror chunk size must leave room for the user request label and text");
     }
   }
 
-  /** Owner snapshots can publish assistant items before their user item. Keep
-   * those items durable until the input is visible, then enqueue in causal order. */
-  acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[], goalTurnIds: readonly string[] = []): void {
+  /** Reorder near-simultaneous input/output only. An input, goal, or recognized
+   * initiation source is never required to publish visible assistant progress. */
+  acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[], activeTurnIds: readonly string[] = []): void {
+    const binding = this.store.getBinding(bindingId);
+    if (!binding?.attached || binding.peerId === null) return;
+    // Upgrade legacy held events only after fresh evidence of this active turn.
+    for (const turnId of activeTurnIds) {
+      const pending = this.store.getValue<DeferredMirror | TaskEvent[]>(this.deferredKey(bindingId, turnId));
+      if (Array.isArray(pending) && pending.length) this.store.setValue(this.deferredKey(bindingId, turnId),
+        { ...this.epoch(binding), firstSeenAt: this.now(), events: pending } satisfies DeferredMirror);
+    }
     const knownInputs = new Set(inputTurnIds);
-    const goalTurns = new Set(goalTurnIds);
     const byTurn = new Map<string, TaskEvent[]>();
     for (const event of events) {
       const group = byTurn.get(event.turnId) ?? [];
@@ -28,20 +41,71 @@ export class TaskMirror {
     }
     for (const [turnId, group] of byTurn) {
       for (const event of group) if (event.type === "user") this.accept(bindingId, event);
-      // A terminal answer with no visible input can be a system-started turn
-      // or a truncated recovery snapshot. Never strand its answer forever.
-      const ready = knownInputs.has(turnId) || goalTurns.has(turnId) || group.some(event => event.type === "final");
+      const terminal = group.some(event => event.type === "final" || event.type === "status"
+        && ["completed", "failed", "interrupted"].includes(event.status));
+      if (terminal) {
+        this.store.setValue(`mirror-terminal:${bindingId}:${turnId}`, this.epoch(binding));
+        this.store.setValue(this.deferredKey(bindingId, turnId), null);
+      }
+      if (knownInputs.has(turnId)) this.markReady(binding, turnId, false);
+      const ready = knownInputs.has(turnId) || this.ready(binding, turnId) !== null || terminal;
       if (ready) this.flushDeferred(bindingId, turnId);
       for (const event of group) {
         if (event.type === "user") continue;
+        if (event.type === "progress" && this.matches(binding, this.store.getValue(`mirror-terminal:${bindingId}:${turnId}`))) continue;
         if ((event.type === "progress" || event.type === "final") && !ready) {
           this.defer(bindingId, event);
         } else this.accept(bindingId, event);
       }
     }
     // A baseline input may become visible with no new event in this snapshot.
-    for (const turnId of inputTurnIds) if (!byTurn.has(turnId)) this.flushDeferred(bindingId, turnId);
-    for (const turnId of goalTurnIds) if (!byTurn.has(turnId)) this.flushDeferred(bindingId, turnId);
+    for (const turnId of inputTurnIds) if (!byTurn.has(turnId)) {
+      this.markReady(binding, turnId, false);
+      this.flushDeferred(bindingId, turnId);
+    }
+  }
+
+  /** Runs on the delivery timer even if a task stream or owner lookup stalls. */
+  tick(): void {
+    this.store.atomic(() => {
+      for (const { bindingId, turnId } of this.store.deferredMirrors()) {
+        const binding = this.store.getBinding(bindingId);
+        const key = this.deferredKey(bindingId, turnId);
+        const pending = this.store.getValue<DeferredMirror | TaskEvent[]>(key);
+        if (!binding?.attached || binding.peerId === null) { this.store.setValue(key, null); continue; }
+        if (this.store.getValue<{ quietTurnIds?: readonly string[] }>(`projection:${bindingId}`)?.quietTurnIds?.includes(turnId)) {
+          this.store.setValue(key, null); continue;
+        }
+        if (!pending || Array.isArray(pending)) continue;
+        if (!this.matches(binding, pending) || this.matches(binding, this.store.getValue(`mirror-terminal:${bindingId}:${turnId}`))) {
+          this.store.setValue(key, null); continue;
+        }
+        if (this.now() - pending.firstSeenAt < MIRROR_ORDERING_GRACE_MS) continue;
+        this.markReady(binding, turnId, true);
+        this.flushDeferred(bindingId, turnId);
+      }
+    });
+  }
+
+  private epoch(binding: Binding): MirrorEpoch {
+    return { taskKey: taskKey(binding), generation: this.store.streamGeneration(binding.id),
+      ...(binding.rolloutPath ? { rolloutPath: comparablePath(binding.rolloutPath) } : {}) };
+  }
+
+  private matches(binding: Binding, epoch: MirrorEpoch | null): boolean {
+    return !!epoch && epoch.taskKey === taskKey(binding) && epoch.generation === this.store.streamGeneration(binding.id)
+      && (epoch.rolloutPath ? comparablePath(epoch.rolloutPath) : undefined)
+        === (binding.rolloutPath ? comparablePath(binding.rolloutPath) : undefined);
+  }
+
+  private ready(binding: Binding, turnId: string): ReadyMirror | null {
+    const ready = this.store.getValue<ReadyMirror>(`mirror-ready:${binding.id}:${turnId}`);
+    return this.matches(binding, ready) ? ready : null;
+  }
+
+  private markReady(binding: Binding, turnId: string, withoutInput: boolean): void {
+    if (this.ready(binding, turnId)?.withoutInput === withoutInput) return;
+    this.store.setValue(`mirror-ready:${binding.id}:${turnId}`, { ...this.epoch(binding), withoutInput } satisfies ReadyMirror);
   }
 
   private deferredKey(bindingId: string, turnId: string): string {
@@ -50,7 +114,11 @@ export class TaskMirror {
 
   private defer(bindingId: string, event: Extract<TaskEvent, { type: "progress" | "final" }>): void {
     const key = this.deferredKey(bindingId, event.turnId);
-    const pending = this.store.getValue<TaskEvent[]>(key) ?? [];
+    const binding = this.store.getBinding(bindingId)!;
+    const saved = this.store.getValue<DeferredMirror | TaskEvent[]>(key);
+    const batch: DeferredMirror = saved && !Array.isArray(saved) && this.matches(binding, saved) ? saved
+      : { ...this.epoch(binding), firstSeenAt: this.now(), events: Array.isArray(saved) ? saved : [] };
+    const pending = batch.events;
     const index = pending.findIndex(item => item.type === event.type && item.id === event.id);
     if (index >= 0) pending[index] = event;
     else pending.push(event);
@@ -60,12 +128,14 @@ export class TaskMirror {
       if (oldestProgress < 0) break;
       pending.splice(oldestProgress, 1);
     }
-    this.store.setValue(key, pending);
+    this.store.setValue(key, batch);
   }
 
   private flushDeferred(bindingId: string, turnId: string): void {
     const key = this.deferredKey(bindingId, turnId);
-    const pending = this.store.getValue<TaskEvent[]>(key) ?? [];
+    const binding = this.store.getBinding(bindingId);
+    const saved = this.store.getValue<DeferredMirror | TaskEvent[]>(key);
+    const pending = Array.isArray(saved) ? saved : binding && this.matches(binding, saved) ? saved!.events : [];
     if (!pending.length) return;
     for (const event of pending) this.accept(bindingId, event);
     this.store.setValue(key, null);
@@ -124,7 +194,8 @@ export class TaskMirror {
           && proof.generation === this.store.streamGeneration(binding.id) && proof.userId !== event.id
           && proof.digest === createHash("sha256").update(event.text.replace(/\r\n?/gu, "\n").trimEnd()).digest("hex")) return;
       }
-      const prefix = event.type === "user" ? USER_REQUEST_PREFIX : "";
+      const prefix = event.type === "user" ? this.ready(binding, event.turnId)?.withoutInput
+        ? LATE_USER_REQUEST_PREFIX : USER_REQUEST_PREFIX : "";
       const showMenu = event.type === "final" && event.showMenu !== false;
       const footer = showMenu ? MENU_FOOTER : "";
       // Reserve room for the footer so it cannot become a separate VK message.

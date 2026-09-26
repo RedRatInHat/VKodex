@@ -39,7 +39,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
     const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
       oldestAcceptedAt ?? Infinity, Math.max(enabledSince, currentEpoch));
     try {
-      const events = await this.tailer.poll(task, since);
+      const events = await this.tailer.poll(task, since, checkpoint?.quietTurnIds);
       // A rebuilt rollout contains both the old branch and anything that was
       // written directly in Codex while VKodex was detached.  The old code
       // allowed only accepted VK turns through the first poll, which silently
@@ -54,6 +54,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
         active: checkpoint?.active ?? [],
         seen: checkpoint?.seen ?? {},
         semanticByIdentity: checkpoint?.semanticByIdentity ?? {},
+        ...(this.tailer.quietTurnIds(task).length ? { quietTurnIds: this.tailer.quietTurnIds(task) } : {}),
         ...(task.rolloutPath ? { rolloutPath: comparablePath(task.rolloutPath) } : {}),
       };
       return { events: visible, historyRebuilt, checkpoint: nextCheckpoint, failure: null };

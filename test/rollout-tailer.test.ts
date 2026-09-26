@@ -29,12 +29,25 @@ test("rollout recovery suppresses quiet heartbeats and unwraps notifications", a
   const quiet = "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>";
   const notify = "<heartbeat><automation_id>monitor</automation_id><decision>NOTIFY</decision><message>Needs attention.</message></heartbeat>";
   await writeFile(rollout,
-    line("2026-09-03T10:00:00.000Z", message("quiet", "quiet-turn", "final_answer", quiet))
+    line("2026-09-03T09:59:00.000Z", { type: "message", role: "user",
+      content: [{ type: "input_text", text: "<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-03T09:59:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "quiet-turn" } })
+    + line("2026-09-03T09:59:30.000Z", message("quiet-progress", "quiet-turn", "commentary", "Private scheduler progress"))
+    + line("2026-09-03T10:00:00.000Z", message("quiet", "quiet-turn", "final_answer", quiet))
     + line("2026-09-03T10:01:00.000Z", message("notify", "notify-turn", "final_answer", notify)));
   const tailer = new RolloutTailer(4096, 4096);
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), [
     { type: "final", id: "notify", turnId: "notify-turn", text: "Needs attention.", showMenu: false },
   ]);
+  assert.deepEqual(tailer.quietTurnIds(task(rollout)), ["quiet-turn"]);
+  // A restarted reader can inherit explicit visibility policy when the input
+  // is no longer inside its read window.
+  await writeFile(rollout, line("2026-09-03T10:02:00.000Z", message("late-quiet", "quiet-turn", "commentary", "Still quiet")));
+  assert.deepEqual(await new RolloutTailer().poll(task(rollout), 0, ["quiet-turn"]), []);
+  // An empty read must not erase policy learned by the primary transport.
+  assert.deepEqual(await tailer.poll(task(rollout), 0, ["another-quiet-turn"]), []);
+  assert.deepEqual(await tailer.poll(task(rollout), 0, ["new-quiet-turn"]), []);
+  assert.ok(tailer.quietTurnIds(task(rollout)).includes("new-quiet-turn"));
 });
 
 test("rollout tailer expands beyond its initial tail window to recover older missed events", async () => {

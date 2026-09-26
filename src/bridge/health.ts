@@ -150,6 +150,13 @@ export class BridgeHealthMonitor {
         : `Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых; отменённых записей: ${delivery.inactivePending}${criticalAge ? `; важные ожидают ${Math.round(criticalAge / 1_000)} с` : ""}.${failureDetail}`,
     });
 
+    const held = this.store.deferredMirrors().filter(item => this.store.getBinding(item.bindingId)?.attached);
+    const overdue = held.filter(item => item.firstSeenAt === null || checkedAt - item.firstSeenAt > 10_000);
+    checks.push({ name: "codex_mirror", state: overdue.length ? "degraded" : "ok",
+      detail: overdue.length
+        ? `Промежуточные сообщения задержаны до очереди VK: ${overdue.length} ход(а). Проверь обработку буфера наблюдения.`
+        : `Зависших промежуточных сообщений нет; короткого упорядочивания ожидают ${held.length} ход(а).` });
+
     const connectedState: HealthState = runtime.connectedRequiredBindings < runtime.requiredBindings ? "degraded" : "ok";
     const detached = (runtime.bindings ?? []).filter(binding => binding.streamMode === "detached").length;
     const leased = (runtime.bindings ?? []).filter(binding => binding.streamMode === "attached").length;

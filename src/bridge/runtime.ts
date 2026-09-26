@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../core/task-state.js";
 import type { TaskHistoryRecovery } from "../core/task-history.js";
 import type { TaskObservationCheckpoint, TaskStateObserver } from "../core/task-observation.js";
@@ -7,7 +6,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails, type TaskEvent, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
@@ -16,7 +15,6 @@ import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
-import { readRolloutUserTurn } from "../desktop/rollout-tailer.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -53,67 +51,6 @@ export class BridgeRuntime {
   private readonly observedTasks = new Map<string, Binding>();
   /** Native resume of a large task may take minutes; it must not hold the health/update loop. */
   private readonly connecting = new Map<string, Promise<void>>();
-  private readonly goalProgressProbes = new Map<string, {
-    taskKey: string; turnId: string; rolloutPath: string | undefined; generation: number;
-    checkedAt: number; pending: boolean; confirmed: boolean;
-  }>();
-
-  private confirmedGoalTurn(binding: Binding, turnId: string | null): readonly string[] {
-    const probe = this.goalProgressProbes.get(binding.id);
-    if (!turnId) return [];
-    const identity = taskKey(binding);
-    const generation = this.store.streamGeneration(binding.id);
-    if (probe?.confirmed && probe.turnId === turnId && probe.taskKey === identity
-      && probe.rolloutPath === binding.rolloutPath && probe.generation === generation) return [turnId];
-    const proof = this.store.getValue<{ taskKey: string; rolloutPath?: string; generation: number }>(
-      `native-input-confirmation:${binding.id}:${turnId}`);
-    return proof?.taskKey === identity && proof.rolloutPath === binding.rolloutPath && proof.generation === generation ? [turnId] : [];
-  }
-
-  private probeGoalProgress(binding: Binding, turnId: string | null, inputTurnIds: readonly string[], fallback = false): void {
-    // A direct app turn can have its user input in the rollout but not the
-    // owner's projected stream. Goal continuations have no user item at all.
-    // Verify either origin before releasing deferred commentary.
-    if (!turnId || inputTurnIds.includes(turnId)) return;
-    const deferred = this.store.getValue<TaskEvent[]>(`deferred-mirror:${binding.id}:${turnId}`);
-    if (!deferred?.some(event => event.type === "progress")) return;
-    const identity = taskKey(binding);
-    const generation = this.store.streamGeneration(binding.id);
-    const previous = this.goalProgressProbes.get(binding.id);
-    if (previous?.taskKey === identity && previous.turnId === turnId
-      && previous.rolloutPath === binding.rolloutPath && previous.generation === generation
-      && (previous.confirmed || previous.pending || this.now() - previous.checkedAt < 30_000)) return;
-    const probe = { taskKey: identity, turnId, rolloutPath: binding.rolloutPath, generation,
-      checkedAt: this.now(), pending: true, confirmed: false };
-    this.goalProgressProbes.set(binding.id, probe);
-    void (async () => {
-      const nativeInput = await readRolloutUserTurn(binding, turnId);
-      const goal = !nativeInput && this.desktop.capabilities.goals && this.desktop.getGoal
-        ? await this.desktop.getGoal(binding) : null;
-      if ((!nativeInput && (goal?.status !== "active" || goal.threadId !== binding.threadId)) || this.stopped
-        || this.goalProgressProbes.get(binding.id) !== probe) return;
-      this.store.atomic(() => {
-        const current = this.store.getBinding(binding.id);
-        const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
-        const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
-        if (!current?.attached || !sameTask(current, binding) || details?.status !== "running"
-          || current.rolloutPath !== binding.rolloutPath || this.store.streamGeneration(binding.id) !== generation
-          || (!fallback && !checkpoint?.active?.includes(turnId))
-          || this.store.acceptedTurns(binding.id).some(turn => turn.turnId === turnId)
-          || Object.keys(checkpoint?.seen ?? {}).some(key => {
-            try { const [seenTurn, type] = JSON.parse(key) as [string, string]; return seenTurn === turnId && type === "user"; }
-            catch { return false; }
-          })) return;
-        if (nativeInput) this.store.setValue(`native-input-confirmation:${binding.id}:${turnId}`,
-          { taskKey: identity, rolloutPath: binding.rolloutPath, generation, userId: nativeInput.id,
-            digest: createHash("sha256").update(nativeInput.text.replace(/\r\n?/gu, "\n").trimEnd()).digest("hex") });
-        this.mirror.acceptObservation(binding.id, nativeInput ? [nativeInput] : [], [], [turnId]);
-        probe.confirmed = true;
-      });
-      if (probe.confirmed) void this.delivery.flush().catch(() => {});
-    })().catch(() => {}).finally(() => { probe.pending = false; probe.checkedAt = this.now(); });
-  }
-
   private streamMode(bindingId: string): "attached" | "detached" | null {
     return this.store.getValue<"attached" | "detached">(`task-stream-mode:${bindingId}`);
   }
@@ -158,7 +95,7 @@ export class BridgeRuntime {
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
     this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot,
       binding => this.releaseForExternalClient(binding));
-    this.mirror = new TaskMirror(store);
+    this.mirror = new TaskMirror(store, 3_500, now);
     this.activity = new TaskActivity(store, now);
     this.unsubscribeCreation = desktop.onCreationUpdate?.(update => this.acceptCreation(update)) ?? null;
   }
@@ -199,6 +136,7 @@ export class BridgeRuntime {
     this.lastHealthAt = this.now();
     this.timer = setInterval(() => {
       this.lastTickAt = this.now();
+      try { this.mirror.tick(); } catch { /* Health reports an overdue mirror buffer. */ }
       try { this.activity.tick(); } catch { /* Retry next tick without interrupting delivery. */ }
       // A slow/offline task must not hold up delivery from other subscriptions.
       void this.delivery.flush().catch(() => {});
@@ -405,7 +343,7 @@ export class BridgeRuntime {
         if (type === "user" && eventTurns.has(turnId)) inputTurnIds.add(turnId);
       }
       this.mirror.acceptObservation(binding.id, events, [...inputTurnIds],
-        [...eventTurns].filter(turnId => this.confirmedGoalTurn(current, turnId).length > 0));
+        events.filter(event => event.type === "progress").map(event => event.turnId));
       for (const event of events) {
         const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
         if (details && event.type !== "user") {
@@ -433,10 +371,6 @@ export class BridgeRuntime {
       }
       if (result.checkpoint) this.store.setValue(`projection:${binding.id}`, result.checkpoint);
     });
-    const goalProgress = [...events].reverse().find(event => event.type === "progress"
-      && !events.some(input => input.type === "user" && input.turnId === event.turnId));
-    if (goalProgress) this.probeGoalProgress(current, goalProgress.turnId,
-      events.filter(event => event.type === "user").map(event => event.turnId), true);
   }
 
   private subscriptionFailed(bindingId: string, failure: TaskStateConnectionFailure): void {
@@ -527,6 +461,7 @@ export class BridgeRuntime {
 
   private async update(): Promise<void> {
     if (this.stopped) return;
+    this.mirror.tick();
     this.manager.panels.transfers.tick();
     this.closeInactiveSubscriptions();
     this.activity.tick();
@@ -539,7 +474,6 @@ export class BridgeRuntime {
         this.releasedIdle.delete(binding.id);
         this.demanded.delete(binding.id);
         this.pendingReacquire.delete(binding.id);
-        this.goalProgressProbes.delete(binding.id);
       }
       this.observedTasks.set(binding.id, binding);
       // Detached ownership is persisted across a bridge restart. Rehydrate
@@ -666,7 +600,7 @@ export class BridgeRuntime {
               this.mirror.acceptObservation(binding.id, observation.events, [
                 ...observation.inputTurnIds,
                 ...this.store.acceptedTurns(binding.id).map(turn => turn.turnId),
-              ], this.confirmedGoalTurn(current, observation.activeTurnId));
+              ], observation.activeTurnId ? [observation.activeTurnId] : []);
               for (const event of observation.events) {
                 if (event.type === "final") {
                   this.store.settleAcceptedTurn(binding.id, event.turnId);
@@ -694,7 +628,6 @@ export class BridgeRuntime {
               if (details.status !== "running" && details.status !== "approval" && !this.pendingReacquire.has(binding.id)) {
                 this.demanded.delete(binding.id);
               }
-              this.probeGoalProgress(current, observation.activeTurnId, observation.inputTurnIds);
             });
             const latest = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
             if (latest && ["idle", "failed", "interrupted"].includes(latest.status)

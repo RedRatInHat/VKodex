@@ -236,6 +236,20 @@ export class BridgeStore {
 
   streamGeneration(id: string): number { return this.getValue<number>(`stream-generation:${id}`) ?? 0; }
 
+  deferredMirrors(): readonly { bindingId: string; turnId: string; firstSeenAt: number | null; count: number }[] {
+    const prefix = "deferred-mirror:";
+    const rows = this.db.prepare("SELECT key, value FROM bridge_values WHERE key GLOB 'deferred-mirror:*' AND value <> 'null'")
+      .all() as { key: string; value: string }[];
+    return rows.flatMap(row => {
+      const separator = row.key.indexOf(":", prefix.length);
+      const value = JSON.parse(row.value) as { firstSeenAt?: number; events?: unknown[] } | unknown[];
+      const events = Array.isArray(value) ? value : value.events;
+      if (separator < 0 || !events?.length) return [];
+      return [{ bindingId: row.key.slice(prefix.length, separator), turnId: row.key.slice(separator + 1),
+        firstSeenAt: !Array.isArray(value) && typeof value.firstSeenAt === "number" ? value.firstSeenAt : null, count: events.length }];
+    });
+  }
+
   stopStreaming(id: string): void {
     this.atomic(() => {
       const binding = this.getBinding(id);

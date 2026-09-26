@@ -419,6 +419,8 @@ The local Codex API may save a title in the catalog without refreshing an alread
 
 ### Messages delivered to VK
 
+Visible commentary is forwarded regardless of whether a turn started in VK, the app, the extension, a goal, or another agent. If its input has not appeared in the stream, the bridge waits at most two seconds to preserve ordering, then releases commentary. This deadline survives restarts and is not extended by new fragments. A later input is labelled as input belonging to that turn; completed answers and old history are not replayed. Explicitly quiet automations retain their notification policy. Health also checks the commentary buffer before the VK delivery queue.
+
 - While a turn is active, the last item in the conversation is a separate silent message such as `thinking... · updated 15:42:20`; it cycles through `thinking..` and `thinking.` and is never appended to agent commentary. After your message, a menu, or a new agent response, VKodex creates a new indicator below and deletes the old one, keeping activity visible in the conversation list without leaving service messages in history. It updates every twenty seconds to avoid VK flood control during long tasks. At completion, the indicator shows `Done.`; errors and lost connections are shown explicitly. Editing stops when streaming is disabled.
 - Every agent progress comment is a separate **silent message**. Additional text for the same comment edits that message no more than once every twenty seconds so several active tasks do not trigger VK flood control. Final answers and requested panels are not delayed by this interval.
 - A final answer is a separate message with a normal notification and a **Menu** button.

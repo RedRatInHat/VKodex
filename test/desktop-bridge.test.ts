@@ -241,7 +241,7 @@ function setup(t: { after(fn: () => void): void }, enableHealth = false) {
   // Most unit tests assert a completely drained fixture queue. Production uses
   // the default bounded batch, covered by a dedicated backlog test below.
   const worker = new DeliveryWorker(chat, store, gate, 3_000, () => time, 100);
-  const mirror = new TaskMirror(store);
+  const mirror = new TaskMirror(store, 3_500, () => time);
   let sequence = 0;
   const input = (text: string, peer = access.ownerId, action?: string): BridgeInput => ({ eventId: `e${sequence++}`, senderId: access.ownerId, peerId: peer, text, ...(action ? { action } : {}) });
   const handle = async (text: string, peer = access.ownerId, action?: string) => { await manager.handle(input(text, peer, action)); await worker.flush(); };
@@ -2940,8 +2940,53 @@ test("goal continuation publishes commentary without waiting for a user message"
   s.mirror.acceptObservation(binding.id, [
     { type: "progress", id: "goal-progress", turnId: "goal-turn", text: "Autonomous progress" },
   ], [], ["goal-turn"]);
+  s.advance(3_000); s.mirror.tick();
   await s.worker.flush();
   assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Autonomous progress"]);
+});
+
+test("commentary deadline survives restart and repeated deltas never postpone it", async t => {
+  const s = setup(t); const binding = s.attach();
+  const progress = { type: "progress" as const, id: "agent-reply", turnId: "unrecognized-origin", text: "First fragment" };
+  s.mirror.acceptObservation(binding.id, [progress], []);
+  s.advance(1_500);
+  s.mirror.acceptObservation(binding.id, [{ ...progress, text: "Complete fragment" }], []);
+  const restarted = new TaskMirror(s.store, 3_500, s.now);
+  s.advance(501); restarted.tick(); await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Complete fragment"]);
+  restarted.acceptObservation(binding.id, [{ ...progress, id: "next", text: "Next progress" }], []);
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Complete fragment", "Next progress"]);
+  restarted.tick(); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 2);
+  assert.equal(s.store.deferredMirrors().length, 0);
+});
+
+test("terminal turns and replaced bindings cannot replay a deferred commentary buffer", async t => {
+  for (const change of ["completed", "interrupted", "detach", "rollout"] as const) {
+    const s = setup(t); const binding = s.attach();
+    const progress = { type: "progress" as const, id: "held", turnId: "turn", text: "Obsolete progress" };
+    s.mirror.acceptObservation(binding.id, [progress], []);
+    if (change === "detach") { s.store.stopStreaming(binding.id); s.store.setAttached(binding.id, true); }
+    else if (change === "rollout") s.store.ensureBinding({ ...task, rolloutPath: "C:/new-branch.jsonl" });
+    else {
+      s.mirror.acceptObservation(binding.id, [{ type: "status", id: "terminal", turnId: "turn", status: change }], []);
+      s.mirror.acceptObservation(binding.id, [progress], []);
+    }
+    s.advance(3_000); s.mirror.tick(); await s.worker.flush();
+    assert.equal(s.chat.sent.length, 0, change);
+    assert.equal(s.store.deferredMirrors().length, 0, change);
+  }
+});
+
+test("legacy deferred progress is adopted only after a fresh active-turn observation", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.setValue(`deferred-mirror:${binding.id}:turn`, [{ type: "progress", id: "legacy", turnId: "turn", text: "Still working" }]);
+  s.advance(10_000); s.mirror.tick(); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 0);
+  s.mirror.acceptObservation(binding.id, [], [], ["turn"]);
+  s.advance(2_001); s.mirror.tick(); await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(item => item.view.text), ["Still working"]);
 });
 
 test("baseline or VK accepted input releases held commentary without echoing a prompt", async t => {

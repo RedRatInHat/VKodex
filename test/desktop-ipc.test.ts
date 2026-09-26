@@ -18,7 +18,7 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject }
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
-import { hasRolloutUserTurn, RolloutTailer } from "../src/desktop/rollout-tailer.js";
+import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/desktop/history-recovery.js";
 import { comparablePath } from "../src/desktop/paths.js";
 import { observeTaskState } from "../src/desktop/task-observation.js";
@@ -228,6 +228,25 @@ test("a slow native resume does not stall the bridge update or start duplicate s
   release();
 });
 
+test("bridge publishes agent-initiated commentary without a user item or goal lookup", async t => {
+  let publish!: (state: IpcObject, initial: boolean) => void;
+  const transport: TaskStateTransport = {
+    subscribe(task, onState) {
+      publish = onState;
+      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+    },
+    close() {},
+  };
+  const s = runtimeSetup(t, undefined, transport);
+  await s.runtime.tick();
+  publish(state([{ type: "functionCallOutput", id: "agent-signal" },
+    { type: "agentMessage", id: "signal-progress", phase: "commentary", text: "Agent-triggered progress" }]), false);
+  s.advance(3_000);
+  await s.runtime.tick();
+  assert.ok(s.sent.some(item => item.view.text === "Agent-triggered progress"));
+  assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
+});
+
 test("bridge releases goal continuation commentary without inventing a user request", async t => {
   let publish!: (state: IpcObject, initial: boolean) => void;
   const transport: TaskStateTransport = {
@@ -248,6 +267,7 @@ test("bridge releases goal continuation commentary without inventing a user requ
   });
   await s.runtime.tick();
   publish(state([{ type: "agentMessage", id: "goal-progress", phase: "commentary", text: "Autonomous progress" }]), false);
+  s.advance(3_000);
   for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Autonomous progress"); attempt++) {
     await new Promise<void>(resolve => setImmediate(resolve));
     await s.runtime.tick(false);
@@ -256,7 +276,7 @@ test("bridge releases goal continuation commentary without inventing a user requ
   assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
 });
 
-test("bridge releases direct app turn commentary when its user input exists only in rollout", async t => {
+test("bridge publishes direct app progress with no accessible rollout and explains a late input", async t => {
   let publish!: (state: IpcObject, initial: boolean) => void;
   const transport: TaskStateTransport = {
     subscribe(task, onState) {
@@ -266,49 +286,22 @@ test("bridge releases direct app turn commentary when its user input exists only
     close() {},
   };
   const s = runtimeSetup(t, undefined, transport);
-  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-user-turn-"));
-  t.after(async () => { await rm(root, { recursive: true, force: true }); });
-  const rolloutPath = path.join(root, "rollout.jsonl");
-  await writeFile(rolloutPath, JSON.stringify({ type: "response_item", payload: {
-    type: "message", role: "user", content: [{ type: "input_text", text: "Continue the task" }],
-    internal_chat_message_metadata_passthrough: { turn_id: "fixture-turn" },
-  } }) + "\n");
-  s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
   await s.runtime.tick();
   publish(state([{ type: "agentMessage", id: "app-progress", phase: "commentary", text: "Direct app progress" }]), false);
+  s.advance(3_000);
   for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Direct app progress"); attempt++) {
     await new Promise<void>(resolve => setImmediate(resolve));
     await s.runtime.tick(false);
   }
   assert.ok(s.sent.some(item => item.view.text === "Direct app progress"));
-  assert.equal(s.sent.filter(item => item.view.text === "## user request\n\nContinue the task").length, 1);
-  assert.ok(s.sent.findIndex(item => item.view.text === "## user request\n\nContinue the task")
-    < s.sent.findIndex(item => item.view.text === "Direct app progress"));
+  assert.equal(s.sent.some(item => item.view.text.startsWith("## user request")), false);
   publish(state([{ type: "userMessage", id: "different-native-id", content: [{ type: "text", text: "Continue the task" }] },
     { type: "agentMessage", id: "app-progress", phase: "commentary", text: "Direct app progress" }]), false);
   await s.runtime.tick(false);
-  assert.equal(s.sent.filter(item => item.view.text === "## user request\n\nContinue the task").length, 1);
+  assert.equal(s.sent.filter(item => item.view.text === "Вход этого хода:\n\nContinue the task").length, 1);
 });
 
-test("rollout user turn proof excludes other turns and scheduler inputs", async t => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-turn-proof-"));
-  t.after(async () => { await rm(root, { recursive: true, force: true }); });
-  const rolloutPath = path.join(root, "rollout.jsonl");
-  const record = (turnId: string, text: string) => JSON.stringify({ type: "response_item", payload: {
-    type: "message", role: "user", content: [{ type: "input_text", text }],
-    internal_chat_message_metadata_passthrough: { turn_id: turnId },
-  } }) + "\n";
-  await writeFile(rolloutPath, record("other-turn", "Other prompt") + record("heartbeat-turn",
-    "<heartbeat><automation_id>daily</automation_id><current_time_iso>2026-09-26T08:00:00Z</current_time_iso><instructions>Check</instructions></heartbeat>"));
-  const task = { ...ref, rolloutPath };
-  assert.equal(await hasRolloutUserTurn(task, "fixture-turn"), false);
-  assert.equal(await hasRolloutUserTurn(task, "heartbeat-turn"), false);
-  await appendFile(rolloutPath, record("fixture-turn", "Direct app prompt"));
-  assert.equal(await hasRolloutUserTurn(task, "fixture-turn"), true);
-  assert.equal(await hasRolloutUserTurn(task, "fixture-turn", 12), false);
-});
-
-test("rollout fallback also publishes commentary from a goal continuation", async t => {
+test("rollout fallback publishes commentary without knowing the initiation source", async t => {
   const turnId = "goal-turn";
   let polled = false;
   const history: TaskHistoryRecovery = {
@@ -320,15 +313,13 @@ test("rollout fallback also publishes commentary from a goal continuation", asyn
         historyRebuilt: false, checkpoint: { since: 100_000, activeAtAttach: [], active: [], seen: {} }, failure: null };
     },
   };
-  const goal: import("../src/desktop/contracts.js").TaskGoal = {
-    threadId: ref.threadId, objective: "Finish the fixture", status: "active", tokenBudget: null,
-    tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
-  };
-  const s = runtimeSetup(t, undefined, undefined, undefined, { get: async () => goal, set: async () => goal, clear: async () => true }, history);
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, history);
   s.store.setValue(`task-details:${s.binding.id}`, { title: "Fixture", status: "running", workspace: "/fixture",
     model: null, effort: null, nextModel: null, nextEffort: null, context: null });
   await (s.runtime as unknown as { mirrorRolloutFallback(binding: Binding): Promise<void> })
     .mirrorRolloutFallback(s.store.getBinding(s.binding.id)!);
+  s.advance(3_000);
+  await s.runtime.tick();
   for (let attempt = 0; attempt < 20 && !s.sent.some(item => item.view.text === "Fallback progress"); attempt++) {
     await new Promise<void>(resolve => setImmediate(resolve));
   }
@@ -2555,6 +2546,10 @@ test("snapshot projection does not mirror quiet scheduler heartbeats", () => {
   ], "completed");
   const next = projectSnapshot(completed, initial.checkpoint, 200);
   assert.deepEqual(next.events.filter(event => event.type !== "status"), []);
+  const partial = projectSnapshot(state([
+    { type: "agentMessage", id: "partial-progress", phase: "commentary", text: "Still quiet" },
+  ]), next.checkpoint, 300);
+  assert.deepEqual(partial.events.filter(event => event.type !== "status"), []);
 });
 
 test("a reconnect recovers the terminal status of an accepted interrupted turn", () => {

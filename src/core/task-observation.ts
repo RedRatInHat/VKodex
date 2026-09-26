@@ -10,6 +10,8 @@ export interface TaskObservationCheckpoint {
   readonly seen: Readonly<Record<string, string>>;
   readonly semanticByIdentity?: Readonly<Record<string, string>>;
   readonly rolloutPath?: string;
+  /** Explicit scheduler visibility policy, independent of turn initiation. */
+  readonly quietTurnIds?: readonly string[];
 }
 
 export interface TaskObservationOptions {
