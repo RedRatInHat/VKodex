@@ -594,6 +594,8 @@ Prompt input is saved to the durable inbox before waiting for its own task conne
 
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
+Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.
+
 At startup and then every `HEALTH_CHECK_INTERVAL_MS`, VKodex checks the complete operating chain:
 
 - SQLite integrity through `PRAGMA quick_check`;

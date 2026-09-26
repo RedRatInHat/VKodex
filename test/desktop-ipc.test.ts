@@ -1310,6 +1310,139 @@ test("a transient command subscription cannot disable the durable task stream wh
   assert.deepEqual(follows, [true]);
 });
 
+test("shared desktop observers keep one native follow until the last lease closes", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 50);
+  const transport = new DesktopTaskStateTransport(client); t.after(() => transport.close());
+  const aStates: IpcObject[] = []; const bStates: IpcObject[] = [];
+  const first = transport.subscribe(ref, state => aStates.push(state), () => {});
+  const second = transport.subscribe(ref, state => bStates.push(state), () => {});
+  await first.start(100); await second.start(100);
+  const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following);
+  first.close();
+  assert.equal(follows().includes(false), false, "closing one observer must not unfollow the remaining observer");
+  assert.deepEqual(follows(), [true]);
+  const aCount = aStates.length; const bCount = bStates.length;
+  server.snapshot(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(aStates.length, aCount); assert.equal(bStates.length, bCount + 1);
+  second.close();
+  assert.deepEqual(follows(), [true, false]);
+});
+
+test("a late desktop observer receives an isolated initial snapshot without another native follow", async t => {
+  const server = new Server(); const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 50));
+  t.after(() => transport.close());
+  const first = transport.subscribe(ref, snapshot => { snapshot.title = "mutated by first observer"; }, () => {});
+  await first.start(100);
+  const seen: Array<{ title: unknown; initial: boolean }> = [];
+  const second = transport.subscribe(ref, (snapshot, initial) => seen.push({ title: snapshot.title, initial }), () => {});
+  await second.start(100);
+  assert.deepEqual(seen, [{ title: undefined, initial: true }]);
+  assert.deepEqual(server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following), [true]);
+  first.close(); second.close();
+});
+
+test("closing one desktop lease during the shared start leaves the other waiting", async t => {
+  const server = new Server(); server.onFollow = () => {};
+  const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 50)); t.after(() => transport.close());
+  const first = transport.subscribe(ref, () => assert.fail("Closed lease received state"), () => {});
+  const seen: boolean[] = [];
+  const second = transport.subscribe(ref, (_state, initial) => seen.push(initial), () => {});
+  const firstStart = first.start(100); const secondStart = second.start(100);
+  await new Promise(resolve => setImmediate(resolve));
+  first.close();
+  await assert.rejects(firstStart, /отменена/u);
+  assert.equal(server.received.some(message => message.method === "thread-stream-following-changed"
+    && (message.params as IpcObject).following === false), false);
+  server.snapshot(); await secondStart;
+  assert.deepEqual(seen, [true]);
+  second.close();
+  assert.deepEqual(server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following), [true, false]);
+});
+
+test("a desktop observer callback failure cannot break its sibling", async t => {
+  const server = new Server(); const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 50));
+  t.after(() => transport.close());
+  const errors: string[] = []; const seen: boolean[] = [];
+  const first = transport.subscribe(ref, () => { throw new Error("observer failed"); }, error => { errors.push(error.message); throw error; });
+  const second = transport.subscribe(ref, (_state, initial) => seen.push(initial), () => assert.fail("Sibling failed"));
+  await first.start(100); await second.start(100);
+  server.snapshot(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(errors, ["observer failed", "observer failed"]);
+  assert.deepEqual(seen, [true, false]);
+  first.close(); second.close();
+});
+
+test("desktop leases fail closed for conflicting source identity on the same wire task", async t => {
+  const server = new Server(); server.dataState = { ...state(), rolloutPath: "C:/profiles/work/sessions/task.jsonl" };
+  const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 50)); t.after(() => transport.close());
+  const first = transport.subscribe({ ...ref, sourceId: "work", rolloutPath: "C:/profiles/work/sessions/task.jsonl" }, () => {}, () => {});
+  await first.start(100);
+  for (const task of [
+    { ...ref, sourceId: "other", rolloutPath: "C:/profiles/work/sessions/task.jsonl" },
+    { ...ref, sourceId: "work", rolloutPath: "C:/profiles/other/sessions/task.jsonl" },
+  ]) {
+    const conflicting = transport.subscribe(task, () => assert.fail("Conflicting source observed state"), () => {});
+    await assert.rejects(conflicting.start(100), /другой каталог/u);
+    conflicting.close();
+  }
+  const rotated = transport.subscribe({ ...ref, sourceId: "work", rolloutPath: "C:/profiles/work/archived_sessions/next.jsonl" },
+    () => {}, () => {});
+  await rotated.start(100);
+  assert.deepEqual(server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following), [true]);
+  rotated.close(); first.close();
+});
+
+test("a desktop observer joining a recovery gap waits for the new verified snapshot", async t => {
+  const server = new Server(); const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => server, 50));
+  t.after(() => transport.close());
+  const first = transport.subscribe(ref, () => {}, () => {}); await first.start(100);
+  server.onFollow = () => {};
+  server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11, sourceClientId: "owner", targetClientIds: ["bridge-client"],
+    params: { hostId: ref.hostId, conversationId: ref.threadId, change: { type: "patches", baseRevision: 999, revision: 1000, patches: [] } } });
+  await new Promise(resolve => setImmediate(resolve));
+  const seen: boolean[] = [];
+  const second = transport.subscribe(ref, (_state, initial) => seen.push(initial), () => {});
+  let settled = false; const starting = second.start(100).finally(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false); assert.equal(seen.length, 0);
+  const followsBeforeClose = server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following);
+  second.close(); await assert.rejects(starting, /отменена/u);
+  assert.deepEqual(server.received.filter(message => message.method === "thread-stream-following-changed")
+    .map(message => (message.params as IpcObject).following), followsBeforeClose);
+  const survivor = transport.subscribe(ref, (_state, initial) => seen.push(initial), () => {});
+  const survivorStart = survivor.start(100);
+  server.snapshot(); await survivorStart;
+  assert.deepEqual(seen, [true]);
+  survivor.close(); first.close();
+});
+
+test("a shared desktop disconnect reaches both leases and a later lease can reconnect", async t => {
+  const servers: Server[] = [];
+  const transport = new DesktopTaskStateTransport(new DesktopIpcClient(() => {
+    const server = new Server(); servers.push(server); return server;
+  }, 50));
+  t.after(() => transport.close());
+  const failures: string[] = [];
+  const first = transport.subscribe(ref, () => {}, error => failures.push(`first: ${error.name}`));
+  const second = transport.subscribe(ref, () => {}, error => failures.push(`second: ${error.name}`));
+  await first.start(100); await second.start(100);
+  servers[0]!.destroy(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(failures, ["first: TaskConnectionLostError", "second: TaskConnectionLostError"]);
+  await assert.rejects(first.verifyOwner(100), DesktopUnavailableError);
+  await assert.rejects(second.verifyOwner(100), DesktopUnavailableError);
+  first.close(); second.close();
+  const recovered: boolean[] = [];
+  const third = transport.subscribe(ref, (_state, initial) => recovered.push(initial), () => {});
+  await third.start(100);
+  assert.equal(servers.length, 2); assert.deepEqual(recovered, [true]);
+  third.close();
+});
+
 test("closing a subscription during connection, discovery or its first snapshot cannot reopen it", async t => {
   for (const phase of ["connect", "discovery", "snapshot"]) {
     const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
