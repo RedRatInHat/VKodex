@@ -19,6 +19,37 @@ export class AppServerUncertainError extends Error {
   constructor() { super("Результат операции Codex неизвестен."); this.name = "AppServerUncertainError"; }
 }
 
+/** Explicit native frontend denial. Ordinary handler failures keep the generic
+ * protocol error; only this validated type preserves a frontend error body. */
+export class AppServerFrontendResponseError extends Error {
+  readonly #nativeError: JsonObject;
+
+  constructor(error: JsonObject) {
+    super("Native frontend rejected a server request.");
+    this.name = "AppServerFrontendResponseError";
+    if (error === null || typeof error !== "object" || Array.isArray(error) ||
+      !Object.hasOwn(error, "code") || !Number.isSafeInteger(error.code) ||
+      !Object.hasOwn(error, "message") || typeof error.message !== "string" ||
+      Object.keys(error).some(key => key !== "code" && key !== "message" && key !== "data"))
+      throw new TypeError("Invalid native frontend error");
+    let decoded: unknown;
+    try {
+      const copy = structuredClone(error);
+      const encoded = JSON.stringify(copy, (_key, item: unknown) => {
+        if (item === undefined || typeof item === "function" || typeof item === "symbol" ||
+          typeof item === "bigint" || typeof item === "number" && !Number.isFinite(item))
+          throw new TypeError("Non-JSON native frontend error");
+        return item;
+      });
+      decoded = JSON.parse(encoded);
+    } catch { throw new TypeError("Invalid native frontend error"); }
+    if (!isDeepStrictEqual(error, decoded)) throw new TypeError("Invalid native frontend error");
+    this.#nativeError = decoded as JsonObject;
+  }
+
+  get wireError(): JsonObject { return structuredClone(this.#nativeError); }
+}
+
 /** ID-free native response for an opt-in synchronous frontend wire writer. */
 export type AppServerResponseEnvelope = Readonly<{ result: JsonObject }> | Readonly<{ error: JsonObject }>;
 
@@ -313,9 +344,14 @@ export class AppServerConnection implements AppServerRpc {
       const result = await handler({ ...request, id }, { signal: controller.signal, responseWritten });
       if (current() && this.replyToServer(child, generation, { id, result })) resolveWritten();
       else this.invalidateServerRequest(pending);
-    } catch {
-      if (current()) this.replyToServer(child, generation, { id, error: { code: -32000, message: "Server request rejected" } });
-      this.invalidateServerRequest(pending);
+    } catch (error) {
+      if (current() && error instanceof AppServerFrontendResponseError &&
+        this.replyToServer(child, generation, { id, error: error.wireError })) resolveWritten();
+      else {
+        if (current()) this.replyToServer(child, generation,
+          { id, error: { code: -32000, message: "Server request rejected" } });
+        this.invalidateServerRequest(pending);
+      }
     } finally {
       if (this.pendingServerRequests.get(id) === pending) this.pendingServerRequests.delete(id);
     }

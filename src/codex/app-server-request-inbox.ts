@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { AppServerFrontendResponseError } from "./app-server-connection.js";
 import type { AppServerServerRequest,
   AppServerServerRequestContext } from "./app-server-connection.js";
 
@@ -29,6 +30,8 @@ export interface RequestInboxOptions {
   readonly isGenerationCurrent: (generation: number) => boolean;
   readonly allowRequest: (request: AppServerServerRequest) => boolean;
   readonly allowAnswer: (request: AppServerServerRequest, result: JsonObject) => boolean;
+  /** Explicit opt-in to native JSON-RPC errors; never inferred from allowAnswer. */
+  readonly allowError?: (request: AppServerServerRequest, error: JsonObject) => boolean;
   readonly maxPending?: number;
 }
 
@@ -45,6 +48,7 @@ interface Pending {
 /** A worker-scoped inbox. The caller must explicitly compose its one App Server
  * request handler; constructing an inbox does not change the existing executor. */
 export class AppServerRequestInbox {
+  private readonly identity: Readonly<{ threadId: string; generation: number }>;
   private readonly pending = new Map<string, Pending>();
   private readonly options: RequestInboxOptions;
   private readonly maxPending: number;
@@ -54,7 +58,10 @@ export class AppServerRequestInbox {
   constructor(options: RequestInboxOptions) {
     if (!options.threadId || !Number.isSafeInteger(options.generation) || options.generation < 1 ||
       typeof options.isGenerationCurrent !== "function" || typeof options.allowRequest !== "function" ||
-      typeof options.allowAnswer !== "function") throw new TypeError("Invalid request inbox owner");
+      typeof options.allowAnswer !== "function" ||
+      options.allowError !== undefined && typeof options.allowError !== "function")
+      throw new TypeError("Invalid request inbox owner");
+    this.identity = Object.freeze({ threadId: options.threadId, generation: options.generation });
     this.maxPending = options.maxPending ?? 64;
     if (!Number.isSafeInteger(this.maxPending) || this.maxPending < 1 || this.maxPending > 1024)
       throw new TypeError("Invalid request inbox capacity");
@@ -62,8 +69,12 @@ export class AppServerRequestInbox {
       threadId: options.threadId, generation: options.generation,
       isGenerationCurrent: options.isGenerationCurrent,
       allowRequest: options.allowRequest, allowAnswer: options.allowAnswer,
+      ...(options.allowError ? { allowError: options.allowError } : {}),
     });
   }
+
+  /** Attachment authority comes from construction, never a frontend frame. */
+  get owner(): Readonly<{ threadId: string; generation: number }> { return this.identity; }
 
   private key(id: string | number): string { return `${typeof id}:${String(id)}`; }
   private current(): boolean { return this.options.isGenerationCurrent(this.options.generation); }
@@ -80,6 +91,7 @@ export class AppServerRequestInbox {
     readonly epoch: number;
     detach(): void;
     answer(id: string | number, result: JsonObject): boolean;
+    reject(id: string | number, error: JsonObject): boolean;
   } {
     if (typeof send !== "function") throw new TypeError("Frontend writer required");
     const attachment = { epoch: ++this.epoch, send };
@@ -92,24 +104,31 @@ export class AppServerRequestInbox {
       epoch: attachment.epoch,
       detach: () => { if (this.attachment === attachment) this.attachment = null; },
       answer: (id, result) => this.answer(attachment, id, result),
+      reject: (id, error) => this.answer(attachment, id, error, true),
     };
   }
 
-  private answer(attachment: { readonly epoch: number }, id: string | number, result: JsonObject): boolean {
+  private answer(attachment: { readonly epoch: number }, id: string | number, result: JsonObject,
+    negative = false): boolean {
     if (this.attachment !== attachment || !this.current() || !validId(id) || !object(result)) return false;
     const pending = this.pending.get(this.key(id));
     if (!pending || pending.answered || pending.context.signal.aborted ||
       pending.request.params.threadId !== this.options.threadId) return false;
     let answer: JsonObject;
+    let error: AppServerFrontendResponseError | undefined;
     try {
       answer = jsonClone(result);
-      if (!this.options.allowAnswer(structuredClone(pending.request), structuredClone(answer))) return false;
+      if (negative) {
+        error = new AppServerFrontendResponseError(answer);
+        if (!this.options.allowError?.(structuredClone(pending.request), error.wireError)) return false;
+      } else if (!this.options.allowAnswer(structuredClone(pending.request), structuredClone(answer))) return false;
     } catch { return false; }
     if (this.attachment !== attachment || !this.current() ||
       this.pending.get(this.key(id)) !== pending || pending.answered ||
       pending.context.signal.aborted) return false;
     pending.answered = true;
-    pending.resolve(answer);
+    if (error) pending.reject(error);
+    else pending.resolve(answer);
     // This receipt confirms only a local write attempt, never worker acceptance.
     void pending.context.responseWritten.then(() => this.retire(id, pending), () => this.retire(id, pending));
     return true;

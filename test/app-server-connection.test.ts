@@ -3,7 +3,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { AppServerConnection, AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
+import { AppServerConnection, AppServerFrontendResponseError, AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import type { AppServerServerRequest, AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
 import { AppServerRequestInbox } from "../src/codex/app-server-request-inbox.js";
 
@@ -146,6 +146,9 @@ test("request inbox snapshots owner settings and shields accepted answer from po
   };
   const inbox = new AppServerRequestInbox(options);
   options.threadId = "other";
+  options.generation = session.generation + 1;
+  assert.deepEqual(inbox.owner, { threadId: "own", generation: session.generation });
+  assert.equal(Object.isFrozen(inbox.owner), true);
   connection.onServerRequest((request, context) => inbox.handle(request, context));
   const attached = inbox.attach(() => {});
   try {
@@ -233,6 +236,68 @@ test("request inbox keeps typed pending IDs when frontend delivery throws", asyn
       .map(message => [message.id, message.result]),
     [[7, { typed: "number" }], ["7", { typed: "string" }]]);
     assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
+  } finally { await connection.close(); }
+});
+
+test("inbox rejects only with explicit error policy and preserves pending after invalid denial", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const options = {
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: (generation: number) => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true,
+  };
+  const inbox = new AppServerRequestInbox(options);
+  options.threadId = "other";
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const attached = inbox.attach(() => {});
+  try {
+    child.send({ id: 51, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attached.reject(51, { code: 4100, message: "denied" }), false);
+    assert.equal(attached.answer(51, { answers: {} }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 51).map(message => message.result), [{ answers: {} }]);
+  } finally { await connection.close(); }
+});
+
+test("inbox explicit negative reply fences epoch, typed ID, policy reentry and answer race", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  let detachOnPolicy = false;
+  let currentDetach: (() => void) | null = null;
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true,
+    allowError: (_request, error) => {
+      if (detachOnPolicy) currentDetach?.();
+      return error.code === 4101;
+    },
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const old = inbox.attach(() => {});
+  try {
+    child.send({ id: 52, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    const current = inbox.attach(() => {});
+    currentDetach = current.detach;
+    assert.equal(old.reject(52, { code: 4101, message: "denied" }), false);
+    assert.equal(current.reject("52", { code: 4101, message: "denied" }), false);
+    assert.equal(current.reject(52, { code: 1.5, message: "bad" }), false);
+    assert.equal(current.reject(52, { code: 4101, message: "bad", data: new Date() }), false);
+    detachOnPolicy = true;
+    assert.equal(current.reject(52, { code: 4101, message: "denied" }), false);
+    detachOnPolicy = false;
+    const final = inbox.attach(() => {});
+    assert.equal(final.reject(52, { code: 4101, message: "denied", data: { reason: "native" } }), true);
+    assert.equal(final.answer(52, { answers: {} }), false);
+    assert.equal(final.reject(52, { code: 4101, message: "duplicate" }), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 52).map(message => message.error),
+      [{ code: 4101, message: "denied", data: { reason: "native" } }]);
   } finally { await connection.close(); }
 });
 
@@ -985,6 +1050,66 @@ test("handler failure rejects its response receipt even when a generic error rep
     const replies = child.messages.filter(message => message.id === 14);
     assert.equal(replies.length, 1);
     assert.equal((replies[0]!.error as JsonObject).code, -32000);
+  } finally { await connection.close(); }
+});
+
+test("explicit frontend errors preserve exact typed IDs and validated native error data", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const original = { code: 4102, message: "frontend denied", data: { reason: "user choice" } };
+  const branded = new AppServerFrontendResponseError(original);
+  original.data.reason = "mutated";
+  const exposed = branded.wireError;
+  (exposed.data as JsonObject).reason = "also mutated";
+  const contexts: AppServerServerRequestContext[] = [];
+  connection.onServerRequest((request, context) => { contexts.push(context); throw request.id === 41 ? branded
+    : new AppServerFrontendResponseError({ code: 4103, message: "string id", data: null }); });
+  try {
+    await connection.start();
+    child.send({ id: 41, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    child.send({ id: "41", method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(contexts.length, 2);
+    await Promise.all(contexts.map(context => context.responseWritten));
+    assert.deepEqual(child.messages.filter(message => message.id === 41 || message.id === "41")
+      .map(message => [message.id, message.error]), [
+        [41, { code: 4102, message: "frontend denied", data: { reason: "user choice" } }],
+        ["41", { code: 4103, message: "string id", data: null }],
+      ]);
+  } finally { await connection.close(); }
+});
+
+test("invalid frontend error payload is rejected before it can reach the worker", () => {
+  for (const payload of [
+    { code: 1.5, message: "bad" }, { code: 1, message: 7 },
+    { code: 1, message: "bad", extra: true },
+    { code: 1, message: "bad", data: new Date() },
+    { code: 1, message: "bad", data: new Map([["x", 1]]) },
+    { code: 1, message: "bad", data: 1n },
+  ]) assert.throws(() => new AppServerFrontendResponseError(payload as never));
+});
+
+test("externally resolved or stale frontend error cannot write a late negative reply", async () => {
+  const first = new AppServerChild(); const second = new AppServerChild();
+  const children = [first, second];
+  const connection = new AppServerConnection(() => children.shift()!.asChild(), undefined, 100);
+  const rejectors: Array<(error: Error) => void> = [];
+  connection.onServerRequest(() => new Promise<JsonObject>((_resolve, reject) => { rejectors.push(reject); }));
+  try {
+    await connection.start();
+    first.send({ id: 42, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    first.send({ method: "serverRequest/resolved", params: { threadId: "own", requestId: 42 } });
+    rejectors[0]!(new AppServerFrontendResponseError({ code: 4104, message: "too late" }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(first.messages.filter(message => message.id === 42), []);
+    first.send({ id: "43", method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    first.disconnect();
+    await connection.start();
+    rejectors[1]!(new AppServerFrontendResponseError({ code: 4105, message: "old generation" }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(second.messages.filter(message => message.id === "43"), []);
   } finally { await connection.close(); }
 });
 
