@@ -63,6 +63,55 @@ test("one long-lived App Server connection initializes once and multiplexes requ
   } finally { await connection.close(); }
 });
 
+test("concurrent requests wait for the initialization handshake before dispatch", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? null : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 5_000);
+  const first = connection.request("thread/read", { threadId: "first" });
+  void first.catch(() => {});
+  let second: Promise<JsonObject> | undefined;
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    second = connection.request("turn/start", { threadId: "second" }, { mutating: true });
+    void second.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.map(message => message.method), ["initialize"],
+      "a spawned child is not yet an initialized connection");
+    child.send({ id: child.messages[0]!.id, result: {} });
+    await Promise.all([first, second]);
+    assert.deepEqual(child.messages.map(message => message.method),
+      ["initialize", "initialized", "thread/read", "turn/start"]);
+  } finally {
+    await connection.close();
+    await Promise.allSettled([first, ...(second ? [second] : [])]);
+  }
+});
+
+test("rejected initialization never dispatches a waiting mutation", async () => {
+  const child = new AppServerChild();
+  child.respond = () => null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 5_000);
+  const first = connection.start();
+  void first.catch(() => {});
+  let second: Promise<JsonObject> | undefined;
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    second = connection.request("turn/start", { threadId: "second" }, { mutating: true });
+    void second.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    child.send({ id: child.messages[0]!.id, error: { code: -32600, message: "fixture init rejection" } });
+    const results = await Promise.allSettled([first, second]);
+    assert.deepEqual(child.messages.map(message => message.method), ["initialize"]);
+    for (const result of results) {
+      assert.equal(result.status, "rejected");
+      if (result.status === "rejected") assert.ok(result.reason instanceof AppServerRejectedError);
+    }
+  } finally {
+    await connection.close();
+    await Promise.allSettled([first, ...(second ? [second] : [])]);
+  }
+});
+
 test("App Server assembles a large response line from bounded chunks", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;

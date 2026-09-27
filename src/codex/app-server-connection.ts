@@ -106,8 +106,11 @@ export class AppServerConnection implements AppServerRpc {
 
   async start(): Promise<void> {
     if (this.stopped) throw new AppServerUnavailableError("Подключение Codex App Server уже остановлено.");
-    if (this.child) return;
+    // open() installs the child before initialize has been acknowledged. Every
+    // concurrent caller must join that handshake, including its rejection,
+    // rather than dispatching a command onto a merely spawned process.
     if (this.starting) return this.starting;
+    if (this.child) return;
     const work = this.open();
     this.starting = work;
     try { await work; } finally { if (this.starting === work) this.starting = null; }
