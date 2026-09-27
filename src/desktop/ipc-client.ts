@@ -285,15 +285,21 @@ export class DesktopIpcClient {
 
   private disconnected(stream: Duplex, error = new DesktopUnavailableError()): void {
     if (this.stream !== stream) return;
-    this.incomingAbort.abort();
+    const incomingAbort = this.incomingAbort;
+    const pending = [...this.pending.values()];
+    const listeners = [...this.disconnectListeners];
+    // Abort handlers run synchronously and may reconnect. Retire the old
+    // session before notifying them; its cleanup must not clear a new
+    // connection's initialization request or expose a closing writer.
     this.stream = null;
     this.clientId = null;
-    for (const request of this.pending.values()) {
+    this.pending.clear();
+    for (const request of pending) {
       clearTimeout(request.timer);
       request.reject(request.mutating ? new UncertainActionError() : error);
     }
-    this.pending.clear();
-    for (const listener of this.disconnectListeners) {
+    incomingAbort.abort();
+    for (const listener of listeners) {
       try { listener(error); } catch { /* Other consumers still need their disconnect notification. */ }
     }
   }

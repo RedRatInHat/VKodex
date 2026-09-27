@@ -1198,6 +1198,38 @@ test("native owner errors are redacted and late results never reach a replacemen
   } finally { client.close(); }
 });
 
+test("IPC abort callbacks cannot write to a closing connection and can reconnect immediately", async () => {
+  const first = new Server(); const second = new Server(); const servers = [first, second];
+  let reconnect: Promise<void> | undefined;
+  let rejectedWrite: Promise<void> | undefined;
+  let finish!: (result: IpcObject) => void;
+  const client = new DesktopIpcClient(() => servers.shift()!, 100, {
+    canHandle: () => true,
+    handle: async (_request, signal) => {
+      signal.addEventListener("abort", () => {
+        rejectedWrite = assert.rejects(client.request("closing-mutation", 1, {}, { mutating: true }), DesktopUnavailableError);
+        reconnect = client.connect();
+      }, { once: true });
+      return new Promise<IpcObject>(resolve => { finish = resolve; });
+    },
+  });
+  try {
+    await client.connect();
+    first.send({ type: "request", requestId: "pending-owner", sourceClientId: "follower", method: "read", version: 1, params: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof finish, "function");
+    client.close();
+    await rejectedWrite;
+    await reconnect;
+    assert.equal(first.received.some(message => message.method === "closing-mutation"), false);
+    assert.equal(second.received.filter(message => message.method === "initialize").length, 1);
+    await client.request("thread-owner-discovery", 1, { conversationId: ref.threadId });
+    finish({ ok: true });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(second.received.some(message => message.requestId === "pending-owner"), false);
+  } finally { client.close(); }
+});
+
 test("IPC decoding accepts fragmented headers and multiple frames without trusting frame lengths", () => {
   const decoder = new FrameDecoder(); const one = encodeFrame({ type: "one" }); const two = encodeFrame({ type: "two" });
   assert.deepEqual(decoder.push(one.subarray(0, 2)), []);
