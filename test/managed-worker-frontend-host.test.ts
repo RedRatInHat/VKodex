@@ -464,6 +464,47 @@ function commandFixture(timeout = 100) {
       input: [{ type: 'text', text: `private-marker-${randomUUID()}` }] } };
   return { managed, child, controlKey, adapterKey, command, journalPath, authority, policy };
 }
+
+test('command quiescence is authenticated, read-only and distinguishes in-flight from durable unknown', async () => {
+  const noPolicy = host(new Child(), {});
+  await noPolicy.managed.start();
+  try { assert.throws(() => noPolicy.managed.commandQuiescence({}), /unavailable/i); }
+  finally { await noPolicy.managed.stop('test-cleanup'); }
+
+  const f = commandFixture(20); await f.managed.start();
+  let policyCalls = 0; f.authority.onAuthorize = () => { policyCalls++; };
+  try {
+    assert.throws(() => f.managed.commandQuiescence({}), /control/i);
+    const fresh = f.managed.commandQuiescence(f.controlKey);
+    assert.deepEqual(fresh, { inFlight: 0, unconfirmed: false });
+    assert.equal(Object.isFrozen(fresh), true);
+    assert.equal(policyCalls, 0);
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    await sentMutation(f.child);
+    const wireCount = f.child.messages.length, admittedCalls = policyCalls;
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 1, unconfirmed: true });
+    assert.equal(f.child.messages.length, wireCount);
+    assert.equal(policyCalls, admittedCalls);
+    assert.equal((await pending).state, 'unknown');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+    f.child.send({ id: f.child.messages.find(frame => frame.method === 'turn/start')!.id,
+      result: { turn: { id: 'late-accepted' } } });
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('validated rejection clears command quiescence without a backend read', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  try {
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 1, unconfirmed: true });
+    f.child.send({ id: request.id, error: { code: -32602, message: 'invalid params' } });
+    assert.equal((await pending).state, 'rejected');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
 async function sentMutation(child: Child, method = 'turn/start'): Promise<Frame> {
   for (let tries = 0; tries < 50; tries++) {
     const frame = child.messages.find(value => value.method === method);

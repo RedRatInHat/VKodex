@@ -106,3 +106,29 @@ test("invalid constructor and receipt identities fail closed", () => {
     assert.equal(journal.get(first.operationId)?.state, "dispatching");
   } finally { journal.close(); }
 });
+
+test("scoped unconfirmed query tracks dispatching and unknown across reopen without writing", () => {
+  const scope = fixture(), first = intent();
+  const a = new ManagedWorkerOperationJournal(scope);
+  assert.equal(a.hasUnconfirmed(), false);
+  const reserved = a.reserve(first).operation;
+  assert.equal(a.hasUnconfirmed(), true);
+  a.close();
+  const b = new ManagedWorkerOperationJournal(scope);
+  let unknown = reserved;
+  try {
+    assert.equal(b.hasUnconfirmed(), true);
+    unknown = b.markUnknown(reserved);
+    assert.equal(b.hasUnconfirmed(), true);
+  } finally { b.close(); }
+  const c = new ManagedWorkerOperationJournal(scope);
+  try {
+    assert.equal(c.hasUnconfirmed(), true);
+    c.accept(unknown, "actual-turn");
+    assert.equal(c.hasUnconfirmed(), false);
+    const rejected = c.reserve(intent()).operation;
+    assert.equal(c.hasUnconfirmed(), true);
+    c.reject(rejected, -32602);
+    assert.equal(c.hasUnconfirmed(), false);
+  } finally { c.close(); }
+});

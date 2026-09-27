@@ -21,6 +21,10 @@ export interface WorkerCommandResponse {
   readonly operation: WorkerOperation;
   readonly response: JsonObject | null;
 }
+export interface WorkerCommandQuiescence {
+  readonly inFlight: number;
+  readonly unconfirmed: boolean;
+}
 export interface WorkerCommandPolicy {
   readonly controlKey: object;
   readonly ownerEpoch: string;
@@ -108,6 +112,13 @@ export class ManagedWorkerCommandDispatcher {
   get(key: object, operationId: string): WorkerOperation | null {
     this.#authenticate(key);
     return this.#journal.get(operationId);
+  }
+  /** Read-only snapshot. Caller must close new admission before using it as
+   * one part of a stop proof; this says nothing about worker idle/history. */
+  quiescence(key: object): WorkerCommandQuiescence {
+    this.#authenticate(key);
+    return Object.freeze({ inFlight: this.#inFlight.size,
+      unconfirmed: this.#journal.hasUnconfirmed() });
   }
   /**
    * Read-only attested lookup for an immutable native intent. It never calls

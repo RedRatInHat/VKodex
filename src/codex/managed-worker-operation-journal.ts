@@ -106,6 +106,12 @@ export class ManagedWorkerOperationJournal {
   journalMode(): string { return this.db.pragma("journal_mode", { simple: true }) as string; }
   synchronousMode(): number { return this.db.pragma("synchronous", { simple: true }) as number; }
 
+  /** Scoped durable evidence only; no reservation or backend request. */
+  hasUnconfirmed(): boolean {
+    return this.db.prepare("SELECT 1 FROM managed_worker_operations WHERE state IN ('dispatching','unknown') LIMIT 1")
+      .get() !== undefined;
+  }
+
   get(operationId: string): WorkerOperation | null {
     const id = validUuid(operationId, "operation ID");
     const row = this.db.prepare("SELECT * FROM managed_worker_operations WHERE operation_id=?").get(id) as OperationRow | undefined;

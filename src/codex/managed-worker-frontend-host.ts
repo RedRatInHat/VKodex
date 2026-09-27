@@ -8,7 +8,7 @@ import { PersistentFrontendSessions } from './persistent-frontend-session.js';
 import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
 import { ManagedWorkerCommandDispatcher, captureWorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
-import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse } from './managed-worker-command-dispatcher.js';
+import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse, WorkerCommandQuiescence } from './managed-worker-command-dispatcher.js';
 import type { WorkerOperation } from './managed-worker-operation-journal.js';
 
 type JsonObject = Record<string, unknown>;
@@ -179,6 +179,12 @@ export class ManagedWorkerFrontendHost {
   commandStatus(controlKey: object, operationId: string): WorkerOperation | null {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.get(controlKey, operationId);
+  }
+
+  /** Read-only control evidence, never an idle or family-ownership proof by itself. */
+  commandQuiescence(controlKey: object): WorkerCommandQuiescence {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.quiescence(controlKey);
   }
 
   /** Read-only, HMAC-attested lookup of a previously reserved command intent. */
