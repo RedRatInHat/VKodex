@@ -200,59 +200,52 @@ test('backend spawn specification strips synthetic bridge hooks and retains TLS 
   assert.deepEqual(spec.stdio, ['pipe', 'pipe', 'pipe']);
 });
 
-async function controlStop(privateDirectory: string, epoch: string, id: string): Promise<Record<string, unknown>> {
-  const endpoint = JSON.parse(await readFile(path.join(privateDirectory, 'endpoint.v1.json'), 'utf8')) as
-    { control: { port: number } };
-  const socket = connect(endpoint.control.port, '127.0.0.1');
+async function controlRequest(port: number, epoch: string, id: string, method: string,
+  afterAuth?: () => void | Promise<void>): Promise<Record<string, unknown>> {
+  const socket = connect(port, '127.0.0.1');
   let buffer = ''; const frames: Record<string, unknown>[] = [];
+  let terminal: 'closed' | 'errored' | null = null;
   socket.on('data', chunk => { buffer += chunk.toString();
     while (buffer.includes('\n')) { const at = buffer.indexOf('\n');
       frames.push(JSON.parse(buffer.slice(0, at)) as Record<string, unknown>);
       buffer = buffer.slice(at + 1); }
   });
-  await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
-  const wait = async (predicate: (frame: Record<string, unknown>) => boolean) => {
+  socket.on('error', () => { terminal = 'errored'; });
+  socket.on('close', () => { terminal ??= 'closed'; });
+  await new Promise<void>((resolve, reject) => {
+    const connected = () => { socket.off('error', failed); resolve(); };
+    const failed = () => { socket.off('connect', connected); reject(new Error('control socket connection failed')); };
+    socket.once('connect', connected); socket.once('error', failed);
+  });
+  const wait = async (phase: 'auth' | 'commandreply', predicate: (frame: Record<string, unknown>) => boolean) => {
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
       const found = frames.find(predicate); if (found) return found;
+      if (terminal !== null) throw new Error(`control socket ${terminal} during ${phase}`);
       await new Promise(resolve => setTimeout(resolve, 5));
     }
-    throw new Error('control response timeout');
+    throw new Error(`control ${phase} timeout (frames=${frames.length})`);
   };
   try {
     socket.write(JSON.stringify({ token: Buffer.alloc(32, 3).toString('base64url') }) + '\n');
-    await wait(frame => frame.ok === true);
-    socket.write(JSON.stringify({ id, epoch, method: 'stop' }) + '\n');
-    return await wait(frame => frame.id === id);
+    await wait('auth', frame => frame.ok === true);
+    await afterAuth?.();
+    socket.write(JSON.stringify({ id, epoch, method }) + '\n');
+    return await wait('commandreply', frame => frame.id === id);
   } finally { socket.destroy(); }
 }
 
+async function controlStop(privateDirectory: string, epoch: string, id: string): Promise<Record<string, unknown>> {
+  const endpoint = JSON.parse(await readFile(path.join(privateDirectory, 'endpoint.v1.json'), 'utf8')) as
+    { control: { port: number } };
+  return controlRequest(endpoint.control.port, epoch, id, 'stop');
+}
+
 async function startupControlRequest(privateDirectory: string, epoch: string,
-  id: string, method: string): Promise<Record<string, unknown>> {
+  id: string, method: string, afterAuth?: () => void | Promise<void>): Promise<Record<string, unknown>> {
   const locator = JSON.parse(await readFile(path.join(privateDirectory, 'startup-control.v1.json'), 'utf8')) as
     { control: { port: number } };
-  const socket = connect(locator.control.port, '127.0.0.1');
-  let buffer = ''; const frames: Record<string, unknown>[] = [];
-  socket.on('data', chunk => { buffer += chunk.toString();
-    while (buffer.includes('\n')) { const at = buffer.indexOf('\n');
-      frames.push(JSON.parse(buffer.slice(0, at)) as Record<string, unknown>);
-      buffer = buffer.slice(at + 1); }
-  });
-  await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
-  const wait = async (predicate: (frame: Record<string, unknown>) => boolean) => {
-    const deadline = Date.now() + 3000;
-    while (Date.now() < deadline) {
-      const found = frames.find(predicate); if (found) return found;
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
-    throw new Error('startup control response timeout');
-  };
-  try {
-    socket.write(JSON.stringify({ token: Buffer.alloc(32, 3).toString('base64url') }) + '\n');
-    await wait(frame => frame.ok === true);
-    socket.write(JSON.stringify({ id, epoch, method }) + '\n');
-    return await wait(frame => frame.id === id);
-  } finally { socket.destroy(); }
+  return controlRequest(locator.control.port, epoch, id, method, afterAuth);
 }
 
 test('control bind failure leaves reserved worker unlaunched', async () => {
@@ -301,6 +294,22 @@ test('bootstrap failure retains authenticated startup diagnosis while EOF cannot
       'stop-refused');
     assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'again', 'status')).result
       ? 'available' : 'missing', 'available');
+    assert.equal(backend.exitCode, null);
+  } finally {
+    await (control as ManagedWorkerControlServer | null)?.close();
+    backend.stdin.end();
+  }
+});
+
+test('control request helper reports an authenticated control termination during command reply', async () => {
+  const { backend, control, reserved, privateDirectory } =
+    await readyFixture({ allow: true }, { enabled: false, early: false }, 'bootstrap-fail');
+  try {
+    if (control === null) throw new Error('fixture control unavailable');
+    const activeControl = control as unknown as ManagedWorkerControlServer;
+    await assert.rejects(startupControlRequest(privateDirectory, reserved.epoch, 'closed', 'status',
+      async () => { await activeControl.close(); }),
+    /control socket (closed|errored) during commandreply/);
     assert.equal(backend.exitCode, null);
   } finally {
     await (control as ManagedWorkerControlServer | null)?.close();
