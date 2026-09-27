@@ -3,7 +3,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { classifyNativeQueueState, type QueueEntryIdentity } from './native-queue-state.js';
 import type { JsonObject } from './homogeneous-queue-policy.js';
-import type { NativeStockQueueJournal } from './native-stock-queue-journal.js';
+import type { NativeStockQueueJournal, PositiveReconciliationProof, StockQueueOperation } from './native-stock-queue-journal.js';
 
 export interface StockAdmissionQualification {
   readonly taskId: string;
@@ -253,7 +253,13 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
     try {
       await this.task(() => {
         this.journal.markAccepted({ opId: flight.opId,
-          fingerprint: flight.fingerprint, stockId: queued.id });
+          fingerprint: flight.fingerprint, stockId: queued.id,
+          input: queued.input, sourceGeneration: this.journal.sourceGeneration,
+          clientUserMessageId: queued.clientUserMessageId, threadId: this.taskId,
+          assertSourceCurrent: () => {
+            this.ownerCurrent();
+            return true;
+          } });
         if (this.inFlight === flight) this.inFlight = null;
       });
       // Publisher has its own serial writer. Failure leaves durable outbox;
@@ -281,6 +287,44 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
       if (this.inFlight === flight) this.inFlight = null;
       flight.reject(new Error('stock outcome and unknown-intent persistence need review', { cause: persistError }));
     }
+  }
+
+  // The adapter must collect authoritative same-generation proof, never infer
+  // acceptance from queue absence. This seam performs no dispatch or retry.
+  async reconcileOutcome({ opId, readProof, assertProofCurrent }: {
+    opId: string;
+    readProof: (operation: StockQueueOperation) => Promise<PositiveReconciliationProof | null>;
+    assertProofCurrent: (proof: PositiveReconciliationProof) => boolean;
+  }): Promise<{ reconciled: boolean }> {
+    if (!nonempty(opId) || typeof readProof !== 'function' || typeof assertProofCurrent !== 'function') {
+      fail('reconciliation dependencies required');
+    }
+    const result = await this.task(async () => {
+      // Do not compete with a still-live RPC. Once it settles, its durable
+      // unknown/reserved record can be recovered without running it twice.
+      if (this.inFlight) fail('stock add still in flight');
+      await this.ownerConfirmed();
+      this.ownerCurrent();
+      const version = this.journal.readTask().version;
+      const op = this.journal.readOperation(opId) ?? fail('reconciliation operation absent');
+      const observed = await readProof(op);
+      this.ownerCurrent();
+      if (observed === null) return { reconciled: false };
+      const proof = clone(observed);
+      if (proof.clientUserMessageId !== opId) fail('reconciliation operation differs');
+      this.journal.reconcilePositive({ expectedVersion: version, proof,
+        assertSourceCurrent: () => {
+          this.ownerCurrent();
+          return assertProofCurrent(proof) === true;
+        } });
+      return { reconciled: true };
+    });
+    // Publication has its own writer and durable retry checkpoint. Never wait
+    // for it while holding the task gate used by publication acknowledgments.
+    if (result.reconciled) {
+      try { await this.publishLatest(); } catch { /* accepted proof stays durable */ }
+    }
+    return result;
   }
 
   async consumeUserMessage({ taskId, ownerEpoch, clientId, turnId, authoritative,

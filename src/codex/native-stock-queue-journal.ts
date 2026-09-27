@@ -5,6 +5,7 @@
 import DatabaseConstructor, { type Database, type Statement } from 'better-sqlite3';
 import type { JsonValue, JsonObject } from './homogeneous-queue-policy.js';
 import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export interface StockQueueOperation {
@@ -14,7 +15,7 @@ export interface StockQueueOperation {
   phase: 'reserved' | 'accepted' | 'unknown'; stockId: string | null;
   acceptedTurnId: string | null; consumed: boolean;
 }
-interface TaskRow { task_id: string; owner_epoch: string; version: number; settings_json: string | null;
+interface TaskRow { task_id: string; owner_epoch: string; source_generation: string; version: number; settings_json: string | null;
   publication_version: number; publication_acked_version: number }
 interface OpRow { task_id: string; op_id: string; seq: number; fingerprint: string;
   native_entry_json: string; admission_evidence_json: string;
@@ -22,7 +23,7 @@ interface OpRow { task_id: string; op_id: string; seq: number; fingerprint: stri
   phase: StockQueueOperation['phase']; stock_id: string | null;
   accepted_turn_id: string | null; consumed: number }
 type IdentityRow = Pick<OpRow, 'op_id' | 'seq' | 'fingerprint' | 'phase' | 'consumed'>;
-interface TaskView { taskId: string; ownerEpoch: string; version: number;
+interface TaskView { taskId: string; ownerEpoch: string; sourceGeneration: string; version: number;
   effectiveSettings: JsonObject | null; publicationVersion: number; publicationAckedVersion: number }
 export interface Page<T> { taskVersion: number; items: T[]; hasMore: boolean; nextCursor: number }
 type InputIdentity = { id: string; seq: number; fingerprint: string;
@@ -35,6 +36,19 @@ export interface StockQueueIntent { expectedVersion: number; opId: string; finge
   nativeEntry: JsonObject; effectiveSettings: JsonObject; admissionEvidence: JsonObject;
   stockInput: readonly JsonValue[];
   forwardedUpstream: JsonObject }
+interface PositiveProofBase {
+  readonly taskId: string; readonly ownerEpoch: string; readonly sourceGeneration: string;
+  readonly sourceRevision: number; readonly complete: true; readonly clientUserMessageId: string;
+  readonly input: readonly JsonValue[]; readonly admissionEvidence: JsonObject;
+  readonly effectiveSettings: JsonObject;
+}
+export type PositiveReconciliationProof =
+  | (PositiveProofBase & { readonly kind: 'queued'; readonly stockId: string })
+  | (PositiveProofBase & { readonly kind: 'started'; readonly turnId: string });
+export type ReconciliationEvidence =
+  | { readonly kind: 'queued' | 'started'; readonly proof: PositiveReconciliationProof }
+  | { readonly kind: 'late-stock'; readonly proof: { readonly sourceGeneration: string;
+      readonly stockId: string; readonly inputHash: string } };
 
 const fail = (reason: string): never => { throw new Error(`Native repeated stock journal refused: ${reason}`); };
 const plain = (value: unknown): value is JsonObject => value !== null && typeof value === 'object' &&
@@ -43,6 +57,8 @@ const nonempty = (value: unknown): value is string => typeof value === 'string' 
 const fingerprint = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
 const copy = <T>(value: T): T => structuredClone(value);
 const maxPageSize = 500;
+const hashJson = (value: readonly JsonValue[]): string =>
+  createHash('sha256').update(json(value)).digest('hex');
 
 function json(value: unknown): string {
   let encoded: string | undefined;
@@ -57,12 +73,12 @@ function pageArgs(afterSeq: number, limit: number): void {
     fail(`page cursor and limit 1..${maxPageSize} required`);
   }
 }
-const taskView = (row: TaskRow | undefined, taskId: string, ownerEpoch: string): TaskView => row ? {
-  taskId, ownerEpoch, version: row.version,
+const taskView = (row: TaskRow | undefined, taskId: string, ownerEpoch: string, sourceGeneration: string): TaskView => row ? {
+  taskId, ownerEpoch, sourceGeneration, version: row.version,
   effectiveSettings: row.settings_json === null ? null : JSON.parse(row.settings_json) as JsonObject,
   publicationVersion: row.publication_version,
   publicationAckedVersion: row.publication_acked_version,
-} : { taskId, ownerEpoch, version: 0, effectiveSettings: null,
+} : { taskId, ownerEpoch, sourceGeneration, version: 0, effectiveSettings: null,
   publicationVersion: 0, publicationAckedVersion: 0 };
 const opView = (row: OpRow, effectiveSettings: JsonObject | null): StockQueueOperation => ({
   opId: row.op_id, seq: row.seq, fingerprint: row.fingerprint,
@@ -77,6 +93,7 @@ export class NativeStockQueueJournal {
   private readonly db: Database;
   readonly taskId: string;
   readonly ownerEpoch: string;
+  readonly sourceGeneration: string;
   private txKind: 'read' | 'write' | null = null;
   private readonly selectTask: Statement<[string], TaskRow>;
   private readonly selectOp: Statement<[string, string], OpRow>;
@@ -86,7 +103,7 @@ export class NativeStockQueueJournal {
   private readonly selectPage: Statement<[string, number, number, number], OpRow>;
   private readonly selectPublicationPage: Statement<[string, number, number], OpRow>;
   private readonly selectAll: Statement<[string], OpRow>;
-  private readonly insertTask: Statement<[string, string, number, string, number, number]>;
+  private readonly insertTask: Statement<[string, string, string, number, string, number, number]>;
   private readonly bumpTask: Statement<[string, number]>;
   private readonly bumpPublication: Statement<[string, number]>;
   private readonly insertOp: Statement<[string, string, number, string, string, string, string, string,
@@ -95,14 +112,26 @@ export class NativeStockQueueJournal {
   private readonly unknownOp: Statement<[string, string]>;
   private readonly consumeOp: Statement<[string, string, string]>;
   private readonly ackPublication: Statement<[number, string, number, number]>;
+  private readonly insertEvidence: Statement<[string, string, ReconciliationEvidence['kind'], string]>;
+  private readonly selectEvidence: Statement<[string, string], { kind: ReconciliationEvidence['kind']; proof_json: string }>;
+  private readonly acceptReconciled: Statement<[string | null, string | null, number, string, string]>;
+  private readonly fillLateStock: Statement<[string, string, string]>;
 
-  constructor({ filePath, taskId, ownerEpoch }: { filePath: string; taskId: string; ownerEpoch: string }) {
+  constructor({ filePath, taskId, ownerEpoch, sourceGeneration }: {
+    filePath: string; taskId: string; ownerEpoch: string; sourceGeneration: string }) {
     if (!nonempty(filePath) || !path.isAbsolute(filePath) ||
-        !nonempty(taskId) || !nonempty(ownerEpoch)) fail('absolute path, task, owner epoch required');
+        !nonempty(taskId) || !nonempty(ownerEpoch) || !nonempty(sourceGeneration)) {
+      fail('absolute path, task, owner epoch, source generation required');
+    }
     this.taskId = taskId;
     this.ownerEpoch = ownerEpoch;
+    this.sourceGeneration = sourceGeneration;
     this.db = new DatabaseConstructor(filePath);
     try {
+      const oldSchema = this.db.prepare<[], { name: string }>(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='native_repeated_op'").get();
+      const version = this.db.pragma('user_version', { simple: true }) as number;
+      if (oldSchema && version !== 2) fail('outcome-v2 requires new database; explicit migration required');
       this.db.pragma('journal_mode = WAL');
       this.db.pragma('synchronous = FULL');
       this.db.pragma('busy_timeout = 5000');
@@ -110,6 +139,7 @@ export class NativeStockQueueJournal {
       this.db.exec(`CREATE TABLE IF NOT EXISTS native_repeated_task (
         task_id TEXT PRIMARY KEY NOT NULL,
         owner_epoch TEXT NOT NULL,
+        source_generation TEXT NOT NULL,
         version INTEGER NOT NULL,
         settings_json TEXT,
         publication_version INTEGER NOT NULL,
@@ -135,10 +165,23 @@ export class NativeStockQueueJournal {
       CREATE INDEX IF NOT EXISTS native_repeated_pending_idx ON native_repeated_op(task_id,consumed,seq);
       CREATE INDEX IF NOT EXISTS native_repeated_phase_idx ON native_repeated_op(task_id,phase);
       CREATE UNIQUE INDEX IF NOT EXISTS native_repeated_stock_idx ON native_repeated_op(task_id,stock_id) WHERE stock_id IS NOT NULL;`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS native_stock_reconciliation_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        op_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('queued','started','late-stock')),
+        proof_json TEXT NOT NULL,
+        FOREIGN KEY(task_id,op_id) REFERENCES native_repeated_op(task_id,op_id)
+      );
+      CREATE INDEX IF NOT EXISTS native_stock_reconciliation_by_op
+        ON native_stock_reconciliation_evidence(task_id,op_id,id);`);
       const columns = this.db.pragma('table_info(native_repeated_op)') as { name: string }[];
-      if (!columns.some(row => row.name === 'admission_evidence_json')) {
+      const taskColumns = this.db.pragma('table_info(native_repeated_task)') as { name: string }[];
+      if (!columns.some(row => row.name === 'admission_evidence_json') ||
+          !taskColumns.some(row => row.name === 'source_generation')) {
         fail('incompatible journal schema; explicit migration required');
       }
+      this.db.pragma('user_version = 2');
       this.selectTask = this.db.prepare<[string], TaskRow>('SELECT * FROM native_repeated_task WHERE task_id=?');
       this.selectOp = this.db.prepare<[string, string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND op_id=?');
       this.selectIdentity = this.db.prepare<[string, string], IdentityRow>('SELECT op_id,seq,fingerprint,phase,consumed FROM native_repeated_op WHERE task_id=? AND op_id=?');
@@ -147,7 +190,7 @@ export class NativeStockQueueJournal {
       this.selectPage = this.db.prepare<[string, number, number, number], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND consumed=? AND seq>? ORDER BY seq LIMIT ?');
       this.selectPublicationPage = this.db.prepare<[string, number, number], OpRow>("SELECT * FROM native_repeated_op WHERE task_id=? AND phase='accepted' AND consumed=0 AND seq>? ORDER BY seq LIMIT ?");
       this.selectAll = this.db.prepare<[string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? ORDER BY seq');
-      this.insertTask = this.db.prepare<[string, string, number, string, number, number]>('INSERT INTO native_repeated_task VALUES(?,?,?,?,?,?)');
+      this.insertTask = this.db.prepare<[string, string, string, number, string, number, number]>('INSERT INTO native_repeated_task VALUES(?,?,?,?,?,?,?)');
       this.bumpTask = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1 WHERE task_id=? AND version=?');
       this.bumpPublication = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1,publication_version=publication_version+1 WHERE task_id=? AND version=?');
       this.insertOp = this.db.prepare<[string, string, number, string, string, string, string, string,
@@ -156,15 +199,24 @@ export class NativeStockQueueJournal {
       this.unknownOp = this.db.prepare<[string, string]>("UPDATE native_repeated_op SET phase='unknown' WHERE task_id=? AND op_id=? AND phase='reserved'");
       this.consumeOp = this.db.prepare<[string, string, string]>('UPDATE native_repeated_op SET accepted_turn_id=?,consumed=1 WHERE task_id=? AND op_id=? AND accepted_turn_id IS NULL');
       this.ackPublication = this.db.prepare<[number, string, number, number]>('UPDATE native_repeated_task SET publication_acked_version=?,version=version+1 WHERE task_id=? AND version=? AND publication_version=?');
+      this.insertEvidence = this.db.prepare<[string, string, ReconciliationEvidence['kind'], string]>(
+        'INSERT INTO native_stock_reconciliation_evidence(task_id,op_id,kind,proof_json) VALUES(?,?,?,?)');
+      this.selectEvidence = this.db.prepare<[string, string], { kind: ReconciliationEvidence['kind']; proof_json: string }>(
+        'SELECT kind,proof_json FROM native_stock_reconciliation_evidence WHERE task_id=? AND op_id=? ORDER BY id');
+      this.acceptReconciled = this.db.prepare<[string | null, string | null, number, string, string]>(
+        "UPDATE native_repeated_op SET phase='accepted',stock_id=?,accepted_turn_id=?,consumed=? WHERE task_id=? AND op_id=? AND phase IN ('reserved','unknown')");
+      this.fillLateStock = this.db.prepare<[string, string, string]>(
+        "UPDATE native_repeated_op SET stock_id=? WHERE task_id=? AND op_id=? AND phase='accepted' AND stock_id IS NULL AND consumed=1");
     } catch (error) { this.db.close(); throw error; }
   }
 
   taskRow(): TaskRow | undefined {
     const row = this.selectTask.get(this.taskId);
     if (row && row.owner_epoch !== this.ownerEpoch) fail('owner epoch mismatch');
+    if (row && row.source_generation !== this.sourceGeneration) fail('source generation mismatch');
     return row;
   }
-  readTask(): TaskView { return taskView(this.taskRow(), this.taskId, this.ownerEpoch); }
+  readTask(): TaskView { return taskView(this.taskRow(), this.taskId, this.ownerEpoch, this.sourceGeneration); }
   readOperation(opId: string): StockQueueOperation | null {
     if (!nonempty(opId)) fail('operation ID required');
     return this.snapshot(() => {
@@ -311,7 +363,7 @@ export class NativeStockQueueJournal {
       if (row?.settings_json !== null && row?.settings_json !== undefined &&
           !isDeepStrictEqual(JSON.parse(row.settings_json), effectiveSettings)) fail('effective settings changed');
       if (!row) {
-        this.insertTask.run(this.taskId, this.ownerEpoch, 0, settingsJson, 0, 0);
+        this.insertTask.run(this.taskId, this.ownerEpoch, this.sourceGeneration, 0, settingsJson, 0, 0);
         row = this.taskRow();
       } else if (row.settings_json === null) fail('missing immutable settings');
       const seq = this.selectNextSeq.get(this.taskId)?.next_seq ?? fail('next sequence absent');
@@ -322,7 +374,11 @@ export class NativeStockQueueJournal {
     });
   }
 
-  markAccepted({ opId, fingerprint: hash, stockId }: { opId: string; fingerprint: string; stockId: string }): StockQueueOperation {
+  markAccepted({ opId, fingerprint: hash, stockId, input, sourceGeneration,
+    clientUserMessageId, threadId, assertSourceCurrent }: {
+    opId: string; fingerprint: string; stockId: string; input?: readonly JsonValue[];
+    sourceGeneration?: string; clientUserMessageId?: string; threadId?: string;
+    assertSourceCurrent?: () => boolean }): StockQueueOperation {
     if (!nonempty(opId) || !fingerprint(hash) || !nonempty(stockId)) fail('accepted receipt incomplete');
     return this.transaction(() => {
       const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
@@ -330,6 +386,21 @@ export class NativeStockQueueJournal {
       if (op.fingerprint !== hash) return fail('operation identity conflict');
       if (op.phase === 'unknown') fail('unknown requires explicit authoritative reconciliation');
       if (op.phase === 'accepted') {
+        if (op.stock_id === null && op.consumed === 1) {
+          if (sourceGeneration !== this.sourceGeneration ||
+              clientUserMessageId !== opId || threadId !== this.taskId ||
+              typeof assertSourceCurrent !== 'function' || assertSourceCurrent() !== true ||
+              !Array.isArray(input) ||
+              !isDeepStrictEqual(input, JSON.parse(op.stock_input_json))) {
+            fail('late stock receipt lacks exact source and input proof');
+          }
+          if (this.fillLateStock.run(stockId, this.taskId, opId).changes !== 1) fail('late stock receipt conflict');
+          this.insertEvidence.run(this.taskId, opId, 'late-stock', json({
+            sourceGeneration: this.sourceGeneration, stockId, inputHash: hashJson(input as JsonValue[]),
+          }));
+          this.bump(task, false); // Consumed entries never reappear in the native publication.
+          return this.readOperation(opId) ?? fail('accepted operation absent');
+        }
         if (op.stock_id !== stockId) fail('stock receipt conflict');
         return this.readOperation(opId) ?? fail('accepted operation absent');
       }
@@ -337,6 +408,71 @@ export class NativeStockQueueJournal {
       if (changed.changes !== 1) fail('accepted phase conflict');
       this.bump(task, true); // Emits [] too when authoritative consume preceded the ACK.
       return this.readOperation(opId) ?? fail('accepted operation absent');
+    });
+  }
+
+  reconciliationEvidence(opId: string): ReconciliationEvidence[] {
+    if (!nonempty(opId)) fail('operation ID required');
+    return this.snapshot(() => {
+      this.taskRow(); // Even evidence reads must match both owner epoch and source generation.
+      return this.selectEvidence.all(this.taskId, opId).map(row => ({
+        kind: row.kind, proof: JSON.parse(row.proof_json) as ReconciliationEvidence['proof'],
+      })) as ReconciliationEvidence[];
+    });
+  }
+
+  reconcilePositive({ expectedVersion, proof, assertSourceCurrent }: {
+    expectedVersion: number; proof: PositiveReconciliationProof; assertSourceCurrent: () => boolean
+  }): StockQueueOperation {
+    const expectedKeys = proof?.kind === 'queued'
+      ? ['admissionEvidence','clientUserMessageId','complete','effectiveSettings','input','kind',
+        'ownerEpoch','sourceGeneration','sourceRevision','stockId','taskId']
+      : ['admissionEvidence','clientUserMessageId','complete','effectiveSettings','input','kind',
+        'ownerEpoch','sourceGeneration','sourceRevision','taskId','turnId'];
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 ||
+        !plain(proof) || (proof.kind !== 'queued' && proof.kind !== 'started') ||
+        Reflect.ownKeys(proof).some(key => typeof key !== 'string') ||
+        Object.keys(proof).sort().join('|') !== expectedKeys.sort().join('|') ||
+        proof.taskId !== this.taskId || proof.ownerEpoch !== this.ownerEpoch ||
+        proof.sourceGeneration !== this.sourceGeneration || proof.complete !== true ||
+        !Number.isSafeInteger(proof.sourceRevision) || proof.sourceRevision < 0 ||
+        !nonempty(proof.clientUserMessageId) || !Array.isArray(proof.input) ||
+        !plain(proof.admissionEvidence) || !plain(proof.effectiveSettings) ||
+        typeof assertSourceCurrent !== 'function' ||
+        (proof.kind === 'queued' && !nonempty(proof.stockId)) ||
+        (proof.kind === 'started' && !nonempty(proof.turnId))) {
+      fail('incomplete positive reconciliation proof');
+    }
+    const proofJson = json(proof);
+    return this.transaction(() => {
+      if (assertSourceCurrent() !== true) fail('reconciliation source changed');
+      const task = this.taskRow();
+      const op = this.selectOp.get(this.taskId, proof.clientUserMessageId);
+      if (!task || !op) return fail('reconciliation operation absent');
+      if (task.version !== expectedVersion) fail('stale reconciliation version');
+      if (!isDeepStrictEqual(proof.input, JSON.parse(op.stock_input_json)) ||
+          !isDeepStrictEqual(proof.admissionEvidence, JSON.parse(op.admission_evidence_json)) ||
+          !isDeepStrictEqual(proof.effectiveSettings, JSON.parse(task.settings_json ?? 'null'))) {
+        fail('reconciliation intent, settings or input conflict');
+      }
+      const stockId = proof.kind === 'queued' ? proof.stockId : op.stock_id;
+      const turnId = proof.kind === 'started' ? proof.turnId : op.accepted_turn_id;
+      const consumed = proof.kind === 'started' ? 1 : op.consumed;
+      if (op.stock_id !== null && stockId !== null && op.stock_id !== stockId) fail('stock ID conflict');
+      if (op.accepted_turn_id !== null && turnId !== null && op.accepted_turn_id !== turnId) {
+        fail('turn ID conflict');
+      }
+      if (op.phase === 'accepted') {
+        const seen = this.selectEvidence.all(this.taskId, op.op_id).some(row =>
+          row.kind === proof.kind && isDeepStrictEqual(JSON.parse(row.proof_json), proof));
+        if (!seen) fail('already accepted with different reconciliation proof');
+        return this.readOperation(op.op_id) ?? fail('accepted operation absent');
+      }
+      const changed = this.acceptReconciled.run(stockId, turnId, consumed, this.taskId, op.op_id);
+      if (changed.changes !== 1) fail('reconciliation phase conflict');
+      this.insertEvidence.run(this.taskId, op.op_id, proof.kind, proofJson);
+      this.bump(task, true); // Includes an empty publication for an already started turn.
+      return this.readOperation(op.op_id) ?? fail('reconciled operation absent');
     });
   }
 

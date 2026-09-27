@@ -5,7 +5,7 @@ import { mkdtemp } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import DatabaseConstructor from 'better-sqlite3';
-import { NativeStockQueueJournal, type StockQueueIntent } from '../src/codex/native-stock-queue-journal.js';
+import { NativeStockQueueJournal, type StockQueueIntent, type PositiveReconciliationProof } from '../src/codex/native-stock-queue-journal.js';
 
 const taskId = 'public-repeat-task', ownerEpoch = 'public-owner-epoch';
 const filename = async () => path.join(await mkdtemp(path.join(os.tmpdir(), 'vkodex-native-stock-journal-')), `${randomUUID()}.sqlite`);
@@ -17,7 +17,143 @@ const intent = (id: string, expectedVersion: number, extras: Partial<StockQueueI
   effectiveSettings: settings(), admissionEvidence: { taskId, ownerEpoch, initializationReceipt: `receipt-${id}` },
   stockInput: [{ type: 'text', text: `PUBLIC_${id}\n`, text_elements: [] }],
   forwardedUpstream: { turnTrigger: false, responsesapiClientMetadata: false }, ...extras });
-const open = async (filePath?: string) => new NativeStockQueueJournal({ filePath: filePath ?? await filename(), taskId, ownerEpoch });
+const open = async (filePath?: string) => new NativeStockQueueJournal({ filePath: filePath ?? await filename(), taskId, ownerEpoch, sourceGeneration: 'source-1' });
+const proof = (id: string, kind: 'queued' | 'started'): PositiveReconciliationProof => {
+  const request = intent(id, 0);
+  const base = { taskId, ownerEpoch, sourceGeneration: 'source-1', sourceRevision: 3,
+    complete: true as const, clientUserMessageId: id, input: request.stockInput,
+    admissionEvidence: request.admissionEvidence, effectiveSettings: request.effectiveSettings };
+  return kind === 'queued' ? { ...base, kind, stockId: `stock-${id}` } :
+    { ...base, kind, turnId: `turn-${id}` };
+};
+
+test('positive queued proof unfreezes exact unknown intent and remains append-only after reopen', async () => {
+  const filePath = await filename(); const j = await open(filePath);
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  assert.throws(() => j.reserve(intent('B', j.read().version)), /unknown outcome freezes/);
+  const queued = proof('A', 'queued');
+  assert.equal(j.reconcilePositive({ expectedVersion: j.read().version, proof: queued,
+    assertSourceCurrent: () => true }).stockId, 'stock-A');
+  assert.deepEqual(j.reconciliationEvidence('A'), [{ kind: 'queued', proof: queued }]);
+  assert.deepEqual(j.publication()!.pendingIds, ['A']);
+  j.close();
+  const reopened = await open(filePath);
+  assert.deepEqual(reopened.reconciliationEvidence('A'), [{ kind: 'queued', proof: queued }]);
+  const version = reopened.read().version;
+  reopened.reconcilePositive({ expectedVersion: version, proof: queued, assertSourceCurrent: () => true });
+  assert.equal(reopened.read().version, version);
+  reopened.reserve(intent('B', version));
+  reopened.close();
+});
+
+test('started proof consumes unknown intent without inventing stock ID; exact late ACK fills it once', async () => {
+  const filePath = await filename(); const j = await open(filePath);
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  const started = proof('A', 'started');
+  const op = j.reconcilePositive({ expectedVersion: j.read().version, proof: started,
+    assertSourceCurrent: () => true });
+  assert.equal(op.stockId, null);
+  assert.equal(op.acceptedTurnId, 'turn-A');
+  assert.equal(op.consumed, true);
+  assert.deepEqual(j.publication()!.pendingIds, []);
+  const version = j.read().version;
+  assert.throws(() => j.markAccepted({ opId: 'A', fingerprint: fp('A'), stockId: 'stock-A' }),
+    /late stock receipt lacks exact/);
+  assert.equal(j.read().version, version);
+  const late = { opId: 'A', fingerprint: fp('A'), stockId: 'stock-A',
+    input: intent('A', 0).stockInput, sourceGeneration: 'source-1',
+    clientUserMessageId: 'A', threadId: taskId, assertSourceCurrent: () => true };
+  j.markAccepted(late);
+  assert.equal(j.readOperation('A')!.stockId, 'stock-A');
+  assert.deepEqual(j.reconciliationEvidence('A').map(e => e.kind), ['started', 'late-stock']);
+  assert.equal(j.read().publicationVersion, 1); // Late fill does not republish.
+  j.close();
+  const reopened = await open(filePath);
+  assert.equal(reopened.readOperation('A')!.stockId, 'stock-A');
+  assert.equal(reopened.reconciliationEvidence('A').length, 2);
+  reopened.close();
+});
+
+test('reconciliation refuses wrong scope, input, settings, incomplete or stale source without writes', async () => {
+  const filePath = await filename(); const j = await open(filePath);
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  const version = j.read().version; const queued = proof('A', 'queued');
+  const attempt = (candidate: PositiveReconciliationProof, current = () => true) =>
+    j.reconcilePositive({ expectedVersion: version, proof: candidate, assertSourceCurrent: current });
+  assert.throws(() => attempt({ ...queued, sourceGeneration: 'other' }), /incomplete positive/);
+  assert.throws(() => attempt({ ...queued, input: [] }), /intent, settings or input conflict/);
+  assert.throws(() => attempt({ ...queued, effectiveSettings: { model: 'other' } }), /intent, settings or input conflict/);
+  assert.throws(() => attempt({ ...queued, complete: false } as unknown as PositiveReconciliationProof), /incomplete positive/);
+  assert.throws(() => attempt(queued, () => false), /source changed/);
+  assert.equal(j.read().version, version);
+  assert.deepEqual(j.reconciliationEvidence('A'), []);
+  j.close();
+  const wrong = new NativeStockQueueJournal({ filePath, taskId, ownerEpoch, sourceGeneration: 'other' });
+  assert.throws(() => wrong.reconciliationEvidence('A'), /source generation mismatch/);
+  assert.throws(() => wrong.readOperation('A'), /source generation mismatch/);
+  wrong.close();
+});
+
+test('positive proof cannot use absence as acceptance or overwrite known stock and turn IDs', async () => {
+  const j = await open();
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  const version = j.read().version;
+  const queued = proof('A', 'queued');
+  if (queued.kind !== 'queued') throw new Error('queued fixture expected');
+  assert.throws(() => j.reconcilePositive({ expectedVersion: version,
+    proof: { ...queued, stockId: '' }, assertSourceCurrent: () => true }), /incomplete positive/);
+  assert.equal(j.read().version, version);
+  j.consume({ opId: 'A', fingerprint: fp('A'), turnId: 'known-turn', authoritative: true });
+  assert.throws(() => j.reconcilePositive({ expectedVersion: j.read().version,
+    proof: proof('A', 'started'), assertSourceCurrent: () => true }), /turn ID conflict/);
+  assert.deepEqual(j.reconciliationEvidence('A'), []);
+  j.close();
+});
+
+test('queued proof after authoritative consume keeps tombstone and permits exactly one next ID', async () => {
+  const j = await open();
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  j.consume({ opId: 'A', fingerprint: fp('A'), turnId: 'turn-A', authoritative: true });
+  const accepted = j.reconcilePositive({ expectedVersion: j.readTask().version,
+    proof: proof('A', 'queued'), assertSourceCurrent: () => true });
+  assert.equal(accepted.consumed, true);
+  assert.equal(accepted.acceptedTurnId, 'turn-A');
+  assert.deepEqual(j.publication()!.pendingIds, []);
+  j.reserve(intent('B', j.readTask().version));
+  assert.throws(() => j.reserve(intent('B', j.readTask().version)), /reused immutable/);
+  j.close();
+});
+
+test('colliding stock ID rolls back reconciliation operation and its evidence', async () => {
+  const j = await open();
+  j.reserve(intent('B', 0));
+  j.markAccepted({ opId: 'B', fingerprint: fp('B'), stockId: 'stock-A' });
+  j.reserve(intent('A', j.readTask().version));
+  j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  const version = j.readTask().version;
+  assert.throws(() => j.reconcilePositive({ expectedVersion: version, proof: proof('A', 'queued'),
+    assertSourceCurrent: () => true }), /UNIQUE|constraint/u);
+  assert.equal(j.readTask().version, version);
+  assert.equal(j.readOperation('A')!.phase, 'unknown');
+  assert.deepEqual(j.reconciliationEvidence('A'), []);
+  j.close();
+});
+
+test('proof exact keyset and owner-scoped evidence reject extras and wrong epoch', async () => {
+  const filePath = await filename(); const j = await open(filePath);
+  j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  const version = j.readTask().version;
+  const extra = { ...proof('A', 'queued'), unexpected: 'must not persist' };
+  assert.throws(() => j.reconcilePositive({ expectedVersion: version, proof: extra,
+    assertSourceCurrent: () => true }), /incomplete positive/);
+  assert.equal(j.readTask().version, version);
+  assert.deepEqual(j.reconciliationEvidence('A'), []);
+  j.close();
+  const wrong = new NativeStockQueueJournal({ filePath, taskId, ownerEpoch: 'wrong',
+    sourceGeneration: 'source-1' });
+  assert.throws(() => wrong.reconciliationEvidence('A'), /owner epoch mismatch/);
+  wrong.close();
+});
 
 test('atomic expected-version reserve admits one racer and preserves immutable ID after reopen', async () => {
   const filePath = await filename(); const a = await open(filePath); const b = await open(filePath);
@@ -53,8 +189,14 @@ test('old journal schema is refused without an implicit migration', async () => 
   const filePath = await filename();
   const old = new DatabaseConstructor(filePath);
   old.exec('CREATE TABLE native_repeated_op(task_id TEXT,op_id TEXT,seq INTEGER,consumed INTEGER,phase TEXT,stock_id TEXT)');
+  old.prepare('INSERT INTO native_repeated_op VALUES(?,?,?,?,?,?)').run(taskId, 'old-operation', 1, 0, 'unknown', null);
   old.close();
-  assert.throws(() => new NativeStockQueueJournal({ filePath, taskId, ownerEpoch }), /incompatible journal schema/);
+  assert.throws(() => new NativeStockQueueJournal({ filePath, taskId, ownerEpoch, sourceGeneration: 'source-1' }), /outcome-v2 requires new database/);
+  const reopened = new DatabaseConstructor(filePath, { readonly: true });
+  assert.deepEqual(reopened.prepare('SELECT op_id,phase FROM native_repeated_op').get(),
+    { op_id: 'old-operation', phase: 'unknown' });
+  assert.equal(reopened.pragma('user_version', { simple: true }), 0);
+  reopened.close();
 });
 
 test('one unresolved stock add blocks a second reservation even with fresh version', async () => {
@@ -327,7 +469,7 @@ test('owner epoch is bound to durable task, and nonauthoritative consume leaves 
   assert.throws(() => j.consume({ opId: 'A', fingerprint: fp('A'), turnId: 'turn-A', authoritative: false }),
     /authoritative/);
   assert.equal(j.read().version, version); j.close();
-  const wrong = new NativeStockQueueJournal({ filePath, taskId, ownerEpoch: 'other-owner' });
+  const wrong = new NativeStockQueueJournal({ filePath, taskId, ownerEpoch: 'other-owner', sourceGeneration: 'source-1' });
   assert.throws(() => wrong.read(), /owner epoch mismatch/);
   assert.throws(() => wrong.reserve(intent('B', version)), /owner epoch mismatch/);
   wrong.close();

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
+import { NativeStockQueueJournal, type PositiveReconciliationProof } from '../src/codex/native-stock-queue-journal.js';
 import { NativeStockAdmission, type StockAdmissionQualification } from '../src/codex/native-stock-admission.js';
 import type { JsonObject } from '../src/codex/homogeneous-queue-policy.js';
 import { prepareNativeStockTextEntry, type NativeStockTextQualification } from '../src/codex/native-stock-text-entry.js';
@@ -42,7 +42,7 @@ async function fixture(t: TestContext, options: {
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'vkodex-stock-admission-'));
   const taskId = randomUUID(), ownerEpoch = randomUUID();
-  const journal = new NativeStockQueueJournal({ filePath: path.join(directory, 'journal.sqlite'), taskId, ownerEpoch });
+  const journal = new NativeStockQueueJournal({ filePath: path.join(directory, 'journal.sqlite'), taskId, ownerEpoch, sourceGeneration: 'source-1' });
   t.after(() => journal.close());
   const adds: Request[] = [], publications: Publication[] = [];
   let owner = true, source = true, dispatch = true, currentSettings = {
@@ -128,6 +128,72 @@ test('unknown queue outcome freezes replay and later append without retry', asyn
   assert.equal(f.journal.readOperation('A')?.phase, 'unknown');
   await assert.rejects(f.coordinator.acceptFullState({ state: [a] }), /unresolved/);
   await assert.rejects(f.coordinator.acceptFullState({ state: [a, entry('B')] }), /unresolved|unknown/);
+  assert.equal(f.adds.length, 1);
+});
+
+test('lost response reconciles from positive read without replay and admits next input once', async t => {
+  let lost = true;
+  const f = await fixture(t, { queueAdd: async request => {
+    if (lost) { lost = false; throw new Error('lost response'); }
+    return { queuedSubmission: { id: `stock-${request.clientUserMessageId}`,
+      clientUserMessageId: request.clientUserMessageId, input: request.input } };
+  } });
+  await assert.rejects(f.coordinator.acceptFullState({ state: [entry('A')] }), /outcome unknown/);
+  const readProof = async (op: NonNullable<ReturnType<NativeStockQueueJournal['readOperation']>>): Promise<PositiveReconciliationProof> => ({
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, sourceGeneration: 'source-1', sourceRevision: 10,
+    complete: true, kind: 'started', turnId: 'turn-A', clientUserMessageId: op.opId,
+    input: op.stockInput, effectiveSettings: op.effectiveSettings, admissionEvidence: op.admissionEvidence,
+  });
+  assert.deepEqual(await f.coordinator.reconcileOutcome({ opId: 'A', readProof,
+    assertProofCurrent: () => true }), { reconciled: true });
+  await f.coordinator.publishLatest();
+  assert.deepEqual(f.publications.map(p => p.ids), [[]]);
+  await f.coordinator.acceptFullState({ state: [entry('A')] });
+  await f.coordinator.acceptFullState({ state: [entry('A'), entry('B')] });
+  assert.deepEqual(f.adds.map(r => r.clientUserMessageId), ['A', 'B']);
+});
+
+test('reconciliation absence or source loss during awaited read cannot unfreeze unknown input', async t => {
+  const f = await fixture(t, { queueAdd: async () => { throw new Error('lost response'); } });
+  await assert.rejects(f.coordinator.acceptFullState({ state: [entry('A')] }), /outcome unknown/);
+  assert.deepEqual(await f.coordinator.reconcileOutcome({ opId: 'A', readProof: async () => null,
+    assertProofCurrent: () => true }), { reconciled: false });
+  let entered = false, current = true;
+  const gate = deferred<void>();
+  const recovery = f.coordinator.reconcileOutcome({ opId: 'A', readProof: async op => {
+    entered = true; await gate.promise;
+    return { taskId: f.taskId, ownerEpoch: f.ownerEpoch, sourceGeneration: 'source-1',
+      sourceRevision: 10, complete: true, kind: 'queued', stockId: 'stock-A',
+      clientUserMessageId: op.opId, input: op.stockInput, effectiveSettings: op.effectiveSettings,
+      admissionEvidence: op.admissionEvidence };
+  }, assertProofCurrent: () => current });
+  await until(() => entered); current = false; gate.resolve();
+  await assert.rejects(recovery, /reconciliation source changed/);
+  assert.equal(f.journal.readOperation('A')!.phase, 'unknown');
+  assert.deepEqual(f.journal.reconciliationEvidence('A'), []);
+  assert.equal(f.adds.length, 1);
+});
+
+test('reconciliation will not race a live add; late ACK after started proof never republishes', async t => {
+  const pending = deferred<Receipt>(), f = await fixture(t, { queueAdd: () => pending.promise });
+  const acceptance = f.coordinator.acceptFullState({ state: [entry('A')] });
+  await until(() => f.adds.length === 1);
+  let reads = 0;
+  await assert.rejects(f.coordinator.reconcileOutcome({ opId: 'A',
+    readProof: async () => { reads++; return null; }, assertProofCurrent: () => true }), /still in flight/);
+  assert.equal(reads, 0);
+  // Simulate a persisted proof produced by recovery before the original RPC
+  // callback reaches this coordinator (e.g. after transport replacement).
+  const op = f.journal.readOperation('A')!;
+  f.journal.reconcilePositive({ expectedVersion: f.journal.readTask().version,
+    proof: { taskId: f.taskId, ownerEpoch: f.ownerEpoch, sourceGeneration: 'source-1',
+      sourceRevision: 10, complete: true, kind: 'started', turnId: 'turn-A',
+      clientUserMessageId: 'A', input: op.stockInput, effectiveSettings: op.effectiveSettings,
+      admissionEvidence: op.admissionEvidence }, assertSourceCurrent: () => true });
+  pending.resolve({ queuedSubmission: { id: 'stock-A', clientUserMessageId: 'A', input: f.adds[0]!.input } });
+  assert.deepEqual(await acceptance, { ok: true });
+  assert.equal(f.journal.readOperation('A')!.stockId, 'stock-A');
+  assert.deepEqual(f.publications.map(p => p.ids), [[]]);
   assert.equal(f.adds.length, 1);
 });
 
@@ -280,7 +346,7 @@ test('hydration after outbox ACK reads current queue then empty consumed state',
 test('synthetic Desktop-shaped entry uses the repo mapper and retains complete qualification evidence', async t => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'vkodex-stock-mapper-'));
   const taskId = randomUUID(), ownerEpoch = randomUUID(), cwd = 'C:/isolated';
-  const journal = new NativeStockQueueJournal({ filePath: path.join(directory, 'journal.sqlite'), taskId, ownerEpoch });
+  const journal = new NativeStockQueueJournal({ filePath: path.join(directory, 'journal.sqlite'), taskId, ownerEpoch, sourceGeneration: 'source-1' });
   t.after(() => journal.close());
   const settings = { cwd, runtimeWorkspaceRoots: [cwd], approvalPolicy: 'never',
     approvalsReviewer: 'user', permissions: ':danger-full-access', sandboxPolicy: { type: 'dangerFullAccess' },
