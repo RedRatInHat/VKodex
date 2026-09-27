@@ -262,8 +262,20 @@ export class ManagedWorkerDaemon {
         qualifyContinuation: fence => this.#bootstrap!.qualifyContinuation(fence),
         clientFactory: this.#options.clientFactory });
       this.#startupPhase = 'owner-starting';
-      await this.#owner.start();
-      if (this.#owner.metadata.state !== 'connected' || !ownerCurrent()) throw new Error('Native owner unavailable');
+      try { await this.#owner.start(); }
+      catch {
+        const native = this.#owner.metadata;
+        // Only a failed initial IPC connection after a qualified projection
+        // may leave the backend ready without a native follower. A bootstrap,
+        // projection, or authority failure remains fatal.
+        if (native.state !== 'disconnected' || native.startupStage !== 'connecting' ||
+          native.failure !== null) throw new Error('Native owner unavailable');
+      }
+      const hostNow = this.#host.metadata;
+      if (!['connected', 'disconnected'].includes(this.#owner.metadata.state) ||
+        hostNow.state !== 'running' || hostNow.taskId !== manifest.taskId ||
+        hostNow.backendGeneration !== this.#generation || !ownerCurrent())
+        throw new Error('Native owner unavailable');
       this.#startupPhase = 'publishing-ready';
       if (!ownerCurrent()) throw new Error('Worker owner changed before publication');
       const endpointRef = randomUUID();

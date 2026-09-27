@@ -79,12 +79,14 @@ class Backend extends EventEmitter {
 class Broker extends Duplex {
   readonly decoder = new FrameDecoder();
   readonly frames: Record<string, unknown>[] = [];
-  constructor(readonly early: Record<string, unknown> | null = null, readonly taskId = '') { super(); }
+  constructor(readonly early: Record<string, unknown> | null = null, readonly taskId = '',
+    readonly rejectInitialize = false) { super(); }
   override _read(): void {}
   override _write(chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
     for (const frame of this.decoder.push(chunk)) {
       this.frames.push(frame);
       if (frame.method === 'initialize') {
+        if (this.rejectInitialize) { queueMicrotask(() => this.destroy()); continue; }
         const reply = encodeFrame({ type: 'response', requestId: frame.requestId,
           resultType: 'success', result: { clientId: 'local-owner' } });
         if (this.early) this.push(Buffer.concat([reply, encodeFrame({ type: 'broadcast',
@@ -115,7 +117,8 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
       responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
-async function readyFixture(family: { allow: boolean; beforeReturn?: () => void } = { allow: true }, native = { enabled: false, early: false },
+async function readyFixture(family: { allow: boolean; beforeReturn?: () => void } = { allow: true },
+  native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
@@ -135,7 +138,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void 
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
     clientFactory: handler => new DesktopIpcClient(() => {
       const broker = new Broker(native.early && brokers.length === 0 ?
-        composerRequest(taskId, home, 'before-ready') : null, taskId);
+        composerRequest(taskId, home, 'before-ready') : null, taskId, native.available === false);
       brokers.push(broker); return broker;
     }, 500, { canHandle: request => handler.canHandle(request),
       handle: async (request, signal) => {
@@ -479,6 +482,57 @@ test('native broker EOF rejoins transport without another backend launch or resu
   socket.write(JSON.stringify({ id: 'stop-after-rejoin', epoch: reserved.epoch, method: 'stop' }) + '\n');
   while (!data.includes('"stopped":true')) await new Promise(resolve => setTimeout(resolve, 5));
   socket.destroy();
+});
+
+test('qualified backend publishes disconnected native gateway then reconnects same worker', async () => {
+  const native = { enabled: false, early: false, available: false };
+  const { daemon, backend, brokers, reserved, privateDirectory, registryPath, home, launches, control } =
+    await readyFixture({ allow: true }, native);
+  try {
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(daemon.metadata.nativeState, 'disconnected');
+    assert.equal(daemon.metadata.nativeStartup?.startupStage, 'connecting');
+    assert.equal(backend.exitCode, null);
+    assert.equal(backend.writes, 0);
+    assert.equal(launches, 1);
+    assert.equal(backend.methods.filter(method => method === 'thread/resume').length, 1);
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'ready'); }
+    finally { registry.close(); }
+    const status = await startupControlRequest(privateDirectory, reserved.epoch, 'headless-status', 'status');
+    assert.equal((status.result as Record<string, unknown>).nativeState, 'disconnected');
+    const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'headless-diagnose', 'diagnose-v1');
+    assert.equal((diagnosis.result as Record<string, unknown>).daemonState, 'ready');
+    assert.equal((diagnosis.result as Record<string, unknown>).ownerEpoch, reserved.epoch);
+    native.available = true;
+    const currentNativeState = () => daemon.metadata.nativeState;
+    const deadline = Date.now() + 4000;
+    while (currentNativeState() !== 'connected' && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(currentNativeState(), 'connected');
+    assert.equal(brokers.length, 2);
+    assert.equal(backend.methods.filter(method => method === 'thread/resume').length, 1);
+    assert.equal(backend.writes, 0);
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'stop-after-late-connect')).result,
+      { stopped: true });
+  } finally {
+    await (control as ManagedWorkerControlServer | null)?.close();
+    if (backend.exitCode === null) backend.stdin.end();
+  }
+});
+
+test('headless backend can be explicitly stopped while native broker remains unavailable', async () => {
+  const { daemon, backend, reserved, privateDirectory, control } = await readyFixture(
+    { allow: true }, { enabled: false, early: false, available: false });
+  try {
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(daemon.metadata.nativeState, 'disconnected');
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'stop-headless')).result,
+      { stopped: true });
+    assert.equal(daemon.metadata.state, 'stopped');
+    assert.equal(backend.exitCode, 0);
+    assert.equal(backend.writes, 0);
+  } finally { await (control as ManagedWorkerControlServer | null)?.close(); }
 });
 
 test('pre-ready start cannot write; qualified first Composer start preserves inherited environment wire', async () => {
