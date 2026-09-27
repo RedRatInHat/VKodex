@@ -189,6 +189,8 @@ test('opt-in daemon composes one backend, bootstrap, native owner, and ready reg
   const { daemon, backend, reserved, home, registryPath, privateDirectory, launches, observations } = await readyFixture();
   assert.equal(daemon.metadata.state, 'ready');
   assert.equal(daemon.metadata.nativeState, 'connected');
+  assert.equal(daemon.metadata.nativeStartup?.startupStage, 'ready');
+  assert.equal(daemon.metadata.nativeStartup?.bootstrapEventCount, 0);
   assert.equal(launches, 1);
   assert.equal(observations, 2); // startup only, never per native notification
   assert.equal(backend.methods.filter(method => method === 'thread/resume').length, 1);

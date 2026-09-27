@@ -16,6 +16,22 @@ type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' 
   'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
   Partial<Pick<ManagedWorkerFrontendHost, 'commandQuiescence' | 'requestQuiescence' | 'acceptedCommandReceipts'>>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
+type StartupStage = 'not-started' | 'observing' | 'reading-initial' | 'validating-initial' |
+  'checking-boundary' | 'connecting' | 'ready';
+type BootstrapCategory = 'status' | 'settings' | 'goal' | 'usage' | 'startup-or-warning' |
+  'turn' | 'item' | 'other';
+const diagnosticCap = 255;
+function bootstrapCategory(method: unknown): BootstrapCategory {
+  if (method === 'thread/status/changed') return 'status';
+  if (method === 'thread/settings/updated') return 'settings';
+  if (method === 'thread/goal/cleared' || method === 'thread/goal/updated') return 'goal';
+  if (method === 'thread/tokenUsage/updated') return 'usage';
+  if (method === 'mcpServer/startupStatus/updated' || method === 'deprecationNotice' ||
+      method === 'warning') return 'startup-or-warning';
+  if (typeof method === 'string' && method.startsWith('turn/')) return 'turn';
+  if (typeof method === 'string' && method.startsWith('item/')) return 'item';
+  return 'other';
+}
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
 const knownVersions = new Map<string, number>([
   ['thread-owner-discovery', 1], ['thread-follower-start-turn', 2],
@@ -65,6 +81,15 @@ export interface ManagedWorkerNativeOwnerMetadata {
   readonly semanticRevision: number;
   readonly followerCount: number;
   readonly failure: string | null;
+  readonly startupStage: StartupStage;
+  /** Count of bootstrap events that invalidate the initial-read boundary. */
+  readonly bootstrapEventCount: number;
+  /** Diagnostic categories include scoped MCP startup notifications exempted below. */
+  readonly bootstrapNotifications: Readonly<Record<BootstrapCategory, number>>;
+  readonly bootstrapPendingRequests: number;
+  readonly bootstrapBoundary: Readonly<{
+    stateIsBootstrapping: boolean; hasEvents: boolean; ownerCurrent: boolean | null;
+  }> | null;
 }
 
 /** One existing worker, one native owner projection. No worker launch/stop or UI reopening. */
@@ -83,6 +108,12 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #authorityRevision = 0;
   #semanticRevision = 0;
   #bootstrapEvents = 0;
+  #startupStage: StartupStage = 'not-started';
+  #bootstrapNotifications: Record<BootstrapCategory, number> =
+    { status: 0, settings: 0, goal: 0, usage: 0, 'startup-or-warning': 0,
+      turn: 0, item: 0, other: 0 };
+  #bootstrapPendingRequests = 0;
+  #bootstrapBoundary: ManagedWorkerNativeOwnerMetadata['bootstrapBoundary'] = null;
   #detachObserver: (() => void) | null = null;
   #detachRequests: (() => void) | null = null;
   #client: DesktopIpcClient | null = null;
@@ -117,7 +148,12 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     return Object.freeze({ state: this.#state, connected: this.#state === 'connected',
       revision: this.#revision, authorityRevision: this.#authorityRevision,
       semanticRevision: this.#semanticRevision,
-      followerCount: this.#followers.size, failure: this.#failure });
+      followerCount: this.#followers.size, failure: this.#failure,
+      startupStage: this.#startupStage,
+      bootstrapEventCount: Math.min(this.#bootstrapEvents, diagnosticCap),
+      bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),
+      bootstrapPendingRequests: this.#bootstrapPendingRequests,
+      bootstrapBoundary: this.#bootstrapBoundary });
   }
 
   #ownerCurrent(): boolean {
@@ -167,7 +203,22 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   }
 
   #observe(event: ManagedWorkerNotification): void {
-    if (this.#state === 'bootstrapping') { this.#bootstrapEvents++; return; }
+    if (this.#state === 'bootstrapping') {
+      const category = bootstrapCategory(event.notification.method);
+      this.#bootstrapNotifications[category] = Math.min(this.#bootstrapNotifications[category] + 1, diagnosticCap);
+      // The projector already treats this exact backend startup-status event
+      // as state-neutral. Only a notification from the pinned live generation
+      // may be excluded from the bootstrap's no-missed-state boundary.
+      if (event.notification.method === 'mcpServer/startupStatus/updated' &&
+          object(event.notification.params) && event.notification.params.threadId === this.#options.taskId &&
+          event.taskId === this.#options.taskId && event.generation === this.#generation) {
+        const meta = this.#options.host.metadata;
+        if (meta.taskId === this.#options.taskId && meta.backendGeneration === this.#generation &&
+            meta.state === 'running') return;
+      }
+      this.#bootstrapEvents++;
+      return;
+    }
     if (this.#state !== 'connected' && this.#state !== 'disconnected') return;
     if (!this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
         event.generation !== this.#generation || !this.#projection) {
@@ -195,7 +246,11 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   }
 
   #observeRequest(event: { taskId: string; generation: number; request: RequestFrame }): void {
-    if (this.#state === 'bootstrapping') { this.#bootstrapEvents++; return; }
+    if (this.#state === 'bootstrapping') {
+      this.#bootstrapEvents++;
+      this.#bootstrapPendingRequests = Math.min(this.#bootstrapPendingRequests + 1, diagnosticCap);
+      return;
+    }
     if (this.#state !== 'connected' && this.#state !== 'disconnected') return;
     if (!this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
         event.generation !== this.#generation || !this.#projection) {
@@ -220,6 +275,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
 
   async #startOnce(): Promise<void> {
     this.#state = 'bootstrapping';
+    this.#startupStage = 'observing';
     try {
       const meta = this.#options.host.metadata;
       if (meta.taskId !== this.#options.taskId || meta.state !== 'running' ||
@@ -231,8 +287,18 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         event => this.#observeRequest(event), () => this.#fail('request-observer-failed'));
       if (this.#state !== 'bootstrapping') { detachRequests(); throw refuse(); }
       this.#detachRequests = detachRequests;
-      const initial = this.#validateInitial(await this.#options.readInitialState());
-      if (this.#state !== 'bootstrapping' || this.#bootstrapEvents !== 0 || !this.#ownerCurrent()) throw refuse();
+      this.#startupStage = 'reading-initial';
+      const read = await this.#options.readInitialState();
+      this.#startupStage = 'validating-initial';
+      const initial = this.#validateInitial(read);
+      this.#startupStage = 'checking-boundary';
+      const stateIsBootstrapping = this.#state === 'bootstrapping';
+      const hasEvents = this.#bootstrapEvents !== 0;
+      // Preserve the old short-circuit: do not call an external authority
+      // callback merely to populate diagnostics after an earlier refusal.
+      const ownerCurrent = stateIsBootstrapping && !hasEvents ? this.#ownerCurrent() : null;
+      this.#bootstrapBoundary = Object.freeze({ stateIsBootstrapping, hasEvents, ownerCurrent });
+      if (!stateIsBootstrapping || hasEvents || !ownerCurrent) throw refuse();
       this.#projection = initial;
       this.#authoritySnapshot = this.#snapshot(initial);
       this.#revision = 1; this.#authorityRevision = 1;
@@ -264,7 +330,9 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         this.#deferredBroadcasts.length = 0;
       });
       this.#state = 'disconnected';
+      this.#startupStage = 'connecting';
       await this.reconnect();
+      this.#startupStage = 'ready';
     } catch (error) {
       if (this.#state === 'bootstrapping') this.#fail('bootstrap-failed');
       else if (this.#state !== 'disconnected' && this.#state !== 'closed') this.#fail('bootstrap-failed');

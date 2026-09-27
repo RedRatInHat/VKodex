@@ -11,7 +11,7 @@ import { compileNativeRequestResponse } from '../codex/native-request-response.j
 import type { AppServerServerRequest } from '../codex/app-server-connection.js';
 import { bootstrapManagedWorker, ManagedWorkerIdleProofRefusedError,
   type ManagedWorkerBootstrap } from './managed-worker-bootstrap.js';
-import { ManagedWorkerNativeOwner } from './managed-worker-native-owner.js';
+import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
@@ -48,6 +48,9 @@ export interface ManagedWorkerDaemonMetadata {
   readonly nativeState: string | null;
   readonly endpointRef: string | null;
   readonly failure: string | null;
+  readonly nativeStartup: Pick<ManagedWorkerNativeOwnerMetadata,
+    'startupStage' | 'bootstrapEventCount' | 'bootstrapNotifications' |
+    'bootstrapPendingRequests' | 'bootstrapBoundary'> | null;
 }
 
 /** Explicit, single-use read-only canary composition. Neither parent EOF nor frontend EOF stops its worker.
@@ -84,9 +87,15 @@ export class ManagedWorkerDaemon {
   }
 
   get metadata(): ManagedWorkerDaemonMetadata {
+    const owner = this.#owner?.metadata;
     return Object.freeze({ state: this.#state, epoch: this.#options.epoch, taskId: this.#taskId,
-      generation: this.#generation, nativeState: this.#owner?.metadata.state ?? null,
-      endpointRef: this.#endpointRef, failure: this.#failure });
+      generation: this.#generation, nativeState: owner?.state ?? null,
+      endpointRef: this.#endpointRef, failure: this.#failure,
+      nativeStartup: owner ? Object.freeze({ startupStage: owner.startupStage,
+        bootstrapEventCount: owner.bootstrapEventCount,
+        bootstrapNotifications: owner.bootstrapNotifications,
+        bootstrapPendingRequests: owner.bootstrapPendingRequests,
+        bootstrapBoundary: owner.bootstrapBoundary }) : null });
   }
 
   start(): Promise<void> {

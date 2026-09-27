@@ -77,7 +77,8 @@ async function waitFrame(frames: IpcObject[], predicate: (frame: IpcObject) => b
 async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state(),
   allowAnswer: (request: AppServerServerRequest, response: IpcObject) => boolean = () => false,
   allowFollower: (id: string) => boolean = id => id === 'follower', composer = false,
-  qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>) {
+  qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>,
+  isOwnerCurrent: () => boolean = () => true) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -96,7 +97,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     encryptionKey: randomBytes(32) }) : null;
   let broker = new Broker(); const brokers = [broker];
   const owner = new ManagedWorkerNativeOwner({ host, adapterKey, controlKey, taskId, ownerEpoch,
-    isOwnerCurrent: () => true, allowFollower, readInitialState,
+    isOwnerCurrent, allowFollower, readInitialState,
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     ...(qualifyContinuation ? { qualifyContinuation } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
@@ -192,13 +193,59 @@ test('semantic fence ignores usage-only changes but advances for turn events and
 test('bootstrap rejects a notification during asynchronous full-history read before IPC claim', async () => {
   let resolve!: (value: NativeProjectionState) => void;
   const read = new Promise<NativeProjectionState>(done => { resolve = done; });
-  const f = await fixture(() => read);
+  let authorityCalls = 0;
+  const f = await fixture(() => read, undefined, undefined, false, undefined,
+    () => { authorityCalls++; return true; });
   try { const starting = f.owner.start();
+    assert.equal(f.owner.metadata.startupStage, 'reading-initial');
     f.child.send('turn/started', { threadId: taskId, turn: { id: 'raced', status: 'inProgress', items: [] } });
     resolve(state());
     await assert.rejects(starting);
+    assert.equal(f.owner.metadata.startupStage, 'checking-boundary');
+    assert.equal(f.owner.metadata.bootstrapEventCount, 1);
+    assert.equal(f.owner.metadata.bootstrapNotifications.turn, 1);
+    assert.equal(f.owner.metadata.bootstrapPendingRequests, 0);
+    assert.deepEqual(f.owner.metadata.bootstrapBoundary,
+      { stateIsBootstrapping: true, ownerCurrent: null, hasEvents: true });
+    assert.equal(authorityCalls, 1);
     assert.equal(f.broker.frames.some(frame => frame.method === 'initialize'), false);
     assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('one scoped MCP startup-status notification does not invalidate an otherwise stable initial read', async () => {
+  let release!: (value: NativeProjectionState) => void;
+  const reading = new Promise<NativeProjectionState>(resolve => { release = resolve; });
+  const f = await fixture(() => reading);
+  try {
+    const starting = f.owner.start();
+    f.child.send('mcpServer/startupStatus/updated', { threadId: taskId, name: 'fixture', status: 'ready' });
+    release(state());
+    await starting;
+    assert.equal(f.owner.metadata.state, 'connected');
+    assert.equal(f.owner.metadata.startupStage, 'ready');
+    assert.equal(f.owner.metadata.bootstrapEventCount, 0);
+    assert.equal(f.owner.metadata.bootstrapNotifications['startup-or-warning'], 1);
+    assert.deepEqual(f.owner.metadata.bootstrapBoundary,
+      { stateIsBootstrapping: true, hasEvents: false, ownerCurrent: true });
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('startup warning remains an invalidating bootstrap event', async () => {
+  let release!: (value: NativeProjectionState) => void;
+  const reading = new Promise<NativeProjectionState>(resolve => { release = resolve; });
+  const f = await fixture(() => reading);
+  try {
+    const starting = f.owner.start();
+    f.child.send('deprecationNotice', { threadId: taskId });
+    release(state());
+    await assert.rejects(starting);
+    assert.equal(f.owner.metadata.bootstrapNotifications['startup-or-warning'], 1);
+    assert.equal(f.owner.metadata.bootstrapEventCount, 1);
+    assert.deepEqual(f.owner.metadata.bootstrapBoundary,
+      { stateIsBootstrapping: true, hasEvents: true, ownerCurrent: null });
+    assert.equal(f.broker.frames.some(frame => frame.method === 'initialize'), false);
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
@@ -210,6 +257,7 @@ test('initialize reply and follow in one chunk establish follower despite foreig
     const snapshot = await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
     assert.deepEqual(snapshot.targetClientIds, ['follower']);
     assert.equal(f.owner.metadata.state, 'connected');
+    assert.equal(f.owner.metadata.startupStage, 'ready');
     assert.equal(f.owner.metadata.followerCount, 1);
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
@@ -327,10 +375,32 @@ test('bootstrap refuses nonterminal turn and explicit pending queue markers', as
   ]) {
     const f = await fixture(async () => ({ ...state(), ...change } as NativeProjectionState));
     try { await assert.rejects(f.owner.start());
+      assert.equal(f.owner.metadata.startupStage, 'validating-initial');
+      assert.equal(f.owner.metadata.bootstrapEventCount, 0);
+      assert.equal(f.owner.metadata.bootstrapBoundary, null);
       assert.equal(f.broker.frames.some(frame => frame.method === 'initialize'), false);
       assert.equal(f.host.metadata.state, 'running');
     } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
   }
+});
+
+test('bootstrap diagnostics distinguish lost owner authority from a notification boundary', async () => {
+  let release!: (value: NativeProjectionState) => void;
+  const reading = new Promise<NativeProjectionState>(resolve => { release = resolve; });
+  let authorized = true;
+  let authorityCalls = 0;
+  const f = await fixture(() => reading, undefined, undefined, false, undefined,
+    () => { authorityCalls++; return authorized; });
+  try {
+    const starting = f.owner.start(); authorized = false; release(state());
+    await assert.rejects(starting);
+    assert.equal(f.owner.metadata.startupStage, 'checking-boundary');
+    assert.deepEqual(f.owner.metadata.bootstrapBoundary,
+      { stateIsBootstrapping: true, ownerCurrent: false, hasEvents: false });
+    assert.equal(f.owner.metadata.bootstrapEventCount, 0);
+    assert.equal(authorityCalls, 2);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
 test('admitted direct start survives owner IPC EOF before final worker write; reconnect duplicate is one wire', async () => {
