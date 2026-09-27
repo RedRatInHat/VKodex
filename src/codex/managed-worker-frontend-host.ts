@@ -1,0 +1,279 @@
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
+import { AppServerConnection } from './app-server-connection.js';
+import { AppServerRequestInbox } from './app-server-request-inbox.js';
+import type { RequestInboxOptions } from './app-server-request-inbox.js';
+import { PersistentFrontendSessions } from './persistent-frontend-session.js';
+import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
+import type { FrontendTransportMetadata } from './frontend-local-transport.js';
+
+type JsonObject = Record<string, unknown>;
+type StopReason = 'owner-request' | 'test-cleanup';
+type HostState = 'new' | 'starting' | 'running' | 'restarting' |
+  'frontend-unavailable' | 'failed' | 'lost' | 'stopping' | 'stopped';
+type ResumeAuthority = NonNullable<ConstructorParameters<typeof PersistentFrontendSessions>[0]['resumeAuthority']>;
+type RequestPolicy = Pick<RequestInboxOptions, 'allowRequest' | 'allowAnswer' | 'allowError'>;
+
+export interface ManagedWorkerFrontendHostOptions extends RequestPolicy {
+  /** Routing scope only; this is not proof of native writer or family ownership. */
+  readonly taskId: string;
+  readonly ownCwd: string;
+  readonly initializeRequest: JsonObject;
+  readonly bootstrapReadMethods: readonly string[];
+  readonly launch: () => ChildProcessWithoutNullStreams;
+  /** In-process object identity held by the authorized frontend adapter. */
+  readonly adapterKey: object;
+  readonly frontendPort?: number;
+  readonly backendTimeoutMs?: number;
+  readonly trustedLocalFrontend?: boolean;
+  readonly resumeAuthority?: ResumeAuthority;
+}
+export interface ManagedWorkerFrontendMetadata {
+  readonly taskId: string;
+  readonly state: HostState;
+  readonly backendGeneration: number | null;
+  readonly frontend: FrontendTransportMetadata | null;
+}
+
+function jsonObject(value: unknown): value is JsonObject {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function strictJsonObject(value: JsonObject): JsonObject {
+  let decoded: unknown;
+  try {
+    const snapshot = structuredClone(value);
+    const encoded = JSON.stringify(snapshot, (_key, item: unknown) => {
+      if (item === undefined || typeof item === 'function' || typeof item === 'symbol' ||
+        typeof item === 'bigint' || typeof item === 'number' && !Number.isFinite(item))
+        throw new TypeError('Non-JSON initialize request');
+      return item;
+    });
+    decoded = JSON.parse(encoded);
+    if (!isDeepStrictEqual(snapshot, decoded) || !jsonObject(decoded))
+      throw new TypeError('Invalid initialize request');
+  } catch { throw new TypeError('Initialize request must be strict JSON'); }
+  return decoded;
+}
+function freezeTree<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const nested of Object.values(value)) freezeTree(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * Single-thread composition host. No daemon, signal handler, or model dispatch.
+ * The caller must authorize explicit stop and establish live-task safety; this
+ * class intentionally performs no automatic idle proof or family traversal.
+ */
+export class ManagedWorkerFrontendHost {
+  readonly #taskId: string;
+  readonly #ownCwd: string;
+  readonly #initializeRequest: JsonObject;
+  readonly #bootstrapReadMethods: readonly string[];
+  readonly #adapterKey: object;
+  readonly #frontendPort: number;
+  readonly #trustedLocalFrontend: boolean;
+  readonly #resumeAuthority: ResumeAuthority | null;
+  readonly #requestPolicy: RequestPolicy;
+  readonly #rpc: AppServerConnection;
+  #state: HostState = 'new';
+  #launched = false;
+  #stopRequested = false;
+  #backendGeneration: number | null = null;
+  #sessions: PersistentFrontendSessions | null = null;
+  #transport: PersistentFrontendLocalTransport | null = null;
+  #startPromise: Promise<void> | null = null;
+  #restartPromise: Promise<void> | null = null;
+  #lossClosePromise: Promise<unknown> | null = null;
+  #stopPromise: Promise<void> | null = null;
+
+  constructor(options: ManagedWorkerFrontendHostOptions) {
+    if (!options || typeof options.taskId !== 'string' || !options.taskId ||
+      typeof options.ownCwd !== 'string' || !options.ownCwd ||
+      !jsonObject(options.initializeRequest) ||
+      !jsonObject(options.initializeRequest.clientInfo) ||
+      !jsonObject(options.initializeRequest.capabilities) ||
+      !Array.isArray(options.bootstrapReadMethods) ||
+      !options.bootstrapReadMethods.every(method => typeof method === 'string') ||
+      typeof options.launch !== 'function' ||
+      !options.adapterKey || typeof options.adapterKey !== 'object' ||
+      typeof options.allowRequest !== 'function' ||
+      typeof options.allowAnswer !== 'function' ||
+      (options.allowError !== undefined && typeof options.allowError !== 'function') ||
+      (options.resumeAuthority !== undefined && typeof options.resumeAuthority !== 'function') ||
+      (options.trustedLocalFrontend !== undefined && typeof options.trustedLocalFrontend !== 'boolean'))
+      throw new TypeError('Explicit worker/frontend host policy is required');
+    const port = options.frontendPort ?? 0;
+    const timeout = options.backendTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(port) || port < 0 || port > 65535 ||
+      !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120_000)
+      throw new TypeError('Invalid worker/frontend host endpoint or timeout');
+    this.#taskId = options.taskId;
+    this.#ownCwd = options.ownCwd;
+    this.#initializeRequest = freezeTree(strictJsonObject(options.initializeRequest));
+    this.#bootstrapReadMethods = Object.freeze([...options.bootstrapReadMethods]);
+    this.#adapterKey = options.adapterKey;
+    this.#frontendPort = port;
+    this.#trustedLocalFrontend = options.trustedLocalFrontend ?? false;
+    this.#resumeAuthority = options.resumeAuthority ?? null;
+    this.#requestPolicy = Object.freeze({ allowRequest: options.allowRequest,
+      allowAnswer: options.allowAnswer, ...(options.allowError ? { allowError: options.allowError } : {}) });
+    const launch = options.launch;
+    this.#rpc = new AppServerConnection(() => {
+      if (this.#launched) throw new Error('Worker launch is single-use');
+      this.#launched = true;
+      return launch();
+    }, this.#initializeRequest, timeout);
+    this.#rpc.onDisconnect(() => this.#loseBackend());
+    // Constructor-only policy validation before any worker launch or listener.
+    new PersistentFrontendSessions({ backendFactory: () => this.#rpc,
+      initializeRequest: this.#initializeRequest, taskId: this.#taskId,
+      ownCwd: this.#ownCwd, bootstrapReadMethods: this.#bootstrapReadMethods,
+      trustedLocalFrontend: this.#trustedLocalFrontend,
+      resumeAuthority: this.#resumeAuthority });
+  }
+
+  get metadata(): ManagedWorkerFrontendMetadata {
+    return Object.freeze({ taskId: this.#taskId, state: this.#state,
+      backendGeneration: this.#backendGeneration,
+      frontend: this.#transport ? this.#transport.metadata : null });
+  }
+
+  /** The token is available only to the caller holding the constructor's key. */
+  frontendCapability(adapterKey: object): Readonly<{ host: string; port: number; token: string }> {
+    if (adapterKey !== this.#adapterKey) throw new TypeError('Unauthorized frontend adapter');
+    if (this.#state !== 'running' || !this.#transport?.address)
+      throw new Error('Frontend listener unavailable');
+    const address = this.#transport.address;
+    return Object.freeze({ host: address.address, port: address.port,
+      token: this.#transport.authToken() });
+  }
+
+  start(): Promise<void> {
+    if (this.#stopRequested) return Promise.reject(new Error('Host is stopping'));
+    if (this.#state === 'running') return Promise.resolve();
+    if (this.#state === 'lost' || this.#state === 'frontend-unavailable' ||
+      this.#state === 'failed' || this.#state === 'restarting')
+      return Promise.reject(new Error('Host frontend unavailable'));
+    if (!this.#startPromise) this.#startPromise = this.#startOnce();
+    return this.#startPromise;
+  }
+  #isLost(): boolean { return this.#state === 'lost'; }
+
+  async #startOnce(): Promise<void> {
+    this.#state = 'starting';
+    try {
+      const session = await this.#rpc.initializedSession();
+      if (this.#stopRequested || this.#isLost() ||
+        !this.#rpc.isSessionCurrent(session.generation)) throw new Error('Worker startup superseded');
+      this.#backendGeneration = session.generation;
+      const inbox = new AppServerRequestInbox({ threadId: this.#taskId,
+        generation: session.generation,
+        isGenerationCurrent: generation => this.#rpc.isSessionCurrent(generation),
+        ...this.#requestPolicy });
+      // Exactly one backend handler. This host owns its private RPC instance.
+      this.#rpc.onServerRequest((request, context) => inbox.handle(request, context));
+      this.#sessions = new PersistentFrontendSessions({
+        backendFactory: initializeRequest => {
+          if (!isDeepStrictEqual(initializeRequest, this.#initializeRequest))
+            throw new TypeError('Frontend initialize request changed');
+          return this.#rpc;
+        },
+        initializeRequest: this.#initializeRequest, taskId: this.#taskId,
+        ownCwd: this.#ownCwd, bootstrapReadMethods: this.#bootstrapReadMethods,
+        trustedLocalFrontend: this.#trustedLocalFrontend,
+        resumeAuthority: this.#resumeAuthority, requestInbox: inbox,
+      });
+      await this.#listenFrontend();
+    } catch (error) {
+      if (!this.#stopRequested && !this.#isLost())
+        this.#state = this.#backendGeneration === null ? 'failed' : 'frontend-unavailable';
+      throw error;
+    }
+  }
+
+  async #listenFrontend(): Promise<void> {
+    const sessions = this.#sessions;
+    if (!sessions || this.#stopRequested || this.#isLost())
+      throw new Error('Frontend listener superseded');
+    const transport = new PersistentFrontendLocalTransport({ sessions,
+      host: '127.0.0.1', port: this.#frontendPort });
+    this.#transport = transport;
+    try {
+      await transport.listen();
+      if (this.#stopRequested || this.#isLost() ||
+        this.#backendGeneration === null || !this.#rpc.isSessionCurrent(this.#backendGeneration))
+        throw new Error('Frontend listener superseded');
+      this.#state = 'running';
+    } catch (error) {
+      await transport.close().catch(() => {});
+      if (this.#transport === transport) this.#transport = null;
+      throw error;
+    }
+  }
+
+  restartFrontend(): Promise<void> {
+    if (this.#restartPromise) return this.#restartPromise;
+    if ((this.#state !== 'running' && this.#state !== 'frontend-unavailable') ||
+      this.#stopRequested || !this.#startPromise || !this.#sessions ||
+      this.#backendGeneration === null || !this.#rpc.isSessionCurrent(this.#backendGeneration))
+      return Promise.reject(new Error('Frontend restart unavailable'));
+    const work = this.#restartOnce();
+    this.#restartPromise = work;
+    void work.then(() => { if (this.#restartPromise === work) this.#restartPromise = null; },
+      () => { if (this.#restartPromise === work) this.#restartPromise = null; });
+    return work;
+  }
+
+  async #restartOnce(): Promise<void> {
+    this.#state = 'restarting';
+    const previous = this.#transport;
+    this.#transport = null;
+    try {
+      await previous?.close();
+      if (this.#stopRequested || this.#isLost()) throw new Error('Frontend restart superseded');
+      await this.#listenFrontend();
+    } catch (error) {
+      if (!this.#stopRequested && !this.#isLost()) this.#state = 'frontend-unavailable';
+      throw error;
+    }
+  }
+
+  #loseBackend(): void {
+    if (this.#state === 'stopping' || this.#state === 'stopped') return;
+    this.#state = 'lost';
+    const transport = this.#transport;
+    this.#transport = null;
+    if (transport) this.#lossClosePromise = transport.close().then(() => null, error => error as unknown);
+  }
+
+  /** Explicit owner action only. Caller must authorize and check live-task safety. */
+  stop(reason: StopReason): Promise<void> {
+    if (reason !== 'owner-request' && reason !== 'test-cleanup')
+      return Promise.reject(new TypeError('Explicit stop reason required'));
+    if (!this.#stopPromise) {
+      this.#stopRequested = true;
+      this.#state = 'stopping';
+      this.#stopPromise = (async () => {
+        const transport = this.#transport;
+        this.#transport = null;
+        let closeFailure: unknown = null;
+        // close() synchronously invalidates the RPC generation and rejects
+        // initialize, even if listener close is still waiting on a bind race.
+        const rpcClose = this.#rpc.close().then(() => null, error => error as unknown);
+        try { await transport?.close(); } catch (error) { closeFailure = error; }
+        const rpcCloseFailure = await rpcClose;
+        const lossCloseFailure = await this.#lossClosePromise;
+        closeFailure ??= rpcCloseFailure;
+        closeFailure ??= lossCloseFailure;
+        await this.#startPromise?.catch(() => {});
+        await this.#restartPromise?.catch(() => {});
+        this.#state = closeFailure === null ? 'stopped' : 'failed';
+        if (closeFailure !== null) throw closeFailure;
+      })();
+    }
+    return this.#stopPromise;
+  }
+}

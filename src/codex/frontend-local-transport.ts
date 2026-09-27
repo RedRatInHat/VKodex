@@ -60,6 +60,9 @@ export class PersistentFrontendLocalTransport {
   #generation = 0;
   #authenticated = 0;
   #closed = false;
+  #listenPromise: Promise<AddressInfo> | null = null;
+  #cancelListen: (() => void) | null = null;
+  #closePromise: Promise<void> | null = null;
   #sockets = new Set<Socket>();
   readonly sessions: FrontendSessions;
   readonly host: string;
@@ -94,24 +97,62 @@ export class PersistentFrontendLocalTransport {
   get metadata(): FrontendTransportMetadata { return Object.freeze({ address: this.address, authenticatedCount: this.#current ? 1 : 0,
     authenticatedConnections: this.#authenticated, generation: this.#generation, hasFrontend: this.#current !== null }); }
 
-  async listen(): Promise<AddressInfo> {
-    if (this.#closed) throw new Error('transport is closed');
-    this.#server.listen(this.port, this.host);
-    await once(this.#server, 'listening');
-    const address = this.address;
-    if (!address) throw new Error('frontend transport did not bind');
-    return address;
+  listen(): Promise<AddressInfo> {
+    if (this.#closed) return Promise.reject(new Error('transport is closed'));
+    if (this.#listenPromise) return this.#listenPromise;
+    const attempt = new Promise<AddressInfo>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        this.#server.off('listening', onListening);
+        this.#server.off('error', onError);
+        this.#server.off('close', onClose);
+        this.#cancelListen = null;
+      };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; cleanup();
+        if (error) { reject(error); return; }
+        const address = this.address;
+        if (address) resolve(address);
+        else reject(new Error('frontend transport did not bind'));
+      };
+      const onListening = () => finish(this.#closed ? new Error('transport is closed') : undefined);
+      const onError = () => finish(new Error('frontend transport could not bind'));
+      const onClose = () => finish(new Error('transport is closed'));
+      this.#cancelListen = onClose;
+      this.#server.once('listening', onListening);
+      this.#server.once('error', onError);
+      this.#server.once('close', onClose);
+      try { this.#server.listen(this.port, this.host); }
+      catch { finish(new Error('frontend transport could not bind')); }
+    });
+    this.#listenPromise = attempt;
+    void attempt.catch(() => { if (this.#listenPromise === attempt) this.#listenPromise = null; });
+    return attempt;
   }
   onClose(listener: () => void): () => void {
     if (typeof listener !== 'function') throw new TypeError('close listener must be a function');
     this.#server.on('close', listener);
     return () => this.#server.off('close', listener);
   }
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise;
     this.#closed = true;
+    // Install the closing error sink before cancelling an in-flight bind.
+    const onError = () => {};
+    this.#server.on('error', onError);
+    this.#cancelListen?.();
     for (const socket of this.#sockets) closeSocket(socket);
-    await new Promise<void>(resolve => this.#server.close(() => resolve()));
+    this.#closePromise = new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error | null) => {
+        this.#server.off('error', onError);
+        if (error && !('code' in error && error.code === 'ERR_SERVER_NOT_RUNNING')) reject(error);
+        else resolve();
+      };
+      try { this.#server.close(finish); }
+      catch (error) { finish(error instanceof Error ? error : new Error('frontend transport close failed')); }
+    });
+    return this.#closePromise;
   }
 
   #accept(socket: Socket): void {

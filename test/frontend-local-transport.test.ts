@@ -218,3 +218,26 @@ test('many valid frames in one TCP chunk are bounded per frame, not aggregate ch
   assert.equal(sessions.state.attaches[0]!.received.length, 2);
   socket.destroy();
 });
+
+test('closing during asynchronous bind settles listen and closes the endpoint', { timeout: 2_000 }, async () => {
+  const transport = new PersistentFrontendLocalTransport({ sessions: fakeSessions() });
+  transports.push(transport);
+  const listening = transport.listen();
+  const rejected = assert.rejects(listening, /closed/i);
+  await transport.close();
+  await rejected;
+  assert.equal(transport.address, null);
+  await assert.rejects(transport.listen(), /closed/i);
+});
+
+test('repeated close waits for the same server close completion', async () => {
+  const { transport } = await create();
+  let closed = false;
+  transport.onClose(() => { closed = true; });
+  const first = transport.close();
+  const second = transport.close();
+  assert.strictEqual(second, first);
+  await second;
+  assert.equal(closed, true);
+  assert.equal(transport.address, null);
+});
