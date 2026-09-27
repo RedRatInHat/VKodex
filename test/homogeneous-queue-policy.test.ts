@@ -52,8 +52,11 @@ test('unknown add outcome freezes even when stock queue appears empty', () => {
   observed(policy, 2);
   assert.equal(policy.status().locked, true);
   assert.throws(() => policy.reserveSettingsChange({ ownerEpoch: 'owner-1', effectiveSettings: settings() }));
+  assert.throws(() => policy.reserveAdd({ ownerEpoch: 'owner-1', clientUserMessageId: 'two', input, effectiveSettings: settings() }),
+    /unresolved admission/, 'an unknown prior send must not admit a new queued message');
   observed(policy, 3, { terminalClientIds: ['one'] });
   assert.equal(policy.status().locked, false);
+  assert.equal(policy.reserveAdd({ ownerEpoch: 'owner-1', clientUserMessageId: 'two', input, effectiveSettings: settings() }).clientUserMessageId, 'two');
 });
 
 test('definitive server rejection releases only after a fresh drained read', () => {
@@ -86,6 +89,8 @@ test('owner epoch change fences late acknowledgments and retains unresolved admi
   policy.observe(ticket, { taskId: 'task-1', ownerEpoch: 'owner-2', revision: 2, complete: true, serialized: true, effectiveSettings: settings(), queueClientIds: [], activeClientIds: [], terminalClientIds: [], idle: true });
   assert.equal(policy.status().locked, true);
   assert.throws(() => policy.reserveSettingsChange({ ownerEpoch: 'owner-2', effectiveSettings: settings() }));
+  assert.throws(() => policy.reserveAdd({ ownerEpoch: 'owner-2', clientUserMessageId: 'two', input, effectiveSettings: settings() }),
+    /unresolved admission/, 'a new owner must not enqueue over the previous owner unresolved send');
 });
 
 test('settings write fences admission and unknown write remains frozen', () => {

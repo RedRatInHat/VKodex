@@ -271,6 +271,11 @@ export class HomogeneousStockQueuePolicy {
     if (typeof clientUserMessageId !== "string" || !clientUserMessageId || this.usedIds.has(clientUserMessageId)) {
       throw new Error("missing or reused client message ID");
     }
+    if ([...this.operations.values()].some(operation => !operation.terminal
+      && operation.outcome !== "definitively-rejected"
+      && (operation.outcome === "unknown" || operation.epochGeneration !== this.epochGeneration))) {
+      throw new Error("unresolved admission must be reconciled before another add");
+    }
     if (this.settings === null || this.settingsWrite || this.poisoned || this.foreign || (this.observedBusy && this.operations.size === 0)
       || requested !== this.settings || (this.lockSettings !== null && requested !== this.lockSettings)) {
       throw new Error("stock queue setting admission denied");
