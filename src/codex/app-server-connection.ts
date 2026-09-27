@@ -30,6 +30,13 @@ export interface AppServerEnvelope {
   readonly params: JsonObject;
 }
 
+/** Actual backend handshake for one process/connection generation. This is not
+ * a frontend compatibility decision or authorization to send native commands. */
+export interface AppServerInitializedSession {
+  readonly generation: number;
+  readonly initializeResult: JsonObject;
+}
+
 export interface AppServerServerRequest extends AppServerEnvelope {
   /** Original worker request identity; numeric and string IDs are distinct. */
   readonly id: string | number;
@@ -75,6 +82,7 @@ const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 export class AppServerConnection implements AppServerRpc {
   private child: ChildProcessWithoutNullStreams | null = null;
   private generation = 0;
+  private initialized: AppServerInitializedSession | null = null;
   private nextId = 1;
   private fragments: string[] = [];
   private fragmentBytes = 0;
@@ -103,6 +111,21 @@ export class AppServerConnection implements AppServerRpc {
   }
 
   onServerRequest(handler: AppServerServerRequestHandler | null): void { this.serverRequestHandler = handler; }
+
+  /** Share the real handshake instead of reinitializing an already-live worker.
+   * Callers must qualify frontend capabilities separately and fence subsequent
+   * work with isSessionCurrent; a receipt is not a durable worker identity. */
+  async initializedSession(): Promise<AppServerInitializedSession> {
+    await this.start();
+    const session = this.initialized;
+    if (!session || !this.isSessionCurrent(session.generation)) throw new AppServerUnavailableError();
+    return structuredClone(session);
+  }
+
+  isSessionCurrent(generation: number): boolean {
+    return !this.stopped && this.child !== null && this.generation === generation
+      && this.initialized?.generation === generation;
+  }
 
   async start(): Promise<void> {
     if (this.stopped) throw new AppServerUnavailableError("Подключение Codex App Server уже остановлено.");
@@ -134,9 +157,11 @@ export class AppServerConnection implements AppServerRpc {
     const failed = () => this.connectionFailed(child, generation);
     child.once("error", failed); child.once("close", failed); child.stdin.once("error", failed);
     try {
-      await this.sendRequest("initialize", this.initializeParams, { timeoutMs: this.defaultTimeoutMs });
+      const initializeResult = await this.sendRequest("initialize", this.initializeParams, { timeoutMs: this.defaultTimeoutMs });
       if (this.child !== child || generation !== this.generation) throw new AppServerUnavailableError();
       this.write(child, { method: "initialized", params: {} });
+      if (this.child !== child || generation !== this.generation) throw new AppServerUnavailableError();
+      this.initialized = { generation, initializeResult };
     } catch (error) {
       this.failConnection(child, generation, error instanceof Error ? error : new AppServerUnavailableError());
       throw error;
@@ -301,7 +326,7 @@ export class AppServerConnection implements AppServerRpc {
 
   private failConnection(child: ChildProcessWithoutNullStreams, generation: number, fallback: Error, skipId?: number): void {
     if (this.child !== child || this.generation !== generation) return;
-    this.child = null; this.fragments = []; this.fragmentBytes = 0;
+    this.child = null; this.initialized = null; this.fragments = []; this.fragmentBytes = 0;
     // Abort listeners can synchronously request a reconnect. Install the
     // teardown barrier before notifying them so open() cannot overtake it.
     this.closing = this.closing.then(() => closeAppServer(child)).catch(() => {});
@@ -318,7 +343,8 @@ export class AppServerConnection implements AppServerRpc {
 
   async close(): Promise<void> {
     this.stopped = true; this.starting = null;
-    const child = this.child; this.child = null; this.fragments = []; this.fragmentBytes = 0; this.generation++;
+    const child = this.child; this.child = null; this.initialized = null;
+    this.fragments = []; this.fragmentBytes = 0; this.generation++;
     this.clearServerRequests();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

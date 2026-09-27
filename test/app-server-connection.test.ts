@@ -112,6 +112,71 @@ test("rejected initialization never dispatches a waiting mutation", async () => 
   }
 });
 
+test("frontend attachment shares the actual initialize result and cannot mutate another receipt", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? null : { id: message.id, result: {} };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 5_000);
+  const first = connection.initializedSession();
+  const second = connection.initializedSession();
+  void first.catch(() => {}); void second.catch(() => {});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.map(message => message.method), ["initialize"]);
+    const actual = { userAgent: "fixture/backend", capabilities: { fixture: ["value"] } };
+    child.send({ id: child.messages[0]!.id, result: actual });
+    const [a, b] = await Promise.all([first, second]);
+    assert.deepEqual(a.initializeResult, actual);
+    assert.deepEqual(b.initializeResult, actual);
+    assert.equal(a.generation, b.generation);
+    assert.equal(connection.isSessionCurrent(a.generation), true);
+    (a.initializeResult.capabilities as JsonObject).fixture = ["changed by one frontend"];
+    assert.deepEqual((await connection.initializedSession()).initializeResult, actual);
+    assert.deepEqual(b.initializeResult, actual);
+    assert.deepEqual(child.messages.map(message => message.method), ["initialize", "initialized"]);
+    await connection.close();
+    assert.equal(connection.isSessionCurrent(a.generation), false);
+    await assert.rejects(connection.initializedSession(), AppServerUnavailableError);
+  } finally {
+    await connection.close();
+    await Promise.allSettled([first, second]);
+  }
+});
+
+test("an initialization receipt expires before disconnect callbacks and never crosses backend generations", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild();
+    const index = children.length;
+    child.respond = message => message.method === "initialize"
+      ? { id: message.id, result: { userAgent: `fixture/backend-${index}` } } : { id: message.id, result: {} };
+    children.push(child); return child.asChild();
+  });
+  try {
+    const first = await connection.initializedSession();
+    let expiredDuringCallback = false;
+    connection.onDisconnect(() => { expiredDuringCallback = !connection.isSessionCurrent(first.generation); });
+    children[0]!.disconnect();
+    assert.equal(expiredDuringCallback, true);
+    const second = await connection.initializedSession();
+    assert.notEqual(second.generation, first.generation);
+    assert.deepEqual(second.initializeResult, { userAgent: "fixture/backend-1" });
+    assert.equal(connection.isSessionCurrent(first.generation), false);
+    assert.equal(connection.isSessionCurrent(second.generation), true);
+    assert.equal(children.length, 2);
+  } finally { await connection.close(); }
+});
+
+test("failed initialization does not expose a session receipt or a live generation", async () => {
+  const child = new AppServerChild();
+  child.respond = message => ({ id: message.id, error: { code: -32600 } });
+  const connection = new AppServerConnection(() => child.asChild());
+  try {
+    await assert.rejects(connection.initializedSession(), AppServerRejectedError);
+    assert.equal(connection.isSessionCurrent(1), false);
+    assert.deepEqual(child.messages.map(message => message.method), ["initialize"]);
+  } finally { await connection.close(); }
+});
+
 test("App Server assembles a large response line from bounded chunks", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
