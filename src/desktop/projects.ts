@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
-import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { ProjectAssignmentUnconfirmedError, DesktopUnavailableError, type DesktopProject, type DesktopTask } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, type DesktopProject, type DesktopTask } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { comparablePath } from "./paths.js";
 
@@ -27,73 +26,48 @@ function legacyProjectId(codexHome: string, nativeProjectId: string): string {
   finally { database?.close(); }
 }
 
-/**
- * Codex desktop can temporarily run with native projects migrated to SQLite
- * while sidebar thread assignments still come from its legacy global state.
- * Mirror a successful native metadata update only in that explicit migration
- * state. Fully migrated and CLI-only profiles remain untouched.
- */
-export async function mirrorLegacyProjectAssignment(codexHome: string, threadId: string, nativeProjectId: string | null): Promise<boolean> {
+function hasNativeProjectTables(codexHome: string): boolean {
+  let database: Database | undefined;
+  try {
+    database = new DatabaseConstructor(path.join(codexHome, "state_5.sqlite"), { readonly: true, fileMustExist: true });
+    const tables = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map(row => row.name));
+    return tables.has("projects") && tables.has("project_roots");
+  } catch { return false; }
+  finally { database?.close(); }
+}
+
+/** Reject project moves that would require modifying Desktop's legacy sidebar
+ * assignment. This read must precede the native metadata write. */
+export async function preflightLegacyProjectAssignment(codexHome: string, threadId: string, nativeProjectId: string | null): Promise<void> {
   const statePath = path.join(codexHome, ".codex-global-state.json");
-  const targetProjectId = nativeProjectId === null ? null : legacyProjectId(codexHome, nativeProjectId);
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let original: string; let before: { size: number; mtimeMs: number };
-    try {
-      [original, before] = await Promise.all([readFile(statePath, "utf8"), stat(statePath)]);
-    } catch (error) {
-      if (isObject(error) && error.code === "ENOENT") return false;
-      throw new ProjectAssignmentUnconfirmedError();
-    }
-    let state: unknown;
-    try { state = JSON.parse(original); } catch { throw new ProjectAssignmentUnconfirmedError(); }
-    if (!isObject(state)) throw new ProjectAssignmentUnconfirmedError();
-    const migration = migrationForHome(state, codexHome);
-    if (migration?.projectsMigrated !== true || migration.threadAssignmentsMigrated === true) return false;
-
-    const assignments = isObject(state["thread-project-assignments"])
-      ? { ...state["thread-project-assignments"] as IpcObject } : {};
-    const originalProjectless = Array.isArray(state["projectless-thread-ids"])
-      ? state["projectless-thread-ids"].filter((id): id is string => typeof id === "string") : [];
-    const existing = assignments[threadId];
-    const wasProjectless = originalProjectless.includes(threadId);
-
-    // During partial migration, new App Server threads intentionally have no
-    // legacy entry. Their native threads.project_id is authoritative and is
-    // already consumed by the catalog. Treat the legacy file as an override
-    // only when this thread actually has an old assignment to replace. This
-    // prevents harmless concurrent sidebar writes from turning a confirmed
-    // native mutation into an uncertain create/transfer result.
-    if (existing === undefined && !wasProjectless) return false;
-    if (targetProjectId === null && existing === undefined && wasProjectless) return true;
-    if (targetProjectId !== null && isObject(existing) && existing.projectKind === "local"
-      && existing.projectId === targetProjectId && !wasProjectless) return true;
-
-    const projectless = originalProjectless.filter(id => id !== threadId);
-    if (nativeProjectId === null) {
-      delete assignments[threadId];
-      projectless.push(threadId);
-    } else {
-      assignments[threadId] = { projectKind: "local", projectId: targetProjectId };
-    }
-    const next = { ...state, "thread-project-assignments": assignments, "projectless-thread-ids": projectless };
-    const serialized = `${JSON.stringify(next)}${original.endsWith("\n") ? "\n" : ""}`;
-    const temporary = `${statePath}.vkodex-${process.pid}-${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporary, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      const current = await stat(statePath);
-      if (current.size !== before.size || current.mtimeMs !== before.mtimeMs) {
-        await rm(temporary, { force: true });
-        await new Promise(resolve => setTimeout(resolve, 20 * 2 ** attempt));
-        continue;
-      }
-      await rename(temporary, statePath);
-      return true;
-    } catch {
-      await rm(temporary, { force: true }).catch(() => {});
-      throw new ProjectAssignmentUnconfirmedError();
-    }
+  let original: string;
+  try { original = await readFile(statePath, "utf8"); }
+  catch (error) {
+    if (isObject(error) && error.code === "ENOENT") return;
+    throw new DesktopUnavailableError("Не удалось проверить состояние проектов Codex до переноса; назначение не изменено.");
   }
-  throw new ProjectAssignmentUnconfirmedError();
+  let state: unknown;
+  try { state = JSON.parse(original); }
+  catch { throw new DesktopUnavailableError("Не удалось прочитать состояние проектов Codex до переноса; назначение не изменено."); }
+  if (!isObject(state)) throw new DesktopUnavailableError("Состояние проектов Codex недоступно для проверки; назначение не изменено.");
+  const migration = migrationForHome(state, codexHome);
+  if (migration?.projectsMigrated === true && migration.threadAssignmentsMigrated === true && hasNativeProjectTables(codexHome)) return;
+
+  const assignments = state["thread-project-assignments"];
+  const projectless = state["projectless-thread-ids"];
+  if ((assignments !== undefined && !isObject(assignments))
+    || (projectless !== undefined && (!Array.isArray(projectless) || projectless.some(id => typeof id !== "string")))) {
+    throw new DesktopUnavailableError("Не удалось проверить старые назначения проектов Codex; назначение не изменено.");
+  }
+  const existing = isObject(assignments) && Object.hasOwn(assignments, threadId) ? assignments[threadId] : undefined;
+  const wasProjectless = Array.isArray(projectless) && projectless.includes(threadId);
+  if (existing === undefined && !wasProjectless) return;
+
+  const targetProjectId = nativeProjectId === null ? null : legacyProjectId(codexHome, nativeProjectId);
+  if (targetProjectId === null && existing === undefined && wasProjectless) return;
+  if (targetProjectId !== null && isObject(existing) && existing.projectKind === "local"
+    && existing.projectOrigin !== "chatgpt" && existing.projectId === targetProjectId && !wasProjectless) return;
+  throw new ActionRejectedError("Старое назначение проекта этой задачи ещё управляется приложением Codex. Перенеси задачу через меню проекта в Codex; VKodex не менял назначение.");
 }
 
 /** Prefer imported App Server projects, retaining only explicit legacy ID

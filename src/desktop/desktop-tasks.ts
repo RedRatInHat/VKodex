@@ -516,8 +516,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.metadata.assignProject(task, rawProjectId);
     const current = (await this.listTasks()).find(candidate => sameTask(candidate, task));
     if (!current) throw new UncertainActionError();
-    const confirmed = this.metadata.read ? (await this.metadata.read(task)).projectId === rawProjectId : current.projectId === expectedProjectId;
-    if (!confirmed) throw new ProjectAssignmentUnconfirmedError();
+    if (current.projectId !== expectedProjectId
+      || (this.metadata.read && (await this.metadata.read(task)).projectId !== rawProjectId)) {
+      throw new ProjectAssignmentUnconfirmedError();
+    }
   }
 
   async transferTask(request: TransferTaskRequest) {

@@ -7,7 +7,7 @@ import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError
 import { normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 export { parseTaskGoal } from "../core/task-goals.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
-import { mirrorLegacyProjectAssignment } from "./projects.js";
+import { preflightLegacyProjectAssignment } from "./projects.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
 import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
@@ -404,8 +404,8 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
     const home = this.sourceHome(task);
+    await preflightLegacyProjectAssignment(home, task.threadId, projectId);
     await this.createMetadata(home).assignProject(task, projectId);
-    await mirrorLegacyProjectAssignment(home, task.threadId, projectId);
   }
 }
 

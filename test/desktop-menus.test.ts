@@ -375,6 +375,42 @@ test("native project assignment uses thread metadata and clears with an empty pr
   ]);
 });
 
+test("partial-migration project move preflights before native or legacy state mutation", async () => {
+  const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
+  const { default: path } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const home = await mkdtemp(path.join(tmpdir(), "vkodex-project-preflight-"));
+  const statePath = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({
+    "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } },
+    "thread-project-assignments": { fixture: { projectKind: "local", projectId: "old-project" } },
+    "projectless-thread-ids": [],
+  });
+  await writeFile(statePath, original);
+  const calls: string[] = [];
+  const native = new NativeDesktopMetadata({ call: async method => { calls.push(method); return {}; } });
+  const metadata = new ProfileDesktopMetadata(() => home, () => native);
+  const error = await metadata.assignProject({ hostId: "local", threadId: "fixture" }, "new-project").catch(error => error);
+  assert.deepEqual({ nativeCalls: calls.length, stateUnchanged: await readFile(statePath, "utf8") === original,
+    rejected: error instanceof ActionRejectedError }, { nativeCalls: 0, stateUnchanged: true, rejected: true });
+});
+
+test("malformed legacy projectless IDs reject before native project mutation", async () => {
+  const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
+  const { default: path } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const home = await mkdtemp(path.join(tmpdir(), "vkodex-project-invalid-ids-"));
+  const statePath = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({ "projectless-thread-ids": ["another", 42] });
+  await writeFile(statePath, original);
+  const calls: string[] = [];
+  const native = new NativeDesktopMetadata({ call: async method => { calls.push(method); return {}; } });
+  const metadata = new ProfileDesktopMetadata(() => home, () => native);
+  await assert.rejects(metadata.assignProject({ hostId: "local", threadId: "fixture" }, "new-project"), DesktopUnavailableError);
+  assert.deepEqual(calls, []);
+  assert.equal(await readFile(statePath, "utf8"), original);
+});
+
 test("an unchanged native project assignment is accepted only after exact readback", async () => {
   const calls: { method: string; params: IpcObject }[] = [];
   const task = { hostId: "local", threadId: "fixture" };

@@ -7,7 +7,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
-import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, ProjectAssignmentUnconfirmedError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
@@ -2063,6 +2063,23 @@ test("project move writes Codex metadata and confirms the catalog without starti
   await assert.rejects(databaseOnly.moveTask(ref, "project-b"),
     error => error instanceof UncertainActionError && /назначение в приложении не подтверждено/u.test(error.message));
   assert.equal(databaseWrites, 1);
+});
+
+test("project move requires both visible catalog and native metadata to confirm the same target", async () => {
+  for (const [visibleProjectId, nativeProjectId] of [["old-project", "new-project"], ["new-project", "old-project"]] as const) {
+    let writes = 0;
+    const adapter = new ConnectedDesktopTasks({
+      listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", projectId: visibleProjectId, updatedAt: 1 }],
+      listProjects: async () => [],
+      resolveProject: async () => ({ rawProjectId: "new-project", sourceId: "", project: { id: "new-project" } }),
+    }, () => assert.fail("Project confirmation must not open a task"), {
+      rename: async () => {}, archive: async () => {}, markdown: async () => "",
+      assignProject: async () => { writes++; },
+      read: async () => ({ title: "Fixture", projectId: nativeProjectId }),
+    });
+    await assert.rejects(adapter.moveTask(ref, "new-project"), ProjectAssignmentUnconfirmedError);
+    assert.equal(writes, 1);
+  }
 });
 
 test("compatibility canary confirms stream protocol v11 through an open task", async () => {

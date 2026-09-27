@@ -6,7 +6,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { type DesktopTask, DesktopUnavailableError } from "../src/desktop/contracts.js";
 import { readTaskCatalog } from "../src/desktop/catalog.js";
-import { assignTaskProjects, desktopProjects, mirrorLegacyProjectAssignment, readDesktopProjectState } from "../src/desktop/projects.js";
+import { assignTaskProjects, desktopProjects, preflightLegacyProjectAssignment, readDesktopProjectState } from "../src/desktop/projects.js";
 import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
 
 const task: DesktopTask = { hostId: "local", threadId: "fixture", title: "Fixture task", workspace: "D:/Fixture/First", updatedAt: 1 };
@@ -17,7 +17,7 @@ const state = {
   },
 };
 
-test("partial project migration mirrors native assignment into the sidebar state", async t => {
+test("partial project migration rejects changed legacy membership without writing sidebar state", async t => {
   const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-mirror-"));
   const database = new Database(path.join(home, "state_5.sqlite")); t.after(() => database.close());
   database.exec(`CREATE TABLE project_idempotency_keys (key TEXT, project_id TEXT, created_at_ms INTEGER);
@@ -27,24 +27,22 @@ test("partial project migration mirrors native assignment into the sidebar state
   await writeFile(file, JSON.stringify({ "app-server-projects-migration-by-host": migration,
     "thread-project-assignments": { untouched: { projectKind: "local", projectId: "other" } },
     "projectless-thread-ids": ["fixture", "another"] }));
-  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), true);
-  let saved = JSON.parse(await readFile(file, "utf8"));
-  assert.deepEqual(saved["thread-project-assignments"].fixture, { projectKind: "local", projectId: "legacy-project" });
-  assert.deepEqual(saved["projectless-thread-ids"], ["another"]);
-  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", null), true);
-  saved = JSON.parse(await readFile(file, "utf8"));
-  assert.equal(saved["thread-project-assignments"].fixture, undefined);
-  assert.deepEqual(saved["projectless-thread-ids"], ["another", "fixture"]);
+  const original = await readFile(file, "utf8");
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "native-project"), { name: "ActionRejectedError" });
+  await preflightLegacyProjectAssignment(home, "fixture", null);
+  assert.equal(await readFile(file, "utf8"), original);
 });
 
-test("fully migrated project state is not rewritten", async () => {
+test("fully migrated project state permits native assignment without rewriting legacy state", async t => {
   const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-native-"));
+  const database = new Database(path.join(home, "state_5.sqlite")); t.after(() => database.close());
+  database.exec("CREATE TABLE projects (id TEXT); CREATE TABLE project_roots (project_id TEXT, path TEXT)");
   const file = path.join(home, ".codex-global-state.json");
   const original = JSON.stringify({ "app-server-projects-migration-by-host": {
     [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: true },
   } });
   await writeFile(file, original);
-  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), false);
+  await preflightLegacyProjectAssignment(home, "fixture", "native-project");
   assert.equal(await readFile(file, "utf8"), original);
 });
 
@@ -56,13 +54,13 @@ test("a new native thread does not require a legacy assignment during partial mi
     "thread-project-assignments": { untouched: { projectKind: "local", projectId: "other" } },
     "projectless-thread-ids": ["another"] });
   await writeFile(file, original);
-  assert.equal(await mirrorLegacyProjectAssignment(home, "new-native-thread", "native-project"), false);
+  await preflightLegacyProjectAssignment(home, "new-native-thread", "native-project");
   assert.equal(await readFile(file, "utf8"), original);
-  assert.equal(await mirrorLegacyProjectAssignment(home, "new-native-thread", null), false);
+  await preflightLegacyProjectAssignment(home, "new-native-thread", null);
   assert.equal(await readFile(file, "utf8"), original);
 });
 
-test("an already matching legacy assignment is idempotent", async () => {
+test("an already matching legacy assignment can pass preflight without a file write", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-matching-"));
   const migration = { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } };
   const file = path.join(home, ".codex-global-state.json");
@@ -70,8 +68,64 @@ test("an already matching legacy assignment is idempotent", async () => {
     "thread-project-assignments": { fixture: { projectKind: "local", projectId: "native-project" } },
     "projectless-thread-ids": [] });
   await writeFile(file, original);
-  assert.equal(await mirrorLegacyProjectAssignment(home, "fixture", "native-project"), true);
+  await preflightLegacyProjectAssignment(home, "fixture", "native-project");
   assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("a matching ChatGPT-origin assignment is not treated as a local project match", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-cloud-origin-"));
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({
+    "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } },
+    "thread-project-assignments": { fixture: { projectKind: "local", projectOrigin: "chatgpt", projectId: "native-project" } },
+    "projectless-thread-ids": [],
+  });
+  await writeFile(file, original);
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "native-project"), { name: "ActionRejectedError" });
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("legacy overrides without a completed assignment migration cannot silently pass", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-legacy-"));
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({ "thread-project-assignments": { fixture: { projectKind: "local", projectId: "old" } } });
+  await writeFile(file, original);
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "new"), { name: "ActionRejectedError" });
+  await preflightLegacyProjectAssignment(home, "new-native-thread", "new");
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("assignment migration flag alone does not authorize a conflicting old override", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-incomplete-"));
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({
+    "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: false, threadAssignmentsMigrated: true } },
+    "thread-project-assignments": { fixture: { projectKind: "local", projectId: "old" } },
+  });
+  await writeFile(file, original);
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "new"), { name: "ActionRejectedError" });
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("full migration flags without native project tables cannot bypass an old override", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-missing-db-"));
+  const file = path.join(home, ".codex-global-state.json");
+  const original = JSON.stringify({
+    "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: true } },
+    "thread-project-assignments": { fixture: { projectKind: "local", projectId: "old" } },
+  });
+  await writeFile(file, original);
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "new"), { name: "ActionRejectedError" });
+  assert.equal(await readFile(file, "utf8"), original);
+});
+
+test("unreadable legacy state fails closed while a native-only profile remains supported", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-project-state-"));
+  await preflightLegacyProjectAssignment(home, "fixture", "native-project");
+  const file = path.join(home, ".codex-global-state.json");
+  await writeFile(file, "not-json");
+  await assert.rejects(preflightLegacyProjectAssignment(home, "fixture", "native-project"), DesktopUnavailableError);
+  assert.equal(await readFile(file, "utf8"), "not-json");
 });
 
 test("imported native projects replace stale IDs while assignment migration controls sidebar membership", async t => {
