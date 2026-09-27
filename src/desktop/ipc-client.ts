@@ -63,6 +63,7 @@ export function encodeFrame(message: IpcObject): Buffer {
 
 interface PendingRequest {
   readonly method: string;
+  readonly targetClientId?: string;
   readonly resolve: (value: IpcObject) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
@@ -179,7 +180,8 @@ export class DesktopIpcClient {
         this.pending.delete(requestId);
         reject(options.mutating ? new UncertainActionError() : new DesktopUnavailableError("Десктоп не ответил вовремя."));
       }, timeoutMs);
-      this.pending.set(requestId, { method, resolve, reject, timer, mutating: options.mutating ?? false });
+      this.pending.set(requestId, { method, resolve, reject, timer, mutating: options.mutating ?? false,
+        ...(options.targetClientId ? { targetClientId: options.targetClientId } : {}) });
       try {
         this.write({
           type: "request", requestId, method, version, params, timeoutMs,
@@ -218,6 +220,12 @@ export class DesktopIpcClient {
     if (message.type === "response" && typeof message.requestId === "string") {
       const pending = this.pending.get(message.requestId);
       if (!pending) return;
+      // A successful targeted reply must come from the addressed owner. Do not
+      // consume the pending request: its real reply may still arrive. Otherwise
+      // the existing deadline reports an unknown write, without retrying it or
+      // closing the shared pipe. This checks routing, not actor authentication.
+      if (message.resultType === "success" && pending.targetClientId !== undefined
+        && message.handledByClientId !== pending.targetClientId) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.requestId);
       if (message.resultType === "success") pending.resolve(message);

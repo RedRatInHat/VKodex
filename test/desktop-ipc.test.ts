@@ -1766,6 +1766,44 @@ test("revision gap requests a fresh snapshot instead of continuing a corrupted s
   subscription.close();
 });
 
+for (const mutating of [false, true]) {
+  test(`targeted IPC ${mutating ? "write" : "read"} requires the addressed owner's receipt`, async () => {
+    for (const receiptOwner of ["replacement-owner", undefined, null, "", 42]) {
+      const server = new Server();
+      const client = new DesktopIpcClient(() => server, 100);
+      try {
+        await client.connect();
+        const send = server.send.bind(server);
+        server.send = message => send(message.type === "response"
+          ? { ...message, handledByClientId: receiptOwner } : message);
+        await assert.rejects(client.request("fixture-operation", 1, {}, { targetClientId: "owner", mutating }),
+          error => mutating ? error instanceof UncertainActionError
+            : error instanceof DesktopUnavailableError && !(error instanceof UncertainActionError));
+        assert.equal(server.received.filter(message => message.method === "fixture-operation").length, 1);
+        // A bad receipt invalidates this operation, not other tasks on the pipe.
+        server.send = send;
+        const next = await client.request("fixture-read", 1, {}, { targetClientId: "owner" });
+        assert.equal(next.handledByClientId, "owner");
+        assert.equal(server.destroyed, false);
+      } finally { client.close(); }
+    }
+  });
+}
+
+test("a different owner's response cannot consume a targeted pending request", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  t.after(() => client.close()); await client.connect();
+  const send = server.send.bind(server);
+  server.send = message => {
+    if (message.type !== "response") { send(message); return; }
+    send({ ...message, handledByClientId: "replacement-owner" });
+    setImmediate(() => send(message));
+  };
+  const response = await client.request("fixture-operation", 1, {}, { targetClientId: "owner", mutating: true });
+  assert.equal(response.handledByClientId, "owner");
+  assert.equal(server.received.filter(message => message.method === "fixture-operation").length, 1);
+});
+
 test("timeouts and disconnected writes are uncertain and never retried by IPC", async t => {
   const server = new Server(); server.answerWrites = false;
   const client = new DesktopIpcClient(() => server, 10); t.after(() => client.close()); await client.connect();
