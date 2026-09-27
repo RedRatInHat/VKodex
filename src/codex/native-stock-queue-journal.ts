@@ -1,0 +1,392 @@
+// Isolated normalized repeated-admission journal. No RPC, native IPC, scheduler.
+// Runtime reads are indexed or paged. `read` and `publication` are diagnostics only.
+// The caller MUST serialize external native publications with one writer: a
+// versioned ACK fences the outbox but cannot reorder sends already in flight.
+import DatabaseConstructor, { type Database, type Statement } from 'better-sqlite3';
+import type { JsonValue, JsonObject } from './homogeneous-queue-policy.js';
+import { isDeepStrictEqual } from 'node:util';
+import path from 'node:path';
+
+export interface StockQueueOperation {
+  opId: string; seq: number; fingerprint: string; nativeEntry: JsonObject;
+  effectiveSettings: JsonObject; admissionEvidence: JsonObject;
+  stockInput: readonly JsonValue[]; forwardedUpstream: JsonObject;
+  phase: 'reserved' | 'accepted' | 'unknown'; stockId: string | null;
+  acceptedTurnId: string | null; consumed: boolean;
+}
+interface TaskRow { task_id: string; owner_epoch: string; version: number; settings_json: string | null;
+  publication_version: number; publication_acked_version: number }
+interface OpRow { task_id: string; op_id: string; seq: number; fingerprint: string;
+  native_entry_json: string; admission_evidence_json: string;
+  stock_input_json: string; forwarded_json: string;
+  phase: StockQueueOperation['phase']; stock_id: string | null;
+  accepted_turn_id: string | null; consumed: number }
+type IdentityRow = Pick<OpRow, 'op_id' | 'seq' | 'fingerprint' | 'phase' | 'consumed'>;
+interface TaskView { taskId: string; ownerEpoch: string; version: number;
+  effectiveSettings: JsonObject | null; publicationVersion: number; publicationAckedVersion: number }
+export interface Page<T> { taskVersion: number; items: T[]; hasMore: boolean; nextCursor: number }
+type InputIdentity = { id: string; seq: number; fingerprint: string;
+  phase: StockQueueOperation['phase']; consumed: boolean };
+export interface PublicationItem { seq: number; opId: string; fingerprint: string; nativeEntry: JsonObject }
+type PageArgs = { afterSeq?: number; limit?: number };
+type PublicationPageArgs = PageArgs & { version: number };
+type CurrentQueuePageArgs = PageArgs & { expectedVersion: number };
+export interface StockQueueIntent { expectedVersion: number; opId: string; fingerprint: string;
+  nativeEntry: JsonObject; effectiveSettings: JsonObject; admissionEvidence: JsonObject;
+  stockInput: readonly JsonValue[];
+  forwardedUpstream: JsonObject }
+
+const fail = (reason: string): never => { throw new Error(`Native repeated stock journal refused: ${reason}`); };
+const plain = (value: unknown): value is JsonObject => value !== null && typeof value === 'object' &&
+  !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+const nonempty = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+const fingerprint = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+const copy = <T>(value: T): T => structuredClone(value);
+const maxPageSize = 500;
+
+function json(value: unknown): string {
+  let encoded: string | undefined;
+  try { encoded = JSON.stringify(value); }
+  catch { fail('non-JSON intent'); }
+  if (encoded === undefined || !isDeepStrictEqual(value, JSON.parse(encoded))) fail('non-JSON intent');
+  return encoded ?? fail('non-JSON intent');
+}
+function pageArgs(afterSeq: number, limit: number): void {
+  if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > maxPageSize) {
+    fail(`page cursor and limit 1..${maxPageSize} required`);
+  }
+}
+const taskView = (row: TaskRow | undefined, taskId: string, ownerEpoch: string): TaskView => row ? {
+  taskId, ownerEpoch, version: row.version,
+  effectiveSettings: row.settings_json === null ? null : JSON.parse(row.settings_json) as JsonObject,
+  publicationVersion: row.publication_version,
+  publicationAckedVersion: row.publication_acked_version,
+} : { taskId, ownerEpoch, version: 0, effectiveSettings: null,
+  publicationVersion: 0, publicationAckedVersion: 0 };
+const opView = (row: OpRow, effectiveSettings: JsonObject | null): StockQueueOperation => ({
+  opId: row.op_id, seq: row.seq, fingerprint: row.fingerprint,
+  nativeEntry: JSON.parse(row.native_entry_json) as JsonObject, effectiveSettings: copy(effectiveSettings ?? fail('missing settings')),
+  admissionEvidence: JSON.parse(row.admission_evidence_json) as JsonObject,
+  stockInput: JSON.parse(row.stock_input_json) as JsonValue[],
+  forwardedUpstream: JSON.parse(row.forwarded_json) as JsonObject, phase: row.phase,
+  stockId: row.stock_id, acceptedTurnId: row.accepted_turn_id, consumed: row.consumed === 1,
+});
+
+export class NativeStockQueueJournal {
+  private readonly db: Database;
+  readonly taskId: string;
+  readonly ownerEpoch: string;
+  private txKind: 'read' | 'write' | null = null;
+  private readonly selectTask: Statement<[string], TaskRow>;
+  private readonly selectOp: Statement<[string, string], OpRow>;
+  private readonly selectIdentity: Statement<[string, string], IdentityRow>;
+  private readonly selectUnresolved: Statement<[string], Pick<OpRow, 'phase'>>;
+  private readonly selectNextSeq: Statement<[string], { next_seq: number }>;
+  private readonly selectPage: Statement<[string, number, number, number], OpRow>;
+  private readonly selectPublicationPage: Statement<[string, number, number], OpRow>;
+  private readonly selectAll: Statement<[string], OpRow>;
+  private readonly insertTask: Statement<[string, string, number, string, number, number]>;
+  private readonly bumpTask: Statement<[string, number]>;
+  private readonly bumpPublication: Statement<[string, number]>;
+  private readonly insertOp: Statement<[string, string, number, string, string, string, string, string,
+    StockQueueOperation['phase'], string | null, string | null, number]>;
+  private readonly acceptOp: Statement<[string, string, string]>;
+  private readonly unknownOp: Statement<[string, string]>;
+  private readonly consumeOp: Statement<[string, string, string]>;
+  private readonly ackPublication: Statement<[number, string, number, number]>;
+
+  constructor({ filePath, taskId, ownerEpoch }: { filePath: string; taskId: string; ownerEpoch: string }) {
+    if (!nonempty(filePath) || !path.isAbsolute(filePath) ||
+        !nonempty(taskId) || !nonempty(ownerEpoch)) fail('absolute path, task, owner epoch required');
+    this.taskId = taskId;
+    this.ownerEpoch = ownerEpoch;
+    this.db = new DatabaseConstructor(filePath);
+    try {
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = FULL');
+      this.db.pragma('busy_timeout = 5000');
+      this.db.pragma('foreign_keys = ON');
+      this.db.exec(`CREATE TABLE IF NOT EXISTS native_repeated_task (
+        task_id TEXT PRIMARY KEY NOT NULL,
+        owner_epoch TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        settings_json TEXT,
+        publication_version INTEGER NOT NULL,
+        publication_acked_version INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS native_repeated_op (
+        task_id TEXT NOT NULL,
+        op_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        native_entry_json TEXT NOT NULL,
+        admission_evidence_json TEXT NOT NULL,
+        stock_input_json TEXT NOT NULL,
+        forwarded_json TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('reserved','accepted','unknown')),
+        stock_id TEXT,
+        accepted_turn_id TEXT,
+        consumed INTEGER NOT NULL CHECK (consumed IN (0,1)),
+        PRIMARY KEY(task_id,op_id),
+        UNIQUE(task_id,seq),
+        FOREIGN KEY(task_id) REFERENCES native_repeated_task(task_id)
+      );
+      CREATE INDEX IF NOT EXISTS native_repeated_pending_idx ON native_repeated_op(task_id,consumed,seq);
+      CREATE INDEX IF NOT EXISTS native_repeated_phase_idx ON native_repeated_op(task_id,phase);
+      CREATE UNIQUE INDEX IF NOT EXISTS native_repeated_stock_idx ON native_repeated_op(task_id,stock_id) WHERE stock_id IS NOT NULL;`);
+      const columns = this.db.pragma('table_info(native_repeated_op)') as { name: string }[];
+      if (!columns.some(row => row.name === 'admission_evidence_json')) {
+        fail('incompatible journal schema; explicit migration required');
+      }
+      this.selectTask = this.db.prepare<[string], TaskRow>('SELECT * FROM native_repeated_task WHERE task_id=?');
+      this.selectOp = this.db.prepare<[string, string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND op_id=?');
+      this.selectIdentity = this.db.prepare<[string, string], IdentityRow>('SELECT op_id,seq,fingerprint,phase,consumed FROM native_repeated_op WHERE task_id=? AND op_id=?');
+      this.selectUnresolved = this.db.prepare<[string], Pick<OpRow, 'phase'>>("SELECT phase FROM native_repeated_op WHERE task_id=? AND phase IN ('reserved','unknown') LIMIT 1");
+      this.selectNextSeq = this.db.prepare<[string], { next_seq: number }>('SELECT COALESCE(MAX(seq),0)+1 AS next_seq FROM native_repeated_op WHERE task_id=?');
+      this.selectPage = this.db.prepare<[string, number, number, number], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND consumed=? AND seq>? ORDER BY seq LIMIT ?');
+      this.selectPublicationPage = this.db.prepare<[string, number, number], OpRow>("SELECT * FROM native_repeated_op WHERE task_id=? AND phase='accepted' AND consumed=0 AND seq>? ORDER BY seq LIMIT ?");
+      this.selectAll = this.db.prepare<[string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? ORDER BY seq');
+      this.insertTask = this.db.prepare<[string, string, number, string, number, number]>('INSERT INTO native_repeated_task VALUES(?,?,?,?,?,?)');
+      this.bumpTask = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1 WHERE task_id=? AND version=?');
+      this.bumpPublication = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1,publication_version=publication_version+1 WHERE task_id=? AND version=?');
+      this.insertOp = this.db.prepare<[string, string, number, string, string, string, string, string,
+        StockQueueOperation['phase'], string | null, string | null, number]>('INSERT INTO native_repeated_op VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+      this.acceptOp = this.db.prepare<[string, string, string]>("UPDATE native_repeated_op SET phase='accepted',stock_id=? WHERE task_id=? AND op_id=? AND phase='reserved'");
+      this.unknownOp = this.db.prepare<[string, string]>("UPDATE native_repeated_op SET phase='unknown' WHERE task_id=? AND op_id=? AND phase='reserved'");
+      this.consumeOp = this.db.prepare<[string, string, string]>('UPDATE native_repeated_op SET accepted_turn_id=?,consumed=1 WHERE task_id=? AND op_id=? AND accepted_turn_id IS NULL');
+      this.ackPublication = this.db.prepare<[number, string, number, number]>('UPDATE native_repeated_task SET publication_acked_version=?,version=version+1 WHERE task_id=? AND version=? AND publication_version=?');
+    } catch (error) { this.db.close(); throw error; }
+  }
+
+  taskRow(): TaskRow | undefined {
+    const row = this.selectTask.get(this.taskId);
+    if (row && row.owner_epoch !== this.ownerEpoch) fail('owner epoch mismatch');
+    return row;
+  }
+  readTask(): TaskView { return taskView(this.taskRow(), this.taskId, this.ownerEpoch); }
+  readOperation(opId: string): StockQueueOperation | null {
+    if (!nonempty(opId)) fail('operation ID required');
+    return this.snapshot(() => {
+      const task = this.readTask();
+      const row = this.selectOp.get(this.taskId, opId);
+      return row ? opView(row, task.effectiveSettings) : null;
+    });
+  }
+  private page(consumed: boolean, { afterSeq = 0, limit = 100 }: PageArgs = {}): Page<StockQueueOperation> {
+    pageArgs(afterSeq, limit);
+    return this.snapshot(() => {
+      const task = this.readTask();
+      const rows = this.selectPage.all(this.taskId, consumed ? 1 : 0, afterSeq, limit + 1);
+      const items = rows.slice(0, limit).map(row => opView(row, task.effectiveSettings));
+      return { taskVersion: task.version, items, hasMore: rows.length > limit,
+        nextCursor: items.at(-1)?.seq ?? afterSeq };
+    });
+  }
+  pendingPage(args: PageArgs = {}): Page<StockQueueOperation> { return this.page(false, args); }
+  consumedPage(args: PageArgs = {}): Page<StockQueueOperation> { return this.page(true, args); }
+  lookupIncomingIdentities({ ids }: { ids: string[] }): { taskVersion: number; items: (InputIdentity | null)[] } {
+    if (!Array.isArray(ids) || ids.length > maxPageSize ||
+        ids.some(id => !nonempty(id)) || new Set(ids).size !== ids.length) {
+      fail(`incoming identity batch of at most ${maxPageSize} unique IDs required`);
+    }
+    return this.snapshot(() => {
+      const task = this.readTask();
+      const items = ids.map(id => {
+        const row = this.selectIdentity.get(this.taskId, id);
+        return row ? { id: row.op_id, seq: row.seq, fingerprint: row.fingerprint,
+          phase: row.phase, consumed: row.consumed === 1 } : null;
+      });
+      return { taskVersion: task.version, items };
+    });
+  }
+  publicationStatus(): { version: number; acknowledgedVersion: number; pending: boolean } {
+    const task = this.readTask();
+    return { version: task.publicationVersion, acknowledgedVersion: task.publicationAckedVersion,
+      pending: task.publicationVersion > task.publicationAckedVersion };
+  }
+  publicationPage({ version, afterSeq = 0, limit = 100 }: PublicationPageArgs): Omit<Page<PublicationItem>, 'taskVersion'> & { version: number } {
+    pageArgs(afterSeq, limit);
+    return this.snapshot(() => {
+      const status = this.publicationStatus();
+      if (!status.pending || version !== status.version) fail('stale publication snapshot');
+      const rows = this.selectPublicationPage.all(this.taskId, afterSeq, limit + 1);
+      const items = rows.slice(0, limit).map(row => ({ seq: row.seq, opId: row.op_id,
+        fingerprint: row.fingerprint, nativeEntry: JSON.parse(row.native_entry_json) as JsonObject }));
+      return { version, items, hasMore: rows.length > limit,
+        nextCursor: items.at(-1)?.seq ?? afterSeq };
+    });
+  }
+  currentQueuePage({ expectedVersion, afterSeq = 0, limit = 100 }: CurrentQueuePageArgs): Page<PublicationItem> {
+    pageArgs(afterSeq, limit);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) fail('expected task version required');
+    return this.snapshot(() => {
+      const task = this.readTask();
+      if (task.version !== expectedVersion) fail('stale task version');
+      const rows = this.selectPublicationPage.all(this.taskId, afterSeq, limit + 1);
+      const items = rows.slice(0, limit).map(row => ({ seq: row.seq, opId: row.op_id,
+        fingerprint: row.fingerprint, nativeEntry: JSON.parse(row.native_entry_json) as JsonObject }));
+      return { taskVersion: task.version, items, hasMore: rows.length > limit,
+        nextCursor: items.at(-1)?.seq ?? afterSeq };
+    });
+  }
+
+  // Diagnostic/test convenience only: walks every operation and is not a runtime API.
+  read(): TaskView & { operations: StockQueueOperation[]; pendingIds: string[]; publicationIds: string[] } {
+    return this.snapshot(() => {
+      const task = this.readTask();
+      const operations = this.selectAll.all(this.taskId).map(row => opView(row, task.effectiveSettings));
+      return { ...task, operations, pendingIds: operations.filter(op => !op.consumed).map(op => op.opId),
+        publicationIds: operations.filter(op => op.phase === 'accepted' && !op.consumed).map(op => op.opId) };
+    });
+  }
+  // Diagnostic/test convenience only; runtime must use publicationPage under one writer.
+  publication(): { version: number; pendingIds: string[]; messages: JsonObject[] } | null {
+    return this.snapshot(() => {
+      const status = this.publicationStatus();
+      if (!status.pending) return null;
+      const rows = this.selectPublicationPage.all(this.taskId, 0, -1);
+      return { version: status.version, pendingIds: rows.map(row => row.op_id),
+        messages: rows.map(row => JSON.parse(row.native_entry_json) as JsonObject) };
+    });
+  }
+
+  private snapshot<T>(fn: () => T): T {
+    if (this.txKind) return fn(); // Includes reads made by this connection's write transaction.
+    this.db.exec('BEGIN'); // Deferred read transaction: first SELECT pins one WAL snapshot.
+    this.txKind = 'read';
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    finally { this.txKind = null; }
+  }
+  private transaction<T>(fn: () => T): T {
+    if (this.txKind) fail('nested write transaction');
+    this.db.exec('BEGIN IMMEDIATE');
+    this.txKind = 'write';
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    finally { this.txKind = null; }
+  }
+  confirmReplay({ expectedVersion, ownerEpoch }: { expectedVersion: number; ownerEpoch: string }): { confirmed: true; version: number } {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 ||
+        ownerEpoch !== this.ownerEpoch) fail('owner epoch mismatch or invalid expected version');
+    return this.transaction(() => {
+      const row = this.taskRow();
+      const version = row?.version ?? 0;
+      if (version !== expectedVersion) fail('stale expected version');
+      if (this.selectUnresolved.get(this.taskId)) fail('unresolved stock add prevents replay confirmation');
+      return { confirmed: true, version };
+    });
+  }
+  private bump(row: TaskRow, publication: boolean): void {
+    const result = publication
+      ? this.bumpPublication.run(this.taskId, row.version)
+      : this.bumpTask.run(this.taskId, row.version);
+    if (result.changes !== 1) fail('concurrent task update');
+  }
+
+  reserve({ expectedVersion, opId, fingerprint: hash, nativeEntry, effectiveSettings,
+    admissionEvidence, stockInput, forwardedUpstream }: StockQueueIntent): StockQueueOperation {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 ||
+        !nonempty(opId) || !fingerprint(hash) || !plain(nativeEntry) || nativeEntry.id !== opId ||
+        !plain(effectiveSettings) || !plain(admissionEvidence) ||
+        Object.keys(admissionEvidence).length === 0 || !Array.isArray(stockInput) ||
+        !plain(forwardedUpstream)) fail('incomplete immutable intent');
+    const nativeJson = json(nativeEntry), settingsJson = json(effectiveSettings);
+    const evidenceJson = json(admissionEvidence);
+    const inputJson = json(stockInput), forwardedJson = json(forwardedUpstream);
+    return this.transaction(() => {
+      let row = this.taskRow();
+      if ((row?.version ?? 0) !== expectedVersion) fail('stale expected version');
+      if (this.selectOp.get(this.taskId, opId)) fail('reused immutable operation ID');
+      const unresolved = this.selectUnresolved.get(this.taskId)?.phase;
+      if (unresolved === 'unknown') fail('unknown outcome freezes admissions');
+      if (unresolved === 'reserved') fail('prior stock add is still unresolved');
+      if (row?.settings_json !== null && row?.settings_json !== undefined &&
+          !isDeepStrictEqual(JSON.parse(row.settings_json), effectiveSettings)) fail('effective settings changed');
+      if (!row) {
+        this.insertTask.run(this.taskId, this.ownerEpoch, 0, settingsJson, 0, 0);
+        row = this.taskRow();
+      } else if (row.settings_json === null) fail('missing immutable settings');
+      const seq = this.selectNextSeq.get(this.taskId)?.next_seq ?? fail('next sequence absent');
+      this.insertOp.run(this.taskId, opId, seq, hash, nativeJson, evidenceJson, inputJson,
+        forwardedJson, 'reserved', null, null, 0);
+      this.bump(row ?? fail('task row absent after reservation'), false);
+      return this.readOperation(opId) ?? fail('reserved operation absent');
+    });
+  }
+
+  markAccepted({ opId, fingerprint: hash, stockId }: { opId: string; fingerprint: string; stockId: string }): StockQueueOperation {
+    if (!nonempty(opId) || !fingerprint(hash) || !nonempty(stockId)) fail('accepted receipt incomplete');
+    return this.transaction(() => {
+      const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
+      if (!task || !op) return fail('operation identity conflict');
+      if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.phase === 'unknown') fail('unknown requires explicit authoritative reconciliation');
+      if (op.phase === 'accepted') {
+        if (op.stock_id !== stockId) fail('stock receipt conflict');
+        return this.readOperation(opId) ?? fail('accepted operation absent');
+      }
+      const changed = this.acceptOp.run(stockId, this.taskId, opId);
+      if (changed.changes !== 1) fail('accepted phase conflict');
+      this.bump(task, true); // Emits [] too when authoritative consume preceded the ACK.
+      return this.readOperation(opId) ?? fail('accepted operation absent');
+    });
+  }
+
+  markUnknown({ opId, fingerprint: hash }: { opId: string; fingerprint: string }): StockQueueOperation {
+    if (!nonempty(opId) || !fingerprint(hash)) fail('unknown receipt incomplete');
+    return this.transaction(() => {
+      const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
+      if (!task || !op) return fail('operation identity conflict');
+      if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.phase === 'accepted') fail('accepted result cannot downgrade');
+      if (op.phase === 'unknown') return this.readOperation(opId) ?? fail('unknown operation absent');
+      const changed = this.unknownOp.run(this.taskId, opId);
+      if (changed.changes !== 1) fail('unknown phase conflict');
+      this.bump(task, false);
+      return this.readOperation(opId) ?? fail('unknown operation absent');
+    });
+  }
+
+  consume({ opId, fingerprint: hash, turnId, authoritative }: { opId: string; fingerprint: string;
+    turnId: string; authoritative: boolean }): StockQueueOperation {
+    if (!nonempty(opId) || !fingerprint(hash) || !nonempty(turnId) || authoritative !== true) {
+      fail('authoritative turn identity required');
+    }
+    return this.transaction(() => {
+      const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
+      if (!task || !op) return fail('operation identity conflict');
+      if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.accepted_turn_id !== null) {
+        if (op.accepted_turn_id !== turnId) fail('turn identity conflict');
+        return this.readOperation(opId) ?? fail('consumed operation absent');
+      }
+      const changed = this.consumeOp.run(turnId, this.taskId, opId);
+      if (changed.changes !== 1) fail('consume conflict');
+      this.bump(task, op.phase === 'accepted');
+      return this.readOperation(opId) ?? fail('consumed operation absent');
+    });
+  }
+
+  acknowledgePublication({ version }: { version: number }): { acknowledged: boolean; currentVersion: number } {
+    if (!Number.isSafeInteger(version) || version < 1) fail('publication version required');
+    return this.transaction(() => {
+      const task = this.taskRow();
+      if (!task) return { acknowledged: false, currentVersion: 0 };
+      if (version !== task.publication_version || version <= task.publication_acked_version) {
+        return { acknowledged: false, currentVersion: task.publication_version };
+      }
+      const changed = this.ackPublication.run(version, this.taskId, task.version, version);
+      if (changed.changes !== 1) fail('concurrent publication update');
+      return { acknowledged: true, currentVersion: version };
+    });
+  }
+  close() { this.db.close(); }
+}
