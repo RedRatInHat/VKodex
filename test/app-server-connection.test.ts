@@ -4,7 +4,8 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { AppServerConnection, AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
-import type { AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
+import type { AppServerServerRequest, AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
+import { AppServerRequestInbox } from "../src/codex/app-server-request-inbox.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -45,6 +46,195 @@ class AppServerChild extends EventEmitter {
   kill(): boolean { this.disconnect(); return true; }
   asChild(): ChildProcessWithoutNullStreams { return this as unknown as ChildProcessWithoutNullStreams; }
 }
+
+test("request inbox keeps worker questions across frontend detach and fences typed replies", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: request => request.method === "item/tool/requestUserInput",
+    allowAnswer: (_request, result) => result.answers !== undefined,
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const firstFrames: JsonObject[] = [];
+  const first = inbox.attach(frame => firstFrames.push(frame));
+  try {
+    child.send({ id: 17, method: "item/tool/requestUserInput", params: { threadId: "own", questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(firstFrames.length, 1);
+    first.detach();
+    assert.equal(child.messages.filter(message => message.id === 17).length, 0,
+      "frontend EOF cannot answer the worker");
+    const secondFrames: JsonObject[] = [];
+    const second = inbox.attach(frame => secondFrames.push(frame));
+    assert.deepEqual(secondFrames, firstFrames);
+    assert.equal(first.answer(17, { answers: {} }), false);
+    assert.equal(second.answer("17", { answers: {} }), false);
+    assert.equal(second.answer(17, { rejected: true }), false);
+    assert.equal(second.answer(17, { answers: {} }), true);
+    assert.equal(second.answer(17, { answers: {} }), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(child.messages.filter(message => message.id === 17 && message.result !== undefined).length, 1);
+    assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
+  } finally { await connection.close(); }
+});
+
+test("request inbox retires externally resolved questions without frontend answer", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true,
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  try {
+    child.send({ id: "17", method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    child.send({ method: "serverRequest/resolved", params: { threadId: "own", requestId: "17" } });
+    await new Promise(resolve => setImmediate(resolve));
+    const frames: JsonObject[] = [];
+    const attachment = inbox.attach(frame => frames.push(frame));
+    assert.deepEqual(frames, []);
+    assert.equal(attachment.answer("17", {}), false);
+    assert.equal(child.messages.filter(message => message.id === "17" && message.result !== undefined).length, 0);
+  } finally { await connection.close(); }
+});
+
+test("request inbox policies cannot mutate request identity or answer through reentry", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  let detach: (() => void) | null = null;
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: request => { request.params.threadId = "other"; return true; },
+    allowAnswer: (_request, result) => { result.answer = "mutated"; detach?.(); return true; },
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const frames: JsonObject[] = [];
+  const attached = inbox.attach(frame => frames.push(frame));
+  detach = attached.detach;
+  try {
+    child.send({ id: 23, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(frames.length, 1);
+    assert.equal((frames[0]!.params as JsonObject).threadId, "own");
+    assert.equal(attached.answer(23, { answer: "original" }), false,
+      "policy reentry invalidates the old attachment");
+    const next = inbox.attach(() => {});
+    assert.equal(next.answer(23, { answer: "original" }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 23 && message.result !== undefined)
+      .map(message => message.result), [{ answer: "original" }]);
+  } finally { await connection.close(); }
+});
+
+test("request inbox snapshots owner settings and shields accepted answer from policy mutation", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const options = {
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: (generation: number) => connection.isSessionCurrent(generation),
+    allowRequest: () => true,
+    allowAnswer: (_request: AppServerServerRequest, result: JsonObject) => { result.answer = "changed"; return true; },
+  };
+  const inbox = new AppServerRequestInbox(options);
+  options.threadId = "other";
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const attached = inbox.attach(() => {});
+  try {
+    child.send({ id: 25, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attached.answer(25, { answer: "original" }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 25 && message.result !== undefined)
+      .map(message => message.result), [{ answer: "original" }]);
+  } finally { await connection.close(); }
+});
+
+test("request inbox retains pending request after an uncloneable answer", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true,
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  const attached = inbox.attach(() => {});
+  try {
+    child.send({ id: 24, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attached.answer(24, { bad: () => 1 }), false);
+    assert.equal(attached.answer(24, { bad: 1n }), false);
+    assert.equal(attached.answer(24, { bad: new Date("2026-09-27T00:00:00Z") }), false);
+    assert.equal(attached.answer(24, { bad: new Map([["key", "value"]]) }), false);
+    assert.equal(attached.answer(24, { answer: "valid" }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 24 && message.result !== undefined)
+      .map(message => message.result), [{ answer: "valid" }]);
+  } finally { await connection.close(); }
+});
+
+test("request inbox stops an old replay loop when a writer reattaches", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true,
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  try {
+    child.send({ id: 31, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    child.send({ id: 32, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    const old: number[] = []; const current: number[] = [];
+    inbox.attach(frame => {
+      old.push(frame.id as number);
+      inbox.attach(next => current.push(next.id as number));
+    });
+    assert.deepEqual(old, [31]);
+    assert.deepEqual(current, [31, 32]);
+  } finally { await connection.close(); }
+});
+
+test("request inbox keeps typed pending IDs when frontend delivery throws", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const session = await connection.initializedSession();
+  const inbox = new AppServerRequestInbox({
+    threadId: "own", generation: session.generation,
+    isGenerationCurrent: generation => connection.isSessionCurrent(generation),
+    allowRequest: () => true, allowAnswer: () => true, maxPending: 2,
+  });
+  connection.onServerRequest((request, context) => inbox.handle(request, context));
+  inbox.attach(() => { throw new Error("frontend disconnected"); });
+  try {
+    child.send({ id: 7, method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    child.send({ id: "7", method: "item/tool/requestUserInput", params: { threadId: "own" } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(child.messages.filter(message => message.id === 7 || message.id === "7").length, 0);
+    const frames: JsonObject[] = [];
+    const attached = inbox.attach(frame => frames.push(frame));
+    assert.deepEqual(frames.map(frame => frame.id), [7, "7"]);
+    assert.equal(attached.answer(7, { typed: "number" }), true);
+    assert.equal(attached.answer("7", { typed: "string" }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(child.messages.filter(message => message.id === 7 || message.id === "7")
+      .map(message => [message.id, message.result]),
+    [[7, { typed: "number" }], ["7", { typed: "string" }]]);
+    assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
+  } finally { await connection.close(); }
+});
 
 test("one long-lived App Server connection initializes once and multiplexes requests and notifications", async () => {
   const child = new AppServerChild();
