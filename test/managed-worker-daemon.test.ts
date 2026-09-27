@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
+import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 
 test('daemon requires explicit follower and IPC policy before private state is read', () => {
   assert.throws(() => new ManagedWorkerDaemon({
@@ -173,6 +174,24 @@ async function readyFixture(family = { allow: true }, native = { enabled: false,
   return { daemon, backend, brokers, handlerErrors, reserved, home, registryPath,
     privateDirectory, launches, observations, control };
 }
+
+test('backend spawn specification strips synthetic bridge hooks and retains TLS and proxy settings', () => {
+  const source = Object.freeze({ Path: 'synthetic-path', HTTP_PROXY: 'http://synthetic.invalid',
+    NO_PROXY: 'synthetic-no-proxy', NODE_EXTRA_CA_CERTS: 'synthetic-ca',
+    CODEX_API_KEY: 'synthetic-auth', cOdEx_HoMe: 'old-home', VK_TOKEN: 'synthetic-vk',
+    vkOdEx_Secret: 'synthetic-vkodex', BOT_DATA_DIR: 'synthetic-bot',
+    nOdE_OpTiOnS: 'synthetic-node-hook', ELECTRON_RUN_AS_NODE: 'synthetic-electron' });
+  const spec = buildBackendWorkerSpawnOptions('C:/qualified/cwd', 'C:/qualified/home', source);
+  assert.deepEqual(spec.env, { Path: 'synthetic-path', HTTP_PROXY: 'http://synthetic.invalid',
+    NO_PROXY: 'synthetic-no-proxy', NODE_EXTRA_CA_CERTS: 'synthetic-ca',
+    CODEX_API_KEY: 'synthetic-auth', CODEX_HOME: 'C:/qualified/home' });
+  assert.deepEqual(source, { Path: 'synthetic-path', HTTP_PROXY: 'http://synthetic.invalid',
+    NO_PROXY: 'synthetic-no-proxy', NODE_EXTRA_CA_CERTS: 'synthetic-ca',
+    CODEX_API_KEY: 'synthetic-auth', cOdEx_HoMe: 'old-home', VK_TOKEN: 'synthetic-vk',
+    vkOdEx_Secret: 'synthetic-vkodex', BOT_DATA_DIR: 'synthetic-bot',
+    nOdE_OpTiOnS: 'synthetic-node-hook', ELECTRON_RUN_AS_NODE: 'synthetic-electron' });
+  assert.deepEqual(spec.stdio, ['pipe', 'pipe', 'pipe']);
+});
 
 async function controlStop(privateDirectory: string, epoch: string, id: string): Promise<Record<string, unknown>> {
   const endpoint = JSON.parse(await readFile(path.join(privateDirectory, 'endpoint.v1.json'), 'utf8')) as

@@ -5,6 +5,7 @@ import { lstat, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ManagedWorkerRegistry } from '../codex/managed-worker-registry.js';
 import { createManagedWorkerPrivateState, type ManagedWorkerPrivateManifest } from './managed-worker-private-state.js';
+import { buildDetachedWorkerSpawnOptions } from './managed-worker-environment.js';
 
 export interface ManagedWorkerLaunchOptions extends Omit<ManagedWorkerPrivateManifest, 'schemaVersion' | 'epoch'> {
   readonly privateBaseDirectory: string;
@@ -78,12 +79,6 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   } catch { throw new ManagedWorkerLaunchError(epoch, 'private-state', 'not-dispatched'); }
   try { await verifyPinnedFiles(input); }
   catch { throw new ManagedWorkerLaunchError(epoch, 'spawn', 'not-dispatched'); }
-  const environment: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: input.home };
-  // A native client's Node/Electron bootstrap/debug hooks must not become daemon hooks.
-  for (const key of Object.keys(environment)) {
-    if (['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RUN_AS_NODE', 'VSCODE_INSPECTOR_OPTIONS'].includes(key.toUpperCase()))
-      delete environment[key];
-  }
   return new Promise((resolve, reject) => {
     let settled = false;
     const fail = (outcome: 'not-dispatched' | 'unknown'): void => {
@@ -94,7 +89,7 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     try {
       const child = (dependencies.spawn ?? spawn)(input.runtime.executable,
         [input.runtime.entrypoint, '--private-base', input.privateBaseDirectory, '--epoch', epoch, '--native-ipc', input.nativeIpc],
-        { cwd: input.cwd, env: environment, shell: false, detached: true, windowsHide: true, stdio: 'ignore' });
+        buildDetachedWorkerSpawnOptions(input.cwd, input.home, process.env));
       // No exit/EOF listener kills a worker; the durable registry/control plane reports its state.
       child.once('error', () => fail('not-dispatched'));
       child.once('spawn', () => {

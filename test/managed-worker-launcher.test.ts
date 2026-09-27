@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { launchManagedWorker, ManagedWorkerLaunchError } from '../src/desktop/managed-worker-launcher.js';
+import { buildManagedWorkerEnvironment, buildDetachedWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), 'vkodex-launcher-'));
@@ -19,6 +20,35 @@ function fixture() {
     privateBaseDirectory: path.join(root, 'private'), nativeIpc: 'local' as const,
     runtime: { executable: runtime, sha256, entrypoint: entry, entrypointSha256: sha256 } } };
 }
+
+const syntheticEnvironment = Object.freeze({
+  Path: 'synthetic-path', HTTPS_PROXY: 'http://synthetic-proxy.invalid',
+  CODEX_API_KEY: 'synthetic-codex-auth', cOdEx_HoMe: 'old-home',
+  VK_TOKEN: 'synthetic-vk', vkOdEx_Secret: 'synthetic-vkodex',
+  bOt_DaTa_DiR: 'synthetic-bot-data', nOdE_OpTiOnS: 'synthetic-node-hook',
+  NODE_PATH: 'synthetic-node-path', eLeCtRoN_Run_As_Node: 'synthetic-electron-hook',
+  VSCODE_INSPECTOR_OPTIONS: 'synthetic-inspector', NORMAL_VALUE: 'safe',
+  NODE_EXTRA_CA_CERTS: 'synthetic-ca', NO_PROXY: 'synthetic-no-proxy',
+});
+
+test('worker environment strips bridge and runtime hooks without mutating caller input', () => {
+  const before = { ...syntheticEnvironment };
+  const result = buildManagedWorkerEnvironment(syntheticEnvironment, 'C:/qualified/home');
+  assert.deepEqual(syntheticEnvironment, before);
+  assert.deepEqual(result, { Path: 'synthetic-path', HTTPS_PROXY: 'http://synthetic-proxy.invalid',
+    CODEX_API_KEY: 'synthetic-codex-auth', NORMAL_VALUE: 'safe', NODE_EXTRA_CA_CERTS: 'synthetic-ca',
+    NO_PROXY: 'synthetic-no-proxy', CODEX_HOME: 'C:/qualified/home' });
+});
+
+test('detached spawn specification applies the same policy to synthetic environment', () => {
+  const { options } = fixture();
+  const spec = buildDetachedWorkerSpawnOptions(options.cwd, options.home, syntheticEnvironment);
+  assert.deepEqual(spec.env, { Path: 'synthetic-path', HTTPS_PROXY: 'http://synthetic-proxy.invalid',
+    CODEX_API_KEY: 'synthetic-codex-auth', NORMAL_VALUE: 'safe', NODE_EXTRA_CA_CERTS: 'synthetic-ca',
+    NO_PROXY: 'synthetic-no-proxy', CODEX_HOME: options.home });
+  assert.equal(spec.detached, true);
+  assert.equal(spec.stdio, 'ignore');
+});
 
 test('launch reserves before protecting state and detaches without secret arguments or stdin', async () => {
   const { root, options } = fixture(); const order: string[] = [];

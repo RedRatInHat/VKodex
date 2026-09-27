@@ -16,6 +16,7 @@ import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
+import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 
 type State = 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
@@ -401,8 +402,7 @@ export class ManagedWorkerDaemon {
 
 function defaultLaunch(cliPath: string, cwd: string, home: string): ChildProcessWithoutNullStreams {
   return spawn(cliPath, ['app-server', '-c', 'features.code_mode_host=true'], {
-    cwd, env: { ...process.env, CODEX_HOME: home },
-    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    ...buildBackendWorkerSpawnOptions(cwd, home, process.env) });
 }
 async function pinnedCli(cliPath: string, sha256: string): Promise<void> {
   if (!/^[0-9a-f]{64}$/iu.test(sha256)) throw new Error('CLI pin invalid');
