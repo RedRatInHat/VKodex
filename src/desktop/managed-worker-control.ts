@@ -8,6 +8,27 @@ export interface ManagedWorkerControlStatus {
   readonly nativeState: string | null;
   readonly nativeRevision: number;
 }
+export interface ManagedWorkerControlDiagnosis {
+  readonly schemaVersion: 1;
+  readonly startupPhase: 'not-started' | 'private-loaded' | 'host-registered' |
+    'control-listening' | 'launching' | 'backend-registered' | 'bootstrapping' |
+    'owner-starting' | 'publishing-ready' | 'ready';
+  readonly daemonState: 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
+  readonly failureCode: 'startup-unavailable' | 'backend-lost' | 'backend-loss-unconfirmed' |
+    'owner-unconfirmed' | 'stop-unconfirmed' | null;
+  readonly registryState: 'reserved' | 'host_registered' | 'backend_registered' |
+    'ready' | 'lost' | 'retired' | null;
+  readonly owner: Readonly<{
+    startupStage: 'not-started' | 'observing' | 'reading-initial' | 'validating-initial' |
+      'checking-boundary' | 'connecting' | 'ready';
+    bootstrapEventCount: number;
+    bootstrapNotifications: Readonly<Record<'status' | 'settings' | 'goal' | 'usage' |
+      'startup-or-warning' | 'turn' | 'item' | 'other', number>>;
+    bootstrapPendingRequests: number;
+    bootstrapBoundary: Readonly<{ stateIsBootstrapping: boolean;
+      hasEvents: boolean; ownerCurrent: boolean | null }> | null;
+  }> | null;
+}
 export interface ManagedWorkerControlOptions {
   readonly ownerEpoch: string;
   readonly taskId: string;
@@ -17,6 +38,7 @@ export interface ManagedWorkerControlOptions {
    * work continues when its client times out. */
   readonly authenticatedIdleTimeoutMs?: number;
   readonly status: () => ManagedWorkerControlStatus;
+  readonly diagnose?: () => ManagedWorkerControlDiagnosis;
   /** Must independently authorize stop and fence current task/family safety.
    * Resolve only after actual shutdown; a failed/unknown attempt is never retried here. */
   readonly requestStop: () => Promise<void>;
@@ -40,6 +62,43 @@ const text = (value: unknown, max: number): value is string => typeof value === 
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
   'failed', 'lost', 'stopping', 'stopped']);
 const nativeStates = new Set(['new', 'bootstrapping', 'connected', 'disconnected', 'failed', 'closed']);
+const startupPhases = new Set(['not-started', 'private-loaded', 'host-registered',
+  'control-listening', 'launching', 'backend-registered', 'bootstrapping',
+  'owner-starting', 'publishing-ready', 'ready']);
+const daemonStates = new Set(['new', 'starting', 'ready', 'failed', 'stopping', 'stopped']);
+const failureCodes = new Set(['startup-unavailable', 'backend-lost', 'backend-loss-unconfirmed',
+  'owner-unconfirmed', 'stop-unconfirmed']);
+const registryStates = new Set(['reserved', 'host_registered', 'backend_registered',
+  'ready', 'lost', 'retired']);
+const startupStages = new Set(['not-started', 'observing', 'reading-initial',
+  'validating-initial', 'checking-boundary', 'connecting', 'ready']);
+const notificationKeys = ['status', 'settings', 'goal', 'usage', 'startup-or-warning',
+  'turn', 'item', 'other'] as const;
+const boundedCount = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 255;
+function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis {
+  if (!object(value) || !exact(value, ['schemaVersion', 'startupPhase', 'daemonState',
+    'failureCode', 'registryState', 'owner']) || value.schemaVersion !== 1 ||
+    typeof value.startupPhase !== 'string' || !startupPhases.has(value.startupPhase) ||
+    typeof value.daemonState !== 'string' || !daemonStates.has(value.daemonState) ||
+    value.failureCode !== null && (typeof value.failureCode !== 'string' || !failureCodes.has(value.failureCode)) ||
+    value.registryState !== null && (typeof value.registryState !== 'string' || !registryStates.has(value.registryState))) return false;
+  const owner = value.owner;
+  if (owner === null) return true;
+  if (!object(owner) || !exact(owner, ['startupStage', 'bootstrapEventCount',
+    'bootstrapNotifications', 'bootstrapPendingRequests', 'bootstrapBoundary']) ||
+    typeof owner.startupStage !== 'string' || !startupStages.has(owner.startupStage) ||
+    !boundedCount(owner.bootstrapEventCount) ||
+    !boundedCount(owner.bootstrapPendingRequests) || !object(owner.bootstrapNotifications) ||
+    !exact(owner.bootstrapNotifications, notificationKeys) ||
+    !notificationKeys.every(key => boundedCount((owner.bootstrapNotifications as Record<string, unknown>)[key])))
+    return false;
+  const boundary = owner.bootstrapBoundary;
+  return boundary === null || object(boundary) &&
+    exact(boundary, ['stateIsBootstrapping', 'hasEvents', 'ownerCurrent']) &&
+    typeof boundary.stateIsBootstrapping === 'boolean' && typeof boundary.hasEvents === 'boolean' &&
+    (boundary.ownerCurrent === null || typeof boundary.ownerCurrent === 'boolean');
+}
 
 /** Opt-in daemon control, not an App Server proxy. Tokens stay in private owner
  * state. Client EOF and listener close never stop the execution worker. */
@@ -60,6 +119,7 @@ export class ManagedWorkerControlServer {
     const idleTimeout = options?.authenticatedIdleTimeoutMs ?? 30_000;
     if (!options || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(options.ownerEpoch) ||
         !text(options.taskId, 256) || typeof options.status !== 'function' ||
+        options.diagnose !== undefined && typeof options.diagnose !== 'function' ||
         typeof options.requestStop !== 'function' || !/^[A-Za-z0-9_-]{43,128}$/u.test(token) ||
         !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 60_000 ||
         !Number.isSafeInteger(idleTimeout) || idleTimeout < 10 || idleTimeout > 60_000)
@@ -123,7 +183,7 @@ export class ManagedWorkerControlServer {
         if (!text(frame.id, 128)) { socket.destroy(); return; }
         const id = frame.id;
         if (!exact(frame, ['id', 'epoch', 'method']) || frame.epoch !== this.#options.ownerEpoch ||
-            !['status', 'stop'].includes(String(frame.method)) || ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
+            !['status', 'diagnose-v1', 'stop'].includes(String(frame.method)) || ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
@@ -137,6 +197,15 @@ export class ManagedWorkerControlServer {
                 !Number.isSafeInteger(status.nativeRevision) || status.nativeRevision < 0) throw new Error();
             send({ id, result: { ownerEpoch: this.#options.ownerEpoch, taskId: this.#options.taskId, ...status } });
           } catch { send({ id, error: 'status-unavailable' }); }
+          continue;
+        }
+        if (frame.method === 'diagnose-v1') {
+          try {
+            const diagnosis = this.#options.diagnose?.();
+            if (!validDiagnosis(diagnosis)) throw new Error();
+            send({ id, result: { ownerEpoch: this.#options.ownerEpoch,
+              taskId: this.#options.taskId, ...diagnosis } });
+          } catch { send({ id, error: 'diagnosis-unavailable' }); }
           continue;
         }
         // Install the single-flight promise before invoking caller code. Only

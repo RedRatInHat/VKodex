@@ -54,6 +54,24 @@ test('authenticated metadata control survives client EOF without stopping its wo
   assert.equal(stops, 0, 'listener shutdown is not worker shutdown');
 });
 
+test('versioned diagnosis returns only fixed startup metadata and no private callback details', async () => {
+  const epoch = randomUUID();
+  const diagnosis = { schemaVersion: 1 as const, startupPhase: 'bootstrapping' as const,
+    daemonState: 'failed' as const, failureCode: 'startup-unavailable' as const,
+    registryState: 'backend_registered' as const, owner: null };
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
+    diagnose: () => diagnosis,
+    requestStop: async () => { throw new ManagedWorkerStopRefusedError(); } });
+  const cap = await server.listen(); const client = await peer(cap);
+  try {
+    client.send({ id: 'd', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'd', result: { ownerEpoch: epoch, taskId: 'own', ...diagnosis } });
+    client.send({ id: 's', epoch, method: 'stop' });
+    assert.deepEqual(await client.read(), { id: 's', error: 'stop-refused' });
+  } finally { client.socket.destroy(); await server.close(); }
+});
+
 test('authorized stop is single flight and continues after sender disconnect', async () => {
   const epoch = randomUUID(); let stops = 0, finish!: () => void;
   const pending = new Promise<void>(resolve => { finish = resolve; });

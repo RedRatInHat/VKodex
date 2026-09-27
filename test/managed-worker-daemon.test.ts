@@ -12,6 +12,7 @@ import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
+import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 
 test('daemon requires explicit follower and IPC policy before private state is read', () => {
   assert.throws(() => new ManagedWorkerDaemon({
@@ -24,6 +25,7 @@ class Backend extends EventEmitter {
   readonly pid = 42424; exitCode: number | null = null; signalCode: NodeJS.Signals | null = null;
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
   readonly frames: Record<string, unknown>[] = [];
+  failBootstrap = false;
   readonly taskId: string; readonly cwd: string;
   constructor(taskId: string, cwd: string) {
     super(); this.taskId = taskId; this.cwd = cwd;
@@ -54,7 +56,8 @@ class Backend extends EventEmitter {
       turns: this.writes && this.materializeTurn ? [{ id: 'accepted-composer-turn', status: 'completed', items: [] }] : [],
       environments: [{ environmentId: 'local', cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }] });
     if (method === 'initialize') return { serverInfo: { name: 'fixture' } };
-    if (method === 'thread/read') return { thread: thread() };
+    if (method === 'thread/read') return { thread: this.failBootstrap && this.resumed ?
+      { ...thread(), status: { type: 'inProgress' } } : thread() };
     if (method === 'thread/turns/list') return { data: this.writes && this.materializeTurn ?
       [{ id: 'accepted-composer-turn', status: 'completed', items: [], itemsView: 'full' }] : [], nextCursor: null };
     if (method === 'thread/goal/get') return { goal: null };
@@ -111,7 +114,8 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
       responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
-async function readyFixture(family = { allow: true }, native = { enabled: false, early: false }) {
+async function readyFixture(family = { allow: true }, native = { enabled: false, early: false },
+  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' = 'normal') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -121,6 +125,8 @@ async function readyFixture(family = { allow: true }, native = { enabled: false,
   const reserved = registry.reserve(home, 'own-family'); registry.close();
   const taskId = 'own-zero-turn';
   const backend = new Backend(taskId, home), brokers: Broker[] = [], handlerErrors: string[] = [];
+  backend.failBootstrap = startup === 'bootstrap-fail';
+  let control: ManagedWorkerControlServer | null = null;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
@@ -138,6 +144,15 @@ async function readyFixture(family = { allow: true }, native = { enabled: false,
         idle.turnCount === 1 && idle.latestTurnId === 'accepted-composer-turn' :
         idle.turnCount === 0 && idle.latestTurnId === null),
     dependencies: {
+      createControl: options => {
+        control = startup === 'control-bind-fail' ?
+          new class extends ManagedWorkerControlServer {
+            override listen(): ReturnType<ManagedWorkerControlServer['listen']> {
+              return Promise.reject(new Error('fixture bind failure'));
+            }
+          }(options) : new ManagedWorkerControlServer(options);
+        return control;
+      },
       loadPrivateState: async () => ({ manifest: {
         schemaVersion: 1, epoch: reserved.epoch, taskId, familyRoot: 'own-family',
         home, cwd: home, cliPath, cliSha256: createHash('sha256').update('pinned-code').digest('hex'),
@@ -153,9 +168,10 @@ async function readyFixture(family = { allow: true }, native = { enabled: false,
       launch: () => { launches++; return backend as unknown as ChildProcessWithoutNullStreams; },
     },
   });
-  await daemon.start();
+  if (startup === 'normal') await daemon.start();
+  else await assert.rejects(daemon.start(), /startup unavailable/);
   return { daemon, backend, brokers, handlerErrors, reserved, home, registryPath,
-    privateDirectory, launches, observations };
+    privateDirectory, launches, observations, control };
 }
 
 async function controlStop(privateDirectory: string, epoch: string, id: string): Promise<Record<string, unknown>> {
@@ -184,6 +200,87 @@ async function controlStop(privateDirectory: string, epoch: string, id: string):
     return await wait(frame => frame.id === id);
   } finally { socket.destroy(); }
 }
+
+async function startupControlRequest(privateDirectory: string, epoch: string,
+  id: string, method: string): Promise<Record<string, unknown>> {
+  const locator = JSON.parse(await readFile(path.join(privateDirectory, 'startup-control.v1.json'), 'utf8')) as
+    { control: { port: number } };
+  const socket = connect(locator.control.port, '127.0.0.1');
+  let buffer = ''; const frames: Record<string, unknown>[] = [];
+  socket.on('data', chunk => { buffer += chunk.toString();
+    while (buffer.includes('\n')) { const at = buffer.indexOf('\n');
+      frames.push(JSON.parse(buffer.slice(0, at)) as Record<string, unknown>);
+      buffer = buffer.slice(at + 1); }
+  });
+  await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+  const wait = async (predicate: (frame: Record<string, unknown>) => boolean) => {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const found = frames.find(predicate); if (found) return found;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    throw new Error('startup control response timeout');
+  };
+  try {
+    socket.write(JSON.stringify({ token: Buffer.alloc(32, 3).toString('base64url') }) + '\n');
+    await wait(frame => frame.ok === true);
+    socket.write(JSON.stringify({ id, epoch, method }) + '\n');
+    return await wait(frame => frame.id === id);
+  } finally { socket.destroy(); }
+}
+
+test('control bind failure leaves reserved worker unlaunched', async () => {
+  const { daemon, backend, launches, control, registryPath, home, privateDirectory } =
+    await readyFixture({ allow: true }, { enabled: false, early: false }, 'control-bind-fail');
+  try {
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(launches, 0);
+    assert.equal(backend.methods.length, 0);
+    await assert.rejects(readFile(path.join(privateDirectory, 'endpoint.v1.json')));
+    await assert.rejects(readFile(path.join(privateDirectory, 'startup-control.v1.json')));
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'host_registered'); }
+    finally { registry.close(); }
+  } finally { await (control as ManagedWorkerControlServer | null)?.close(); }
+});
+
+test('bootstrap failure retains authenticated startup diagnosis while EOF cannot stop worker', async () => {
+  const { daemon, backend, launches, control, reserved, privateDirectory, registryPath, home } =
+    await readyFixture({ allow: true }, { enabled: false, early: false }, 'bootstrap-fail');
+  try {
+    assert.equal(launches, 1);
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(daemon.metadata.startupPhase, 'bootstrapping');
+    const locator = JSON.parse(await readFile(path.join(privateDirectory, 'startup-control.v1.json'), 'utf8')) as
+      Record<string, unknown>;
+    assert.deepEqual(Object.keys(locator).sort(), ['control', 'epoch', 'host', 'schemaVersion']);
+    assert.equal(locator.epoch, reserved.epoch);
+    assert.equal(JSON.stringify(locator).includes(Buffer.alloc(32, 3).toString('base64url')), false);
+    await assert.rejects(readFile(path.join(privateDirectory, 'endpoint.v1.json')));
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'backend_registered'); }
+    finally { registry.close(); }
+    const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'd', 'diagnose-v1');
+    assert.deepEqual(diagnosis.result, { ownerEpoch: reserved.epoch, taskId: 'own-zero-turn',
+      schemaVersion: 1, startupPhase: 'bootstrapping', daemonState: 'failed',
+      failureCode: 'startup-unavailable', registryState: 'backend_registered', owner: null });
+    const changed = new ManagedWorkerRegistry(registryPath);
+    try {
+      const row = changed.get(home, 'own-family')!;
+      changed.markLost(row, row.host!, row.backend!, 'backend_unavailable');
+    } finally { changed.close(); }
+    const later = await startupControlRequest(privateDirectory, reserved.epoch, 'later', 'diagnose-v1');
+    assert.equal((later.result as Record<string, unknown>).registryState, 'lost');
+    assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 's', 'stop')).error,
+      'stop-refused');
+    assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'again', 'status')).result
+      ? 'available' : 'missing', 'available');
+    assert.equal(backend.exitCode, null);
+  } finally {
+    await (control as ManagedWorkerControlServer | null)?.close();
+    backend.stdin.end();
+  }
+});
 
 test('opt-in daemon composes one backend, bootstrap, native owner, and ready registry', async () => {
   const { daemon, backend, reserved, home, registryPath, privateDirectory, launches, observations } = await readyFixture();

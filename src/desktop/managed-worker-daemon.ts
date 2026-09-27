@@ -12,7 +12,8 @@ import type { AppServerServerRequest } from '../codex/app-server-connection.js';
 import { bootstrapManagedWorker, ManagedWorkerIdleProofRefusedError,
   type ManagedWorkerBootstrap } from './managed-worker-bootstrap.js';
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
-import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError } from './managed-worker-control.js';
+import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
+  type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
@@ -38,6 +39,7 @@ export interface ManagedWorkerDaemonOptions {
     loadPrivateState?: typeof loadManagedWorkerPrivateState;
     observeProcess?: typeof readWindowsProcessIdentity;
     launch?: (cliPath: string, cwd: string, home: string) => ChildProcessWithoutNullStreams;
+    createControl?: (options: ManagedWorkerControlOptions) => ManagedWorkerControlServer;
   }>;
 }
 export interface ManagedWorkerDaemonMetadata {
@@ -48,6 +50,7 @@ export interface ManagedWorkerDaemonMetadata {
   readonly nativeState: string | null;
   readonly endpointRef: string | null;
   readonly failure: string | null;
+  readonly startupPhase: ManagedWorkerControlDiagnosis['startupPhase'];
   readonly nativeStartup: Pick<ManagedWorkerNativeOwnerMetadata,
     'startupStage' | 'bootstrapEventCount' | 'bootstrapNotifications' |
     'bootstrapPendingRequests' | 'bootstrapBoundary'> | null;
@@ -58,7 +61,8 @@ export interface ManagedWorkerDaemonMetadata {
 export class ManagedWorkerDaemon {
   readonly #options: ManagedWorkerDaemonOptions;
   #state: State = 'new';
-  #failure: string | null = null;
+  #failure: ManagedWorkerControlDiagnosis['failureCode'] = null;
+  #startupPhase: ManagedWorkerControlDiagnosis['startupPhase'] = 'not-started';
   #taskId: string | null = null;
   #generation: number | null = null;
   #endpointRef: string | null = null;
@@ -91,6 +95,7 @@ export class ManagedWorkerDaemon {
     return Object.freeze({ state: this.#state, epoch: this.#options.epoch, taskId: this.#taskId,
       generation: this.#generation, nativeState: owner?.state ?? null,
       endpointRef: this.#endpointRef, failure: this.#failure,
+      startupPhase: this.#startupPhase,
       nativeStartup: owner ? Object.freeze({ startupStage: owner.startupStage,
         bootstrapEventCount: owner.bootstrapEventCount,
         bootstrapNotifications: owner.bootstrapNotifications,
@@ -108,6 +113,7 @@ export class ManagedWorkerDaemon {
 
   async #startOnce(): Promise<void> {
     this.#state = 'starting';
+    let launchAttempted = false;
     try {
       const state = await (this.#options.dependencies?.loadPrivateState ?? loadManagedWorkerPrivateState)({
         baseDirectory: this.#options.baseDirectory, epoch: this.#options.epoch });
@@ -116,6 +122,7 @@ export class ManagedWorkerDaemon {
         !path.isAbsolute(manifest.cliPath) || !path.isAbsolute(manifest.cwd) || !path.isAbsolute(manifest.home))
         throw new Error('Private manifest scope invalid');
       this.#taskId = manifest.taskId;
+      this.#startupPhase = 'private-loaded';
       this.#registry = new ManagedWorkerRegistry(manifest.registryPath);
       const reserved = this.#registry.get(manifest.home, manifest.familyRoot);
       if (!reserved || reserved.epoch !== manifest.epoch || reserved.state !== 'reserved')
@@ -126,6 +133,7 @@ export class ManagedWorkerDaemon {
       if (!self) throw new Error('Host process birth unavailable');
       this.#self = self;
       this.#attempt = this.#registry.registerHost(reserved, self);
+      this.#startupPhase = 'host-registered';
       await pinnedCli(manifest.cliPath, manifest.cliSha256);
       const adapterKey = {}, controlKey = {};
       const launched: { child: ChildProcessWithoutNullStreams | null } = { child: null };
@@ -139,6 +147,32 @@ export class ManagedWorkerDaemon {
           launched.child.exitCode === null && launched.child.signalCode === null;
       };
       this.#currentOwner = ownerCurrent;
+      const currentRegistryState = (): ManagedWorkerControlDiagnosis['registryState'] => {
+        try {
+          const row = this.#registry?.get(manifest.home, manifest.familyRoot);
+          return row?.epoch === manifest.epoch ? row.state : null;
+        } catch { return null; }
+      };
+      this.#control = (this.#options.dependencies?.createControl ??
+        (options => new ManagedWorkerControlServer(options)))({
+        ownerEpoch: manifest.epoch, taskId: manifest.taskId,
+        token: Buffer.from(state.keys.controlToken, 'base64').toString('base64url'),
+        status: () => ({ hostState: this.#host?.metadata.state ?? 'new',
+          backendGeneration: this.#host?.metadata.backendGeneration ?? null,
+          nativeState: this.#owner?.metadata.state ?? null,
+          nativeRevision: this.#owner?.metadata.revision ?? 0 }),
+        diagnose: () => ({ schemaVersion: 1, startupPhase: this.#startupPhase,
+          daemonState: this.#state, failureCode: this.#failure,
+          registryState: currentRegistryState(),
+          owner: this.metadata.nativeStartup }),
+        requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
+      });
+      const controlEndpoint = await this.#control.listen();
+      await writePrivateLocator(state, 'startup-control.v1.json', {
+        schemaVersion: 1, epoch: manifest.epoch, host: self,
+        control: { host: controlEndpoint.host, port: controlEndpoint.port },
+      });
+      this.#startupPhase = 'control-listening';
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
         if (!ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId ||
@@ -188,6 +222,8 @@ export class ManagedWorkerDaemon {
         taskId: manifest.taskId, ownCwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
         bootstrapReadMethods: ['thread/turns/list', 'config/read'],
         launch: () => {
+          launchAttempted = true;
+          this.#startupPhase = 'launching';
           launched.child = (this.#options.dependencies?.launch ?? defaultLaunch)(manifest.cliPath, manifest.cwd, manifest.home);
           return launched.child;
         }, adapterKey, resumeAuthority: ({ taskId, generation }) => ({
@@ -209,7 +245,9 @@ export class ManagedWorkerDaemon {
       this.#generation = meta.backendGeneration;
       this.#backend = { ...observed, generation: meta.backendGeneration };
       this.#attempt = this.#registry.registerBackend(this.#attempt, self, this.#backend);
+      this.#startupPhase = 'backend-registered';
       launched.child.once('exit', () => this.#backendExited());
+      this.#startupPhase = 'bootstrapping';
       this.#bootstrap = await bootstrapManagedWorker({ host: this.#host, adapterKey,
         taskId: manifest.taskId, cwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
         resumeParams: manifest.resumeParams });
@@ -222,27 +260,24 @@ export class ManagedWorkerDaemon {
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
         qualifyContinuation: fence => this.#bootstrap!.qualifyContinuation(fence),
         clientFactory: this.#options.clientFactory });
+      this.#startupPhase = 'owner-starting';
       await this.#owner.start();
       if (this.#owner.metadata.state !== 'connected' || !ownerCurrent()) throw new Error('Native owner unavailable');
-      this.#control = new ManagedWorkerControlServer({ ownerEpoch: manifest.epoch, taskId: manifest.taskId,
-        token: Buffer.from(state.keys.controlToken, 'base64').toString('base64url'),
-        status: () => ({ hostState: this.#host?.metadata.state ?? 'failed',
-          backendGeneration: this.#host?.metadata.backendGeneration ?? null,
-          nativeState: this.#owner?.metadata.state ?? null, nativeRevision: this.#owner?.metadata.revision ?? 0 }),
-        requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
-      });
-      const endpoint = await this.#control.listen();
+      this.#startupPhase = 'publishing-ready';
       if (!ownerCurrent()) throw new Error('Worker owner changed before publication');
       const endpointRef = randomUUID();
       await writeEndpoint(state, { schemaVersion: 1, epoch: manifest.epoch, endpointRef,
-        host: self, backend: this.#backend, control: { host: endpoint.host, port: endpoint.port } });
+        host: self, backend: this.#backend,
+        control: { host: controlEndpoint.host, port: controlEndpoint.port } });
       this.#attempt = this.#registry.markReady(this.#attempt, self, this.#backend, endpointRef);
       this.#endpointRef = endpointRef;
       this.#state = 'ready';
+      this.#startupPhase = 'ready';
       this.#admissionOpen = true;
       this.#scheduleReconnect();
     } catch {
-      this.#state = 'failed'; this.#failure = 'startup-unavailable';
+      this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
+      if (!launchAttempted) await this.#control?.close().catch(() => {});
       // No implicit worker shutdown on uncertain startup after launch.
       throw new Error('Managed worker daemon startup unavailable');
     }
@@ -377,8 +412,11 @@ async function pinnedCli(cliPath: string, sha256: string): Promise<void> {
     throw new Error('CLI pin mismatch');
 }
 async function writeEndpoint(state: ManagedWorkerPrivateState, endpoint: Row): Promise<void> {
-  const file = path.join(state.privateDirectory, 'endpoint.v1.json');
+  await writePrivateLocator(state, 'endpoint.v1.json', endpoint);
+}
+async function writePrivateLocator(state: ManagedWorkerPrivateState, filename: string, value: Row): Promise<void> {
+  const file = path.join(state.privateDirectory, filename);
   const handle = await open(file, 'wx', 0o600);
-  try { await handle.writeFile(JSON.stringify(endpoint)); await handle.sync(); }
+  try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); }
   finally { await handle.close(); }
 }
