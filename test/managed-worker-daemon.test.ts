@@ -116,10 +116,12 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
 }
 
 async function readyFixture(family: { allow: boolean; beforeReturn?: () => void } = { allow: true }, native = { enabled: false, early: false },
-  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' = 'normal') {
+  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
+  if (startup === 'endpoint-collision')
+    await writeFile(path.join(privateDirectory, 'endpoint.v1.json'), 'preexisting-own-endpoint');
   const cliPath = path.join(root, 'cli.exe'), registryPath = path.join(root, 'registry.sqlite');
   await writeFile(cliPath, 'pinned-code');
   const registry = new ManagedWorkerRegistry(registryPath);
@@ -297,6 +299,36 @@ test('bootstrap failure retains authenticated startup diagnosis while EOF cannot
     assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'again', 'status')).result
       ? 'available' : 'missing', 'available');
     assert.equal(backend.exitCode, null);
+  } finally {
+    await (control as ManagedWorkerControlServer | null)?.close();
+    backend.stdin.end();
+  }
+});
+
+test('post-owner ready endpoint collision retires native gateway but preserves backend and startup control', async () => {
+  const { daemon, backend, brokers, control, reserved, privateDirectory, registryPath, home } =
+    await readyFixture({ allow: true }, { enabled: true, early: false }, 'endpoint-collision');
+  try {
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(daemon.metadata.startupPhase, 'publishing-ready');
+    assert.equal(daemon.metadata.nativeState, 'closed');
+    assert.equal(brokers.length, 1);
+    assert.equal(brokers[0]!.destroyed, true);
+    assert.equal(backend.exitCode, null);
+    assert.equal(backend.writes, 0);
+    assert.equal(await readFile(path.join(privateDirectory, 'endpoint.v1.json'), 'utf8'),
+      'preexisting-own-endpoint');
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'backend_registered'); }
+    finally { registry.close(); }
+    const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'failed-owner', 'diagnose-v1');
+    assert.deepEqual(diagnosis.result, { ownerEpoch: reserved.epoch, taskId: 'own-zero-turn',
+      schemaVersion: 1, startupPhase: 'publishing-ready', daemonState: 'failed',
+      failureCode: 'startup-unavailable', registryState: 'backend_registered',
+      owner: daemon.metadata.nativeStartup });
+    assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'stop', 'stop')).error,
+      'stop-refused');
+    assert.equal(backend.writes, 0);
   } finally {
     await (control as ManagedWorkerControlServer | null)?.close();
     backend.stdin.end();

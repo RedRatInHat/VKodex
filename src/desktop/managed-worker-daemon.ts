@@ -278,6 +278,12 @@ export class ManagedWorkerDaemon {
       this.#scheduleReconnect();
     } catch {
       this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
+      // A native owner may already be connected when ready publication fails.
+      // Retire only that gateway; the owned backend and diagnostic control stay available.
+      if (launchAttempted) {
+        this.#clearReconnect();
+        try { this.#owner?.close(); } catch { /* Preserve uncertain startup for explicit reconciliation. */ }
+      }
       if (!launchAttempted) await this.#control?.close().catch(() => {});
       // No implicit worker shutdown on uncertain startup after launch.
       throw new Error('Managed worker daemon startup unavailable');
