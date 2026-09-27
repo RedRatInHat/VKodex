@@ -18,6 +18,7 @@ class FakeRpc implements AppServerRpc {
   title: string | null = "Task";
   projectId: string | null = null;
   goal: JsonObject | null = null;
+  queueReceipt: JsonObject | undefined;
   fail: Error | null = null;
   failMethod: string | null = null;
   failAfterMethod: string | null = null;
@@ -47,7 +48,9 @@ class FakeRpc implements AppServerRpc {
       if (action.startsWith("uncertain")) throw new AppServerUncertainError();
       return {};
     }
-    if (method === "thread/queue/add") return { queuedSubmission: { id: "queue-1" } };
+    if (method === "thread/queue/add") return this.queueReceipt ?? {
+      queuedSubmission: { id: "queue-1", clientUserMessageId: params.clientUserMessageId },
+    };
     if (method === "thread/settings/update" && this.modelUpdatePlan.length) throw this.modelUpdatePlan.shift()!;
     if (method === "thread/list") return { data: this.descendants.map(id => ({ id })), nextCursor: null };
     if (method === "thread/turns/list" && this.unloadedDescendantStatus === "empty" && params.threadId !== "task") {
@@ -195,6 +198,18 @@ test("an unavailable owner before dispatch is a retryable route failure, not an 
     await assert.rejects(executor.submitWithReceipt(request()), TaskNotOpenError);
     assert.equal(rpc.requests.some(item => item.method === "turn/start" || item.method === "turn/steer"), false);
   } finally { executor.close(); }
+});
+
+test("native queue receipts must identify the same submission without retrying unknown outcomes", async () => {
+  for (const clientUserMessageId of [undefined, null, "another-operation", 1]) {
+    const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+    rpc.queueReceipt = { queuedSubmission: { id: "queue-1", clientUserMessageId } };
+    try {
+      await assert.rejects(executor.queue(request()), UncertainActionError);
+      assert.equal(rpc.requests.filter(item => item.method === "thread/queue/add").length, 1);
+      assert.equal(rpc.requests.some(item => item.method === "turn/start" || item.method === "turn/steer"), false);
+    } finally { executor.close(); }
+  }
 });
 
 test("App Server executor uses native interrupt, queue and settings APIs", async () => {

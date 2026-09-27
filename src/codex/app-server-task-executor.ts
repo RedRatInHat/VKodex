@@ -225,8 +225,9 @@ export class AppServerTaskExecutor {
       const result = await this.rpc.request("thread/queue/add", {
         threadId: request.task.threadId, clientUserMessageId: request.operationId, input: [...prepared.input],
       }, { mutating: true });
-      const id = isObject(result.queuedSubmission) ? idOf(result.queuedSubmission.id) : null;
-      if (!id) throw new UncertainActionError();
+      const queued = result.queuedSubmission;
+      const id = isObject(queued) ? idOf(queued.id) : null;
+      if (!id || !isObject(queued) || queued.clientUserMessageId !== request.operationId) throw new UncertainActionError();
       return id;
     } catch (error) { throw operationError(error, "добавление сообщения в очередь"); }
   }
