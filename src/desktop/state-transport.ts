@@ -85,6 +85,11 @@ export class DesktopTaskStateTransport implements TaskStateTransport {
           if (!active()) throw unavailable();
         } finally { consumer.cancelStart = null; consumer.ready = null; }
       },
+      diagnostic: () => {
+        if (!started || !active() || entry?.error) return { kind: "unknown" as const };
+        const nativeOwnerClientId = entry?.upstream.owner;
+        return { kind: "native-observer" as const, ...(nativeOwnerClientId ? { nativeOwnerClientId } : {}) };
+      },
       verifyOwner: async (timeoutMs = 5_000) => {
         if (!started || !active() || entry!.error) throw entry?.error ?? unavailable();
         await entry!.upstream.verifyOwner(timeoutMs);

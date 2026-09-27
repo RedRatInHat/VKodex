@@ -543,3 +543,18 @@ test("stalled runtime updates and missing Codex streams are visible independentl
   assert.equal(report.checks.find(check => check.name === "runtime")!.state, "failed");
   assert.equal(report.checks.find(check => check.name === "codex_streams")!.state, "degraded");
 });
+
+test("health labels route evidence without equating it to physical native writer ownership", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 1,
+    requiredBindings: 0, connectedRequiredBindings: 0, bindings: [{ id: "route", title: "Route", source: ".codex", status: "idle", connected: true,
+      lastConfirmedAt: now, failure: null, route: { kind: "native-observer" as const, nativeOwnerClientId: "native-client", routeGeneration: 3 } }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  const route = report.checks.find(check => check.name === "codex_route_evidence:route")!;
+  assert.match(route.detail, /наблюдатель native.*3.*native-client/u);
+  assert.match(route.detail, /не физического writer/u);
+  assert.match(report.checks.find(check => check.name === "codex_streams")!.detail, /локальных аренд потока VKodex.*не подтверждает физического native writer/u);
+});

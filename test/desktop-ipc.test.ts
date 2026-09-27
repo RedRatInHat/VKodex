@@ -3533,3 +3533,36 @@ test("closed or changed native questions cannot become ordinary prompts", async 
     assert.equal(server.received.some(m => String(m.method).startsWith("thread-follower-")), false);
   }
 });
+
+test("task state diagnostics distinguish explicit route evidence from unknown and advance local generation", async () => {
+  let attempt = 0;
+  let now = 100;
+  const transport: TaskStateTransport = {
+    subscribe(task) {
+      const kind = attempt++ === 0 ? "native-observer" as const : "unknown" as const;
+      return { task, start: async () => {}, verifyOwner: async () => {},
+        diagnostic: () => kind === "native-observer" ? { kind, nativeOwnerClientId: "native-owner" } : { kind }, close: () => {} };
+    }, close() {},
+  };
+  const connections = new TaskStateConnections(transport, () => now);
+  const pending = connections.connect("binding", ref, () => {}, () => {});
+  assert.deepEqual(connections.diagnostic("binding"), { kind: "unknown", routeGeneration: 1 });
+  await pending;
+  assert.deepEqual(connections.diagnostic("binding"), { kind: "native-observer", nativeOwnerClientId: "native-owner", routeGeneration: 1 });
+  now += 45_001;
+  assert.deepEqual(connections.diagnostic("binding"), { kind: "unknown", routeGeneration: 1 }, "stale verification cannot retain route evidence");
+  await connections.connect("binding", { ...ref, threadId: "replacement" }, () => {}, () => {});
+  assert.deepEqual(connections.diagnostic("binding"), { kind: "unknown", routeGeneration: 2 });
+  await connections.stop();
+});
+
+test("Desktop state stream reports native observer route and only its discovered native owner id", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100); t.after(() => client.close());
+  const transport = new DesktopTaskStateTransport(client); t.after(() => transport.close());
+  server.ownerId = "native-owner"; server.onFollow = () => server.snapshot();
+  const stream = transport.subscribe(ref, () => {}, () => {});
+  await stream.start();
+  assert.deepEqual(stream.diagnostic?.(), { kind: "native-observer", nativeOwnerClientId: "native-owner" });
+  stream.close();
+  assert.deepEqual(stream.diagnostic?.(), { kind: "unknown" });
+});

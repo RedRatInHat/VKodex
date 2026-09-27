@@ -2,11 +2,20 @@ import { TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js"
 
 export type TaskState = Record<string, unknown>;
 
+/** Route evidence only. It never asserts physical native writer ownership. */
+export interface TaskStateRouteDiagnostic {
+  readonly kind: "native-observer" | "app-server" | "unknown";
+  readonly nativeOwnerClientId?: string;
+  readonly routeGeneration?: number;
+}
+
 /** A task-scoped state stream owned by one Codex execution adapter. */
 export interface TaskStateStream {
   readonly task: TaskRef;
   start(timeoutMs?: number): Promise<void>;
   verifyOwner(timeoutMs?: number): Promise<void>;
+  /** Optional local route evidence; never a physical native writer claim. */
+  diagnostic?(): TaskStateRouteDiagnostic;
   close(): void;
 }
 
@@ -45,6 +54,7 @@ class RoutedTaskStateStream implements TaskStateStream {
     }
   }
   verifyOwner(timeoutMs?: number): Promise<void> { return this.active.verifyOwner(timeoutMs); }
+  diagnostic(): TaskStateRouteDiagnostic { return this.active.diagnostic?.() ?? { kind: "unknown" }; }
   close(): void {
     this.closed = true; this.active.close();
     if (this.active !== this.primary && !this.primaryClosed) this.primary.close();
@@ -81,12 +91,14 @@ interface TaskStateConnection {
   ready: boolean;
   lastVerifiedAt: number | null;
   verifying: Promise<void> | null;
+  generation: number;
 }
 
 /** Owns task stream identity, retry gates and periodic owner verification. */
 export class TaskStateConnections {
   private readonly connections = new Map<string, TaskStateConnection>();
   private readonly retryAfter = new Map<string, number>();
+  private generation = 0;
 
   constructor(private readonly transport: TaskStateTransport, private readonly now: () => number = Date.now) {}
 
@@ -94,6 +106,13 @@ export class TaskStateConnections {
   has(id: string): boolean { return this.connections.has(id); }
   matches(id: string, task: TaskRef): boolean { return this.connections.get(id)?.key === taskKey(task); }
   lastVerifiedAt(id: string): number | null { return this.connections.get(id)?.lastVerifiedAt ?? null; }
+  diagnostic(id: string): TaskStateRouteDiagnostic | null {
+    const connection = this.connections.get(id);
+    if (!connection) return null;
+    if (!this.connected(id)) return { kind: "unknown", routeGeneration: connection.generation };
+    const diagnostic = connection.stream.diagnostic?.() ?? { kind: "unknown" as const };
+    return { ...diagnostic, routeGeneration: connection.generation };
+  }
   connected(id: string, freshnessMs = 45_000): boolean {
     const connection = this.connections.get(id);
     return !!connection?.ready && connection.lastVerifiedAt !== null && this.now() - connection.lastVerifiedAt <= freshnessMs;
@@ -118,8 +137,9 @@ export class TaskStateConnections {
       connection.ready = true;
       onState(state, initial);
     }, error => this.fail(id, stream, error));
+    const generation = ++this.generation;
     const connection: TaskStateConnection = {
-      task, key: taskKey(task), stream, onFailure, ready: false, lastVerifiedAt: null, verifying: null,
+      task, key: taskKey(task), stream, onFailure, ready: false, lastVerifiedAt: null, verifying: null, generation,
     };
     this.connections.set(id, connection);
     try {

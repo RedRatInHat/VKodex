@@ -548,3 +548,17 @@ test("native observer recovers the terminal status of an accepted interrupted tu
     { type: "status", id: "status:turn", turnId: "turn", status: "interrupted" },
   ]);
 });
+
+test("App Server state streams report executor routing without claiming native writer identity", async () => {
+  const rpc = new FakeRpc(); rpc.responses.set("thread/resume", [resume([])]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  try {
+    assert.deepEqual(stream.diagnostic?.(), { kind: "unknown" });
+    await stream.start();
+    assert.deepEqual(stream.diagnostic?.(), { kind: "app-server" });
+    stream.close();
+    assert.deepEqual(stream.diagnostic?.(), { kind: "unknown" });
+  }
+  finally { stream.close(); transport.close(); }
+});

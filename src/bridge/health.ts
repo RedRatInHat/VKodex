@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { sameTask, type DesktopCompatibility, type CodexTasks } from "../core/codex-tasks.js";
+import type { TaskStateRouteDiagnostic } from "../core/task-state.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 
@@ -27,6 +28,8 @@ export interface RuntimeHealthState {
     readonly leaseSince?: number | null;
     readonly lastConfirmedAt: number | null;
     readonly failure: "usageLimit" | "serverOverloaded" | "systemError" | null;
+    /** Local route evidence, never a claim of physical native writer ownership. */
+    readonly route?: TaskStateRouteDiagnostic;
   }[];
 }
 
@@ -173,7 +176,7 @@ export class BridgeHealthMonitor {
     const leased = (runtime.bindings ?? []).filter(binding => binding.streamMode === "attached").length;
     const detachedTitles = (runtime.bindings ?? []).filter(binding => binding.streamMode === "detached").map(binding => `«${binding.title.slice(0, 80)}»`);
     checks.push({ name: "codex_streams", state: connectedState,
-      detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; владельцев потока VKodex: ${leased}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}; освобождённых после хода: ${detached}${detachedTitles.length ? ` (${detachedTitles.join(", ")})` : ""}. Остальные беседы подключатся при активности.` });
+      detail: `Live-подключений: ${runtime.connectedBindings} из ${runtime.activeBindings}; локальных аренд потока VKodex: ${leased}; выполняющиеся или ожидающие ответа: ${runtime.connectedRequiredBindings} из ${runtime.requiredBindings}; освобождённых после хода: ${detached}${detachedTitles.length ? ` (${detachedTitles.join(", ")})` : ""}. Локальная аренда не подтверждает физического native writer; остальные беседы подключатся при активности.` });
     const failedTasks = runtime.failedBindings ?? 0;
     checks.push({ name: "codex_tasks", state: failedTasks ? "degraded" : "ok",
       detail: failedTasks ? `Задач с ошибкой Codex: ${failedTasks}. Проверь /menu и /limits в соответствующей беседе. Это состояние задач, а не обрыв VK.` : "У подключённых задач нет подтверждённых системных ошибок Codex." });
@@ -198,6 +201,12 @@ export class BridgeHealthMonitor {
         : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
+      if (binding.connected && binding.route) {
+        const route = binding.route;
+        const label = route.kind === "native-observer" ? "наблюдатель native" : route.kind === "app-server" ? "канал App Server" : "не подтверждён";
+        checks.push({ name: `codex_route_evidence:${binding.id}`, state: "ok",
+          detail: `«${binding.title.slice(0, 120)}»: маршрут ${label}; локальное поколение маршрута процесса ${route.routeGeneration ?? "неизвестно"}${route.nativeOwnerClientId ? `; native owner client ${route.nativeOwnerClientId}` : ""}. Это доказательство маршрута, а не физического writer.` });
+      }
       const routeFailure = this.store.getValue<{ at: number; kind: "no-active-owner" }>(`route-failure:${binding.id}`);
       if (routeFailure?.kind === "no-active-owner") {
         const at = Number.isSafeInteger(routeFailure.at) && Math.abs(routeFailure.at) <= 8.64e15

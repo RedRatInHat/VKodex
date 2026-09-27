@@ -175,10 +175,13 @@ export class BridgeRuntime {
       const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
       const streamMode: "attached" | "detached" | "unknown" = this.streamMode(binding.id) ?? (isConnected(binding) ? "attached" : "unknown");
       const lease = this.store.getValue<{ lastEventAt?: number | null; leaseSince?: number | null }>(`task-lease:${binding.id}`);
+      const route = !this.desktop.isCreationActive?.(binding) && this.connections.connected(binding.id)
+        ? this.connections.diagnostic(binding.id) : null;
       return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
         status: details?.status ?? "unavailable", connected: isConnected(binding),
         lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
-        streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null };
+        streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null,
+        ...(route ? { route } : {}) };
     });
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));

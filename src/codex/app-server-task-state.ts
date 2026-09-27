@@ -360,6 +360,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
         await entry.starting;
         if (!closed && !this.closed && entry.consumers.has(consumer) && !consumer.seen && entry.latest) this.deliver(consumer, entry.latest);
       },
+      diagnostic: () => consumer.started && !closed && !joined?.error ? { kind: "app-server" as const } : { kind: "unknown" as const },
       verifyOwner: async () => {
         const entry = joined;
         if (closed || !entry || !consumer.started || entry.error) throw entry?.error ?? new AppServerUnavailableError("Подписка наблюдения не активна.");
