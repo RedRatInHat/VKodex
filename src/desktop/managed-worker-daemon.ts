@@ -357,7 +357,9 @@ export class ManagedWorkerDaemon {
           (owner.metadata.state === 'connected' || owner.metadata.state === 'disconnected');
       };
       if (!stable() || generation === null) throw new ManagedWorkerStopRefusedError();
-      const revision = owner.metadata.revision;
+      // Usage counters can advance while these read-only checks run. Fence
+      // conversation/authority changes, not an unrelated display revision.
+      const semanticRevision = owner.metadata.semanticRevision;
       const receipts = host.acceptedCommandReceipts(controlKey);
       if (receipts.some(receipt => receipt.method !== 'turn/start'))
         throw new ManagedWorkerStopRefusedError();
@@ -378,7 +380,7 @@ export class ManagedWorkerDaemon {
       const after = host.commandQuiescence(controlKey), pending = host.requestQuiescence(controlKey);
       if (after.inFlight || after.unconfirmed || pending.unresolved || pending.generation !== generation ||
         !isDeepStrictEqual(host.acceptedCommandReceipts(controlKey), receipts) ||
-        owner.metadata.revision !== revision || !stable()) throw new ManagedWorkerStopRefusedError();
+        owner.metadata.semanticRevision !== semanticRevision || !stable()) throw new ManagedWorkerStopRefusedError();
       // Retire admitted grants before the last synchronous host-stop boundary.
       this.#state = 'stopping';
       this.#clearReconnect();

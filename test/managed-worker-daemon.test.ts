@@ -115,7 +115,7 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
       responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
-async function readyFixture(family = { allow: true }, native = { enabled: false, early: false },
+async function readyFixture(family: { allow: boolean; beforeReturn?: () => void } = { allow: true }, native = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' = 'normal') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
@@ -140,10 +140,12 @@ async function readyFixture(family = { allow: true }, native = { enabled: false,
         try { return await handler.handle(request, signal); }
         catch (error) { handlerErrors.push(error instanceof Error ? error.message : 'non-error'); throw error; }
       } }),
-    verifyFamilyQuiescent: async ({ idle }) => family.allow &&
-      (native.enabled && backend.writes && backend.materializeTurn ?
+    verifyFamilyQuiescent: async ({ idle }) => {
+      family.beforeReturn?.();
+      return family.allow && (native.enabled && backend.writes && backend.materializeTurn ?
         idle.turnCount === 1 && idle.latestTurnId === 'accepted-composer-turn' :
-        idle.turnCount === 0 && idle.latestTurnId === null),
+        idle.turnCount === 0 && idle.latestTurnId === null);
+    },
     dependencies: {
       createControl: options => {
         control = startup === 'control-bind-fail' ?
@@ -300,6 +302,36 @@ test('bootstrap failure retains authenticated startup diagnosis while EOF cannot
     backend.stdin.end();
   }
 });
+
+for (const meaningful of [false, true]) {
+  test(`stop fence ${meaningful ? 'rejects a new turn' : 'permits usage-only updates'} during family proof`, async () => {
+    const family: { allow: boolean; beforeReturn?: () => void } = { allow: true };
+    const f = await readyFixture(family);
+    const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    family.beforeReturn = () => {
+      f.backend.stdout.write(JSON.stringify(meaningful
+        ? { method: 'turn/started', params: { threadId: 'own-zero-turn',
+          turn: { id: 'raced-turn', status: 'inProgress', items: [] } } }
+        : { method: 'thread/tokenUsage/updated', params: { threadId: 'own-zero-turn',
+          turnId: 'usage-only', tokenUsage: { total: usage, last: usage, modelContextWindow: null } } }) + '\n');
+    };
+    try {
+      const reply = await controlStop(f.privateDirectory, f.reserved.epoch, 'fenced-stop');
+      if (meaningful) {
+        assert.equal(reply.error, 'stop-refused');
+        assert.equal(f.backend.exitCode, null);
+        assert.equal(f.daemon.metadata.state, 'ready');
+      } else {
+        assert.deepEqual(reply.result, { stopped: true });
+        assert.equal(f.backend.exitCode, 0);
+      }
+    } finally {
+      await (f.control as ManagedWorkerControlServer | null)?.close();
+      if (f.backend.exitCode === null) f.backend.stdin.end();
+    }
+  });
+}
 
 test('opt-in daemon composes one backend, bootstrap, native owner, and ready registry', async () => {
   const { daemon, backend, reserved, home, registryPath, privateDirectory, launches, observations } = await readyFixture();
