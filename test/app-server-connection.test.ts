@@ -1230,6 +1230,173 @@ test("a timed-out mutation preserves the writer, pending reads and late turn not
   } finally { clearInterval(keepAlive); await connection.close(); }
 });
 
+test("opt-in late mutation receipt is once, cloned, and precedes later notifications", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const keepAlive = setInterval(() => {}, 1_000);
+  const order: string[] = []; const late: JsonObject[] = [];
+  let ordinary = 0;
+  try {
+    const session = await connection.initializedSession();
+    connection.onNotification(() => order.push("notification"));
+    await assert.rejects(connection.request("turn/start", { threadId: "own" }, {
+      mutating: true, expectedGeneration: session.generation, timeoutMs: 10,
+      onResponseEnvelope: () => ordinary++,
+      onLateResponseEnvelope: envelope => { order.push("late"); late.push(envelope as JsonObject); },
+    }), AppServerUncertainError);
+    const id = child.messages.find(message => message.method === "turn/start")?.id;
+    const response = { id, result: { turn: { id: "accepted" } } };
+    child.send(response);
+    child.send({ method: "turn/started", params: { threadId: "own" } });
+    child.send(response);
+    assert.deepEqual(order, ["late", "notification"]);
+    assert.deepEqual(late, [{ result: { turn: { id: "accepted" } } }]);
+    assert.equal(ordinary, 0);
+    (late[0]!.result as JsonObject).turn = "changed";
+    assert.deepEqual(response.result, { turn: { id: "accepted" } });
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+    assert.equal(child.messages.filter(message => message.method === "turn/start").length, 1);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("late callback needs mutating and explicit current generation; malformed answer retires it", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const keepAlive = setInterval(() => {}, 1_000);
+  const late: JsonObject[] = []; let ordinary = 0;
+  try {
+    const session = await connection.initializedSession();
+    const options = [
+      { mutating: true, timeoutMs: 10, onLateResponseEnvelope: (value: JsonObject) => late.push(value) },
+      { mutating: false, expectedGeneration: session.generation, timeoutMs: 10,
+        onLateResponseEnvelope: (value: JsonObject) => late.push(value) },
+      { mutating: true, expectedGeneration: session.generation, timeoutMs: 10,
+        onResponseEnvelope: () => ordinary++, onLateResponseEnvelope: (value: JsonObject) => late.push(value) },
+      { mutating: true, expectedGeneration: session.generation, timeoutMs: 10,
+        onResponseEnvelope: () => ordinary++ },
+    ];
+    for (const option of options) await assert.rejects(connection.request("turn/start", {}, option));
+    const ids = child.messages.filter(message => message.method === "turn/start").map(message => message.id);
+    child.send({ id: ids[0], result: { ok: true } });
+    child.send({ id: ids[1], result: { ok: true } });
+    child.send({ id: ids[2], result: { ok: true }, error: { code: 1, message: "ambiguous" } });
+    child.send({ id: ids[2], result: { ok: true } });
+    child.send({ id: ids[3], result: { ok: true } });
+    assert.deepEqual(late, []);
+    assert.equal(ordinary, 0);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("late receipt callback throw is isolated and generation loss clears tombstones", async () => {
+  const first = new AppServerChild(); first.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const second = new AppServerChild();
+  const children = [first, second];
+  const connection = new AppServerConnection(() => children.shift()!.asChild(), undefined, 1_000);
+  const keepAlive = setInterval(() => {}, 1_000);
+  let calls = 0;
+  try {
+    const session = await connection.initializedSession();
+    await assert.rejects(connection.request("turn/start", {}, { mutating: true,
+      expectedGeneration: session.generation, timeoutMs: 10,
+      onLateResponseEnvelope: () => { calls++; throw new Error("observer failure"); } }), AppServerUncertainError);
+    const firstId = first.messages.find(message => message.method === "turn/start")?.id;
+    first.send({ id: firstId, error: { code: 409, message: "rejected" } });
+    assert.equal(calls, 1);
+    await assert.rejects(connection.request("turn/start", {}, { mutating: true,
+      expectedGeneration: session.generation, timeoutMs: 10,
+      onLateResponseEnvelope: () => calls++ }), AppServerUncertainError);
+    const secondId = first.messages.filter(message => message.method === "turn/start")[1]?.id;
+    first.disconnect();
+    await connection.start();
+    first.send({ id: secondId, result: { ok: true } });
+    second.send({ id: secondId, result: { ok: true } });
+    assert.equal(calls, 1);
+    second.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+    const current = await connection.initializedSession();
+    await assert.rejects(connection.request("turn/start", {}, { mutating: true,
+      expectedGeneration: current.generation, timeoutMs: 10,
+      onLateResponseEnvelope: () => calls++ }), AppServerUncertainError);
+    const closeId = second.messages.find(message => message.method === "turn/start")?.id;
+    await connection.close();
+    second.send({ id: closeId, result: { ok: true } });
+    assert.equal(calls, 1);
+    assert.equal(second.messages.filter(message => message.method === "turn/start").length, 1);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("late receipt tombstones evict oldest at a bounded capacity", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const keepAlive = setInterval(() => {}, 1_000);
+  const observed: number[] = [];
+  try {
+    const session = await connection.initializedSession();
+    await Promise.all(Array.from({ length: 129 }, (_, index) =>
+      assert.rejects(connection.request("turn/start", {}, { mutating: true,
+        expectedGeneration: session.generation, timeoutMs: 10,
+        onLateResponseEnvelope: () => observed.push(index) }), AppServerUncertainError)));
+    const ids = child.messages.filter(message => message.method === "turn/start").map(message => message.id);
+    assert.equal(ids.length, 129);
+    child.send({ id: ids[0], result: { ok: true } });
+    child.send({ id: ids[128], result: { ok: true } });
+    assert.deepEqual(observed, [128]);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("final before-write guard rejects only this request after authority revocation", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    const session = await connection.initializedSession();
+    let checks = 0;
+    let authorized = true;
+    const rejected = connection.request("turn/start", {}, {
+      mutating: true, expectedGeneration: session.generation,
+      assertBeforeWrite: () => { checks++; if (!authorized) throw new Error("authority-revoked"); },
+    });
+    authorized = false;
+    await assert.rejects(rejected, /authority-revoked/);
+    assert.equal(checks, 1);
+    assert.equal(child.messages.some(message => message.method === "turn/start"), false);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+    assert.deepEqual(await connection.request("thread/read", { threadId: "own" }), { ok: true });
+  } finally { await connection.close(); }
+});
+
+test("before-write guard reentrant close cannot dispatch onto the old child", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    const session = await connection.initializedSession();
+    let closing!: Promise<void>;
+    await assert.rejects(connection.request("turn/start", {}, {
+      mutating: true, expectedGeneration: session.generation,
+      assertBeforeWrite: () => { closing = connection.close(); },
+    }), AppServerUnavailableError);
+    await closing;
+    assert.equal(child.messages.some(message => message.method === "turn/start"), false);
+  } finally { await connection.close(); }
+});
+
+test("ambiguous live mutation response cannot become a definitive error receipt", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
+    : { id: message.id, result: { accepted: true }, error: { code: 409, message: "denied" } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let ordinary = 0;
+  try {
+    const session = await connection.initializedSession();
+    await assert.rejects(connection.request("turn/start", {}, { mutating: true,
+      expectedGeneration: session.generation, onResponseEnvelope: () => ordinary++ }), AppServerUncertainError);
+    assert.equal(ordinary, 0);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+  } finally { await connection.close(); }
+});
+
 test("a timed-out read does not disconnect unrelated profile work", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }

@@ -5,8 +5,13 @@ import type { Socket } from 'node:net';
 import { PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import test from 'node:test';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
+import type { WorkerCommand, WorkerCommandPolicy } from '../src/codex/managed-worker-command-dispatcher.js';
 
 type Frame = Record<string, unknown>;
 const taskId = 'own-thread';
@@ -291,4 +296,146 @@ test('explicit stop during startup cannot publish a late listener', async () => 
   assert.equal(fixture.managed.metadata.state, 'stopped');
   assert.throws(() => fixture.managed.frontendCapability(key));
   assert.equal(fixture.launches, 1);
+});
+
+function commandFixture(timeout = 100) {
+  const child = new Child(); const adapterKey = {}; const controlKey = {};
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-command-host-'));
+  const journalPath = path.join(directory, 'operations.sqlite');
+  const authority = { current: true, admit: true, onAuthorize: () => {} };
+  const policy: WorkerCommandPolicy = { controlKey, ownerEpoch: randomUUID(), journalPath,
+    fingerprintKey: randomBytes(32), isOwnerCurrent: () => authority.current,
+    authorize: ({ params }) => {
+      authority.onAuthorize();
+      return authority.admit && params.model === 'qualified-fixture-model';
+    } };
+  const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
+    initializeRequest: init, adapterKey, bootstrapReadMethods: [], backendTimeoutMs: timeout,
+    allowRequest: () => true, allowAnswer: () => true, commandPolicy: policy,
+    launch: () => child.asChild() });
+  const command: WorkerCommand = { operationId: randomUUID(), method: 'turn/start',
+    params: { threadId: taskId, clientUserMessageId: randomUUID(), model: 'qualified-fixture-model',
+      input: [{ type: 'text', text: `private-marker-${randomUUID()}` }] } };
+  return { managed, child, controlKey, adapterKey, command, journalPath, authority, policy };
+}
+async function sentMutation(child: Child, method = 'turn/start'): Promise<Frame> {
+  for (let tries = 0; tries < 50; tries++) {
+    const frame = child.messages.find(value => value.method === method);
+    if (frame) return frame;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  throw new Error('mutation-not-written');
+}
+
+test('owner command receipt survives frontend restart and duplicates never dispatch again', async () => {
+  const f = commandFixture(2000);
+  await f.managed.start();
+  try {
+    assert.throws(() => f.managed.executeCommand({}, f.command), /control/i);
+    const running = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    assert.equal(f.managed.commandStatus(f.controlKey, f.command.operationId)?.state, 'dispatching');
+    await f.managed.restartFrontend();
+    f.child.send({ id: request.id, result: { turn: { id: 'real-turn' } } });
+    assert.equal((await running).receiptId, 'real-turn');
+    f.authority.admit = false; // Starting another turn is now inadmissible.
+    const duplicate = await f.managed.executeCommand(f.controlKey, f.command);
+    assert.equal(duplicate.state, 'accepted');
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'initialize').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('timeout is durable unknown, late receipt settles once without a second model turn', async () => {
+  const f = commandFixture(20); await f.managed.start();
+  try {
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    assert.equal((await pending).state, 'unknown');
+    assert.equal((await f.managed.executeCommand(f.controlKey, f.command)).state, 'unknown');
+    assert.throws(() => f.managed.executeCommand(f.controlKey, { ...f.command, operationId: randomUUID(),
+      params: { ...f.command.params, clientUserMessageId: randomUUID() } }), /unresolved|unsettled|pending/i);
+    f.child.send({ id: request.id, result: { turn: { id: 'late-turn' } } });
+    const accepted = f.managed.commandStatus(f.controlKey, f.command.operationId);
+    assert.equal(accepted?.state, 'accepted'); assert.equal(accepted?.receiptId, 'late-turn');
+    f.child.send({ id: request.id, result: { turn: { id: 'duplicate-conflict' } } });
+    assert.deepEqual(f.managed.commandStatus(f.controlKey, f.command.operationId), accepted);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.child.stdin.writableEnded, false);
+    const raw = [f.journalPath, `${f.journalPath}-wal`].filter(existsSync)
+      .map(file => readFileSync(file).toString()).join('');
+    assert.equal(raw.includes((f.command.params.input as Array<{ text: string }>)[0]!.text), false);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('owner revoked before actual write does not dispatch or close the worker', async () => {
+  const f = commandFixture(); await f.managed.start();
+  try {
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    f.authority.current = false;
+    assert.equal((await pending).state, 'unknown');
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
+    assert.equal(f.child.stdin.writableEnded, false);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('owner policy cannot reenter command admission before reservation or write', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  let checking = false; let checks = 0;
+  f.authority.onAuthorize = () => {
+    if (checking) return; // Bound the regression without overflowing the stack.
+    checking = true;
+    try {
+      for (const operationId of [f.command.operationId, randomUUID()]) {
+        assert.throws(() => f.managed.executeCommand(f.controlKey, { ...f.command, operationId }), /reentrant/i);
+      }
+      checks++;
+    } finally { checking = false; }
+  };
+  try {
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    f.child.send({ id: request.id, result: { turn: { id: 'one-turn' } } });
+    assert.equal((await pending).state, 'accepted');
+    assert.equal(checks, 2); // Admission and immediately before the RPC write.
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('only validated receipts settle a command; internal errors remain unknown', async () => {
+  for (const code of [-32602, -32603]) {
+    const f = commandFixture(); await f.managed.start();
+    try {
+      const pending = f.managed.executeCommand(f.controlKey, f.command);
+      const request = await sentMutation(f.child);
+      f.child.send({ id: request.id, error: { code, message: 'private server detail' } });
+      const result = await pending;
+      assert.equal(result.state, code === -32602 ? 'rejected' : 'unknown');
+      assert.equal(f.child.stdin.writableEnded, false);
+    } finally { await f.managed.stop('test-cleanup'); }
+  }
+});
+
+test('stock queue receipt requires exact client identity and input echo', async () => {
+  for (const matching of [true, false]) {
+    const f = commandFixture(); await f.managed.start();
+    try {
+      const command = { ...f.command, method: 'thread/queue/add' as const };
+      const pending = f.managed.executeCommand(f.controlKey, command);
+      const request = await sentMutation(f.child, command.method);
+      f.child.send({ id: request.id, result: { queuedSubmission: { id: 'queue-entry',
+        clientUserMessageId: command.params.clientUserMessageId,
+        input: matching ? command.params.input : [{ type: 'text', text: 'changed' }] } } });
+      assert.equal((await pending).state, matching ? 'accepted' : 'unknown');
+    } finally { await f.managed.stop('test-cleanup'); }
+  }
+});
+
+test('stopping host settles in-flight command without losing its durable unknown state', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  const pending = f.managed.executeCommand(f.controlKey, f.command);
+  await sentMutation(f.child);
+  await f.managed.stop('test-cleanup');
+  assert.equal((await pending).state, 'unknown');
+  assert.throws(() => f.managed.commandStatus(f.controlKey, f.command.operationId), /control/i);
 });

@@ -6,6 +6,9 @@ import type { RequestInboxOptions } from './app-server-request-inbox.js';
 import { PersistentFrontendSessions } from './persistent-frontend-session.js';
 import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
+import { ManagedWorkerCommandDispatcher, captureWorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
+import type { WorkerCommand, WorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
+import type { WorkerOperation } from './managed-worker-operation-journal.js';
 
 type JsonObject = Record<string, unknown>;
 type StopReason = 'owner-request' | 'test-cleanup';
@@ -27,6 +30,8 @@ export interface ManagedWorkerFrontendHostOptions extends RequestPolicy {
   readonly backendTimeoutMs?: number;
   readonly trustedLocalFrontend?: boolean;
   readonly resumeAuthority?: ResumeAuthority;
+  /** Explicit owner-only commands. Native frontend read/rejoin remains separate. */
+  readonly commandPolicy?: WorkerCommandPolicy;
 }
 export interface ManagedWorkerFrontendMetadata {
   readonly taskId: string;
@@ -63,7 +68,7 @@ function freezeTree<T>(value: T): T {
 }
 
 /**
- * Single-thread composition host. No daemon, signal handler, or model dispatch.
+ * Single-thread composition host. No daemon, signal handler, or scheduler.
  * The caller must authorize explicit stop and establish live-task safety; this
  * class intentionally performs no automatic idle proof or family traversal.
  */
@@ -78,6 +83,8 @@ export class ManagedWorkerFrontendHost {
   readonly #resumeAuthority: ResumeAuthority | null;
   readonly #requestPolicy: RequestPolicy;
   readonly #rpc: AppServerConnection;
+  readonly #commandPolicy: WorkerCommandPolicy | null;
+  #commands: ManagedWorkerCommandDispatcher | null = null;
   #state: HostState = 'new';
   #launched = false;
   #stopRequested = false;
@@ -120,6 +127,7 @@ export class ManagedWorkerFrontendHost {
     this.#resumeAuthority = options.resumeAuthority ?? null;
     this.#requestPolicy = Object.freeze({ allowRequest: options.allowRequest,
       allowAnswer: options.allowAnswer, ...(options.allowError ? { allowError: options.allowError } : {}) });
+    this.#commandPolicy = options.commandPolicy === undefined ? null : captureWorkerCommandPolicy(options.commandPolicy);
     const launch = options.launch;
     this.#rpc = new AppServerConnection(() => {
       if (this.#launched) throw new Error('Worker launch is single-use');
@@ -139,6 +147,17 @@ export class ManagedWorkerFrontendHost {
     return Object.freeze({ taskId: this.#taskId, state: this.#state,
       backendGeneration: this.#backendGeneration,
       frontend: this.#transport ? this.#transport.metadata : null });
+  }
+
+  /** Durable control outcome, not a native turn/start response. */
+  executeCommand(controlKey: object, command: WorkerCommand): Promise<WorkerOperation> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.execute(controlKey, command);
+  }
+
+  commandStatus(controlKey: object, operationId: string): WorkerOperation | null {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.get(controlKey, operationId);
   }
 
   /** The token is available only to the caller holding the constructor's key. */
@@ -169,6 +188,9 @@ export class ManagedWorkerFrontendHost {
       if (this.#stopRequested || this.#isLost() ||
         !this.#rpc.isSessionCurrent(session.generation)) throw new Error('Worker startup superseded');
       this.#backendGeneration = session.generation;
+      if (this.#commandPolicy) this.#commands = new ManagedWorkerCommandDispatcher(
+        this.#rpc, this.#taskId, session.generation, this.#commandPolicy, () =>
+          !this.#stopRequested && ['running', 'restarting', 'frontend-unavailable'].includes(this.#state));
       const inbox = new AppServerRequestInbox({ threadId: this.#taskId,
         generation: session.generation,
         isGenerationCurrent: generation => this.#rpc.isSessionCurrent(generation),
@@ -265,6 +287,8 @@ export class ManagedWorkerFrontendHost {
         const rpcClose = this.#rpc.close().then(() => null, error => error as unknown);
         try { await transport?.close(); } catch (error) { closeFailure = error; }
         const rpcCloseFailure = await rpcClose;
+        try { await this.#commands?.close(); } catch (error) { closeFailure ??= error; }
+        this.#commandPolicy?.fingerprintKey.fill(0);
         const lossCloseFailure = await this.#lossClosePromise;
         closeFailure ??= rpcCloseFailure;
         closeFailure ??= lossCloseFailure;

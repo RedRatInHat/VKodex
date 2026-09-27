@@ -61,6 +61,11 @@ export interface AppServerRequestOptions {
   readonly expectedGeneration?: number;
   /** Called before the next inbound frame; never await or log native error details. */
   readonly onResponseEnvelope?: (envelope: AppServerResponseEnvelope) => void;
+  /** Optional receipt after a timed-out, generation-pinned mutation. Never
+   * changes the original uncertain rejection or replays the request. */
+  readonly onLateResponseEnvelope?: (envelope: AppServerResponseEnvelope) => void;
+  /** Synchronous authority fence after start() and immediately before wire write. */
+  readonly assertBeforeWrite?: () => void;
 }
 
 export interface AppServerEnvelope {
@@ -107,6 +112,11 @@ interface PendingRequest {
   readonly onResponseEnvelope: ((envelope: AppServerResponseEnvelope) => void) | undefined;
 }
 
+interface LateResponseReceipt {
+  readonly generation: number;
+  readonly callback: (envelope: AppServerResponseEnvelope) => void;
+}
+
 interface PendingServerRequest {
   readonly request: AppServerEnvelope;
   readonly controller: AbortController;
@@ -116,6 +126,7 @@ interface PendingServerRequest {
 
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+const MAX_LATE_RESPONSE_RECEIPTS = 128;
 
 /** One restartable JSONL App Server connection owned by a single Codex profile. */
 export class AppServerConnection implements AppServerRpc {
@@ -129,6 +140,7 @@ export class AppServerConnection implements AppServerRpc {
   private closing: Promise<void> = Promise.resolve();
   private stopped = false;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly lateResponseReceipts = new Map<number, LateResponseReceipt>();
   private readonly pendingServerRequests = new Map<string | number, PendingServerRequest>();
   private readonly notificationListeners = new Set<(notification: AppServerEnvelope) => void>();
   private readonly disconnectListeners = new Set<(error: Error) => void>();
@@ -214,18 +226,30 @@ export class AppServerConnection implements AppServerRpc {
       return Promise.reject(new AppServerUnavailableError());
     const child = this.child;
     if (!child) return Promise.reject(new AppServerUnavailableError());
+    const generation = this.generation;
+    try { options.assertBeforeWrite?.(); }
+    catch (error) { return Promise.reject(error); }
+    if (this.child !== child || this.generation !== generation ||
+      (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration)))
+      return Promise.reject(new AppServerUnavailableError());
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
         if (!pending) return;
         this.pending.delete(id);
+        if (pending.mutating && options.expectedGeneration === generation &&
+          this.isSessionCurrent(generation) && typeof options.onLateResponseEnvelope === "function") {
+          this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope });
+          if (this.lateResponseReceipts.size > MAX_LATE_RESPONSE_RECEIPTS)
+            this.lateResponseReceipts.delete(this.lateResponseReceipts.keys().next().value!);
+        }
         const error = pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError("Codex App Server не ответил вовремя.");
         pending.reject(error);
         // A timeout describes this operation, not the health of the writer.
         // A mutation may already be running: keep its notifications and other
         // tasks alive, and let the caller reconcile the uncertain outcome.
-        // A late response for this retired request is ignored by acceptResponse.
+        // Without an explicit scoped receipt callback, the late response is ignored.
       }, options.timeoutMs ?? this.defaultTimeoutMs);
       timer.unref();
       this.pending.set(id, { mutating: options.mutating === true, resolve, reject, timer,
@@ -293,8 +317,33 @@ export class AppServerConnection implements AppServerRpc {
 
   private acceptResponse(id: number, value: JsonObject): void {
     const pending = this.pending.get(id);
-    if (!pending) return;
+    if (!pending) {
+      const late = this.lateResponseReceipts.get(id);
+      if (!late) return;
+      this.lateResponseReceipts.delete(id);
+      if (!this.isSessionCurrent(late.generation)) return;
+      const hasResult = Object.hasOwn(value, "result"), hasError = Object.hasOwn(value, "error");
+      if (hasResult === hasError) return;
+      let envelope: AppServerResponseEnvelope;
+      if (hasResult) {
+        if (!isObject(value.result)) return;
+        envelope = { result: value.result };
+      } else {
+        if (!isObject(value.error) ||
+          !(Number.isSafeInteger(value.error.code) || typeof value.error.code === "string") ||
+          typeof value.error.message !== "string") return;
+        envelope = { error: value.error };
+      }
+      try { late.callback(structuredClone(envelope)); }
+      catch { /* A late observer cannot abort the shared worker. */ }
+      return;
+    }
     this.pending.delete(id); clearTimeout(pending.timer);
+    if (Object.hasOwn(value, "result") && Object.hasOwn(value, "error")) {
+      pending.reject(pending.mutating ? new AppServerUncertainError() :
+        new AppServerUnavailableError("Codex App Server вернул неоднозначный ответ."));
+      return;
+    }
     const deliver = (envelope: AppServerResponseEnvelope): void => {
       if (!pending.onResponseEnvelope) return;
       try { pending.onResponseEnvelope(structuredClone(envelope)); }
@@ -383,6 +432,7 @@ export class AppServerConnection implements AppServerRpc {
   private failConnection(child: ChildProcessWithoutNullStreams, generation: number, fallback: Error, skipId?: number): void {
     if (this.child !== child || this.generation !== generation) return;
     this.child = null; this.initialized = null; this.fragments = []; this.fragmentBytes = 0;
+    this.lateResponseReceipts.clear();
     // Abort listeners can synchronously request a reconnect. Install the
     // teardown barrier before notifying them so open() cannot overtake it.
     this.closing = this.closing.then(() => closeAppServer(child)).catch(() => {});
@@ -401,6 +451,7 @@ export class AppServerConnection implements AppServerRpc {
     this.stopped = true; this.starting = null;
     const child = this.child; this.child = null; this.initialized = null;
     this.fragments = []; this.fragmentBytes = 0; this.generation++;
+    this.lateResponseReceipts.clear();
     this.clearServerRequests();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

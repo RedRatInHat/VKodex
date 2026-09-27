@@ -1,0 +1,184 @@
+import { createHmac } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import path from 'node:path';
+import type { AppServerConnection, AppServerResponseEnvelope } from './app-server-connection.js';
+import { ManagedWorkerOperationJournal } from './managed-worker-operation-journal.js';
+import type { WorkerOperation, WorkerMutationMethod } from './managed-worker-operation-journal.js';
+
+type JsonObject = Record<string, unknown>;
+export interface WorkerCommand {
+  readonly operationId: string;
+  readonly method: WorkerMutationMethod;
+  readonly params: JsonObject;
+}
+export interface WorkerCommandScope {
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  readonly threadId: string;
+}
+export interface WorkerCommandPolicy {
+  readonly controlKey: object;
+  readonly ownerEpoch: string;
+  readonly journalPath: string;
+  readonly fingerprintKey: Uint8Array;
+  /** Must establish actual authority and the method's full settings/queue policy.
+   * A matching directory, registry reservation or task ID alone is insufficient. */
+  readonly authorize: (context: Readonly<WorkerCommandScope & WorkerCommand>) => boolean;
+  readonly isOwnerCurrent: (scope: Readonly<WorkerCommandScope>) => boolean;
+}
+type Backend = Pick<AppServerConnection, 'request' | 'isSessionCurrent'>;
+const object = (value: unknown): value is JsonObject =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+function freeze<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const entry of Object.values(value)) freeze(entry);
+    Object.freeze(value);
+  }
+  return value;
+}
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (object(value)) return `{${Object.keys(value).sort().map(key =>
+    `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function snapshot(command: WorkerCommand): Readonly<WorkerCommand> {
+  if (!object(command) || !uuid.test(command.operationId) ||
+      (command.method !== 'turn/start' && command.method !== 'thread/queue/add') ||
+      !object(command.params)) throw new TypeError('Invalid worker command');
+  try {
+    const copy = structuredClone(command);
+    const encoded = JSON.stringify(copy);
+    if (Buffer.byteLength(encoded) > 32 * 1024 * 1024 ||
+        !isDeepStrictEqual(copy, JSON.parse(encoded))) throw new Error();
+    if (Object.keys(copy).some(key => !['operationId', 'method', 'params'].includes(key))) throw new Error();
+    return freeze(copy);
+  } catch { throw new TypeError('Worker command must be bounded strict JSON'); }
+}
+
+/** Copies policy before worker launch. Key bytes never enter journal/metadata. */
+export function captureWorkerCommandPolicy(policy: WorkerCommandPolicy): WorkerCommandPolicy {
+  if (!policy || !policy.controlKey || typeof policy.controlKey !== 'object' ||
+      typeof policy.ownerEpoch !== 'string' || !uuid.test(policy.ownerEpoch) ||
+      typeof policy.journalPath !== 'string' || !path.isAbsolute(policy.journalPath) ||
+      !(policy.fingerprintKey instanceof Uint8Array) || policy.fingerprintKey.byteLength < 32 ||
+      policy.fingerprintKey.byteLength > 128 || typeof policy.authorize !== 'function' ||
+      typeof policy.isOwnerCurrent !== 'function') throw new TypeError('Explicit worker command policy required');
+  return Object.freeze({ controlKey: policy.controlKey, ownerEpoch: policy.ownerEpoch,
+    journalPath: policy.journalPath, fingerprintKey: Buffer.from(policy.fingerprintKey),
+    authorize: policy.authorize, isOwnerCurrent: policy.isOwnerCurrent });
+}
+
+/** Owner control API, NOT a synthetic native RPC response or a scheduler. */
+export class ManagedWorkerCommandDispatcher {
+  readonly #policy: WorkerCommandPolicy;
+  readonly #scope: Readonly<WorkerCommandScope>;
+  readonly #journal: ManagedWorkerOperationJournal;
+  readonly #inFlight = new Set<Promise<WorkerOperation>>();
+  #closed = false;
+  #checkingPolicy = false;
+
+  constructor(readonly backend: Backend, threadId: string, backendGeneration: number,
+    policy: WorkerCommandPolicy, readonly canExecute: () => boolean) {
+    this.#policy = captureWorkerCommandPolicy(policy);
+    this.#scope = Object.freeze({ ownerEpoch: policy.ownerEpoch, backendGeneration, threadId });
+    this.#journal = new ManagedWorkerOperationJournal({ filePath: policy.journalPath, ...this.#scope });
+  }
+
+  #authenticate(key: object): void {
+    if (key !== this.#policy.controlKey || this.#closed) throw new Error('Worker control unavailable');
+  }
+  #current(): boolean {
+    return !this.#closed && this.canExecute() && this.backend.isSessionCurrent(this.#scope.backendGeneration) &&
+      this.#policy.isOwnerCurrent(this.#scope) === true;
+  }
+  #checkPolicy<T>(check: () => T): T {
+    if (this.#checkingPolicy) throw new Error('Reentrant worker command policy');
+    this.#checkingPolicy = true;
+    try { return check(); } finally { this.#checkingPolicy = false; }
+  }
+  get(key: object, operationId: string): WorkerOperation | null {
+    this.#authenticate(key);
+    return this.#journal.get(operationId);
+  }
+  execute(key: object, value: WorkerCommand): Promise<WorkerOperation> {
+    this.#authenticate(key);
+    // Owner callbacks must not recursively admit either this or a different
+    // operation before the outer reservation/write has been fenced.
+    if (this.#checkingPolicy) throw new Error('Reentrant worker command admission');
+    const command = snapshot(value);
+    if (command.params.threadId !== this.#scope.threadId ||
+        typeof command.params.clientUserMessageId !== 'string' ||
+        !Array.isArray(command.params.input) || command.params.input.length === 0)
+      throw new TypeError('Exact thread, client input identity and input required');
+    const authorize = () => this.#checkPolicy(() => {
+      if (!this.#current() || this.#policy.authorize(Object.freeze({ ...this.#scope, ...command })) !== true)
+        throw new Error('Worker command authority unavailable');
+      // Policy code may synchronously revoke the owner or stop this host.
+      if (!this.#current()) throw new Error('Worker command authority changed');
+    });
+    const fingerprint = createHmac('sha256', this.#policy.fingerprintKey)
+      .update(canonical({ ...this.#scope, ...command })).digest('hex');
+    const intent = { operationId: command.operationId,
+      clientUserMessageId: command.params.clientUserMessageId, method: command.method, fingerprint };
+    // Retrieving an immutable prior outcome is not a fresh execution. A now
+    // active turn may legitimately make the original start policy inadmissible.
+    if (this.#journal.get(command.operationId))
+      return Promise.resolve(this.#journal.reserve(intent).operation);
+    authorize();
+    const reservation = this.#journal.reserve(intent);
+    if (!reservation.created) return Promise.resolve(reservation.operation);
+    const work = this.#dispatch(command, authorize);
+    this.#inFlight.add(work);
+    void work.then(() => this.#inFlight.delete(work), () => this.#inFlight.delete(work));
+    return work;
+  }
+
+  #receipt(command: WorkerCommand, envelope: AppServerResponseEnvelope): void {
+    if (!this.#checkPolicy(() => this.#current())) return;
+    const operation = this.#journal.get(command.operationId);
+    if (!operation) return;
+    if ('error' in envelope) {
+      // Generic internal/server failures may occur after side effects. Only
+      // standard request/method/parameter validation errors prove rejection.
+      if (typeof envelope.error.message === 'string' &&
+          [-32600, -32601, -32602].includes(envelope.error.code as number))
+        this.#journal.reject(operation, envelope.error.code as number);
+      return;
+    }
+    const result = envelope.result;
+    if (command.method === 'turn/start') {
+      if (object(result.turn) && typeof result.turn.id === 'string')
+        this.#journal.accept(operation, result.turn.id);
+    } else if (object(result.queuedSubmission) &&
+        typeof result.queuedSubmission.id === 'string' &&
+        result.queuedSubmission.clientUserMessageId === command.params.clientUserMessageId &&
+        isDeepStrictEqual(result.queuedSubmission.input, command.params.input)) {
+      this.#journal.accept(operation, result.queuedSubmission.id);
+    }
+  }
+
+  async #dispatch(command: WorkerCommand, authorize: () => void): Promise<WorkerOperation> {
+    const receipt = (envelope: AppServerResponseEnvelope) => this.#receipt(command, envelope);
+    try {
+      await this.backend.request(command.method, structuredClone(command.params), {
+        mutating: true, expectedGeneration: this.#scope.backendGeneration,
+        assertBeforeWrite: authorize, onResponseEnvelope: receipt, onLateResponseEnvelope: receipt,
+      });
+    } catch { /* RPC failure never justifies replay or stopping the worker. */ }
+    const observed = this.#journal.get(command.operationId);
+    if (!observed) throw new Error('Worker operation result unavailable');
+    // Only durable receipt processing establishes acceptance. Even a successful
+    // raw RPC result is unknown if its shape or persistence could not be proven.
+    return observed.state === 'dispatching' ? this.#journal.markUnknown(observed) : observed;
+  }
+
+  /** Call only after stopping/invalidation of the RPC, so in-flight calls settle. */
+  async close(): Promise<void> {
+    this.#closed = true;
+    await Promise.allSettled([...this.#inFlight]);
+    this.#journal.close();
+    this.#policy.fingerprintKey.fill(0);
+  }
+}
