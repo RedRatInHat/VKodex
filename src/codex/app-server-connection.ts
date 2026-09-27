@@ -19,12 +19,17 @@ export class AppServerUncertainError extends Error {
   constructor() { super("Результат операции Codex неизвестен."); this.name = "AppServerUncertainError"; }
 }
 
+/** ID-free native response for an opt-in synchronous frontend wire writer. */
+export type AppServerResponseEnvelope = Readonly<{ result: JsonObject }> | Readonly<{ error: JsonObject }>;
+
 export interface AppServerRequestOptions {
   /** A dispatched mutation must never be replayed after timeout or disconnect. */
   readonly mutating?: boolean;
   readonly timeoutMs?: number;
   /** Refuse to launch or dispatch on a different initialized connection. */
   readonly expectedGeneration?: number;
+  /** Called before the next inbound frame; never await or log native error details. */
+  readonly onResponseEnvelope?: (envelope: AppServerResponseEnvelope) => void;
 }
 
 export interface AppServerEnvelope {
@@ -68,6 +73,7 @@ interface PendingRequest {
   readonly resolve: (value: JsonObject) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+  readonly onResponseEnvelope: ((envelope: AppServerResponseEnvelope) => void) | undefined;
 }
 
 interface PendingServerRequest {
@@ -191,7 +197,8 @@ export class AppServerConnection implements AppServerRpc {
         // A late response for this retired request is ignored by acceptResponse.
       }, options.timeoutMs ?? this.defaultTimeoutMs);
       timer.unref();
-      this.pending.set(id, { mutating: options.mutating === true, resolve, reject, timer });
+      this.pending.set(id, { mutating: options.mutating === true, resolve, reject, timer,
+        onResponseEnvelope: options.onResponseEnvelope });
       try { this.write(child, { id, method, params }); }
       catch {
         clearTimeout(timer); this.pending.delete(id);
@@ -257,14 +264,21 @@ export class AppServerConnection implements AppServerRpc {
     const pending = this.pending.get(id);
     if (!pending) return;
     this.pending.delete(id); clearTimeout(pending.timer);
+    const deliver = (envelope: AppServerResponseEnvelope): void => {
+      if (!pending.onResponseEnvelope) return;
+      try { pending.onResponseEnvelope(structuredClone(envelope)); }
+      catch { /* A frontend writer cannot abort the shared worker. */ }
+    };
     if (value.error !== undefined) {
       const error = isObject(value.error) ? value.error : {};
+      if (isObject(value.error)) deliver({ error: value.error });
       const code = typeof error.code === "number" || typeof error.code === "string" ? error.code : null;
       const reason = typeof error.message === "string" && /already has an active writer/iu.test(error.message)
         ? "active-writer" as const : null;
       pending.reject(new AppServerRejectedError(code, reason)); return;
     }
     if (!isObject(value.result)) { pending.reject(new AppServerUnavailableError("Codex App Server вернул некорректный ответ.")); return; }
+    deliver({ result: value.result });
     pending.resolve(value.result);
   }
 

@@ -63,6 +63,106 @@ test("one long-lived App Server connection initializes once and multiplexes requ
   } finally { await connection.close(); }
 });
 
+test("raw response callback preserves response-before-notification order in one stdout chunk", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "thread/read" ? null
+    : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const order: string[] = [];
+  let observed: JsonObject | null = null;
+  connection.onNotification(() => order.push("notification"));
+  try {
+    await connection.start();
+    const pending = connection.request("thread/read", { threadId: "own" }, {
+      onResponseEnvelope: envelope => {
+        order.push("response"); observed = envelope;
+        ((envelope as { result: JsonObject }).result.thread as JsonObject).id = "callback-local-change";
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const id = child.messages.find(message => message.method === "thread/read")!.id;
+    const response = { id, result: { thread: { id: "own" } } };
+    const notification = { method: "thread/status/changed", params: { threadId: "own" } };
+    child.stdout.write(`${JSON.stringify(response)}\n${JSON.stringify(notification)}\n`);
+    const result = await pending; order.push("settled");
+    assert.deepEqual(order, ["response", "notification", "settled"]);
+    assert.deepEqual(observed, { result: { thread: { id: "callback-local-change" } } },
+      "the callback receives its own ID-free clone");
+    assert.deepEqual(result, { thread: { id: "own" } },
+      "callback mutation cannot change the safe Promise result");
+  } finally { await connection.close(); }
+});
+
+test("opt-in raw error callback retains native details while the Promise error stays safe", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "thread/read" ? null
+    : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let observed: JsonObject | null = null;
+  try {
+    await connection.start();
+    const pending = connection.request("thread/read", { threadId: "own" }, {
+      onResponseEnvelope: envelope => { observed = envelope; },
+    });
+    void pending.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    const id = child.messages.find(message => message.method === "thread/read")!.id;
+    child.send({ id, error: { code: -32010, message: "private native detail",
+      data: { nativeTag: "opaque" } } });
+    await assert.rejects(pending, error => error instanceof AppServerRejectedError &&
+      error.code === -32010 && !error.message.includes("private native detail"));
+    assert.deepEqual(observed, { error: { code: -32010,
+      message: "private native detail", data: { nativeTag: "opaque" } } });
+  } finally { await connection.close(); }
+});
+
+test("throwing raw response callback cannot lose the worker, response, or next notification", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "thread/read" ? null
+    : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const notifications: string[] = [];
+  let calls = 0;
+  connection.onNotification(notification => notifications.push(notification.method));
+  try {
+    await connection.start();
+    const pending = connection.request("thread/read", { threadId: "own" }, {
+      onResponseEnvelope: () => { calls++; throw new Error("frontend writer failed"); },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const id = child.messages.find(message => message.method === "thread/read")!.id;
+    child.stdout.write(`${JSON.stringify({ id, result: { ok: true } })}\n` +
+      `${JSON.stringify({ method: "turn/started", params: { threadId: "own" } })}\n`);
+    assert.deepEqual(await pending, { ok: true });
+    assert.equal(calls, 1);
+    assert.deepEqual(notifications, ["turn/started"]);
+    assert.deepEqual(await connection.request("model/list"), { ok: true });
+  } finally { await connection.close(); }
+});
+
+test("retired timeout and late duplicate responses never invoke a raw callback", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "thread/read" ? null
+    : { id: message.id, result: { ok: true } };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  let calls = 0;
+  try {
+    await connection.start();
+    const pending = connection.request("thread/read", { threadId: "own" }, {
+      timeoutMs: 5, onResponseEnvelope: () => { calls++; },
+    });
+    void pending.catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 15));
+    await assert.rejects(pending, AppServerUnavailableError);
+    const id = child.messages.find(message => message.method === "thread/read")!.id;
+    child.send({ id, result: { late: true } });
+    child.send({ id, result: { duplicate: true } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls, 0);
+    assert.deepEqual(await connection.request("model/list"), { ok: true });
+  } finally { await connection.close(); }
+});
+
 test("concurrent requests wait for the initialization handshake before dispatch", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "initialize" ? null : { id: message.id, result: { ok: true } };
