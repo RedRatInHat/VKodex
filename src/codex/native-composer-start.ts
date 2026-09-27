@@ -1,4 +1,6 @@
 import { prepareNativeFollowerStart, type NativeFollowerStartSnapshot } from "./native-follower-start.js";
+import { isDeepStrictEqual } from "node:util";
+import type { QualifiedContinuationEvidence } from "../desktop/managed-worker-bootstrap.js";
 
 type Row = Record<string, unknown>;
 export interface NativeComposerStartResult {
@@ -31,9 +33,70 @@ function checkedProfile(value: Row): void {
  * Caller must fence the same live worker generation before dispatch.
  */
 export function compileNativeReadOnlyComposerStart(snapshot: unknown, follower: unknown, defaults: unknown = null): NativeComposerStartResult {
+  if (!object(snapshot) || !Array.isArray(snapshot.turns) || snapshot.turns.length !== 0)
+    fail('first turn requires empty history');
+  return compileQualifiedComposerStart(snapshot, follower, defaults);
+}
+
+/** A second or later Composer send requires separately qualified live worker
+ * evidence. Historical turn params never become current permission defaults. */
+export function compileNativeReadOnlyContinuationComposerStart(snapshot: unknown, follower: unknown,
+  evidence: QualifiedContinuationEvidence): NativeComposerStartResult {
+  if (!object(snapshot) || !object(evidence) || !object(evidence.owner) || !object(evidence.effective) ||
+      !Array.isArray(snapshot.turns) || snapshot.turns.length === 0 ||
+      !object(snapshot.turnsPagination) || snapshot.turnsPagination.hasLoadedOldest !== true ||
+      snapshot.turnsPagination.olderCursor !== null ||
+      !object(snapshot.threadRuntimeStatus) || snapshot.threadRuntimeStatus.type !== 'idle' ||
+      !Array.isArray(snapshot.requests) || snapshot.requests.length !== 0 ||
+      snapshot.nativeQueue !== undefined && (!Array.isArray(snapshot.nativeQueue) || snapshot.nativeQueue.length !== 0) ||
+      snapshot.queuedFollowUps !== undefined &&
+        (!Array.isArray(snapshot.queuedFollowUps) || snapshot.queuedFollowUps.length !== 0))
+    fail('continuation is not fully loaded and idle');
+  const seen = new Set<string>();
+  for (const turn of snapshot.turns) {
+    if (!object(turn) || !text(turn.turnId) || seen.has(turn.turnId) ||
+        Object.keys(turn).sort().join('|') !== 'status|turnId' ||
+        !['completed', 'failed', 'interrupted'].includes(String(turn.status)))
+      fail('continuation history is not terminal');
+    seen.add(turn.turnId);
+  }
+  const owner = evidence.owner, effective = evidence.effective;
+  if (owner.threadId !== snapshot.id ||
+      typeof owner.ownerEpoch !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(owner.ownerEpoch) ||
+      !Number.isSafeInteger(owner.backendGeneration) || owner.backendGeneration < 1 ||
+      !Number.isSafeInteger(owner.semanticRevision) || owner.semanticRevision < 0 ||
+      owner.pendingRequests !== 0 || owner.queuedFollowUps !== 0 ||
+      owner.inFlightCommands !== 0 || owner.unconfirmedOperations !== false ||
+      evidence.turnCount !== snapshot.turns.length ||
+      evidence.latestTurnId !== snapshot.turns.at(-1)?.turnId ||
+      !Array.isArray(evidence.terminalTurnIds) ||
+      !isDeepStrictEqual(evidence.terminalTurnIds, snapshot.turns.map(turn => (turn as Row).turnId)) ||
+      typeof evidence.historyDigest !== 'string' || !/^[0-9a-f]{64}$/iu.test(evidence.historyDigest))
+    fail('continuation owner/history evidence differs');
+  const settings = snapshot.latestThreadSettings, selected = snapshot.currentPermissions;
+  if (!object(settings) || !object(selected) ||
+      effective.model !== 'gpt-5.6-sol' || effective.effort !== 'low' ||
+      effective.cwd !== snapshot.cwd || effective.activePermissionProfileId !== ':read-only' ||
+      effective.approvalPolicy !== 'on-request' || effective.approvalsReviewer !== 'user' ||
+      effective.sandboxType !== 'readOnly' || effective.networkAccess !== false ||
+      !isDeepStrictEqual(effective.runtimeWorkspaceRoots, [snapshot.cwd]) ||
+      !isDeepStrictEqual(effective.environments, snapshot.environments) ||
+      settings.cwd !== snapshot.cwd || settings.model !== effective.model ||
+      settings.effort !== effective.effort || settings.approvalPolicy !== 'on-request' ||
+      settings.approvalsReviewer !== 'user' || settings.serviceTier !== effective.serviceTier ||
+      snapshot.latestModel !== effective.model || snapshot.latestReasoningEffort !== effective.effort ||
+      !['never', 'on-request'].includes(String(selected.approvalPolicy)) ||
+      selected.approvalsReviewer !== 'user' ||
+      !isDeepStrictEqual(selected.runtimeWorkspaceRoots, [snapshot.cwd]))
+    fail('continuation effective and selected policy are not qualified');
+  checkedProfile(settings); checkedProfile(selected);
+  return compileQualifiedComposerStart(snapshot, follower, evidence.composerDefaults);
+}
+
+function compileQualifiedComposerStart(snapshot: Row, follower: unknown, defaults: unknown): NativeComposerStartResult {
   if (!object(snapshot) || snapshot.hostId !== "local" || snapshot.resumeState !== "resumed" ||
       !text(snapshot.id) || !text(snapshot.cwd) || !text(snapshot.latestModel)) fail("native snapshot is not local/resumed");
-  if (snapshot.workspaceKind !== "projectless" || !Array.isArray(snapshot.turns) || snapshot.turns.length !== 0 ||
+  if (snapshot.workspaceKind !== "projectless" || !Array.isArray(snapshot.turns) ||
       !Array.isArray(snapshot.environments) || snapshot.environments.length > 1) fail("native first-turn workspace is not qualified");
   for (const environment of snapshot.environments) {
     if (!object(environment)) fail("native environment is not qualified");

@@ -291,6 +291,8 @@ test('continuation qualifier accepts bounded completed history and exact ID-only
       const evidence = await bootstrap.qualifyContinuation(ownerFence);
       assert.equal(evidence.turnCount, count);
       assert.equal(evidence.latestTurnId, `turn-${count - 1}`);
+      assert.deepEqual(evidence.terminalTurnIds, fixture.turns.map(turn => turn.id));
+      assert.equal(Object.isFrozen(evidence.terminalTurnIds), true);
       assert.equal(evidence.effective.activePermissionProfileId, ':read-only');
       assert.equal(evidence.effective.approvalPolicy, 'never');
       assert.equal(fixture.idOnlyResumeCount, 1);

@@ -14,6 +14,7 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-
 import type { IpcObject } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerNativeOwner } from '../src/desktop/managed-worker-native-owner.js';
 import type { NativeProjectionState } from '../src/codex/managed-native-projection.js';
+import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from '../src/desktop/managed-worker-bootstrap.js';
 
 const taskId = 'own-native-task';
 function state(): NativeProjectionState {
@@ -75,7 +76,8 @@ async function waitFrame(frames: IpcObject[], predicate: (frame: IpcObject) => b
 }
 async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state(),
   allowAnswer: (request: AppServerServerRequest, response: IpcObject) => boolean = () => false,
-  allowFollower: (id: string) => boolean = id => id === 'follower', composer = false) {
+  allowFollower: (id: string) => boolean = id => id === 'follower', composer = false,
+  qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -96,6 +98,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   const owner = new ManagedWorkerNativeOwner({ host, adapterKey, controlKey, taskId, ownerEpoch,
     isOwnerCurrent: () => true, allowFollower, readInitialState,
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
+    ...(qualifyContinuation ? { qualifyContinuation } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
       return broker;
@@ -118,6 +121,45 @@ function composerState(): NativeProjectionState {
       approvalPolicy: 'never', approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/own'] } };
 }
 
+function continuationState(): NativeProjectionState {
+  const base = composerState();
+  const mode = { mode: 'default', settings: {
+    model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } };
+  return { ...base, latestModel: 'gpt-5.6-sol', latestCollaborationMode: mode,
+    latestThreadSettings: { ...base.latestThreadSettings, model: 'gpt-5.6-sol',
+      approvalPolicy: 'on-request', approvalsReviewer: 'user' },
+    environments: [{ environmentId: 'local', cwd: 'C:/own', runtimeWorkspaceRoots: ['C:/own'] }],
+    turns: [{ turnId: 'completed-old', status: 'completed', items: [],
+      params: { input: [], clientUserMessageId: null }, turnStartedAtMs: 1,
+      finalAssistantStartedAtMs: 2, durationMs: null, error: null } as NativeProjectionState['turns'][number]],
+    nativeQueue: [], queuedFollowUps: [] };
+}
+
+function continuationEvidence(fence: () => ContinuationOwnerFence): QualifiedContinuationEvidence {
+  return { owner: fence(), turnCount: 1, latestTurnId: 'completed-old',
+    terminalTurnIds: ['completed-old'], historyDigest: 'a'.repeat(64),
+    effective: { model: 'gpt-5.6-sol', effort: 'low', cwd: 'C:/own',
+      activePermissionProfileId: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+      sandboxType: 'readOnly', networkAccess: false, serviceTier: null,
+      runtimeWorkspaceRoots: ['C:/own'], environments: continuationState().environments as IpcObject[] },
+    composerDefaults: { taskId, cwd: 'C:/own', summary: null, personality: 'pragmatic' } };
+}
+
+function continuationRequest(clientId: string, requestId: string): IpcObject {
+  return { type: 'request', requestId, sourceClientId: 'follower', hostId: 'local',
+    targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+    params: { conversationId: taskId, turnStart: {
+      request: { threadId: taskId, clientUserMessageId: clientId,
+        input: [{ type: 'text', text: 'test', text_elements: [] }], cwd: 'C:/own', model: null,
+        effort: null, serviceTier: null, collaborationMode: continuationState().latestCollaborationMode,
+        permissions: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+        turnTrigger: 'composer', multiAgentMode: 'explicitRequestOnly',
+        responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' } },
+      context: { inheritThreadSettings: true, writingBlockContextPrepared: true,
+        localTurnMetadata: { fileAttachmentCount: 0 }, attachments: [], commentAttachments: [],
+        responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
+}
+
 function snapshotTurn(frame: IpcObject): IpcObject | null {
   if (frame.method !== 'thread-stream-state-changed') return null;
   const params = frame.params as IpcObject;
@@ -125,6 +167,27 @@ function snapshotTurn(frame: IpcObject): IpcObject | null {
   const state = change?.conversationState as IpcObject;
   return ((state?.turns as IpcObject[] | undefined) ?? [])[0] ?? null;
 }
+
+test('semantic fence ignores usage-only changes but advances for turn events and reconnect', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    const initial = f.owner.metadata.semanticRevision;
+    assert.ok(Number.isSafeInteger(initial));
+    const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    f.child.send('thread/tokenUsage/updated', { threadId: taskId, turnId: 'old',
+      tokenUsage: { total: usage, last: usage, modelContextWindow: null } });
+    assert.equal(f.owner.metadata.semanticRevision, initial);
+    f.child.send('turn/started', { threadId: taskId, turn: { id: 'new', status: 'inProgress', items: [] } });
+    assert.equal(f.owner.metadata.semanticRevision, initial + 1);
+    f.broker.destroy(); await new Promise(resolve => setImmediate(resolve));
+    const disconnected = f.owner.metadata.semanticRevision;
+    assert.ok(disconnected > initial + 1);
+    await f.owner.reconnect();
+    assert.ok(f.owner.metadata.semanticRevision > disconnected);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
 
 test('bootstrap rejects a notification during asynchronous full-history read before IPC claim', async () => {
   let resolve!: (value: NativeProjectionState) => void;
@@ -398,6 +461,89 @@ test('Composer intent overlays only its accepted observed turn and retries after
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     assert.equal(f.owner.metadata.state, 'connected');
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+});
+
+test('qualified second Composer send uses one actual wire and accepted duplicate skips fresh qualification', async () => {
+  let qualified = 0;
+  const f = await fixture(async () => continuationState(), undefined, undefined, true,
+    async fence => { qualified++; return continuationEvidence(fence); });
+  const follow = () => f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed',
+    version: 1, sourceClientId: 'follower',
+    params: { conversationId: taskId, hostId: 'local', following: true } });
+  const clientId = randomUUID();
+  try {
+    await f.owner.start(); follow();
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.child.send('thread/goal/cleared', { threadId: taskId });
+    assert.equal(f.owner.metadata.state, 'connected');
+    f.child.onFrame = frame => {
+      if (frame.method === 'turn/start') queueMicrotask(() => f.child.reply(frame.id,
+        { turn: { id: 'continuation-turn', status: 'inProgress', extra: 'actual-native' } }));
+    };
+    f.broker.send(continuationRequest(clientId, 'continuation-first'));
+    const first = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'continuation-first');
+    assert.equal(first.resultType, 'success');
+    assert.deepEqual((first.result as IpcObject).result,
+      { turn: { id: 'continuation-turn', status: 'inProgress', extra: 'actual-native' } });
+    assert.equal(qualified, 1);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    assert.equal((wire.params as IpcObject).turnTrigger, 'composer');
+    assert.equal((wire.params as IpcObject).model, null);
+    assert.equal((wire.params as IpcObject).approvalPolicy, 'on-request');
+    // The accepted native receipt has not yet appeared in full terminal
+    // history. A different command cannot use the old continuation proof.
+    f.broker.send(continuationRequest(randomUUID(), 'continuation-other'));
+    const denied = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'continuation-other');
+    assert.equal(denied.resultType, 'error');
+    assert.equal(qualified, 2);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'continuation-turn', status: 'inProgress', startedAt: 3, items: [] } });
+    assert.ok(f.owner.metadata.semanticRevision > 1);
+    f.broker.destroy();
+    await new Promise(resolve => setImmediate(resolve));
+    await f.owner.reconnect(); follow();
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.broker.send(continuationRequest(clientId, 'continuation-duplicate'));
+    const duplicate = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'continuation-duplicate');
+    assert.equal(duplicate.resultType, 'success');
+    assert.deepEqual(duplicate.result, first.result);
+    assert.equal(qualified, 2);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+});
+
+test('semantic change during continuation qualification refuses before durable intent or worker wire', async () => {
+  let entered!: () => void, release!: () => void;
+  const begun = new Promise<void>(resolve => { entered = resolve; });
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(async () => continuationState(), undefined, undefined, true,
+    async fence => { const evidence = continuationEvidence(fence); entered(); await hold; return evidence; });
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    const clientId = randomUUID();
+    f.broker.send(continuationRequest(clientId, 'semantic-race'));
+    await begun;
+    f.child.send('thread/goal/cleared', { threadId: taskId });
+    assert.equal(f.owner.metadata.state, 'connected');
+    const before = f.owner.metadata.semanticRevision;
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'raced-turn', status: 'inProgress', startedAt: 4, items: [] } });
+    assert.ok(f.owner.metadata.semanticRevision > before);
+    release();
+    const denied = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'semantic-race');
+    assert.equal(denied.resultType, 'error');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    assert.equal(f.intentStore?.getByClientUserMessageId(clientId), null);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { release?.(); f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
 });
 
 test('pending user question survives IPC EOF, answers once, completes only on native resolution', async () => {

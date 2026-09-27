@@ -65,6 +65,7 @@ export interface QualifiedContinuationEvidence {
   readonly owner: ContinuationOwnerFence;
   readonly turnCount: number;
   readonly latestTurnId: string | null;
+  readonly terminalTurnIds: readonly string[];
   /** Ephemeral history anchor; no transcript content is returned. */
   readonly historyDigest: string;
   readonly effective: Readonly<{
@@ -492,6 +493,7 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
       checkOwner();
       return freezeTree({ owner: admitted, turnCount: after.turns.length,
         latestTurnId: after.turns.at(-1)?.id as string | undefined ?? null,
+        terminalTurnIds: after.turns.map(turn => turn.id as string),
         historyDigest: after.historyDigest, effective, composerDefaults: defaults });
     }, checkOwner);
   };

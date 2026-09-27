@@ -50,7 +50,7 @@ export interface ManagedWorkerDaemonMetadata {
   readonly failure: string | null;
 }
 
-/** Explicit, single-use canary composition. Neither parent EOF nor frontend EOF stops its worker.
+/** Explicit, single-use read-only canary composition. Neither parent EOF nor frontend EOF stops its worker.
  * The caller supplies a separately qualified local peer policy and family proof. */
 export class ManagedWorkerDaemon {
   readonly #options: ManagedWorkerDaemonOptions;
@@ -211,6 +211,7 @@ export class ManagedWorkerDaemon {
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, isOwnerCurrent: ownerCurrent,
         allowFollower: this.#options.allowFollower, readInitialState: this.#bootstrap.readInitialState,
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
+        qualifyContinuation: fence => this.#bootstrap!.qualifyContinuation(fence),
         clientFactory: this.#options.clientFactory });
       await this.#owner.start();
       if (this.#owner.metadata.state !== 'connected' || !ownerCurrent()) throw new Error('Native owner unavailable');

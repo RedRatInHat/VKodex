@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compileNativeReadOnlyComposerStart } from "../src/codex/native-composer-start.js";
+import { compileNativeReadOnlyComposerStart, compileNativeReadOnlyContinuationComposerStart } from "../src/codex/native-composer-start.js";
+import type { QualifiedContinuationEvidence } from "../src/desktop/managed-worker-bootstrap.js";
 
 type Row = Record<string, unknown>;
 function snapshot(): Row {
@@ -132,4 +133,104 @@ test("environment roots and tier requirements preserve wire/UI differences", () 
   const invalid = envelope(s); parts(invalid).request.serviceTier = "default";
   assert.throws(() => compileNativeReadOnlyComposerStart(s, invalid));
   assert.throws(() => compileNativeReadOnlyComposerStart(s, invalid, { taskId: s.id, cwd: s.cwd, fastModeAllowed: "true" }));
+});
+
+function continuation(): { state: Row; follower: Row; evidence: QualifiedContinuationEvidence } {
+  const state = snapshot();
+  state.latestModel = 'gpt-5.6-sol';
+  state.latestCollaborationMode = { mode: 'default', settings: {
+    model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } };
+  state.latestThreadSettings = { ...(state.latestThreadSettings as Row), model: 'gpt-5.6-sol',
+    serviceTier: null, approvalPolicy: 'on-request', approvalsReviewer: 'user' };
+  state.turns = [{ turnId: 'completed-first', status: 'completed' }];
+  state.turnsPagination = { hasLoadedOldest: true, olderCursor: null };
+  state.threadRuntimeStatus = { type: 'idle' };
+  state.requests = []; state.nativeQueue = []; state.queuedFollowUps = [];
+  state.environments = [{ environmentId: 'local', cwd: state.cwd, runtimeWorkspaceRoots: [state.cwd] }];
+  const follower = envelope(state); parts(follower).request.serviceTier = null;
+  const evidence: QualifiedContinuationEvidence = {
+    owner: { threadId: 'thread-1', ownerEpoch: '11111111-1111-4111-8111-111111111111',
+      backendGeneration: 1, semanticRevision: 7, pendingRequests: 0, queuedFollowUps: 0,
+      inFlightCommands: 0, unconfirmedOperations: false },
+    turnCount: 1, latestTurnId: 'completed-first', terminalTurnIds: ['completed-first'], historyDigest: 'a'.repeat(64),
+    effective: { model: 'gpt-5.6-sol', effort: 'low', cwd: 'C:/isolated',
+      activePermissionProfileId: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+      sandboxType: 'readOnly', networkAccess: false, serviceTier: null,
+      runtimeWorkspaceRoots: ['C:/isolated'], environments: structuredClone(state.environments) as Row[] },
+    composerDefaults: { taskId: 'thread-1', cwd: 'C:/isolated', summary: null, personality: 'pragmatic' },
+  };
+  return { state, follower, evidence };
+}
+
+test('V3-style continuation preserves full history and explicit on-request despite stale UI never', () => {
+  const { state, follower, evidence } = continuation();
+  const stateBefore = structuredClone(state), followerBefore = structuredClone(follower);
+  assert.throws(() => compileNativeReadOnlyComposerStart(state, follower));
+  const compiled = compileNativeReadOnlyContinuationComposerStart(state, follower, evidence);
+  assert.equal(compiled.request.permissions, ':read-only');
+  assert.equal(compiled.request.approvalPolicy, 'on-request');
+  assert.equal(compiled.request.approvalsReviewer, 'user');
+  assert.deepEqual(compiled.request.environments, state.environments);
+  assert.equal(compiled.request.cwd, null);
+  assert.equal(compiled.request.runtimeWorkspaceRoots, null);
+  assert.equal(compiled.uiParams.cwd, state.cwd);
+  assert.deepEqual(compiled.localMetadata, { fileAttachmentCount: 0 });
+  assert.deepEqual(state, stateBefore); assert.deepEqual(follower, followerBefore);
+});
+
+test('continuation is bounded by qualified history, not an exactly-one prior turn rule', () => {
+  const { state, follower, evidence } = continuation();
+  (state.turns as Row[]).push({ turnId: 'completed-second', status: 'completed' });
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).turnCount = 2;
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).latestTurnId = 'completed-second';
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).terminalTurnIds = ['completed-first', 'completed-second'];
+  const compiled = compileNativeReadOnlyContinuationComposerStart(state, follower, evidence);
+  assert.equal(compiled.request.threadId, 'thread-1');
+  assert.equal(compiled.request.approvalPolicy, 'on-request');
+  assert.equal((state.turns as Row[]).length, 2);
+});
+
+test('continuation rejects a changed historical prefix despite equal count and latest turn ID', () => {
+  const { state, follower, evidence } = continuation();
+  (state.turns as Row[]).push({ turnId: 'completed-second', status: 'completed' });
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).turnCount = 2;
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).latestTurnId = 'completed-second';
+  (evidence as unknown as { turnCount: number; latestTurnId: string; terminalTurnIds: string[] }).terminalTurnIds = ['different-first', 'completed-second'];
+  assert.throws(() => compileNativeReadOnlyContinuationComposerStart(state, follower, evidence),
+    { name: 'TypeError' });
+});
+
+test('continuation rejects missing history coverage, activity, drift and unsafe permission sources', () => {
+  const cases: [string, (state: Row, follower: Row, evidence: QualifiedContinuationEvidence) => void][] = [
+    ['no prior turn', s => { s.turns = []; }],
+    ['nonterminal', s => { (s.turns as Row[])[0]!.status = 'inProgress'; }],
+    ['historical item payload', s => { (s.turns as Row[])[0]!.items = [{ type: 'userMessage' }]; }],
+    ['not full', s => { (s.turnsPagination as Row).hasLoadedOldest = false; }],
+    ['cursor', s => { (s.turnsPagination as Row).olderCursor = 'opaque'; }],
+    ['history count', (_s, _f, e) => { (e as { turnCount: number }).turnCount = 2; }],
+    ['history last ID', (_s, _f, e) => { (e as { latestTurnId: string }).latestTurnId = 'other'; }],
+    ['active runtime', s => { s.threadRuntimeStatus = { type: 'inProgress' }; }],
+    ['pending request', s => { s.requests = [{ id: 1 }]; }],
+    ['native queue', s => { s.nativeQueue = [{ id: 'queued' }]; }],
+    ['follow-up queue', s => { s.queuedFollowUps = [{ id: 'queued' }]; }],
+    ['owner pending', (_s, _f, e) => { (e.owner as { pendingRequests: number }).pendingRequests = 1; }],
+    ['effective approval', (_s, _f, e) => { (e.effective as { approvalPolicy: string }).approvalPolicy = 'never'; }],
+    ['latest approval', s => { (s.latestThreadSettings as Row).approvalPolicy = 'never'; }],
+    ['latest reviewer', s => { (s.latestThreadSettings as Row).approvalsReviewer = 'guardian_subagent'; }],
+    ['latest model', s => { (s.latestThreadSettings as Row).model = 'other'; }],
+    ['latest tier', s => { (s.latestThreadSettings as Row).serviceTier = 'default'; }],
+    ['latest sandbox', s => { (s.latestThreadSettings as Row).sandboxPolicy = { type: 'readOnly', networkAccess: true }; }],
+    ['UI profile', s => { (s.currentPermissions as Row).activePermissionProfile = { id: ':workspace' }; }],
+    ['UI network', s => { (s.currentPermissions as Row).sandboxPolicy = { type: 'readOnly', networkAccess: true }; }],
+    ['UI roots', s => { (s.currentPermissions as Row).runtimeWorkspaceRoots = []; }],
+    ['effective roots', (_s, _f, e) => { (e.effective as unknown as { runtimeWorkspaceRoots: string[] }).runtimeWorkspaceRoots = []; }],
+    ['incoming approval absent', (_s, f) => { delete parts(f).request.approvalPolicy; }],
+    ['incoming server default', (_s, f) => { parts(f).context.useAppServerPermissionDefault = true; }],
+    ['incoming selection', (_s, f) => { parts(f).context.usePermissionSelection = true; }],
+  ];
+  for (const [label, change] of cases) {
+    const { state, follower, evidence } = continuation(); change(state, follower, evidence);
+    assert.throws(() => compileNativeReadOnlyContinuationComposerStart(state, follower, evidence),
+      { name: 'TypeError' }, label);
+  }
 });

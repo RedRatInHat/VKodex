@@ -12,6 +12,7 @@ import { ManagedWorkerNativeStartHandler } from '../src/desktop/managed-worker-n
 import type { NativeStartAuthority } from '../src/desktop/managed-worker-native-start.js';
 import { NativeStartIntentStore } from '../src/codex/native-start-intent-store.js';
 import { prepareNativeFollowerStart } from '../src/codex/native-follower-start.js';
+import type { QualifiedContinuationEvidence } from '../src/desktop/managed-worker-bootstrap.js';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject, IpcIncomingRequest } from '../src/desktop/ipc-client.js';
 
@@ -68,8 +69,9 @@ async function fixture(timeout = 2000) {
     launch: () => child as unknown as ChildProcessWithoutNullStreams,
     commandPolicy: { controlKey, ownerEpoch, fingerprintKey: randomBytes(32),
       journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-native-start-')), 'ops.sqlite'),
-      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'gpt-fixture' ||
-        params.model === null && ((params.collaborationMode as IpcObject)?.settings as IpcObject)?.model === 'gpt-fixture' } });
+      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'gpt-fixture' || params.model === 'gpt-5.6-sol' ||
+        params.model === null && ['gpt-fixture', 'gpt-5.6-sol'].includes(
+          ((params.collaborationMode as IpcObject)?.settings as IpcObject)?.model as string) } });
   await host.start();
   const handler = new ManagedWorkerNativeStartHandler({ host, controlKey, taskId, ownerEpoch,
     authority: () => authority, authorizeFollower: r => state.authorized && r.sourceClientId === 'desktop' });
@@ -79,6 +81,44 @@ async function fixture(timeout = 2000) {
       clientUserMessageId: randomUUID(), input: [{ type: 'text', text: 'native input', text_elements: [] }] },
       context: { inheritThreadSettings: true } } } };
   return { host, handler, child, request, state, authority, controlKey, taskId, ownerEpoch };
+}
+
+function continuationFixture(f: Awaited<ReturnType<typeof fixture>>): {
+  request: IpcIncomingRequest; evidence: QualifiedContinuationEvidence;
+} {
+  const sandboxPolicy = { type: 'readOnly', networkAccess: false }, profile = { id: ':read-only' };
+  const mode = { mode: 'default', settings: { model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } };
+  const snapshot = { id: f.taskId, cwd: 'C:/native-test', hostId: 'local', resumeState: 'resumed',
+    workspaceKind: 'projectless', turns: [{ turnId: 'prior-terminal', status: 'completed' }],
+    turnsPagination: { hasLoadedOldest: true, olderCursor: null }, threadRuntimeStatus: { type: 'idle' },
+    requests: [], nativeQueue: [], queuedFollowUps: [],
+    environments: [{ environmentId: 'local', cwd: 'C:/native-test', runtimeWorkspaceRoots: ['C:/native-test'] }],
+    latestModel: 'gpt-5.6-sol', latestReasoningEffort: 'low', latestServiceTier: null,
+    latestCollaborationMode: mode,
+    currentPermissions: { activePermissionProfile: profile, sandboxPolicy, approvalPolicy: 'on-request',
+      approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/native-test'] },
+    latestThreadSettings: { cwd: 'C:/native-test', model: 'gpt-5.6-sol', effort: 'low', serviceTier: null,
+      summary: null, personality: 'pragmatic', activePermissionProfile: profile, sandboxPolicy,
+      approvalPolicy: 'on-request', approvalsReviewer: 'user' } };
+  Object.assign(f.authority, { semanticRevision: 7, snapshot, composer: { snapshot, defaults: {
+    taskId: f.taskId, cwd: 'C:/native-test', summary: null, personality: 'pragmatic' } } });
+  const request = structuredClone(f.request), start = request.params.turnStart as IpcObject;
+  Object.assign(start.request as IpcObject, { cwd: 'C:/native-test', model: null, effort: null, serviceTier: null,
+    collaborationMode: mode, permissions: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+    turnTrigger: 'composer', responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' },
+    multiAgentMode: 'explicitRequestOnly' });
+  start.context = { inheritThreadSettings: true, writingBlockContextPrepared: true,
+    localTurnMetadata: { fileAttachmentCount: 0 }, attachments: [], commentAttachments: [], responseItems: [],
+    useAppServerPermissionDefault: false, usePermissionSelection: false };
+  const evidence: QualifiedContinuationEvidence = { owner: { threadId: f.taskId, ownerEpoch: f.ownerEpoch,
+    backendGeneration: 1, semanticRevision: 7, pendingRequests: 0, queuedFollowUps: 0,
+    inFlightCommands: 0, unconfirmedOperations: false }, turnCount: 1, latestTurnId: 'prior-terminal', terminalTurnIds: ['prior-terminal'],
+    historyDigest: 'a'.repeat(64), effective: { model: 'gpt-5.6-sol', effort: 'low', cwd: 'C:/native-test',
+      activePermissionProfileId: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+      sandboxType: 'readOnly', networkAccess: false, serviceTier: null, runtimeWorkspaceRoots: ['C:/native-test'],
+      environments: structuredClone(snapshot.environments) }, composerDefaults: {
+      taskId: f.taskId, cwd: 'C:/native-test', summary: null, personality: 'pragmatic' } };
+  return { request, evidence };
 }
 
 test('Composer intent survives adapter recreation and first-turn eligibility loss without a second write', async () => {
@@ -253,4 +293,96 @@ test('revoking native admission in the asynchronous write gap cannot start a tur
     assert.equal(f.child.frames.some(frame => frame.method === 'turn/start'), false);
     assert.equal(f.child.stdin.writableEnded, false);
   } finally { await f.host.stop('test-cleanup'); }
+});
+
+test('qualified V3 Composer continuation dispatches only after exact live evidence', async () => {
+  const f = await fixture(), { request, evidence } = continuationFixture(f);
+  let qualified = 0;
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: new NativeStartIntentStore({
+      filePath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-continuation-')), 'intent.sqlite'),
+      ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) }),
+    qualifyContinuation: async captured => { qualified++; assert.equal(captured.semanticRevision, 7); return evidence; } });
+  try {
+    const running = handler.handle(request, new AbortController().signal);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    assert.equal(qualified, 1); assert.equal((((wire.params as IpcObject).collaborationMode as IpcObject).settings as IpcObject).model, 'gpt-5.6-sol');
+    f.child.reply(wire.id, { turn: { id: 'continuation-turn', status: 'inProgress' } });
+    assert.deepEqual(await running, { result: { turn: { id: 'continuation-turn', status: 'inProgress' } } });
+  } finally { handler.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('continuation qualification drift prevents intent persistence and worker write', async () => {
+  const f = await fixture(), { request, evidence } = continuationFixture(f);
+  const store = new NativeStartIntentStore({ filePath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-continuation-drift-')), 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority, authorizeFollower: () => true,
+    intentStore: store, qualifyContinuation: async () => { Object.assign(f.authority, { semanticRevision: 8 }); return evidence; } });
+  try {
+    await assert.rejects(handler.handle(request, new AbortController().signal));
+    assert.equal(store.list().length, 0); assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('concurrent new continuation qualification is refused rather than queued', async () => {
+  const f = await fixture(), { request, evidence } = continuationFixture(f);
+  const store = new NativeStartIntentStore({ filePath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-continuation-race-')), 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority, authorizeFollower: () => true,
+    intentStore: store, qualifyContinuation: async () => { await gate; return evidence; } });
+  try {
+    const first = handler.handle(request, new AbortController().signal);
+    await new Promise(resolve => setImmediate(resolve));
+    const second = structuredClone(request);
+    ((second.params.turnStart as IpcObject).request as IpcObject).clientUserMessageId = randomUUID();
+    await assert.rejects(handler.handle(second, new AbortController().signal));
+    assert.equal(store.list().length, 0); assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    release!(); const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    f.child.reply(wire.id, { turn: { id: 'race-first', status: 'inProgress' } }); await first;
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('accepted continuation duplicate returns its receipt after authority drift without requalification', async () => {
+  const f = await fixture(), { request, evidence } = continuationFixture(f);
+  const store = new NativeStartIntentStore({ filePath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-continuation-duplicate-')), 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let qualified = 0;
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority, authorizeFollower: () => true,
+    intentStore: store, qualifyContinuation: async () => { qualified++; return evidence; } });
+  try {
+    const running = handler.handle(request, new AbortController().signal);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    const actual = { turn: { id: 'continuation-accepted', status: 'inProgress' } };
+    f.child.reply(wire.id, actual); assert.deepEqual(await running, { result: actual });
+    Object.assign(f.authority, { semanticRevision: 8, authorityRevision: 2 });
+    assert.deepEqual(await handler.handle({ ...request, requestId: 'continuation-rejoin' }, new AbortController().signal),
+      { result: actual });
+    assert.equal(qualified, 1); assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('continuation intent-only reservation refuses changed original semantic admission', async () => {
+  const f = await fixture(50), { request, evidence } = continuationFixture(f);
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-continuation-intent-only-'));
+  const options = { filePath: path.join(directory, 'intent.sqlite'), ownerEpoch: f.ownerEpoch,
+    backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) };
+  let store = new NativeStartIntentStore(options);
+  const make = () => new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority, authorizeFollower: () => true,
+    intentStore: store, qualifyContinuation: async () => evidence });
+  let handler = make();
+  try {
+    await assert.rejects(handler.handle(request, new AbortController().signal), /receipt unavailable/);
+    assert.equal(store.list().length, 1);
+    handler.close(); store.close(); store = new NativeStartIntentStore(options); handler = make();
+    Object.assign(f.authority, { semanticRevision: 8 });
+    await assert.rejects(handler.handle({ ...request, requestId: 'continuation-intent-rejoin' }, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
 });

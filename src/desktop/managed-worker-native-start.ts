@@ -3,8 +3,9 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ManagedWorkerFrontendHost } from '../codex/managed-worker-frontend-host.js';
 import { prepareNativeFollowerStart } from '../codex/native-follower-start.js';
 import type { NativeFollowerStartSnapshot } from '../codex/native-follower-start.js';
-import { compileNativeReadOnlyComposerStart } from '../codex/native-composer-start.js';
+import { compileNativeReadOnlyComposerStart, compileNativeReadOnlyContinuationComposerStart } from '../codex/native-composer-start.js';
 import type { NativeStartIntentStore, NativeStartIntent } from '../codex/native-start-intent-store.js';
+import type { QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
 import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-client.js';
 
 export interface NativeStartAuthority {
@@ -12,6 +13,8 @@ export interface NativeStartAuthority {
   readonly backendGeneration: number;
   /** Settings/authority revision, NOT the revision of streamed turn events. */
   readonly authorityRevision: number;
+  /** Optional owner semantic fence. Continuation qualification requires it. */
+  readonly semanticRevision?: number;
   readonly snapshot: NativeFollowerStartSnapshot;
   /** Explicit opt-in to the qualified first-turn Composer contract. */
   readonly composer?: { readonly snapshot: IpcObject; readonly defaults: IpcObject | null } | null;
@@ -26,6 +29,9 @@ interface Options {
    * is routing data, not authentication or proof of writer ownership. */
   readonly authorizeFollower: (request: Readonly<IpcIncomingRequest>, authority: NativeStartAuthority) => boolean;
   readonly intentStore?: NativeStartIntentStore;
+  /** Qualifies current policy on the same already-loaded worker. Only its
+   * fenced ID-only resume/read is allowed; never create or replace a worker. */
+  readonly qualifyContinuation?: (authority: NativeStartAuthority) => Promise<QualifiedContinuationEvidence>;
   /** Refresh local projection only after validating an actual accepted receipt. */
   readonly onAccepted?: () => void;
 }
@@ -43,6 +49,7 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
   readonly #commands = new Map<string, Remembered>();
   #bytes = 0;
   #checking = false;
+  #qualifyingContinuation = false;
   #closed = false;
 
   constructor(options: Options) {
@@ -50,7 +57,8 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         !options.controlKey || typeof options.controlKey !== 'object' ||
         typeof options.authority !== 'function' || typeof options.authorizeFollower !== 'function' ||
         typeof options.host?.executeCommandWithResponse !== 'function' ||
-        options.onAccepted !== undefined && typeof options.onAccepted !== 'function') throw refused();
+        options.onAccepted !== undefined && typeof options.onAccepted !== 'function' ||
+        options.qualifyContinuation !== undefined && typeof options.qualifyContinuation !== 'function') throw refused();
     if (options.intentStore && (options.intentStore.owner.ownerEpoch !== options.ownerEpoch ||
         options.intentStore.owner.threadId !== options.taskId ||
         options.intentStore.owner.backendGeneration !== options.host.metadata.backendGeneration)) throw refused();
@@ -70,7 +78,8 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
       const host = o.host.metadata;
       if (!a || a.ownerEpoch !== o.ownerEpoch || a.snapshot.id !== o.taskId ||
           !Number.isSafeInteger(a.authorityRevision) || a.authorityRevision < 0 ||
-          !Number.isSafeInteger(a.backendGeneration) || a.backendGeneration < 1 ||
+        !Number.isSafeInteger(a.backendGeneration) || a.backendGeneration < 1 ||
+        a.semanticRevision !== undefined && (!Number.isSafeInteger(a.semanticRevision) || a.semanticRevision < 0) ||
           host.taskId !== o.taskId || host.backendGeneration !== a.backendGeneration ||
           host.state !== 'running' || o.authorizeFollower(request, structuredClone(a)) !== true)
         throw refused();
@@ -93,6 +102,7 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     const actual = this.#capture(request);
     if (actual.ownerEpoch !== expected.ownerEpoch || actual.backendGeneration !== expected.backendGeneration ||
         actual.authorityRevision !== expected.authorityRevision ||
+        actual.semanticRevision !== expected.semanticRevision ||
         !isDeepStrictEqual(actual.snapshot, expected.snapshot) ||
         !isDeepStrictEqual(actual.composer, expected.composer)) throw refused();
   }
@@ -125,9 +135,31 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
       // compiler and lose local metadata or explicit permission settings.
       const context = start.context;
       const ordinary = object(context) && Object.keys(context).every(key => key === 'inheritThreadSettings');
-      const compiled = ordinary ? null : authority.composer && this.#options.intentStore
-        ? compileNativeReadOnlyComposerStart(authority.composer.snapshot, envelope, authority.composer.defaults)
-        : (() => { throw refused(); })();
+      let compiled: ReturnType<typeof compileNativeReadOnlyComposerStart> | null;
+      if (ordinary) compiled = null;
+      else if (!authority.composer || !this.#options.intentStore) throw refused();
+      else {
+        const turns = authority.composer.snapshot.turns;
+        if (!Array.isArray(turns) || turns.length === 0) {
+          compiled = compileNativeReadOnlyComposerStart(authority.composer.snapshot, envelope, authority.composer.defaults);
+        } else {
+          if (!this.#options.qualifyContinuation || authority.semanticRevision === undefined || this.#qualifyingContinuation)
+            throw refused();
+          this.#qualifyingContinuation = true;
+          try {
+            const evidence = await this.#options.qualifyContinuation(structuredClone(authority));
+            if (!evidence || typeof evidence !== 'object' || !evidence.owner || typeof evidence.owner !== 'object' ||
+                evidence.owner.ownerEpoch !== authority.ownerEpoch ||
+                evidence.owner.backendGeneration !== authority.backendGeneration ||
+                evidence.owner.threadId !== this.#options.taskId ||
+                evidence.owner.semanticRevision !== authority.semanticRevision) throw refused();
+            // The qualifier is asynchronous. Re-capture before any durable
+            // native intent record or worker command can be made.
+            this.#sameAuthority(request, authority);
+            compiled = compileNativeReadOnlyContinuationComposerStart(authority.composer.snapshot, envelope, evidence);
+          } finally { this.#qualifyingContinuation = false; }
+        }
+      }
       intent = { envelope: structuredClone(envelope),
         command: { operationId, method: 'turn/start',
           params: compiled?.request ?? prepareNativeFollowerStart(authority.snapshot, envelope) },
@@ -138,6 +170,9 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     const commandBytes = Buffer.byteLength(JSON.stringify(command));
     if (commandBytes > 32 * 1024 * 1024) throw refused();
     const bytes = Buffer.byteLength(JSON.stringify(intent));
+    // A durable exact duplicate does not requalify. The dispatcher returns its
+    // prior receipt without calling beforeWrite; intent-only records still
+    // invoke beforeWrite against their original stored admission below.
     this.#sameAuthority(request, authority);
     if (signal.aborted) throw refused();
     // Record the original settings resolution for retransmission. The worker's

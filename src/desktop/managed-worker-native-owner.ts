@@ -10,9 +10,11 @@ import { DesktopIpcClient } from './ipc-client.js';
 import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-client.js';
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
+import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
 
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
-  'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'>;
+  'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
+  Partial<Pick<ManagedWorkerFrontendHost, 'commandQuiescence' | 'requestQuiescence' | 'acceptedCommandReceipts'>>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
 const knownVersions = new Map<string, number>([
@@ -51,6 +53,8 @@ export interface ManagedWorkerNativeOwnerOptions {
   readonly intentStore?: NativeStartIntentStore;
   /** Explicit first-turn read-only Composer opt-in; defaults must be qualified from native config. */
   readonly composerDefaults?: () => IpcObject | null;
+  /** Opt-in same-worker current-policy read. Must fence every awaited RPC. */
+  readonly qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>;
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
 }
 export interface ManagedWorkerNativeOwnerMetadata {
@@ -58,6 +62,7 @@ export interface ManagedWorkerNativeOwnerMetadata {
   readonly connected: boolean;
   readonly revision: number;
   readonly authorityRevision: number;
+  readonly semanticRevision: number;
   readonly followerCount: number;
   readonly failure: string | null;
 }
@@ -76,6 +81,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #authoritySnapshot: NativeStartAuthority['snapshot'] | null = null;
   #revision = 0;
   #authorityRevision = 0;
+  #semanticRevision = 0;
   #bootstrapEvents = 0;
   #detachObserver: (() => void) | null = null;
   #detachRequests: (() => void) | null = null;
@@ -98,6 +104,11 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         typeof options.readInitialState !== 'function' ||
         options.composerDefaults !== undefined &&
           (typeof options.composerDefaults !== 'function' || !options.intentStore) ||
+        options.qualifyContinuation !== undefined &&
+          (typeof options.qualifyContinuation !== 'function' || !options.composerDefaults ||
+            typeof options.host.commandQuiescence !== 'function' ||
+            typeof options.host.requestQuiescence !== 'function' ||
+            typeof options.host.acceptedCommandReceipts !== 'function') ||
         (options.clientFactory !== undefined && typeof options.clientFactory !== 'function')) throw refuse();
     this.#options = Object.freeze({ ...options });
   }
@@ -105,6 +116,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   get metadata(): ManagedWorkerNativeOwnerMetadata {
     return Object.freeze({ state: this.#state, connected: this.#state === 'connected',
       revision: this.#revision, authorityRevision: this.#authorityRevision,
+      semanticRevision: this.#semanticRevision,
       followerCount: this.#followers.size, failure: this.#failure });
   }
 
@@ -162,8 +174,17 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#fail('owner-changed'); return;
     }
     try {
+      // The narrow continuation path proves goal=null before ID-only resume.
+      // That resume emits this no-op notification. Active-goal updates remain
+      // unsupported and retire this adapter, never the running worker.
+      if (this.#options.qualifyContinuation && event.notification.method === 'thread/goal/cleared' &&
+          object(event.notification.params) &&
+          Object.keys(event.notification.params).length === 1 &&
+          event.notification.params.threadId === this.#options.taskId) return;
       const next = applyNotification(this.#projection, event.notification);
       if (next === this.#projection) return;
+      if (event.notification.method !== 'thread/tokenUsage/updated' &&
+          !isDeepStrictEqual(next, this.#projection)) this.#semanticRevision++;
       const settings = this.#snapshot(next);
       if (!isDeepStrictEqual(settings, this.#authoritySnapshot)) {
         this.#authoritySnapshot = settings; this.#authorityRevision++;
@@ -183,6 +204,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     try {
       const next = projectNativeServerRequest(this.#projection, event.request);
       if (next === this.#projection) return;
+      this.#semanticRevision++;
       this.#projection = next; this.#revision++;
       for (const source of this.#followers.keys()) this.#sendSnapshot(source);
     } catch { this.#fail('request-projection-failed'); }
@@ -214,10 +236,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#projection = initial;
       this.#authoritySnapshot = this.#snapshot(initial);
       this.#revision = 1; this.#authorityRevision = 1;
+      this.#semanticRevision = 1;
       this.#startHandler = new ManagedWorkerNativeStartHandler({
         host: this.#options.host, controlKey: this.#options.controlKey,
         taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
         authority: () => this.#authority(),
+        ...(this.#options.qualifyContinuation ? {
+          qualifyContinuation: (authority: NativeStartAuthority) => this.#qualifyContinuation(authority),
+        } : {}),
         authorizeFollower: request => {
           const grant = this.#grants.get(request.requestId);
           return grant?.sourceClientId === request.sourceClientId && this.#ownerCurrent() &&
@@ -225,7 +251,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         },
         ...(this.#options.intentStore ? { intentStore: this.#options.intentStore,
           onAccepted: () => {
-            this.#revision++;
+            this.#revision++; this.#semanticRevision++;
             for (const source of this.#followers.keys()) this.#sendSnapshot(source);
           } } : {}),
       });
@@ -233,7 +259,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         (handler => new DesktopIpcClient(undefined, 15_000, handler)))(this);
       this.#client.onBroadcast(message => this.#broadcastReceived(message));
       this.#client.onDisconnect(() => {
-        if (this.#state === 'connected') this.#state = 'disconnected';
+        if (this.#state === 'connected') { this.#state = 'disconnected'; this.#semanticRevision++; }
         this.#followers.clear(); // Admitted grants survive this transport EOF.
         this.#deferredBroadcasts.length = 0;
       });
@@ -257,6 +283,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         this.#client!.close(); throw refuse();
       }
       this.#state = 'connected';
+      this.#semanticRevision++;
       const buffered = this.#deferredBroadcasts.splice(0);
       for (const message of buffered) this.#broadcastReceived(message);
     })();
@@ -272,11 +299,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     let composer: NativeStartAuthority['composer'];
     if (this.#options.composerDefaults) {
       composer = null;
-      if (this.#projection?.turns.length === 0) {
-        const snapshot: IpcObject = { turns: [] };
+      if (this.#projection && (this.#projection.turns.length === 0 || this.#options.qualifyContinuation)) {
+        const snapshot: IpcObject = { turns: this.#projection.turns.map(turn => ({
+          turnId: turn.turnId, status: turn.status,
+        })) };
         for (const key of ['id', 'cwd', 'hostId', 'resumeState', 'workspaceKind', 'environments',
           'latestModel', 'latestReasoningEffort', 'latestServiceTier', 'latestThreadSettings',
-          'latestCollaborationMode', 'currentPermissions']) {
+          'latestCollaborationMode', 'currentPermissions', 'turnsPagination', 'threadRuntimeStatus',
+          'requests', 'nativeQueue', 'queuedFollowUps']) {
           if (this.#projection[key] !== undefined) snapshot[key] = copy(this.#projection[key]);
         }
         composer = { snapshot, defaults: copy(this.#options.composerDefaults()) };
@@ -284,7 +314,42 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     }
     return { ownerEpoch: this.#options.ownerEpoch, backendGeneration: this.#generation,
       authorityRevision: this.#authorityRevision, snapshot: copy(this.#authoritySnapshot),
+      ...(this.#options.qualifyContinuation ? { semanticRevision: this.#semanticRevision } : {}),
       ...(composer === undefined ? {} : { composer }) };
+  }
+
+  async #qualifyContinuation(authority: NativeStartAuthority): Promise<QualifiedContinuationEvidence> {
+    const qualifier = this.#options.qualifyContinuation;
+    if (!qualifier) throw refuse();
+    const fence = (): ContinuationOwnerFence => {
+      if (!this.#ownerCurrent() || !this.#projection || this.#generation === null ||
+          this.#semanticRevision !== authority.semanticRevision ||
+          this.#authorityRevision !== authority.authorityRevision ||
+          !isDeepStrictEqual(this.#authoritySnapshot, authority.snapshot) ||
+          !['connected', 'disconnected'].includes(this.#state)) throw refuse();
+      const command = this.#options.host.commandQuiescence!(this.#options.controlKey);
+      const requests = this.#options.host.requestQuiescence!(this.#options.controlKey);
+      if (requests.generation !== this.#generation) throw refuse();
+      let queuedFollowUps = 0;
+      for (const field of ['nativeQueue', 'queuedFollowUps']) {
+        const queue = this.#projection[field];
+        if (queue !== undefined && !Array.isArray(queue)) throw refuse();
+        if (Array.isArray(queue)) queuedFollowUps += queue.length;
+      }
+      return Object.freeze({ threadId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
+        backendGeneration: this.#generation, semanticRevision: this.#semanticRevision,
+        pendingRequests: Math.max(requests.unresolved, this.#projection.requests.length),
+        queuedFollowUps, inFlightCommands: command.inFlight, unconfirmedOperations: command.unconfirmed });
+    };
+    const before = fence();
+    const receipts = this.#options.host.acceptedCommandReceipts!(this.#options.controlKey);
+    if (receipts.some(receipt => receipt.method !== 'turn/start')) throw refuse();
+    const result = await qualifier(fence);
+    if (!isDeepStrictEqual(before, fence()) || !isDeepStrictEqual(result.owner, before) ||
+        !isDeepStrictEqual(receipts, this.#options.host.acceptedCommandReceipts!(this.#options.controlKey)) ||
+        !Array.isArray(result.terminalTurnIds) ||
+        receipts.some(receipt => !result.terminalTurnIds.includes(receipt.receiptId))) throw refuse();
+    return result;
   }
 
   #route(request: IpcIncomingRequest): boolean {
