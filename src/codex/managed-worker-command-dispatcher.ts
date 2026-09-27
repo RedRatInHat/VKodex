@@ -16,6 +16,11 @@ export interface WorkerCommandScope {
   readonly backendGeneration: number;
   readonly threadId: string;
 }
+/** The response is a copy of the actual native result, or null when unavailable. */
+export interface WorkerCommandResponse {
+  readonly operation: WorkerOperation;
+  readonly response: JsonObject | null;
+}
 export interface WorkerCommandPolicy {
   readonly controlKey: object;
   readonly ownerEpoch: string;
@@ -75,7 +80,9 @@ export class ManagedWorkerCommandDispatcher {
   readonly #policy: WorkerCommandPolicy;
   readonly #scope: Readonly<WorkerCommandScope>;
   readonly #journal: ManagedWorkerOperationJournal;
-  readonly #inFlight = new Set<Promise<WorkerOperation>>();
+  readonly #inFlight = new Map<string, Promise<WorkerOperation>>();
+  readonly #responses = new Map<string, { receiptId: string; value: JsonObject; bytes: number }>();
+  #responseBytes = 0;
   #closed = false;
   #checkingPolicy = false;
 
@@ -103,7 +110,25 @@ export class ManagedWorkerCommandDispatcher {
     return this.#journal.get(operationId);
   }
   execute(key: object, value: WorkerCommand): Promise<WorkerOperation> {
+    return this.#execute(key, value, false);
+  }
+
+  executeWithResponse(key: object, value: WorkerCommand,
+    beforeWrite?: () => void): Promise<WorkerCommandResponse> {
+    const work = this.#execute(key, value, true, beforeWrite);
+    return work.then(operation => {
+      const current = this.#journal.get(operation.operationId) ?? operation;
+      const cached = current.state === 'accepted' ? this.#responses.get(operation.operationId) : null;
+      return { operation: current, response: cached && cached.receiptId === current.receiptId
+        ? structuredClone(cached.value) : null };
+    });
+  }
+
+  #execute(key: object, value: WorkerCommand, awaitDuplicate: boolean,
+    beforeWrite?: () => void): Promise<WorkerOperation> {
     this.#authenticate(key);
+    if (beforeWrite !== undefined && typeof beforeWrite !== 'function')
+      throw new TypeError('Scoped before-write callback must be a function');
     // Owner callbacks must not recursively admit either this or a different
     // operation before the outer reservation/write has been fenced.
     if (this.#checkingPolicy) throw new Error('Reentrant worker command admission');
@@ -115,6 +140,7 @@ export class ManagedWorkerCommandDispatcher {
     const authorize = () => this.#checkPolicy(() => {
       if (!this.#current() || this.#policy.authorize(Object.freeze({ ...this.#scope, ...command })) !== true)
         throw new Error('Worker command authority unavailable');
+      beforeWrite?.();
       // Policy code may synchronously revoke the owner or stop this host.
       if (!this.#current()) throw new Error('Worker command authority changed');
     });
@@ -124,15 +150,42 @@ export class ManagedWorkerCommandDispatcher {
       clientUserMessageId: command.params.clientUserMessageId, method: command.method, fingerprint };
     // Retrieving an immutable prior outcome is not a fresh execution. A now
     // active turn may legitimately make the original start policy inadmissible.
-    if (this.#journal.get(command.operationId))
-      return Promise.resolve(this.#journal.reserve(intent).operation);
+    if (this.#journal.get(command.operationId)) {
+      const previous = this.#journal.reserve(intent).operation;
+      return awaitDuplicate ? this.#inFlight.get(command.operationId) ?? Promise.resolve(previous) :
+        Promise.resolve(previous);
+    }
     authorize();
     const reservation = this.#journal.reserve(intent);
     if (!reservation.created) return Promise.resolve(reservation.operation);
     const work = this.#dispatch(command, authorize);
-    this.#inFlight.add(work);
-    void work.then(() => this.#inFlight.delete(work), () => this.#inFlight.delete(work));
+    this.#inFlight.set(command.operationId, work);
+    void work.then(() => this.#inFlight.delete(command.operationId),
+      () => this.#inFlight.delete(command.operationId));
     return work;
+  }
+
+  #cacheResponse(operation: WorkerOperation, result: JsonObject): void {
+    if (operation.state !== 'accepted' || operation.receiptId === null || this.#closed) return;
+    let copy: JsonObject; let bytes: number;
+    try {
+      copy = structuredClone(result);
+      const encoded = JSON.stringify(copy);
+      bytes = Buffer.byteLength(encoded);
+      if (bytes > 64 * 1024 * 1024 || !isDeepStrictEqual(copy, JSON.parse(encoded))) return;
+    } catch { return; }
+    const old = this.#responses.get(operation.operationId);
+    if (old) this.#responseBytes -= old.bytes;
+    this.#responses.delete(operation.operationId);
+    while (this.#responses.size >= 128 || this.#responseBytes + bytes > 64 * 1024 * 1024) {
+      const oldest = this.#responses.keys().next().value;
+      if (oldest === undefined) break;
+      this.#responseBytes -= this.#responses.get(oldest)!.bytes;
+      this.#responses.delete(oldest);
+    }
+    this.#responses.set(operation.operationId,
+      { receiptId: operation.receiptId, value: copy, bytes });
+    this.#responseBytes += bytes;
   }
 
   #receipt(command: WorkerCommand, envelope: AppServerResponseEnvelope): void {
@@ -150,12 +203,12 @@ export class ManagedWorkerCommandDispatcher {
     const result = envelope.result;
     if (command.method === 'turn/start') {
       if (object(result.turn) && typeof result.turn.id === 'string')
-        this.#journal.accept(operation, result.turn.id);
+        this.#cacheResponse(this.#journal.accept(operation, result.turn.id), result);
     } else if (object(result.queuedSubmission) &&
         typeof result.queuedSubmission.id === 'string' &&
         result.queuedSubmission.clientUserMessageId === command.params.clientUserMessageId &&
         isDeepStrictEqual(result.queuedSubmission.input, command.params.input)) {
-      this.#journal.accept(operation, result.queuedSubmission.id);
+      this.#cacheResponse(this.#journal.accept(operation, result.queuedSubmission.id), result);
     }
   }
 
@@ -177,7 +230,8 @@ export class ManagedWorkerCommandDispatcher {
   /** Call only after stopping/invalidation of the RPC, so in-flight calls settle. */
   async close(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#inFlight]);
+    await Promise.allSettled([...this.#inFlight.values()]);
+    this.#responses.clear(); this.#responseBytes = 0;
     this.#journal.close();
     this.#policy.fingerprintKey.fill(0);
   }

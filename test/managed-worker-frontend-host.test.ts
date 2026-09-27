@@ -9,6 +9,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
 import type { WorkerCommand, WorkerCommandPolicy } from '../src/codex/managed-worker-command-dispatcher.js';
@@ -421,12 +422,16 @@ test('stock queue receipt requires exact client identity and input echo', async 
     const f = commandFixture(); await f.managed.start();
     try {
       const command = { ...f.command, method: 'thread/queue/add' as const };
-      const pending = f.managed.executeCommand(f.controlKey, command);
+      const pending = f.managed.executeCommandWithResponse(f.controlKey, command);
       const request = await sentMutation(f.child, command.method);
-      f.child.send({ id: request.id, result: { queuedSubmission: { id: 'queue-entry',
+      const native = { queuedSubmission: { id: 'queue-entry',
         clientUserMessageId: command.params.clientUserMessageId,
-        input: matching ? command.params.input : [{ type: 'text', text: 'changed' }] } } });
-      assert.equal((await pending).state, matching ? 'accepted' : 'unknown');
+        input: matching ? command.params.input : [{ type: 'text', text: 'changed' }] },
+        nativeExtra: { retained: true } };
+      f.child.send({ id: request.id, result: native });
+      const outcome = await pending;
+      assert.equal(outcome.operation.state, matching ? 'accepted' : 'unknown');
+      assert.deepEqual(outcome.response, matching ? native : null);
     } finally { await f.managed.stop('test-cleanup'); }
   }
 });
@@ -438,4 +443,142 @@ test('stopping host settles in-flight command without losing its durable unknown
   await f.managed.stop('test-cleanup');
   assert.equal((await pending).state, 'unknown');
   assert.throws(() => f.managed.commandStatus(f.controlKey, f.command.operationId), /control/i);
+});
+
+test('response relay preserves actual native fields, clone isolation and duplicate one-wire semantics', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  try {
+    const first = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    const duplicate = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    const native = { turn: { id: 'native-turn', status: 'inProgress' },
+      extra: { nativeOnly: ['retained'] } };
+    f.child.send({ id: request.id, result: native });
+    const [a, b] = await Promise.all([first, duplicate]);
+    assert.equal(a.operation.state, 'accepted');
+    assert.deepEqual(a.response, native); assert.deepEqual(b.response, native);
+    (a.response!.extra as { nativeOnly: string[] }).nativeOnly.push('mutation');
+    assert.deepEqual(b.response, native);
+    const third = await f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    assert.deepEqual(third.response, native);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.throws(() => f.managed.executeCommandWithResponse(f.controlKey,
+      { ...f.command, params: { ...f.command.params, model: 'changed' } }), /conflict/i);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('response relay returns null while unknown and exact late native result after durable receipt', async () => {
+  const f = commandFixture(20); await f.managed.start();
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    const unknown = await pending;
+    assert.equal(unknown.operation.state, 'unknown'); assert.equal(unknown.response, null);
+    const native = { turn: { id: 'late-native' }, extra: { echoed: true } };
+    f.child.send({ id: request.id, result: native });
+    assert.equal(f.managed.commandStatus(f.controlKey, f.command.operationId)?.state, 'accepted');
+    const duplicate = await f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    assert.deepEqual(duplicate.response, native);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('response relay never fabricates native success for rejected, malformed or failed persistence', async () => {
+  for (const reply of [
+    { error: { code: -32602, message: 'invalid params' } },
+    { result: { turn: { id: 7 }, extra: 'untrusted' } },
+  ]) {
+    const f = commandFixture(); await f.managed.start();
+    try {
+      const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+      const request = await sentMutation(f.child); f.child.send({ id: request.id, ...reply });
+      const outcome = await pending;
+      assert.equal(outcome.response, null);
+      assert.equal(outcome.operation.state, 'error' in reply ? 'rejected' : 'unknown');
+    } finally { await f.managed.stop('test-cleanup'); }
+  }
+  const f = commandFixture(); await f.managed.start();
+  const db = new Database(f.journalPath);
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    db.exec(`CREATE TRIGGER deny_accept BEFORE UPDATE ON managed_worker_operations
+      WHEN NEW.state = 'accepted' BEGIN SELECT RAISE(ABORT, 'deny accepted receipt'); END`);
+    f.child.send({ id: request.id, result: { turn: { id: 'not-durable' }, extra: true } });
+    const outcome = await pending;
+    assert.equal(outcome.response, null);
+    assert.notEqual(outcome.operation.state, 'accepted');
+  } finally { db.close(); await f.managed.stop('test-cleanup'); }
+});
+
+test('response cache eviction and reopened journal never reconstruct native result from receipt ID', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  const first = f.command;
+  try {
+    for (let index = 0; index < 129; index++) {
+      const command = index === 0 ? first : { ...first, operationId: randomUUID(),
+        params: { ...first.params, clientUserMessageId: randomUUID() } };
+      const pending = f.managed.executeCommandWithResponse(f.controlKey, command);
+      let request: Frame | undefined;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        request = f.child.messages.find(frame => frame.method === 'turn/start' &&
+          (frame.params as Frame)?.clientUserMessageId === command.params.clientUserMessageId);
+        if (request) break;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      assert.ok(request);
+      f.child.send({ id: request.id, result: { turn: { id: `native-${index}` }, extra: index } });
+      assert.equal((await pending).operation.state, 'accepted');
+    }
+    const evicted = await f.managed.executeCommandWithResponse(f.controlKey, first);
+    assert.equal(evicted.operation.state, 'accepted'); assert.equal(evicted.response, null);
+  } finally { await f.managed.stop('test-cleanup'); }
+  const reopenedChild = new Child();
+  const reopened = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
+    initializeRequest: init, adapterKey: {}, bootstrapReadMethods: [],
+    allowRequest: () => true, allowAnswer: () => true, commandPolicy: f.policy,
+    launch: () => reopenedChild.asChild() });
+  await reopened.start();
+  try {
+    const result = await reopened.executeCommandWithResponse(f.controlKey, first);
+    assert.equal(result.operation.state, 'accepted'); assert.equal(result.response, null);
+    assert.equal(reopenedChild.messages.some(frame => frame.method === 'turn/start'), false);
+  } finally { await reopened.stop('test-cleanup'); }
+});
+
+test('scoped before-write fence revocation leaves an unknown journal entry without native write', async () => {
+  const f = commandFixture(); await f.managed.start();
+  let lease = true; let checks = 0;
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command, () => {
+      checks++;
+      if (!lease) throw new Error('follower lease revoked');
+    });
+    lease = false;
+    const outcome = await pending;
+    assert.equal(outcome.operation.state, 'unknown'); assert.equal(outcome.response, null);
+    assert.equal(checks, 2);
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
+    assert.equal(f.child.stdin.writableEnded, false);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('accepted duplicate validates intent but does not recheck the scoped lease callback', async () => {
+  const f = commandFixture(); await f.managed.start();
+  let checks = 0;
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command,
+      () => { checks++; });
+    const request = await sentMutation(f.child);
+    f.child.send({ id: request.id, result: { turn: { id: 'native-result' } } });
+    assert.equal((await pending).operation.state, 'accepted');
+    assert.equal(checks, 2);
+    const duplicate = await f.managed.executeCommandWithResponse(f.controlKey, f.command,
+      () => { throw new Error('duplicate callback must not run'); });
+    assert.equal(duplicate.operation.state, 'accepted');
+    assert.deepEqual(duplicate.response, { turn: { id: 'native-result' } });
+    assert.throws(() => f.managed.executeCommandWithResponse(f.controlKey, f.command, 42 as never),
+      /before.write|callback|function/i);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
 });
