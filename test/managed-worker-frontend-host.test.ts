@@ -12,6 +12,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
+import type { ManagedWorkerNotification } from '../src/codex/managed-worker-frontend-host.js';
 import type { WorkerCommand, WorkerCommandPolicy } from '../src/codex/managed-worker-command-dispatcher.js';
 
 type Frame = Record<string, unknown>;
@@ -87,6 +88,73 @@ function host(child: Child, adapterKey: object, port = 0) {
     launch: () => { launches++; return child.asChild(); } });
   return { managed, get launches() { return launches; } };
 }
+
+test('scoped notification observers survive frontend detach without owning worker lifetime', async () => {
+  const child = new Child(), key = {}, fixture = host(child, key);
+  const managed = fixture.managed;
+  const seen: ManagedWorkerNotification[] = [];
+  const failures: string[] = [];
+  const failed = (reason: string) => { failures.push(reason); };
+  assert.throws(() => managed.observeNotifications(key, () => {}, failed));
+  await managed.start();
+  try {
+    assert.throws(() => managed.observeNotifications({}, () => {}, failed), TypeError);
+    const unwatchBroken = managed.observeNotifications(key, event => {
+      event.notification.params.mutated = true;
+      throw new Error('isolated projection failure');
+    }, failed);
+    const unwatch = managed.observeNotifications(key, event => seen.push(event), failed);
+    child.send({ method: 'turn/started', params: { threadId: 'other', turn: { id: 'other-turn' } } });
+    child.send({ method: 'turn/started', params: { threadId: taskId, turn: { id: 'one' } } });
+    assert.equal(seen.length, 1);
+    assert.deepEqual(failures, ['observer-failed']);
+    assert.deepEqual(seen[0], { taskId, generation: 1,
+      notification: { method: 'turn/started', params: { threadId: taskId, turn: { id: 'one' } } } });
+    await managed.restartFrontend();
+    child.send({ method: 'turn/completed', params: { threadId: taskId, turn: { id: 'one' } } });
+    assert.equal(seen.length, 2);
+    unwatch(); unwatch(); unwatchBroken();
+    child.send({ method: 'turn/started', params: { threadId: taskId, turn: { id: 'two' } } });
+    assert.equal(seen.length, 2);
+    assert.equal(child.stdin.writableEnded, false);
+    assert.equal(fixture.launches, 1);
+    managed.observeNotifications(key, event => seen.push(event), failed);
+    child.disconnect();
+    child.send({ method: 'turn/completed', params: { threadId: taskId, turn: { id: 'two' } } });
+    assert.equal(seen.length, 2);
+    assert.deepEqual(failures, ['observer-failed', 'backend-lost']);
+    assert.throws(() => managed.observeNotifications(key, () => {}, failed));
+  } finally { await managed.stop('test-cleanup'); }
+});
+
+test('an asynchronous projection callback is retired without an unhandled rejection or worker stop', async () => {
+  const child = new Child(), key = {}, { managed } = host(child, key);
+  await managed.start();
+  try {
+    const failures: string[] = [];
+    managed.observeNotifications(key, async () => { throw new Error('projection rejected'); },
+      reason => { failures.push(reason); });
+    child.send({ method: 'turn/started', params: { threadId: taskId, turn: { id: 'one' } } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(failures, ['observer-failed']);
+    child.send({ method: 'turn/completed', params: { threadId: taskId, turn: { id: 'one' } } });
+    assert.deepEqual(failures, ['observer-failed']);
+    assert.equal(managed.metadata.state, 'running');
+  } finally { await managed.stop('test-cleanup'); }
+});
+
+test('observer retirement cannot reenter a second owner stop', async () => {
+  const child = new Child(), key = {}, { managed } = host(child, key);
+  await managed.start();
+  let reentered: Promise<void> | undefined;
+  managed.observeNotifications(key, () => {}, reason => {
+    assert.equal(reason, 'owner-stopped');
+    reentered = managed.stop('owner-request');
+  });
+  const stopping = managed.stop('owner-request');
+  await stopping;
+  assert.strictEqual(reentered, stopping);
+});
 
 test('one backend and one handler survive listener restart; old capability and answer fail', async () => {
   const child = new Child(); const key = {};

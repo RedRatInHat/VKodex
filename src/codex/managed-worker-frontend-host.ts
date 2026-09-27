@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { AppServerConnection } from './app-server-connection.js';
+import type { AppServerEnvelope } from './app-server-connection.js';
 import { AppServerRequestInbox } from './app-server-request-inbox.js';
 import type { RequestInboxOptions } from './app-server-request-inbox.js';
 import { PersistentFrontendSessions } from './persistent-frontend-session.js';
@@ -39,6 +40,12 @@ export interface ManagedWorkerFrontendMetadata {
   readonly backendGeneration: number | null;
   readonly frontend: FrontendTransportMetadata | null;
 }
+export interface ManagedWorkerNotification {
+  readonly taskId: string;
+  readonly generation: number;
+  readonly notification: AppServerEnvelope;
+}
+export type WorkerObserverFailure = 'observer-failed' | 'backend-lost' | 'owner-stopped';
 
 function jsonObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -95,6 +102,7 @@ export class ManagedWorkerFrontendHost {
   #restartPromise: Promise<void> | null = null;
   #lossClosePromise: Promise<unknown> | null = null;
   #stopPromise: Promise<void> | null = null;
+  readonly #observers = new Map<() => void, (reason: WorkerObserverFailure) => void>();
 
   constructor(options: ManagedWorkerFrontendHostOptions) {
     if (!options || typeof options.taskId !== 'string' || !options.taskId ||
@@ -165,6 +173,57 @@ export class ManagedWorkerFrontendHost {
   commandStatus(controlKey: object, operationId: string): WorkerOperation | null {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.get(controlKey, operationId);
+  }
+
+  /** Same-worker scoped observation, independent of frontend socket lifetime.
+   * This is a live subscription, not a durable event journal or history read.
+   * Listeners must apply events synchronously; failure retires that observer.
+   * Bootstrap/revision reconciliation belongs to the projection owner, which
+   * must invalidate its projection on failure, not keep publishing stale state. */
+  observeNotifications(adapterKey: object,
+    listener: (event: ManagedWorkerNotification) => void,
+    onFailure: (reason: WorkerObserverFailure) => void): () => void {
+    if (adapterKey !== this.#adapterKey || typeof listener !== 'function' || typeof onFailure !== 'function')
+      throw new TypeError('Unauthorized worker observer');
+    const generation = this.#backendGeneration;
+    if (this.#state !== 'running' || generation === null || !this.#rpc.isSessionCurrent(generation))
+      throw new Error('Worker observation unavailable');
+    let active = true;
+    const remove = this.#rpc.onNotification(notification => {
+      if (!active || this.#stopRequested || !this.#rpc.isSessionCurrent(generation) ||
+          !['running', 'restarting', 'frontend-unavailable'].includes(this.#state)) return;
+      const params = notification.params;
+      const started = notification.method === 'thread/started' && jsonObject(params.thread)
+        ? params.thread : null;
+      if ((params.threadId ?? started?.id) !== this.#taskId ||
+          started !== null && started.id !== this.#taskId) return;
+      // A faulty renderer cannot mutate another observer's event or kill RPC.
+      try {
+        const result: unknown = listener({ taskId: this.#taskId, generation,
+          notification: structuredClone(notification) });
+        if (result !== null && (typeof result === 'object' || typeof result === 'function') &&
+            'then' in result && typeof result.then === 'function') {
+          void Promise.resolve(result).catch(() => {});
+          failObserver('observer-failed');
+        }
+      } catch { failObserver('observer-failed'); }
+    });
+    const detach = () => {
+      if (!active) return;
+      active = false; remove(); this.#observers.delete(detach);
+    };
+    const failObserver = (reason: WorkerObserverFailure) => {
+      if (!active) return;
+      detach();
+      // Even a failure reporter cannot reject into the backend's event loop.
+      try { void Promise.resolve(onFailure(reason)).catch(() => {}); } catch { /* isolated callback */ }
+    };
+    this.#observers.set(detach, failObserver);
+    return detach;
+  }
+
+  #detachObservers(reason: WorkerObserverFailure): void {
+    for (const failObserver of this.#observers.values()) failObserver(reason);
   }
 
   /** The token is available only to the caller holding the constructor's key. */
@@ -273,6 +332,7 @@ export class ManagedWorkerFrontendHost {
   #loseBackend(): void {
     if (this.#state === 'stopping' || this.#state === 'stopped') return;
     this.#state = 'lost';
+    this.#detachObservers('backend-lost');
     const transport = this.#transport;
     this.#transport = null;
     if (transport) this.#lossClosePromise = transport.close().then(() => null, error => error as unknown);
@@ -304,6 +364,8 @@ export class ManagedWorkerFrontendHost {
         this.#state = closeFailure === null ? 'stopped' : 'failed';
         if (closeFailure !== null) throw closeFailure;
       })();
+      // Publish the single stop promise before invoking caller callbacks.
+      this.#detachObservers('owner-stopped');
     }
     return this.#stopPromise;
   }
