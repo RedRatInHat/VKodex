@@ -425,6 +425,39 @@ test('unexpected backend exit retires ready admission and marks only its registr
   } finally { check.close(); }
 });
 
+test('native projection failure retires daemon readiness while preserving backend and diagnosis', async () => {
+  const { daemon, backend, control, reserved, privateDirectory, registryPath, home } = await readyFixture();
+  try {
+    backend.stdout.write(JSON.stringify({ method: 'thread/unsupported',
+      params: { threadId: 'own-zero-turn' } }) + '\n');
+    const ownerDeadline = Date.now() + 2000;
+    while (daemon.metadata.nativeState !== 'failed' && Date.now() < ownerDeadline)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(daemon.metadata.nativeState, 'failed');
+    const daemonDeadline = Date.now() + 2500;
+    while (daemon.metadata.state === 'ready' && Date.now() < daemonDeadline)
+      await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(daemon.metadata.failure, 'native-owner-unavailable');
+    assert.equal(backend.exitCode, null);
+    assert.equal(backend.writes, 0);
+    assert.equal(backend.methods.filter(method => method === 'thread/resume').length, 1);
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'ready'); }
+    finally { registry.close(); }
+    const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'owner-failed', 'diagnose-v1');
+    assert.equal((diagnosis.result as Record<string, unknown>).daemonState, 'failed');
+    assert.equal((diagnosis.result as Record<string, unknown>).failureCode, 'native-owner-unavailable');
+    assert.equal((diagnosis.result as Record<string, unknown>).registryState, 'ready');
+    assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'stop-failed', 'stop')).error,
+      'stop-refused');
+    assert.equal(backend.exitCode, null);
+  } finally {
+    await (control as ManagedWorkerControlServer | null)?.close();
+    backend.stdin.end();
+  }
+});
+
 test('native broker EOF rejoins transport without another backend launch or resume', async () => {
   const { daemon, backend, brokers, reserved, privateDirectory } = await readyFixture();
   assert.equal(brokers.length, 1);

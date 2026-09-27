@@ -15,7 +15,7 @@ export interface ManagedWorkerControlDiagnosis {
     'owner-starting' | 'publishing-ready' | 'ready';
   readonly daemonState: 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
   readonly failureCode: 'startup-unavailable' | 'backend-lost' | 'backend-loss-unconfirmed' |
-    'owner-unconfirmed' | 'stop-unconfirmed' | null;
+    'owner-unconfirmed' | 'native-owner-unavailable' | 'stop-unconfirmed' | null;
   readonly registryState: 'reserved' | 'host_registered' | 'backend_registered' |
     'ready' | 'lost' | 'retired' | null;
   readonly owner: Readonly<{
@@ -67,7 +67,7 @@ const startupPhases = new Set(['not-started', 'private-loaded', 'host-registered
   'owner-starting', 'publishing-ready', 'ready']);
 const daemonStates = new Set(['new', 'starting', 'ready', 'failed', 'stopping', 'stopped']);
 const failureCodes = new Set(['startup-unavailable', 'backend-lost', 'backend-loss-unconfirmed',
-  'owner-unconfirmed', 'stop-unconfirmed']);
+  'owner-unconfirmed', 'native-owner-unavailable', 'stop-unconfirmed']);
 const registryStates = new Set(['reserved', 'host_registered', 'backend_registered',
   'ready', 'lost', 'retired']);
 const startupStages = new Set(['not-started', 'observing', 'reading-initial',

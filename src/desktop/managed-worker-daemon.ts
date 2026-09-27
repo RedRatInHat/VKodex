@@ -324,10 +324,18 @@ export class ManagedWorkerDaemon {
         void this.#control?.close().catch(() => {});
         return;
       }
-      if (this.#owner.metadata.state !== 'disconnected' || this.#reconnectPending) {
-        if (this.#owner.metadata.state === 'connected') this.#reconnectDelayMs = 1_000;
-        if (this.#owner.metadata.state === 'connected' || this.#owner.metadata.state === 'disconnected')
-          this.#scheduleReconnect();
+      const nativeState = this.#owner.metadata.state;
+      if (nativeState !== 'connected' && nativeState !== 'disconnected') {
+        // The backend is still owned and may be active. Only native routing is
+        // unavailable; retain authenticated diagnosis and never relaunch it.
+        this.#admissionOpen = false; this.#state = 'failed';
+        this.#failure = 'native-owner-unavailable';
+        this.#clearReconnect();
+        return;
+      }
+      if (nativeState !== 'disconnected' || this.#reconnectPending) {
+        if (nativeState === 'connected') this.#reconnectDelayMs = 1_000;
+        this.#scheduleReconnect();
         return;
       }
       this.#reconnectPending = true;
