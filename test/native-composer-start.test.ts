@@ -46,6 +46,14 @@ test("qualified first-turn read-only Composer compiles separate wire, UI and loc
   assert.deepEqual(s, beforeS); assert.deepEqual(f, beforeF);
 });
 
+test('omitted optional UI collections remain strict JSON for durable intent storage', () => {
+  const s = snapshot(), f = envelope(s);
+  delete parts(f).context.attachments;
+  delete parts(f).context.commentAttachments;
+  const compiled = compileNativeReadOnlyComposerStart(s, f);
+  assert.deepEqual(JSON.parse(JSON.stringify(compiled)), compiled);
+});
+
 test("rejects unqualified permission and Composer context instead of discarding them", () => {
   const cases: [string, (s: Row, f: Row) => void][] = [
     ["host", s => { s.hostId = "remote"; }], ["resume", s => { s.resumeState = "starting"; }],

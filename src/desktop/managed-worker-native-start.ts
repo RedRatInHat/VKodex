@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ManagedWorkerFrontendHost } from '../codex/managed-worker-frontend-host.js';
-import type { WorkerCommand } from '../codex/managed-worker-command-dispatcher.js';
 import { prepareNativeFollowerStart } from '../codex/native-follower-start.js';
 import type { NativeFollowerStartSnapshot } from '../codex/native-follower-start.js';
+import { compileNativeReadOnlyComposerStart } from '../codex/native-composer-start.js';
+import type { NativeStartIntentStore, NativeStartIntent } from '../codex/native-start-intent-store.js';
 import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-client.js';
 
 export interface NativeStartAuthority {
@@ -12,6 +13,8 @@ export interface NativeStartAuthority {
   /** Settings/authority revision, NOT the revision of streamed turn events. */
   readonly authorityRevision: number;
   readonly snapshot: NativeFollowerStartSnapshot;
+  /** Explicit opt-in to the qualified first-turn Composer contract. */
+  readonly composer?: { readonly snapshot: IpcObject; readonly defaults: IpcObject | null } | null;
 }
 interface Options {
   readonly host: Pick<ManagedWorkerFrontendHost, 'metadata' | 'executeCommandWithResponse'>;
@@ -22,8 +25,11 @@ interface Options {
   /** Must validate an established follower lease. Broker sourceClientId alone
    * is routing data, not authentication or proof of writer ownership. */
   readonly authorizeFollower: (request: Readonly<IpcIncomingRequest>, authority: NativeStartAuthority) => boolean;
+  readonly intentStore?: NativeStartIntentStore;
+  /** Refresh local projection only after validating an actual accepted receipt. */
+  readonly onAccepted?: () => void;
 }
-interface Remembered { readonly envelope: IpcObject; readonly command: WorkerCommand; readonly bytes: number }
+interface Remembered extends NativeStartIntent { readonly bytes: number }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const object = (v: unknown): v is IpcObject => !!v && typeof v === 'object' && !Array.isArray(v);
 const refused = () => new Error('Native worker start is not authorized or representable');
@@ -43,7 +49,11 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     if (!options || !options.taskId || !uuid.test(options.ownerEpoch) ||
         !options.controlKey || typeof options.controlKey !== 'object' ||
         typeof options.authority !== 'function' || typeof options.authorizeFollower !== 'function' ||
-        typeof options.host?.executeCommandWithResponse !== 'function') throw refused();
+        typeof options.host?.executeCommandWithResponse !== 'function' ||
+        options.onAccepted !== undefined && typeof options.onAccepted !== 'function') throw refused();
+    if (options.intentStore && (options.intentStore.owner.ownerEpoch !== options.ownerEpoch ||
+        options.intentStore.owner.threadId !== options.taskId ||
+        options.intentStore.owner.backendGeneration !== options.host.metadata.backendGeneration)) throw refused();
     this.#options = Object.freeze({ ...options });
   }
 
@@ -83,7 +93,8 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     const actual = this.#capture(request);
     if (actual.ownerEpoch !== expected.ownerEpoch || actual.backendGeneration !== expected.backendGeneration ||
         actual.authorityRevision !== expected.authorityRevision ||
-        !isDeepStrictEqual(actual.snapshot, expected.snapshot)) throw refused();
+        !isDeepStrictEqual(actual.snapshot, expected.snapshot) ||
+        !isDeepStrictEqual(actual.composer, expected.composer)) throw refused();
   }
 
   async handle(incoming: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject> {
@@ -104,19 +115,37 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
       'vkodex-native-start-v2', authority.ownerEpoch, this.#options.taskId, clientId,
     ])).digest('hex');
     const operationId = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-8${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
-    const previous = this.#commands.get(operationId);
+    const persisted = this.#options.intentStore?.get(operationId);
+    const previous = persisted?.intent ?? this.#commands.get(operationId);
     if (previous && !isDeepStrictEqual(previous.envelope, envelope)) throw refused();
-    const command = previous?.command ?? { operationId, method: 'turn/start' as const,
-      params: prepareNativeFollowerStart(authority.snapshot, envelope) };
+    let intent: NativeStartIntent;
+    if (previous) intent = previous;
+    else {
+      // An extended Composer context must never fall back to the ordinary
+      // compiler and lose local metadata or explicit permission settings.
+      const context = start.context;
+      const ordinary = object(context) && Object.keys(context).every(key => key === 'inheritThreadSettings');
+      const compiled = ordinary ? null : authority.composer && this.#options.intentStore
+        ? compileNativeReadOnlyComposerStart(authority.composer.snapshot, envelope, authority.composer.defaults)
+        : (() => { throw refused(); })();
+      intent = { envelope: structuredClone(envelope),
+        command: { operationId, method: 'turn/start',
+          params: compiled?.request ?? prepareNativeFollowerStart(authority.snapshot, envelope) },
+        admission: structuredClone(authority) as unknown as IpcObject,
+        uiParams: compiled?.uiParams ?? null, localMetadata: compiled?.localMetadata ?? null };
+    }
+    const command = intent.command;
     const commandBytes = Buffer.byteLength(JSON.stringify(command));
     if (commandBytes > 32 * 1024 * 1024) throw refused();
-    const bytes = envelopeBytes + commandBytes;
+    const bytes = Buffer.byteLength(JSON.stringify(intent));
     this.#sameAuthority(request, authority);
     if (signal.aborted) throw refused();
     // Record the original settings resolution for retransmission. The worker's
     // durable ledger is authoritative if this bounded memory cache is gone.
     if (!previous) {
-      this.#commands.set(operationId, { envelope: structuredClone(envelope), command, bytes });
+      // Failure to durably preserve intent prevents the native write entirely.
+      this.#options.intentStore?.reserve(operationId, clientId, intent);
+      this.#commands.set(operationId, { ...structuredClone(intent), bytes });
       this.#bytes += bytes;
       while (this.#commands.size > 128 || this.#bytes > 64 * 1024 * 1024) {
         const oldest = this.#commands.keys().next().value!;
@@ -125,7 +154,7 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
       }
     }
     const outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
-      () => this.#sameAuthority(request, authority));
+      () => this.#sameAuthority(request, intent.admission as unknown as NativeStartAuthority));
     // This signal only gates delivery. Never interrupt an accepted model turn.
     if (signal.aborted) throw new Error('Native response delivery disconnected; worker outcome retained');
     const current = this.#capture(request);
@@ -138,6 +167,7 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         !object(result) || !object(result.turn) || typeof result.turn.id !== 'string' ||
         !result.turn.id || result.turn.id !== op.receiptId)
       throw new Error('Actual native start receipt unavailable; do not replay the command');
+    this.#options.onAccepted?.();
     return { result: structuredClone(result) };
   }
 

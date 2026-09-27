@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,8 @@ import test from 'node:test';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
 import { ManagedWorkerNativeStartHandler } from '../src/desktop/managed-worker-native-start.js';
 import type { NativeStartAuthority } from '../src/desktop/managed-worker-native-start.js';
+import { NativeStartIntentStore } from '../src/codex/native-start-intent-store.js';
+import { prepareNativeFollowerStart } from '../src/codex/native-follower-start.js';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject, IpcIncomingRequest } from '../src/desktop/ipc-client.js';
 
@@ -66,7 +68,8 @@ async function fixture(timeout = 2000) {
     launch: () => child as unknown as ChildProcessWithoutNullStreams,
     commandPolicy: { controlKey, ownerEpoch, fingerprintKey: randomBytes(32),
       journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-native-start-')), 'ops.sqlite'),
-      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'gpt-fixture' } });
+      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'gpt-fixture' ||
+        params.model === null && ((params.collaborationMode as IpcObject)?.settings as IpcObject)?.model === 'gpt-fixture' } });
   await host.start();
   const handler = new ManagedWorkerNativeStartHandler({ host, controlKey, taskId, ownerEpoch,
     authority: () => authority, authorizeFollower: r => state.authorized && r.sourceClientId === 'desktop' });
@@ -75,8 +78,109 @@ async function fixture(timeout = 2000) {
     params: { conversationId: taskId, turnStart: { request: { threadId: taskId,
       clientUserMessageId: randomUUID(), input: [{ type: 'text', text: 'native input', text_elements: [] }] },
       context: { inheritThreadSettings: true } } } };
-  return { host, handler, child, request, state, authority };
+  return { host, handler, child, request, state, authority, controlKey, taskId, ownerEpoch };
 }
+
+test('Composer intent survives adapter recreation and first-turn eligibility loss without a second write', async () => {
+  const f = await fixture();
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-composer-intent-'));
+  const options = { filePath: path.join(directory, 'intent.sqlite'), ownerEpoch: f.ownerEpoch,
+    backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) };
+  let store = new NativeStartIntentStore(options);
+  const sandboxPolicy = { type: 'readOnly', networkAccess: false };
+  const mode = { mode: 'default', settings: { model: 'gpt-fixture', reasoning_effort: 'low', developer_instructions: null } };
+  const profile = { id: ':read-only' };
+  const full = { ...structuredClone(f.authority.snapshot), hostId: 'local', resumeState: 'resumed',
+    workspaceKind: 'projectless', turns: [], environments: [], latestCollaborationMode: mode,
+    currentPermissions: { activePermissionProfile: profile, sandboxPolicy, approvalPolicy: 'never',
+      approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/native-test'] },
+    latestThreadSettings: { cwd: 'C:/native-test', model: 'gpt-fixture', effort: 'low', serviceTier: null,
+      summary: null, personality: 'pragmatic', activePermissionProfile: profile, sandboxPolicy } };
+  Object.assign(f.authority, { snapshot: full, composer: { snapshot: full, defaults: null } });
+  const request = structuredClone(f.request), start = request.params.turnStart as IpcObject;
+  Object.assign(start.request as IpcObject, { cwd: 'C:/native-test', model: null, effort: null, serviceTier: null,
+    collaborationMode: mode, permissions: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+    turnTrigger: 'composer', responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' },
+    multiAgentMode: 'explicitRequestOnly' });
+  start.context = { inheritThreadSettings: true, writingBlockContextPrepared: true,
+    localTurnMetadata: { fileAttachmentCount: 0 }, attachments: [], commentAttachments: [], responseItems: [],
+    useAppServerPermissionDefault: false, usePermissionSelection: false };
+  const make = () => new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => f.state.authorized, intentStore: store });
+  let handler = make();
+  try {
+    const run = handler.handle(request, new AbortController().signal);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    assert.equal(store.list().length, 1); // Written before the worker receives anything.
+    assert.equal((wire.params as IpcObject).permissions, ':read-only');
+    Object.assign(f.authority, { composer: null }); // Real turn 0 -> 1 after admission.
+    const actual = { turn: { id: 'composer-turn', status: 'inProgress' } };
+    f.child.reply(wire.id, actual);
+    assert.deepEqual(await run, { result: actual });
+    handler.close(); store.close();
+    store = new NativeStartIntentStore(options); handler = make();
+    assert.deepEqual(await handler.handle({ ...request, requestId: 'reconnected' }, new AbortController().signal),
+      { result: actual });
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.deepEqual(store.list()[0]!.intent.localMetadata, { fileAttachmentCount: 0 });
+    const changed = structuredClone(request);
+    ((changed.params.turnStart as IpcObject).request as IpcObject).input = [{ type: 'text', text: 'changed' }];
+    await assert.rejects(handler.handle(changed, new AbortController().signal));
+    const newId = structuredClone(request);
+    ((newId.params.turnStart as IpcObject).request as IpcObject).clientUserMessageId = randomUUID();
+    await assert.rejects(handler.handle(newId, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('reopened intent-only reservation cannot dispatch under changed original admission', async () => {
+  const f = await fixture();
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-intent-gap-'));
+  const options = { filePath: path.join(directory, 'intent.sqlite'), ownerEpoch: f.ownerEpoch,
+    backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) };
+  let store = new NativeStartIntentStore(options);
+  const envelope = structuredClone(f.request.params);
+  const clientId = ((envelope.turnStart as IpcObject).request as IpcObject).clientUserMessageId as string;
+  const digest = createHash('sha256').update(JSON.stringify([
+    'vkodex-native-start-v2', f.ownerEpoch, f.taskId, clientId])).digest('hex');
+  const operationId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-8${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+  const original = structuredClone(f.authority);
+  store.reserve(operationId, clientId, { envelope,
+    command: { operationId, method: 'turn/start',
+      params: prepareNativeFollowerStart(original.snapshot, envelope) },
+    admission: original as unknown as IpcObject, uiParams: null, localMetadata: null });
+  assert.equal(f.host.commandStatus(f.controlKey, operationId), null);
+  store.close(); // A crash/recreation after intent commit, before operation-journal reservation.
+  store = new NativeStartIntentStore(options);
+  Object.assign(f.authority, { authorityRevision: 2,
+    snapshot: { ...f.authority.snapshot, latestModel: 'changed-model' } });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    assert.equal(f.host.commandStatus(f.controlKey, operationId), null);
+    assert.deepEqual(store.get(operationId)?.intent.admission, original);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('intent persistence capacity failure prevents operation reservation and worker write', async () => {
+  const f = await fixture();
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-intent-fail-'));
+  const store = new NativeStartIntentStore({ filePath: path.join(directory, 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
+    encryptionKey: randomBytes(32), maxBytes: 128 });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    assert.equal(store.list().length, 0);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
 
 test('native IPC receives exact worker result only after durable dispatch; duplicate does not run twice', async () => {
   const f = await fixture(), broker = new Broker();

@@ -2,6 +2,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ManagedWorkerFrontendHost, ManagedWorkerNotification } from '../codex/managed-worker-frontend-host.js';
 import type { RequestFrame } from '../codex/app-server-request-inbox.js';
 import { compileNativeRequestResponse } from '../codex/native-request-response.js';
+import type { NativeStartIntentRecord, NativeStartIntentStore } from '../codex/native-start-intent-store.js';
+import { projectNativeStartIntents } from '../codex/native-start-intent-projection.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import { applyNotification, projectNativeServerRequest } from '../codex/managed-native-projection.js';
 import { DesktopIpcClient } from './ipc-client.js';
@@ -10,7 +12,7 @@ import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.j
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
-  'observePendingRequests' | 'createRequestResponder'>;
+  'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
 const knownVersions = new Map<string, number>([
@@ -45,6 +47,10 @@ export interface ManagedWorkerNativeOwnerOptions {
   readonly allowFollower: (sourceClientId: string) => boolean;
   /** Must return a caller-qualified, exhausted full-history, idle snapshot. No worker creation/resume. */
   readonly readInitialState: () => Promise<NativeProjectionState>;
+  /** Caller manages the private encrypted store and its key independently of IPC. */
+  readonly intentStore?: NativeStartIntentStore;
+  /** Explicit first-turn read-only Composer opt-in; defaults must be qualified from native config. */
+  readonly composerDefaults?: () => IpcObject | null;
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
 }
 export interface ManagedWorkerNativeOwnerMetadata {
@@ -61,6 +67,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   readonly #options: ManagedWorkerNativeOwnerOptions;
   readonly #followers = new Map<string, object>();
   readonly #grants = new Map<string, Grant>();
+  readonly #intentCache = new Map<string, NativeStartIntentRecord>();
   readonly #deferredBroadcasts: IpcObject[] = [];
   #state: OwnerState = 'new';
   #failure: string | null = null;
@@ -82,12 +89,15 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         typeof options.host.executeCommandWithResponse !== 'function' ||
         typeof options.host.observePendingRequests !== 'function' ||
         typeof options.host.createRequestResponder !== 'function' ||
+        options.intentStore !== undefined && typeof options.host.commandStatusForIntent !== 'function' ||
         !options.adapterKey || typeof options.adapterKey !== 'object' ||
         !options.controlKey || typeof options.controlKey !== 'object' ||
         typeof options.taskId !== 'string' || !options.taskId ||
         typeof options.ownerEpoch !== 'string' || !/^[0-9a-f-]{36}$/iu.test(options.ownerEpoch) ||
         typeof options.isOwnerCurrent !== 'function' || typeof options.allowFollower !== 'function' ||
         typeof options.readInitialState !== 'function' ||
+        options.composerDefaults !== undefined &&
+          (typeof options.composerDefaults !== 'function' || !options.intentStore) ||
         (options.clientFactory !== undefined && typeof options.clientFactory !== 'function')) throw refuse();
     this.#options = Object.freeze({ ...options });
   }
@@ -138,7 +148,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #fail(reason: string): void {
     if (this.#state === 'failed' || this.#state === 'closed') return;
     this.#state = 'failed'; this.#failure = reason;
-    this.#followers.clear(); this.#grants.clear(); this.#deferredBroadcasts.length = 0;
+    this.#followers.clear(); this.#grants.clear(); this.#intentCache.clear(); this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
     this.#detachRequests?.(); this.#detachRequests = null;
     this.#startHandler?.close(); this.#client?.close();
@@ -210,8 +220,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         authority: () => this.#authority(),
         authorizeFollower: request => {
           const grant = this.#grants.get(request.requestId);
-          return grant?.sourceClientId === request.sourceClientId && this.#ownerCurrent();
+          return grant?.sourceClientId === request.sourceClientId && this.#ownerCurrent() &&
+            this.#grants.get(request.requestId) === grant;
         },
+        ...(this.#options.intentStore ? { intentStore: this.#options.intentStore,
+          onAccepted: () => {
+            this.#revision++;
+            for (const source of this.#followers.keys()) this.#sendSnapshot(source);
+          } } : {}),
       });
       this.#client = (this.#options.clientFactory ??
         (handler => new DesktopIpcClient(undefined, 15_000, handler)))(this);
@@ -253,8 +269,22 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #authority(): NativeStartAuthority | null {
     if (!this.#ownerCurrent() || !this.#authoritySnapshot || this.#generation === null ||
         !['connected', 'disconnected'].includes(this.#state)) return null;
+    let composer: NativeStartAuthority['composer'];
+    if (this.#options.composerDefaults) {
+      composer = null;
+      if (this.#projection?.turns.length === 0) {
+        const snapshot: IpcObject = { turns: [] };
+        for (const key of ['id', 'cwd', 'hostId', 'resumeState', 'workspaceKind', 'environments',
+          'latestModel', 'latestReasoningEffort', 'latestServiceTier', 'latestThreadSettings',
+          'latestCollaborationMode', 'currentPermissions']) {
+          if (this.#projection[key] !== undefined) snapshot[key] = copy(this.#projection[key]);
+        }
+        composer = { snapshot, defaults: copy(this.#options.composerDefaults()) };
+      }
+    }
     return { ownerEpoch: this.#options.ownerEpoch, backendGeneration: this.#generation,
-      authorityRevision: this.#authorityRevision, snapshot: copy(this.#authoritySnapshot) };
+      authorityRevision: this.#authorityRevision, snapshot: copy(this.#authoritySnapshot),
+      ...(composer === undefined ? {} : { composer }) };
   }
 
   #route(request: IpcIncomingRequest): boolean {
@@ -320,11 +350,30 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
 
   #sendSnapshot(source: string): boolean {
     if (!this.#projection || !this.#client || this.#state !== 'connected' || !this.#ownerCurrent()) return false;
+    let published = this.#projection;
+    if (this.#options.intentStore) {
+      try {
+        const records = new Map<string, NativeStartIntentRecord>();
+        for (const turn of published.turns) for (const item of turn.items) {
+          const clientId = item.type === 'userMessage' ? item.clientId : null;
+          if (typeof clientId !== 'string' || !clientId || clientId.length > 128 ||
+              clientId.trim() !== clientId || /[\u0000-\u001f\u007f]/u.test(clientId)) continue;
+          let record = this.#intentCache.get(clientId);
+          if (!record) {
+            record = this.#options.intentStore.getByClientUserMessageId(clientId) ?? undefined;
+            if (record) this.#intentCache.set(clientId, record);
+          }
+          if (record) records.set(record.operationId, record);
+        }
+        published = projectNativeStartIntents(published, [...records.values()].map(record => ({ record,
+          operation: this.#options.host.commandStatusForIntent(this.#options.controlKey, record.intent.command) })));
+      } catch { this.#fail('intent-projection-failed'); return false; }
+    }
     try {
       this.#client.broadcast('thread-stream-state-changed', 11,
         { hostId: 'local', conversationId: this.#options.taskId,
           change: { type: 'snapshot', revision: this.#revision,
-            conversationState: copy(this.#projection) } }, source);
+            conversationState: copy(published) } }, source);
       return true;
     } catch { this.#followers.delete(source); return false; }
   }
@@ -366,7 +415,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   /** Gateway retirement never calls host.stop or closes the native worker. */
   close(): void {
     if (this.#state === 'closed') return;
-    this.#state = 'closed'; this.#followers.clear(); this.#grants.clear();
+    this.#state = 'closed'; this.#followers.clear(); this.#grants.clear(); this.#intentCache.clear();
     this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
     this.#detachRequests?.(); this.#detachRequests = null;

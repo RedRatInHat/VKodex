@@ -492,6 +492,34 @@ test('owner command receipt survives frontend restart and duplicates never dispa
   } finally { await f.managed.stop('test-cleanup'); }
 });
 
+test('read-only attested command lookup never reserves or authorizes a fresh write', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  let policyCalls = 0; f.authority.onAuthorize = () => { policyCalls++; };
+  try {
+    assert.equal(f.managed.commandStatusForIntent(f.controlKey, f.command), null);
+    assert.equal(policyCalls, 0);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 0);
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    f.child.send({ id: request.id, result: { turn: { id: 'attested-turn' } } });
+    assert.equal((await pending).state, 'accepted');
+    const before = f.child.messages.filter(frame => frame.method === 'turn/start').length;
+    f.authority.admit = false;
+    const found = f.managed.commandStatusForIntent(f.controlKey, f.command);
+    assert.equal(found?.state, 'accepted'); assert.equal(found?.receiptId, 'attested-turn');
+    assert.equal(policyCalls, 2); // Lookup is not a fresh authorization.
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, before);
+    assert.throws(() => f.managed.commandStatusForIntent(f.controlKey, { ...f.command,
+      params: { ...f.command.params, input: [{ type: 'text', text: 'changed' }] } }), /intent conflict/i);
+    assert.throws(() => f.managed.commandStatusForIntent(f.controlKey, { ...f.command,
+      params: { ...f.command.params, approvalPolicy: 'changed' } }), /intent conflict/i);
+    assert.throws(() => f.managed.commandStatusForIntent({}, f.command), /control/i);
+    assert.equal(f.managed.commandStatusForIntent(f.controlKey, { ...f.command, operationId: randomUUID(),
+      params: { ...f.command.params, clientUserMessageId: randomUUID() } }), null);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, before);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
 test('timeout is durable unknown, late receipt settles once without a second model turn', async () => {
   const f = commandFixture(20); await f.managed.start();
   try {

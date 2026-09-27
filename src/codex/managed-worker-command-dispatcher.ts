@@ -109,6 +109,21 @@ export class ManagedWorkerCommandDispatcher {
     this.#authenticate(key);
     return this.#journal.get(operationId);
   }
+  /**
+   * Read-only attested lookup for an immutable native intent. It never calls
+   * authorization, reserves a journal row, or writes to the backend.
+   */
+  getForIntent(key: object, value: WorkerCommand): WorkerOperation | null {
+    this.#authenticate(key);
+    const command = snapshot(value);
+    const prior = this.#journal.get(command.operationId);
+    if (!prior) return null;
+    const clientUserMessageId = command.params.clientUserMessageId;
+    if (typeof clientUserMessageId !== 'string' || prior.clientUserMessageId !== clientUserMessageId ||
+        prior.method !== command.method || prior.fingerprint !== this.#fingerprint(command))
+      throw new Error('Worker command intent conflict');
+    return prior;
+  }
   execute(key: object, value: WorkerCommand): Promise<WorkerOperation> {
     return this.#execute(key, value, false);
   }
@@ -144,8 +159,7 @@ export class ManagedWorkerCommandDispatcher {
       // Policy code may synchronously revoke the owner or stop this host.
       if (!this.#current()) throw new Error('Worker command authority changed');
     });
-    const fingerprint = createHmac('sha256', this.#policy.fingerprintKey)
-      .update(canonical({ ...this.#scope, ...command })).digest('hex');
+    const fingerprint = this.#fingerprint(command);
     const intent = { operationId: command.operationId,
       clientUserMessageId: command.params.clientUserMessageId, method: command.method, fingerprint };
     // Retrieving an immutable prior outcome is not a fresh execution. A now
@@ -163,6 +177,11 @@ export class ManagedWorkerCommandDispatcher {
     void work.then(() => this.#inFlight.delete(command.operationId),
       () => this.#inFlight.delete(command.operationId));
     return work;
+  }
+
+  #fingerprint(command: Readonly<WorkerCommand>): string {
+    return createHmac('sha256', this.#policy.fingerprintKey)
+      .update(canonical({ ...this.#scope, ...command })).digest('hex');
   }
 
   #cacheResponse(operation: WorkerOperation, result: JsonObject): void {

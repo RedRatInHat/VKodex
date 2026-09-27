@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
+import { NativeStartIntentStore } from '../src/codex/native-start-intent-store.js';
 import type { AppServerServerRequest } from '../src/codex/app-server-connection.js';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject } from '../src/desktop/ipc-client.js';
@@ -74,7 +75,7 @@ async function waitFrame(frames: IpcObject[], predicate: (frame: IpcObject) => b
 }
 async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state(),
   allowAnswer: (request: AppServerServerRequest, response: IpcObject) => boolean = () => false,
-  allowFollower: (id: string) => boolean = id => id === 'follower') {
+  allowFollower: (id: string) => boolean = id => id === 'follower', composer = false) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -82,17 +83,47 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     launch: () => child as unknown as ChildProcessWithoutNullStreams,
     commandPolicy: { controlKey, ownerEpoch, fingerprintKey: randomBytes(32),
       journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-owner-')), 'ops.sqlite'),
-      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'fixture-model' } });
+      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'fixture-model' ||
+        composer && params.model === null && params.permissions === ':read-only' } });
   await host.start();
+  const generation = host.metadata.backendGeneration;
+  assert.ok(generation);
+  const intentStore = composer ? new NativeStartIntentStore({
+    filePath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-composer-intent-')), 'intent.sqlite'),
+    ownerEpoch, backendGeneration: generation, threadId: taskId,
+    encryptionKey: randomBytes(32) }) : null;
   let broker = new Broker(); const brokers = [broker];
   const owner = new ManagedWorkerNativeOwner({ host, adapterKey, controlKey, taskId, ownerEpoch,
     isOwnerCurrent: () => true, allowFollower, readInitialState,
+    ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
       return broker;
     }, 1000, handler) });
-  return { child, host, get broker() { return broker; }, brokers, owner, adapterKey,
+  return { child, host, get broker() { return broker; }, brokers, owner, intentStore, adapterKey,
     controlKey, ownerEpoch };
+}
+
+function composerState(): NativeProjectionState {
+  const base = state();
+  const profile = { id: ':read-only' };
+  const sandbox = { type: 'readOnly', networkAccess: false };
+  const mode = { mode: 'default', settings: {
+    model: 'fixture-model', reasoning_effort: 'low', developer_instructions: null } };
+  return { ...base, resumeState: 'resumed', workspaceKind: 'projectless', environments: [],
+    latestCollaborationMode: mode,
+    latestThreadSettings: { cwd: 'C:/own', model: 'fixture-model', effort: 'low', serviceTier: null,
+      summary: null, personality: 'pragmatic', activePermissionProfile: profile, sandboxPolicy: sandbox },
+    currentPermissions: { activePermissionProfile: profile, sandboxPolicy: sandbox,
+      approvalPolicy: 'never', approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/own'] } };
+}
+
+function snapshotTurn(frame: IpcObject): IpcObject | null {
+  if (frame.method !== 'thread-stream-state-changed') return null;
+  const params = frame.params as IpcObject;
+  const change = params?.change as IpcObject;
+  const state = change?.conversationState as IpcObject;
+  return ((state?.turns as IpcObject[] | undefined) ?? [])[0] ?? null;
 }
 
 test('bootstrap rejects a notification during asynchronous full-history read before IPC claim', async () => {
@@ -282,6 +313,91 @@ test('admitted direct start survives owner IPC EOF before final worker write; re
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     assert.equal(f.host.metadata.state, 'running');
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('Composer intent overlays only its accepted observed turn and retries after first-turn eligibility is gone', async () => {
+  const f = await fixture(async () => composerState(), undefined, undefined, true);
+  const clientId = randomUUID();
+  const user = { id: 'composer-user', type: 'userMessage', clientId,
+    content: [{ type: 'text', text: 'hello', text_elements: [] }] };
+  const params = { conversationId: taskId, turnStart: {
+    request: { threadId: taskId, clientUserMessageId: clientId, input: user.content,
+      cwd: 'C:/own', model: null, effort: null, serviceTier: null,
+      collaborationMode: composerState().latestCollaborationMode,
+      permissions: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+      turnTrigger: 'composer', multiAgentMode: 'explicitRequestOnly',
+      responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' } },
+    context: { inheritThreadSettings: true, writingBlockContextPrepared: true,
+      localTurnMetadata: { fileAttachmentCount: 0 }, attachments: [], commentAttachments: [],
+      responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } };
+  const request = { type: 'request', requestId: 'composer-first', sourceClientId: 'follower',
+    hostId: 'local', targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2, params };
+  const follow = () => f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed',
+    version: 1, sourceClientId: 'follower',
+    params: { conversationId: taskId, hostId: 'local', following: true } });
+  try {
+    await f.owner.start(); follow();
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.broker.send(request);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    assert.equal((wire.params as IpcObject).turnTrigger, 'composer');
+    assert.equal(f.intentStore?.getByClientUserMessageId(clientId)?.intent.uiParams?.turnTrigger, 'composer');
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'composer-turn', status: 'inProgress', startedAt: 1, items: [] } });
+    f.child.send('item/started', { threadId: taskId, turnId: 'composer-turn', item: user });
+    const pending = await waitFrame(f.broker.frames, frame =>
+      snapshotTurn(frame)?.turnId === 'composer-turn' &&
+      ((snapshotTurn(frame)?.items as IpcObject[] | undefined) ?? []).some(item => item.clientId === clientId));
+    assert.equal((snapshotTurn(pending)!.params as IpcObject).turnTrigger, undefined);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    // A full-history refresh may temporarily lack the user item. Acceptance
+    // alone must not apply the local UI overlay to that incomplete turn.
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'composer-turn', status: 'inProgress', itemsView: 'full', items: [] } });
+    f.child.reply(wire.id, { turn: { id: 'composer-turn', status: 'inProgress' } });
+    const accepted = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'composer-first');
+    assert.equal(accepted.resultType, 'success');
+    const record = f.intentStore!.getByClientUserMessageId(clientId);
+    assert.ok(record);
+    assert.equal(f.host.commandStatus(f.controlKey, record.operationId)?.receiptId, 'composer-turn');
+    const acceptedWithoutUser = f.broker.frames.filter(frame =>
+      snapshotTurn(frame)?.turnId === 'composer-turn').at(-1)!;
+    assert.equal((snapshotTurn(acceptedWithoutUser)!.params as IpcObject).turnTrigger, undefined);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'composer-turn', status: 'inProgress', itemsView: 'full', items: [user] } });
+    const overlaid = await waitFrame(f.broker.frames, frame =>
+      snapshotTurn(frame)?.turnId === 'composer-turn' &&
+      (snapshotTurn(frame)?.params as IpcObject | undefined)?.turnTrigger === 'composer');
+    const ui = snapshotTurn(overlaid)!.params as IpcObject;
+    assert.equal(ui.fileAttachmentCount, 0);
+    assert.equal(ui.cwd, 'C:/own');
+    assert.deepEqual(ui.runtimeWorkspaceRoots, ['C:/own']);
+    assert.deepEqual(ui.responsesapiClientMetadata,
+      { source: 'codex', client_type: 'desktop_app' });
+    assert.deepEqual(ui.sandboxPolicy,
+      { type: 'readOnly', networkAccess: false });
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'composer-turn', status: 'inProgress', itemsView: 'full', items: [user] } });
+    const refreshed = await waitFrame(f.broker.frames, frame =>
+      snapshotTurn(frame)?.turnId === 'composer-turn' &&
+      ((frame.params as IpcObject).change as IpcObject).revision === f.owner.metadata.revision);
+    assert.equal((snapshotTurn(refreshed)!.params as IpcObject).turnTrigger, 'composer');
+    f.broker.destroy();
+    await new Promise(resolve => setImmediate(resolve));
+    await f.owner.reconnect(); follow();
+    const resumed = await waitFrame(f.broker.frames, frame =>
+      (snapshotTurn(frame)?.params as IpcObject | undefined)?.turnTrigger === 'composer');
+    assert.equal(snapshotTurn(resumed)?.turnId, 'composer-turn');
+    f.broker.send({ ...request, requestId: 'composer-retry' });
+    const retry = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'composer-retry');
+    assert.equal(retry.resultType, 'success');
+    assert.deepEqual((retry.result as IpcObject).result,
+      { turn: { id: 'composer-turn', status: 'inProgress' } });
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.owner.metadata.state, 'connected');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
 });
 
 test('pending user question survives IPC EOF, answers once, completes only on native resolution', async () => {

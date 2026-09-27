@@ -181,6 +181,12 @@ export class ManagedWorkerFrontendHost {
     return this.#commands.get(controlKey, operationId);
   }
 
+  /** Read-only, HMAC-attested lookup of a previously reserved command intent. */
+  commandStatusForIntent(controlKey: object, command: WorkerCommand): WorkerOperation | null {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.getForIntent(controlKey, command);
+  }
+
   /** Same-worker scoped observation, independent of frontend socket lifetime.
    * This is a live subscription, not a durable event journal or history read.
    * Listeners must apply events synchronously; failure retires that observer.

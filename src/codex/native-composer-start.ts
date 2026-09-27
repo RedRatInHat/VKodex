@@ -125,8 +125,9 @@ export function compileNativeReadOnlyComposerStart(snapshot: unknown, follower: 
   const uiParams: Row = { ...copy(request), ...copy(params), cwd: snapshot.cwd, runtimeWorkspaceRoots: copy(roots),
     sandboxPolicy: copy(snapshot.currentPermissions.sandboxPolicy),
     responsesapiClientMetadata: copy(request.responsesapiClientMetadata),
-    attachments: copy(context.attachments), commentAttachments: copy(context.commentAttachments),
     useAppServerPermissionDefault: false };
+  for (const key of ['attachments', 'commentAttachments'])
+    if (Object.hasOwn(context, key)) uiParams[key] = copy(context[key]);
   if (!Object.hasOwn(request, "environments")) delete uiParams.environments;
   return { request: params, uiParams, localMetadata: copy(context.localTurnMetadata) };
 }
