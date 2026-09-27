@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
+import type { AppServerServerRequest } from '../src/codex/app-server-connection.js';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerNativeOwner } from '../src/desktop/managed-worker-native-owner.js';
@@ -71,11 +72,13 @@ async function waitFrame(frames: IpcObject[], predicate: (frame: IpcObject) => b
     if (Date.now() > end) throw new Error('fixture-frame-timeout');
     await new Promise(resolve => setTimeout(resolve, 5)); }
 }
-async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state()) {
+async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state(),
+  allowAnswer: (request: AppServerServerRequest, response: IpcObject) => boolean = () => false,
+  allowFollower: (id: string) => boolean = id => id === 'follower') {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
-    bootstrapReadMethods: [], adapterKey, allowRequest: () => false, allowAnswer: () => false,
+    bootstrapReadMethods: [], adapterKey, allowRequest: () => true, allowAnswer,
     launch: () => child as unknown as ChildProcessWithoutNullStreams,
     commandPolicy: { controlKey, ownerEpoch, fingerprintKey: randomBytes(32),
       journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-owner-')), 'ops.sqlite'),
@@ -83,7 +86,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   await host.start();
   let broker = new Broker(); const brokers = [broker];
   const owner = new ManagedWorkerNativeOwner({ host, adapterKey, controlKey, taskId, ownerEpoch,
-    isOwnerCurrent: () => true, allowFollower: id => id === 'follower', readInitialState,
+    isOwnerCurrent: () => true, allowFollower, readInitialState,
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
       return broker;
@@ -279,4 +282,124 @@ test('admitted direct start survives owner IPC EOF before final worker write; re
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     assert.equal(f.host.metadata.state, 'running');
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('pending user question survives IPC EOF, answers once, completes only on native resolution', async () => {
+  const f = await fixture(undefined, (_request, response) => !!response.answers);
+  const follow = () => f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed',
+    version: 1, sourceClientId: 'follower',
+    params: { conversationId: taskId, hostId: 'local', following: true } });
+  const latest = (): IpcObject => {
+    const frame = f.broker.frames.filter(value => value.method === 'thread-stream-state-changed').at(-1)!;
+    return ((frame.params as IpcObject).change as IpcObject).conversationState as IpcObject;
+  };
+  try {
+    await f.owner.start(); follow();
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'question-turn', status: 'inProgress', items: [] } });
+    f.broker.destroy(); await new Promise(resolve => setImmediate(resolve));
+    f.child.stdout.write(`${JSON.stringify({ id: 7, method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, turnId: 'question-turn', itemId: 'question-item', questions: [
+        { id: 'q', header: 'Choose', question: 'Continue?', isSecret: false, isOther: false, options: [] },
+      ] } })}\n`);
+    await f.owner.reconnect(); follow();
+    assert.equal((latest().requests as IpcObject[]).length, 1);
+    const request = { requestId: 'answer', sourceClientId: 'follower', hostId: 'local',
+      method: 'thread-follower-submit-user-input', version: 1,
+      params: { conversationId: taskId, requestId: 7, response: { answers: { q: { answers: ['yes'] } } } } };
+    await assert.rejects(f.owner.handle({ ...request,
+      params: { ...request.params, requestId: '7' } }, new AbortController().signal));
+    assert.deepEqual(await f.owner.handle(request, new AbortController().signal), { ok: true });
+    await waitFrame(f.child.frames, frame => frame.id === 7 && !!frame.result);
+    await assert.rejects(f.owner.handle(request, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.id === 7 && !!frame.result).length, 1);
+    assert.equal((latest().requests as IpcObject[]).length, 1);
+    const item = ((latest().turns as IpcObject[])[0]!.items as IpcObject[])[0]!;
+    assert.equal(item.completed, false);
+    f.child.send('serverRequest/resolved', { threadId: taskId, requestId: 7 });
+    assert.equal((latest().requests as IpcObject[]).length, 0);
+    assert.equal((((latest().turns as IpcObject[])[0]!.items as IpcObject[])[0]!).completed, true);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('final follower policy cannot retire Gateway and still authorize an answer', async () => {
+  let arm = false;
+  const f = await fixture(undefined, () => { arm = true; return true; }, id => {
+    if (arm) f.owner.close();
+    return id === 'follower';
+  });
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 't', status: 'inProgress', items: [] } });
+    f.child.stdout.write(`${JSON.stringify({ id: 7, method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, turnId: 't', itemId: 'i', questions: [] } })}\n`);
+    await assert.rejects(f.owner.handle({ requestId: 'answer', sourceClientId: 'follower',
+      method: 'thread-follower-submit-user-input', version: 1,
+      params: { conversationId: taskId, requestId: 7, response: { answers: {} } },
+    }, new AbortController().signal));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.child.frames.some(frame => frame.id === 7 && !!frame.result), false);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('approval routes match the pending method and preserve typed request IDs', async () => {
+  const f = await fixture(undefined, () => true);
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 't', status: 'inProgress', items: [] } });
+    const samples = [
+      { id: 8, method: 'item/commandExecution/requestApproval',
+        route: 'thread-follower-command-approval-decision', extra: { availableDecisions: ['decline'] },
+        reply: { decision: 'decline' } },
+      { id: '8', method: 'item/fileChange/requestApproval',
+        route: 'thread-follower-file-approval-decision', extra: {}, reply: { decision: 'cancel' } },
+      { id: 9, method: 'item/permissions/requestApproval',
+        route: 'thread-follower-permissions-request-approval-response', extra: { permissions: {} },
+        reply: { response: { permissions: {}, scope: 'turn' } } },
+    ];
+    for (const sample of samples) f.child.stdout.write(`${JSON.stringify({ id: sample.id,
+      method: sample.method, params: { threadId: taskId, turnId: 't', itemId: `i-${sample.id}`,
+        ...sample.extra } })}\n`);
+    for (const sample of samples) {
+      const request = { requestId: `reply-${sample.id}`, sourceClientId: 'follower',
+        method: sample.route, version: 1,
+        params: { conversationId: taskId, requestId: sample.id, ...sample.reply } };
+      await assert.rejects(f.owner.handle({ ...request, method: 'thread-follower-submit-user-input' },
+        new AbortController().signal));
+      assert.deepEqual(await f.owner.handle(request, new AbortController().signal), { ok: true });
+      const wire = await waitFrame(f.child.frames, frame => frame.id === sample.id && !!frame.result);
+      assert.deepEqual(wire.result, 'response' in sample.reply ? sample.reply.response : sample.reply);
+    }
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('pending replay fences idle bootstrap; unsupported live request retires only Gateway', async () => {
+  for (const replay of [true, false]) {
+    const f = await fixture(undefined, () => true);
+    try {
+      if (!replay) await f.owner.start();
+      f.child.stdout.write(`${JSON.stringify({ id: 77, method: 'unqualified/request',
+        params: { threadId: taskId, turnId: 't', itemId: 'i' } })}\n`);
+      if (replay) await assert.rejects(f.owner.start());
+      assert.equal(f.owner.metadata.state, 'failed');
+      assert.equal(f.owner.metadata.failure, replay ? 'bootstrap-failed' : 'request-projection-failed');
+      assert.equal(f.host.metadata.state, 'running');
+      assert.equal(f.child.frames.some(frame => frame.id === 77 && ('result' in frame || 'error' in frame)), false);
+      // A different authorized frontend can still answer the same inbox after
+      // retiring the unsupported renderer; no cancellation was fabricated.
+      const responder = f.host.createRequestResponder(f.controlKey);
+      assert.equal(responder.answer(77, {}), true);
+      await waitFrame(f.child.frames, frame => frame.id === 77 && !!frame.result);
+      responder.detach();
+    } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  }
 });

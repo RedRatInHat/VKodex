@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { AppServerConnection } from './app-server-connection.js';
 import type { AppServerEnvelope } from './app-server-connection.js';
 import { AppServerRequestInbox } from './app-server-request-inbox.js';
-import type { RequestInboxOptions } from './app-server-request-inbox.js';
+import type { PendingRequestResponder, RequestFrame, RequestInboxOptions } from './app-server-request-inbox.js';
 import { PersistentFrontendSessions } from './persistent-frontend-session.js';
 import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
@@ -44,6 +44,11 @@ export interface ManagedWorkerNotification {
   readonly taskId: string;
   readonly generation: number;
   readonly notification: AppServerEnvelope;
+}
+export interface ManagedWorkerPendingRequest {
+  readonly taskId: string;
+  readonly generation: number;
+  readonly request: RequestFrame;
 }
 export type WorkerObserverFailure = 'observer-failed' | 'backend-lost' | 'owner-stopped';
 
@@ -92,6 +97,7 @@ export class ManagedWorkerFrontendHost {
   readonly #rpc: AppServerConnection;
   readonly #commandPolicy: WorkerCommandPolicy | null;
   #commands: ManagedWorkerCommandDispatcher | null = null;
+  #inbox: AppServerRequestInbox | null = null;
   #state: HostState = 'new';
   #launched = false;
   #stopRequested = false;
@@ -226,6 +232,65 @@ export class ManagedWorkerFrontendHost {
     for (const failObserver of this.#observers.values()) failObserver(reason);
   }
 
+  /** Observe inbox requests without replacing the persistent frontend attachment. */
+  observePendingRequests(adapterKey: object, listener: (event: ManagedWorkerPendingRequest) => void,
+    onFailure: (reason: WorkerObserverFailure) => void): () => void {
+    if (adapterKey !== this.#adapterKey || typeof listener !== 'function' || typeof onFailure !== 'function')
+      throw new TypeError('Unauthorized pending-request observer');
+    const inbox = this.#inbox; const generation = this.#backendGeneration;
+    if (!inbox || this.#state !== 'running' || generation === null || !this.#rpc.isSessionCurrent(generation))
+      throw new Error('Pending request observation unavailable');
+    let active = true; let inboxDetach: (() => void) | null = null;
+    const detach = () => {
+      if (!active) return;
+      active = false; inboxDetach?.(); this.#observers.delete(detach);
+    };
+    const failed = (reason: WorkerObserverFailure) => {
+      if (!active) return;
+      detach(); try { void Promise.resolve(onFailure(reason)).catch(() => {}); } catch { /* isolated */ }
+    };
+    // Register host retirement before Inbox's synchronous replay can re-enter stop/loss.
+    this.#observers.set(detach, failed);
+    try {
+      const received = inbox.observePending(frame => {
+        if (!active || !['running', 'restarting', 'frontend-unavailable'].includes(this.#state) || this.#stopRequested ||
+            !this.#rpc.isSessionCurrent(generation)) return;
+        try {
+          const returned: unknown = listener(Object.freeze({ taskId: this.#taskId, generation, request: structuredClone(frame) }));
+          if (returned !== null && (typeof returned === 'object' || typeof returned === 'function') &&
+              'then' in returned && typeof returned.then === 'function') {
+            void Promise.resolve(returned).catch(() => {}); failed('observer-failed');
+          }
+        } catch { failed('observer-failed'); }
+      }, () => failed('observer-failed'));
+      inboxDetach = received;
+      if (!active) received();
+    } catch (error) { failed('observer-failed'); throw error; }
+    return detach;
+  }
+
+  /** Capability for an owner command policy; it neither exposes Inbox nor replaces its attachment. */
+  createRequestResponder(controlKey: object, isAuthorized: () => boolean = () => true): PendingRequestResponder {
+    if (typeof isAuthorized !== 'function') throw new TypeError('Request responder authority required');
+    const inbox = this.#inbox; const policy = this.#commandPolicy; const generation = this.#backendGeneration;
+    if (!inbox || !policy || controlKey !== policy.controlKey ||
+      !['running', 'restarting', 'frontend-unavailable'].includes(this.#state) || generation === null)
+      throw new Error('Worker request responder unavailable');
+    const authorized = (): boolean => {
+      if (this.#stopRequested || !['running', 'restarting', 'frontend-unavailable'].includes(this.#state) || this.#backendGeneration !== generation ||
+          !this.#rpc.isSessionCurrent(generation)) return false;
+      const scope = { ownerEpoch: policy.ownerEpoch, backendGeneration: generation, threadId: this.#taskId };
+      let current = false; let narrow = false;
+      try { current = policy.isOwnerCurrent(scope) === true; if (current) narrow = isAuthorized() === true; }
+      catch { return false; }
+      if (!(current && narrow)) return false;
+      try { if (policy.isOwnerCurrent(scope) !== true) return false; } catch { return false; }
+      return !this.#stopRequested && ['running', 'restarting', 'frontend-unavailable'].includes(this.#state) &&
+        this.#backendGeneration === generation && this.#rpc.isSessionCurrent(generation);
+    };
+    return inbox.createResponder(authorized);
+  }
+
   /** The token is available only to the caller holding the constructor's key. */
   frontendCapability(adapterKey: object): Readonly<{ host: string; port: number; token: string }> {
     if (adapterKey !== this.#adapterKey) throw new TypeError('Unauthorized frontend adapter');
@@ -261,6 +326,7 @@ export class ManagedWorkerFrontendHost {
         generation: session.generation,
         isGenerationCurrent: generation => this.#rpc.isSessionCurrent(generation),
         ...this.#requestPolicy });
+      this.#inbox = inbox;
       // Exactly one backend handler. This host owns its private RPC instance.
       this.#rpc.onServerRequest((request, context) => inbox.handle(request, context));
       this.#sessions = new PersistentFrontendSessions({

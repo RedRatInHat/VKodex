@@ -1,13 +1,16 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { ManagedWorkerFrontendHost, ManagedWorkerNotification } from '../codex/managed-worker-frontend-host.js';
+import type { RequestFrame } from '../codex/app-server-request-inbox.js';
+import { compileNativeRequestResponse } from '../codex/native-request-response.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
-import { applyNotification } from '../codex/managed-native-projection.js';
+import { applyNotification, projectNativeServerRequest } from '../codex/managed-native-projection.js';
 import { DesktopIpcClient } from './ipc-client.js';
 import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-client.js';
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 
-type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse'>;
+type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
+  'observePendingRequests' | 'createRequestResponder'>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
 const knownVersions = new Map<string, number>([
@@ -22,6 +25,9 @@ const knownVersions = new Map<string, number>([
   ['thread-follower-submit-mcp-server-elicitation-response', 1],
   ['thread-follower-set-queued-follow-ups-state', 1],
 ]);
+const replyMethods = new Set(['thread-follower-submit-user-input',
+  'thread-follower-permissions-request-approval-response',
+  'thread-follower-command-approval-decision', 'thread-follower-file-approval-decision']);
 const object = (value: unknown): value is IpcObject =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const copy = <T>(value: T): T => structuredClone(value);
@@ -65,6 +71,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #authorityRevision = 0;
   #bootstrapEvents = 0;
   #detachObserver: (() => void) | null = null;
+  #detachRequests: (() => void) | null = null;
   #client: DesktopIpcClient | null = null;
   #startHandler: ManagedWorkerNativeStartHandler | null = null;
   #startPromise: Promise<void> | null = null;
@@ -73,6 +80,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   constructor(options: ManagedWorkerNativeOwnerOptions) {
     if (!options || !options.host || typeof options.host.observeNotifications !== 'function' ||
         typeof options.host.executeCommandWithResponse !== 'function' ||
+        typeof options.host.observePendingRequests !== 'function' ||
+        typeof options.host.createRequestResponder !== 'function' ||
         !options.adapterKey || typeof options.adapterKey !== 'object' ||
         !options.controlKey || typeof options.controlKey !== 'object' ||
         typeof options.taskId !== 'string' || !options.taskId ||
@@ -131,6 +140,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     this.#state = 'failed'; this.#failure = reason;
     this.#followers.clear(); this.#grants.clear(); this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
+    this.#detachRequests?.(); this.#detachRequests = null;
     this.#startHandler?.close(); this.#client?.close();
   }
 
@@ -153,6 +163,21 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     } catch { this.#fail('projection-failed'); }
   }
 
+  #observeRequest(event: { taskId: string; generation: number; request: RequestFrame }): void {
+    if (this.#state === 'bootstrapping') { this.#bootstrapEvents++; return; }
+    if (this.#state !== 'connected' && this.#state !== 'disconnected') return;
+    if (!this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
+        event.generation !== this.#generation || !this.#projection) {
+      this.#fail('owner-changed'); return;
+    }
+    try {
+      const next = projectNativeServerRequest(this.#projection, event.request);
+      if (next === this.#projection) return;
+      this.#projection = next; this.#revision++;
+      for (const source of this.#followers.keys()) this.#sendSnapshot(source);
+    } catch { this.#fail('request-projection-failed'); }
+  }
+
   start(): Promise<void> {
     if (this.#state === 'connected') return Promise.resolve();
     if (this.#startPromise) return this.#startPromise;
@@ -170,6 +195,10 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#generation = meta.backendGeneration;
       this.#detachObserver = this.#options.host.observeNotifications(this.#options.adapterKey,
         event => this.#observe(event), () => this.#fail('observer-failed'));
+      const detachRequests = this.#options.host.observePendingRequests(this.#options.adapterKey,
+        event => this.#observeRequest(event), () => this.#fail('request-observer-failed'));
+      if (this.#state !== 'bootstrapping') { detachRequests(); throw refuse(); }
+      this.#detachRequests = detachRequests;
       const initial = this.#validateInitial(await this.#options.readInitialState());
       if (this.#state !== 'bootstrapping' || this.#bootstrapEvents !== 0 || !this.#ownerCurrent()) throw refuse();
       this.#projection = initial;
@@ -249,6 +278,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       if (!this.#sendSnapshot(request.sourceClientId)) throw refuse();
       return { revision: this.#revision };
     }
+    if (replyMethods.has(request.method)) return this.#answerRequest(request);
     if (request.method !== 'thread-follower-start-turn') throw refuse();
     if (!this.#followerCurrent(request.sourceClientId) || !this.#startHandler ||
         this.#grants.size >= 128 || this.#grants.has(request.requestId)) throw refuse();
@@ -262,8 +292,29 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     } finally { if (this.#grants.get(request.requestId) === grant) this.#grants.delete(request.requestId); }
   }
 
+  #answerRequest(request: IpcIncomingRequest): IpcObject {
+    const params = request.params;
+    if (!this.#followerCurrent(request.sourceClientId)) throw refuse();
+    const pending = this.#projection?.requests.find(value => value.id === params.requestId);
+    if (!pending) throw refuse();
+    const response = compileNativeRequestResponse(request.method, params, pending);
+    // The inbox retains the sole response writer. This capability only narrows
+    // its existing policy and never replaces the native frontend attachment.
+    const responder = this.#options.host.createRequestResponder(this.#options.controlKey, () =>
+      this.#state === 'connected' && this.#ownerCurrent() && this.#followerCurrent(request.sourceClientId) &&
+      this.#projection?.requests.some(value => value.id === pending.id && value.method === pending.method) === true);
+    try {
+      if (!responder.answer(pending.id, response)) throw refuse();
+      // Native IPC acknowledges local submission. Only serverRequest/resolved
+      // may remove the projected request or mark its transcript completed.
+      return { ok: true };
+    } finally { responder.detach(); }
+  }
+
   #followerCurrent(source: string): boolean {
-    try { return this.#followers.has(source) && this.#options.allowFollower(source) === true; }
+    const lease = this.#followers.get(source);
+    try { return lease !== undefined && this.#options.allowFollower(source) === true &&
+      this.#followers.get(source) === lease && this.#state === 'connected'; }
     catch { return false; }
   }
 
@@ -318,6 +369,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     this.#state = 'closed'; this.#followers.clear(); this.#grants.clear();
     this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
+    this.#detachRequests?.(); this.#detachRequests = null;
     this.#startHandler?.close(); this.#client?.close();
   }
 }

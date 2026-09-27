@@ -6,6 +6,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AppServerInitializedSession, AppServerRequestOptions,
   AppServerResponseEnvelope } from '../src/codex/app-server-connection.js';
 import { PersistentFrontendSessions } from '../src/codex/persistent-frontend-session.js';
+import { AppServerRequestInbox } from '../src/codex/app-server-request-inbox.js';
 
 type JsonObject = Record<string, unknown>;
 type TestFrame = JsonObject & {
@@ -291,6 +292,111 @@ test('actual inbox and connection preserve wire order, replay, and native error'
       assert.equal(child.messages.filter(frame => frame.method === 'initialize').length, 1);
     } finally { await rpc.close(); }
   });
+
+test('inbox observer and independent responder coexist with frontend attachment and typed replay', async () => {
+  let current = true;
+  const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
+    isGenerationCurrent: () => current, allowRequest: () => true,
+    allowAnswer: () => true, allowError: () => true });
+  const controller = new AbortController();
+  const written = deferred<void>();
+  const request = (id: string | number) => ({ id, method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } });
+  const numeric = inbox.handle(request(7), { signal: controller.signal, responseWritten: written.promise });
+  const literal = inbox.handle(request('7'), { signal: controller.signal, responseWritten: written.promise });
+  const frontendFrames: JsonObject[] = [];
+  const frontend = inbox.attach(frame => frontendFrames.push(frame));
+  const observerFrames: JsonObject[] = [], faults: string[] = [];
+  const detach = inbox.observePending(frame => { observerFrames.push(frame); frame.params.questions = ['tampered']; },
+    reason => faults.push(reason));
+  const live = inbox.handle(request(8), { signal: controller.signal, responseWritten: written.promise });
+  assert.deepEqual(frontendFrames.map(frame => frame.id), [7, '7', 8]);
+  assert.deepEqual(observerFrames.map(frame => frame.id), [7, '7', 8]);
+  assert.deepEqual(frontendFrames[0]!.params, request(7).params);
+  let authorized = true;
+  const responder = inbox.createResponder(() => authorized);
+  assert.equal(responder.answer(7, { answers: { n: 'native' } }), true);
+  assert.equal(frontend.answer(7, { answers: {} }), false);
+  assert.deepEqual(await numeric, { answers: { n: 'native' } });
+  assert.equal(frontend.answer('7', { answers: {} }), true);
+  assert.deepEqual(await literal, { answers: {} });
+  assert.equal(responder.answer('7', { answers: {} }), false);
+  assert.equal(responder.answer(8, { answers: { live: true } }), true);
+  assert.deepEqual(await live, { answers: { live: true } });
+  responder.detach(); detach(); frontend.detach(); current = false;
+  assert.deepEqual(faults, []);
+});
+
+test('faulty pending observers retire alone and frontend EOF leaves typed requests replayable', async () => {
+  const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
+    isGenerationCurrent: () => true, allowRequest: () => true,
+    allowAnswer: () => true });
+  const controller = new AbortController(), written = deferred<void>();
+  const pending = inbox.handle({ id: '7', method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } },
+  { signal: controller.signal, responseWritten: written.promise });
+  const errors: string[] = [];
+  inbox.observePending(() => { throw new Error('observer failed'); }, reason => errors.push(reason));
+  inbox.observePending((() => Promise.reject(new Error('async observer failed'))) as () => void,
+    reason => errors.push(reason));
+  assert.deepEqual(errors, ['observer-faulted', 'observer-faulted']);
+  const first = inbox.attach(() => {}); first.detach();
+  const replayed: Array<string | number> = [];
+  const detach = inbox.observePending(frame => replayed.push(frame.id), () => {});
+  assert.deepEqual(replayed, ['7']);
+  const second = inbox.attach(frame => replayed.push(String(frame.id)));
+  assert.deepEqual(replayed, ['7', '7']);
+  assert.equal(first.answer('7', {}), false);
+  assert.equal(second.answer(7, {}), false);
+  assert.equal(second.answer('7', { answers: {} }), true);
+  assert.deepEqual(await pending, { answers: {} });
+  detach(); second.detach();
+});
+
+test('independent responder loses authority during policy and never bypasses answer policy', async () => {
+  let current = true, authorized = true, policyCalls = 0;
+  const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
+    isGenerationCurrent: () => current, allowRequest: () => true,
+    allowAnswer: () => { policyCalls++; authorized = false; return true; },
+    allowError: () => false });
+  const controller = new AbortController(), written = deferred<void>();
+  const pending = inbox.handle({ id: 7, method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } },
+  { signal: controller.signal, responseWritten: written.promise });
+  const responder = inbox.createResponder(() => authorized);
+  assert.equal(responder.answer('7', {}), false);
+  assert.equal(responder.reject(7, { code: -32602, message: 'No' }), false);
+  assert.equal(policyCalls, 0);
+  assert.equal(responder.answer(7, {}), false);
+  assert.equal(policyCalls, 1);
+  authorized = true; current = false;
+  assert.equal(responder.answer(7, {}), false);
+  current = true; responder.detach();
+  assert.equal(responder.answer(7, {}), false);
+  const frontend = inbox.attach(() => {});
+  assert.equal(frontend.answer(7, {}), true);
+  assert.equal(policyCalls, 2);
+  assert.deepEqual(await pending, {});
+  frontend.detach();
+});
+
+test('responder self-detach in post-policy authority callback cannot settle pending request', async () => {
+  const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
+    isGenerationCurrent: () => true, allowRequest: () => true, allowAnswer: () => true });
+  const controller = new AbortController(), written = deferred<void>();
+  const pending = inbox.handle({ id: 9, method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } },
+  { signal: controller.signal, responseWritten: written.promise });
+  let calls = 0;
+  let responder!: ReturnType<typeof inbox.createResponder>;
+  responder = inbox.createResponder(() => { if (++calls === 2) responder.detach(); return true; });
+  assert.equal(responder.answer(9, {}), false);
+  assert.equal(calls, 2);
+  const frontend = inbox.attach(() => {});
+  assert.equal(frontend.answer(9, { answers: {} }), true);
+  assert.deepEqual(await pending, { answers: {} });
+  frontend.detach();
+});
 
 test('bootstrap reads are opt-in, validated, and leave mutations unavailable', async () => {
   const backend = fakeBackend();

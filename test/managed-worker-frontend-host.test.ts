@@ -156,6 +156,83 @@ test('observer retirement cannot reenter a second owner stop', async () => {
   assert.strictEqual(reentered, stopping);
 });
 
+test('pending observer replays without replacing the persistent frontend inbox attachment', async () => {
+  const child = new Child(), key = {}, { managed } = host(child, key);
+  await managed.start();
+  try {
+    const frontend = await client(managed.frontendCapability(key));
+    frontend.send({ id: 1, method: 'initialize', params: init });
+    assert.equal((await frontend.next()).id, 1);
+    child.send({ id: 'pending-replay', method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    const seen: unknown[] = []; const failures: string[] = [];
+    assert.throws(() => managed.observePendingRequests({}, () => {}, () => {}), TypeError);
+    managed.observePendingRequests(key, async () => { throw new Error('async observer'); }, reason => failures.push(reason));
+    const detach = managed.observePendingRequests(key, event => seen.push(event), reason => failures.push(reason));
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], { taskId, generation: 1,
+      request: { id: 'pending-replay', method: 'item/tool/requestUserInput', params: { threadId: taskId, questions: [] } } });
+    assert.equal((await frontend.next()).id, 'pending-replay');
+    detach(); child.disconnect();
+    assert.deepEqual(failures, ['observer-failed']);
+  } finally { await managed.stop('test-cleanup'); }
+});
+
+test('synchronous pending replay may stop the host without retaining an orphan observer', async () => {
+  const child = new Child(), key = {}, { managed } = host(child, key);
+  await managed.start();
+  child.send({ id: 'stop-replay', method: 'item/tool/requestUserInput', params: { threadId: taskId, questions: [] } });
+  await new Promise(resolve => setImmediate(resolve));
+  let stopped: Promise<void> | undefined;
+  const detach = managed.observePendingRequests(key, () => { stopped = managed.stop('owner-request'); }, () => {});
+  await stopped;
+  detach(); detach();
+  assert.equal(managed.metadata.state, 'stopped');
+});
+
+test('request responder is command-key scoped, policy fenced, and invalidated by loss', async () => {
+  const f = commandFixture(); await f.managed.start();
+  try {
+    assert.throws(() => f.managed.createRequestResponder({}), /responder/i);
+    let narrow = true;
+    const responder = f.managed.createRequestResponder(f.controlKey, () => narrow);
+    f.child.send({ id: 'native-answer', method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(responder.answer('native-answer', { answers: {} }), true);
+    assert.equal(responder.answer('native-answer', { answers: {} }), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.child.messages.filter(frame => frame.id === 'native-answer' && 'result' in frame).length, 1);
+    f.child.send({ id: 'revoked-answer', method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    narrow = false; assert.equal(responder.answer('revoked-answer', { answers: {} }), false);
+    f.child.disconnect(); assert.equal(responder.answer('revoked-answer', { answers: {} }), false);
+    responder.detach();
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('responder remains usable across frontend restart but a reentrant final guard cannot settle', async () => {
+  const f = commandFixture(); await f.managed.start();
+  try {
+    const observed: unknown[] = [];
+    f.managed.observePendingRequests(f.adapterKey, event => observed.push(event.request.id), () => {});
+    const restarting = f.managed.restartFrontend();
+    f.child.send({ id: 'restart-answer', method: 'item/tool/requestUserInput', params: { threadId: taskId, questions: [] } });
+    assert.deepEqual(observed, ['restart-answer']);
+    const responder = f.managed.createRequestResponder(f.controlKey);
+    assert.equal(responder.answer('restart-answer', { answers: {} }), true);
+    await restarting;
+    f.child.send({ id: 'reentrant-answer', method: 'item/tool/requestUserInput', params: { threadId: taskId, questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    const revoked = f.managed.createRequestResponder(f.controlKey, () => { void f.managed.stop('owner-request'); return true; });
+    assert.equal(revoked.answer('reentrant-answer', { answers: {} }), false);
+    await f.managed.stop('test-cleanup');
+    responder.detach(); revoked.detach();
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
 test('one backend and one handler survive listener restart; old capability and answer fail', async () => {
   const child = new Child(); const key = {};
   const fixture = host(child, key); const managed = fixture.managed;

@@ -4,7 +4,12 @@ import type { AppServerServerRequest,
   AppServerServerRequestContext } from "./app-server-connection.js";
 
 type JsonObject = Record<string, unknown>;
-type RequestFrame = Readonly<{ id: string | number; method: string; params: JsonObject }>;
+export type RequestFrame = Readonly<{ id: string | number; method: string; params: JsonObject }>;
+export interface PendingRequestResponder {
+  detach(): void;
+  answer(id: string | number, result: JsonObject): boolean;
+  reject(id: string | number, error: JsonObject): boolean;
+}
 const object = (value: unknown): value is JsonObject =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const validId = (id: unknown): id is string | number =>
@@ -43,6 +48,12 @@ interface Pending {
   readonly reject: (error: Error) => void;
   readonly abort: () => void;
   answered: boolean;
+  settling: boolean;
+}
+interface PendingObserver {
+  readonly listener: (frame: RequestFrame) => void;
+  readonly onFailure: (reason: string) => void;
+  active: boolean;
 }
 
 /** A worker-scoped inbox. The caller must explicitly compose its one App Server
@@ -54,6 +65,7 @@ export class AppServerRequestInbox {
   private readonly maxPending: number;
   private epoch = 0;
   private attachment: { readonly epoch: number; readonly send: (frame: RequestFrame) => void } | null = null;
+  private readonly observers = new Set<PendingObserver>();
 
   constructor(options: RequestInboxOptions) {
     if (!options.threadId || !Number.isSafeInteger(options.generation) || options.generation < 1 ||
@@ -87,6 +99,54 @@ export class AppServerRequestInbox {
     catch { if (this.attachment === attachment) this.attachment = null; }
   }
 
+  private observerFailure(observer: PendingObserver): void {
+    if (!observer.active) return;
+    observer.active = false;
+    this.observers.delete(observer);
+    try { void Promise.resolve(observer.onFailure("observer-faulted")).catch(() => {}); }
+    catch { /* A faulty failure reporter cannot affect the pending worker request. */ }
+  }
+
+  private notify(observer: PendingObserver, pending: Pending): void {
+    if (!observer.active || pending.answered || pending.context.signal.aborted || !this.current()) return;
+    try {
+      const returned: unknown = observer.listener(this.frame(pending.request));
+      if (returned !== null && (typeof returned === "object" || typeof returned === "function") &&
+          typeof (returned as { then?: unknown }).then === "function") {
+        void Promise.resolve(returned).catch(() => {});
+        this.observerFailure(observer);
+      }
+    } catch { this.observerFailure(observer); }
+  }
+
+  /** Independent read-only pending-request feed; never installs a backend handler. */
+  observePending(listener: (frame: RequestFrame) => void,
+    onFailure: (reason: string) => void): () => void {
+    if (typeof listener !== "function" || typeof onFailure !== "function")
+      throw new TypeError("Pending observer callbacks required");
+    const observer: PendingObserver = { listener, onFailure, active: true };
+    this.observers.add(observer);
+    for (const pending of [...this.pending.values()]) {
+      if (!observer.active) break;
+      if (this.pending.get(this.key(pending.request.id)) === pending) this.notify(observer, pending);
+    }
+    return () => { observer.active = false; this.observers.delete(observer); };
+  }
+
+  /** Separate response capability; attachment and responder use the same one-winner settlement. */
+  createResponder(isAuthorized: () => boolean): PendingRequestResponder {
+    if (typeof isAuthorized !== "function") throw new TypeError("Responder authority required");
+    let active = true;
+    const eligible = () => {
+      if (!active) return false;
+      const approved = isAuthorized() === true;
+      return approved && active;
+    };
+    return { detach: () => { active = false; },
+      answer: (id, result) => this.answer(eligible, id, result),
+      reject: (id, error) => this.answer(eligible, id, error, true) };
+  }
+
   attach(send: (frame: RequestFrame) => void): {
     readonly epoch: number;
     detach(): void;
@@ -103,35 +163,36 @@ export class AppServerRequestInbox {
     return {
       epoch: attachment.epoch,
       detach: () => { if (this.attachment === attachment) this.attachment = null; },
-      answer: (id, result) => this.answer(attachment, id, result),
-      reject: (id, error) => this.answer(attachment, id, error, true),
+      answer: (id, result) => this.answer(() => this.attachment === attachment, id, result),
+      reject: (id, error) => this.answer(() => this.attachment === attachment, id, error, true),
     };
   }
 
-  private answer(attachment: { readonly epoch: number }, id: string | number, result: JsonObject,
+  private answer(eligible: () => boolean, id: string | number, result: JsonObject,
     negative = false): boolean {
-    if (this.attachment !== attachment || !this.current() || !validId(id) || !object(result)) return false;
+    if (!validId(id) || !object(result)) return false;
     const pending = this.pending.get(this.key(id));
-    if (!pending || pending.answered || pending.context.signal.aborted ||
+    if (!pending || pending.answered || pending.settling || pending.context.signal.aborted ||
       pending.request.params.threadId !== this.options.threadId) return false;
-    let answer: JsonObject;
-    let error: AppServerFrontendResponseError | undefined;
+    pending.settling = true;
     try {
-      answer = jsonClone(result);
+      if (!eligible() || !this.current()) return false;
+      const answer = jsonClone(result);
+      let error: AppServerFrontendResponseError | undefined;
       if (negative) {
         error = new AppServerFrontendResponseError(answer);
-        if (!this.options.allowError?.(structuredClone(pending.request), error.wireError)) return false;
-      } else if (!this.options.allowAnswer(structuredClone(pending.request), structuredClone(answer))) return false;
+        if (this.options.allowError?.(structuredClone(pending.request), error.wireError) !== true) return false;
+      } else if (this.options.allowAnswer(structuredClone(pending.request), structuredClone(answer)) !== true) return false;
+      if (!eligible() || !this.current() || this.pending.get(this.key(id)) !== pending ||
+        pending.answered || pending.context.signal.aborted) return false;
+      pending.answered = true;
+      if (error) pending.reject(error);
+      else pending.resolve(answer);
+      // This receipt confirms only a local write attempt, never worker acceptance.
+      void pending.context.responseWritten.then(() => this.retire(id, pending), () => this.retire(id, pending));
+      return true;
     } catch { return false; }
-    if (this.attachment !== attachment || !this.current() ||
-      this.pending.get(this.key(id)) !== pending || pending.answered ||
-      pending.context.signal.aborted) return false;
-    pending.answered = true;
-    if (error) pending.reject(error);
-    else pending.resolve(answer);
-    // This receipt confirms only a local write attempt, never worker acceptance.
-    void pending.context.responseWritten.then(() => this.retire(id, pending), () => this.retire(id, pending));
-    return true;
+    finally { pending.settling = false; }
   }
 
   handle(request: AppServerServerRequest, context: AppServerServerRequestContext): Promise<JsonObject> {
@@ -142,7 +203,7 @@ export class AppServerRequestInbox {
     let approved: boolean;
     try { approved = this.options.allowRequest(structuredClone(request)); }
     catch { approved = false; }
-    if (!approved || !this.current() || context.signal.aborted)
+    if (approved !== true || !this.current() || context.signal.aborted)
       return Promise.reject(new Error("Server request outside inbox policy"));
     const key = this.key(request.id);
     const prior = this.pending.get(key);
@@ -155,12 +216,15 @@ export class AppServerRequestInbox {
     const pending: Pending = {
       request: structuredClone(request), context, promise, resolve, reject,
       abort: () => this.retire(request.id, pending, new Error("Server request resolved or connection lost")),
-      answered: false,
+      answered: false, settling: false,
     };
     this.pending.set(key, pending);
     context.signal.addEventListener("abort", pending.abort, { once: true });
     if (context.signal.aborted) pending.abort();
-    else this.deliver(pending);
+    else {
+      for (const observer of [...this.observers]) this.notify(observer, pending);
+      this.deliver(pending);
+    }
     return promise;
   }
 
