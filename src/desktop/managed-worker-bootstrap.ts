@@ -1,5 +1,6 @@
 import { connect } from 'node:net';
 import type { Socket } from 'node:net';
+import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
@@ -37,7 +38,44 @@ export interface ManagedWorkerBootstrap {
   /** Re-read the same worker before a first owner start; never resumes or writes. */
   readInitialState(): Promise<NativeProjectionState>;
   /** Current idle evidence only; does not recertify historical permissions. */
-  verifyIdle(): Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
+  verifyIdle(expectedTurnIds?: readonly string[]): Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
+  /** Actual current policy on the same loaded worker; no turn/model write. */
+  qualifyContinuation(ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence>;
+}
+export interface ContinuationOwnerFence {
+  readonly threadId: string;
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  /** Must advance on meaningful settings, turn, request, queue and owner-reconnect transitions. */
+  readonly semanticRevision: number;
+  readonly pendingRequests: number;
+  readonly queuedFollowUps: number;
+  readonly inFlightCommands: number;
+  readonly unconfirmedOperations: boolean;
+}
+/** Definite idle-history evidence insufficient for an accepted start; not a transport failure. */
+export class ManagedWorkerIdleProofRefusedError extends Error {
+  readonly reason = 'accepted-turn-not-terminal' as const;
+  constructor() {
+    super('accepted-turn-not-terminal');
+    this.name = 'ManagedWorkerIdleProofRefusedError';
+  }
+}
+export interface QualifiedContinuationEvidence {
+  readonly owner: ContinuationOwnerFence;
+  readonly turnCount: number;
+  readonly latestTurnId: string | null;
+  /** Ephemeral history anchor; no transcript content is returned. */
+  readonly historyDigest: string;
+  readonly effective: Readonly<{
+    model: 'gpt-5.6-sol'; effort: 'low'; cwd: string;
+    activePermissionProfileId: ':read-only'; approvalPolicy: 'never' | 'on-request';
+    approvalsReviewer: 'user'; sandboxType: 'readOnly'; networkAccess: false;
+    serviceTier: 'default' | null;
+    runtimeWorkspaceRoots: readonly string[];
+    environments: readonly Row[];
+  }>;
+  readonly composerDefaults: ComposerDefaults;
 }
 
 function object(value: unknown): value is Row { return value !== null && typeof value === 'object' && !Array.isArray(value); }
@@ -290,15 +328,88 @@ function initialProjection(start: Row, read: Row, taskId: string, cwd: string): 
   return state;
 }
 
+function ownerFenceSnapshot(value: unknown, taskId: string, generation: number): ContinuationOwnerFence {
+  if (!object(value) || value.threadId !== taskId || typeof value.ownerEpoch !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value.ownerEpoch) ||
+    /^0{8}-0{4}-0{4}-0{4}-0{12}$/u.test(value.ownerEpoch) ||
+    value.backendGeneration !== generation || !Number.isSafeInteger(value.semanticRevision) ||
+    (value.semanticRevision as number) < 0 ||
+    ![value.pendingRequests, value.queuedFollowUps, value.inFlightCommands].every(count =>
+      Number.isSafeInteger(count) && (count as number) === 0) ||
+    value.unconfirmedOperations !== false)
+    fail('continuation-owner-fence-unqualified');
+  return freezeTree(jsonCopy(value as unknown as ContinuationOwnerFence));
+}
+function currentThreadTuple(thread: Row, cwd: string): Row {
+  if (thread.model !== 'gpt-5.6-sol' || thread.reasoningEffort !== 'low' ||
+    !samePath(thread.cwd, cwd) || !Array.isArray(thread.environments) || thread.environments.length > 1)
+    fail('continuation-current-thread-unqualified');
+  if (thread.environments.length === 1) {
+    const environment = thread.environments[0];
+    if (!object(environment) || environment.environmentId !== 'local' ||
+      !strictKeys(environment, ['environmentId', 'cwd', 'runtimeWorkspaceRoots']) ||
+      !samePath(environment.cwd, cwd) || !isDeepStrictEqual(environment.runtimeWorkspaceRoots, [cwd]))
+      fail('continuation-current-environment-unqualified');
+  }
+  return { model: thread.model, effort: thread.reasoningEffort, cwd,
+    environments: jsonCopy(thread.environments) };
+}
+function effectiveContinuation(resume: Row, taskId: string, cwd: string): QualifiedContinuationEvidence['effective'] {
+  const thread = threadOf(resume, taskId, cwd, ['idle']);
+  const current = currentThreadTuple(thread, cwd);
+  if (resume.model !== current.model || resume.reasoningEffort !== current.effort ||
+    !samePath(resume.cwd, cwd) || !object(resume.activePermissionProfile) ||
+    resume.activePermissionProfile.id !== ':read-only' || !object(resume.sandbox) ||
+    resume.sandbox.type !== 'readOnly' || resume.sandbox.networkAccess !== false ||
+    !strictKeys(resume.sandbox, ['type', 'networkAccess']) ||
+    !isDeepStrictEqual(resume.runtimeWorkspaceRoots, [cwd]) ||
+    (resume.serviceTier !== null && resume.serviceTier !== 'default') ||
+    !['never', 'on-request'].includes(resume.approvalPolicy as string) ||
+    resume.approvalsReviewer !== 'user') fail('continuation-effective-policy-unqualified');
+  return freezeTree({ model: 'gpt-5.6-sol' as const, effort: 'low' as const, cwd,
+    activePermissionProfileId: ':read-only' as const,
+    approvalPolicy: resume.approvalPolicy as 'never' | 'on-request',
+    approvalsReviewer: 'user' as const, sandboxType: 'readOnly' as const,
+    networkAccess: false as const, serviceTier: resume.serviceTier as 'default' | null,
+    runtimeWorkspaceRoots: [cwd],
+    environments: current.environments as Row[] });
+}
+interface ContinuationPhase {
+  readonly turns: Row[];
+  readonly historyDigest: string;
+  readonly current: Row;
+}
+async function continuationPhase(reader: FrontendReader, taskId: string, cwd: string): Promise<ContinuationPhase> {
+  const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
+    taskId, cwd, ['idle']);
+  const before = currentThreadTuple(first, cwd);
+  const turns = await fullHistory(reader, taskId);
+  await noGoalOrQueue(reader, taskId);
+  const last = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
+    taskId, cwd, ['idle']);
+  if (!isDeepStrictEqual(before, currentThreadTuple(last, cwd)) ||
+    !isDeepStrictEqual(first.turns, last.turns) || (last.turns as unknown[]).length !== turns.length ||
+    !turns.every((turn, index) => {
+      const observed = (last.turns as unknown[])[index];
+      return terminalStatuses.has(turn.status as string) && object(observed) &&
+        terminalStatuses.has(observed.status as string) && observed.status === turn.status &&
+        observed.id === turn.id;
+    })) fail('continuation-history-unstable-or-nonterminal');
+  return { turns, historyDigest: createHash('sha256').update(JSON.stringify(turns)).digest('hex'),
+    current: before };
+}
+
 /** Qualifies one already-running, owner-scoped backend. Never launches or stops it. */
 export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOptions): Promise<ManagedWorkerBootstrap> {
   const { generation, resume, initialize } = scope(options);
   const host = options.host, adapterKey = options.adapterKey, taskId = options.taskId, cwd = options.cwd;
   const guard = () => current(host, taskId, generation);
-  const withReader = async <T>(work: (reader: FrontendReader) => Promise<T>): Promise<T> => {
-    guard();
-    const reader = await FrontendReader.open(host.frontendCapability(adapterKey), initialize, guard);
-    try { guard(); const result = await work(reader); guard(); return result; }
+  const withReader = async <T>(work: (reader: FrontendReader) => Promise<T>,
+    extraGuard: () => void = () => {}): Promise<T> => {
+    const check = () => { guard(); extraGuard(); };
+    check();
+    const reader = await FrontendReader.open(host.frontendCapability(adapterKey), initialize, check);
+    try { check(); const result = await work(reader); check(); return result; }
     finally { reader.close(); }
   };
   const qualified = await withReader(async reader => {
@@ -329,8 +440,12 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
       !isDeepStrictEqual(state.environments, qualified.state.environments)) fail('initial-settings-drift');
     return freezeTree(state);
   });
-  const verifyIdle = async (): Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>> =>
-    withReader(async reader => {
+  const verifyIdle = async (expectedTurnIds: readonly string[] = []):
+    Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>> => {
+    const expected = jsonCopy(expectedTurnIds);
+    if (!Array.isArray(expected) || expected.some(id => typeof id !== 'string' || !id) ||
+      new Set(expected).size !== expected.length) fail('invalid-expected-turn-ids');
+    return withReader(async reader => {
       const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
       const turns = await fullHistory(reader, taskId);
@@ -346,8 +461,40 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
             observed.id === turn.id;
         }))
         fail('idle-history-unstable-or-nonterminal');
+      const terminalIds = new Set(turns.map(turn => turn.id));
+      if (expected.some(id => !terminalIds.has(id))) throw new ManagedWorkerIdleProofRefusedError();
       return Object.freeze({ turnCount: turns.length, latestTurnId: turns.at(-1)?.id as string | undefined ?? null });
     });
+  };
+  const qualifyContinuation = async (ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence> => {
+    if (typeof ownerFence !== 'function') fail('continuation-owner-fence-required');
+    // The caller owns this semantic counter: settings, turn, pending-request,
+    // queue and owner-reconnect transitions must advance it. Token usage and
+    // an already-null goal notification alone need not advance it.
+    const admitted = ownerFenceSnapshot(ownerFence(), taskId, generation);
+    const checkOwner = () => {
+      if (!isDeepStrictEqual(admitted, ownerFenceSnapshot(ownerFence(), taskId, generation)))
+        fail('continuation-owner-fence-changed');
+    };
+    return withReader(async reader => {
+      const before = await continuationPhase(reader, taskId, cwd);
+      if (before.turns.length === 0) fail('continuation-requires-prior-turn');
+      // Exact ID-only rejoin on the already-loaded same worker. No history,
+      // path, model, permission, config, or other override is ever sent.
+      const resumeCurrent = await reader.request('thread/resume', { threadId: taskId });
+      const effective = effectiveContinuation(resumeCurrent, taskId, cwd);
+      if (!isDeepStrictEqual(before.current, { model: effective.model, effort: effective.effort,
+        cwd, environments: effective.environments })) fail('continuation-resume-read-differs');
+      const after = await continuationPhase(reader, taskId, cwd);
+      if (before.historyDigest !== after.historyDigest || !isDeepStrictEqual(before.current, after.current))
+        fail('continuation-state-changed-during-rejoin');
+      const defaults = defaultsOf(await reader.request('config/read', { cwd, includeLayers: false }), taskId, cwd);
+      checkOwner();
+      return freezeTree({ owner: admitted, turnCount: after.turns.length,
+        latestTurnId: after.turns.at(-1)?.id as string | undefined ?? null,
+        historyDigest: after.historyDigest, effective, composerDefaults: defaults });
+    }, checkOwner);
+  };
   return Object.freeze({ generation, initialState: qualified.state,
-    composerDefaults: qualified.defaults, readInitialState, verifyIdle });
+    composerDefaults: qualified.defaults, readInitialState, verifyIdle, qualifyContinuation });
 }

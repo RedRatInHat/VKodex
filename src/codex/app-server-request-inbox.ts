@@ -88,6 +88,10 @@ export class AppServerRequestInbox {
   /** Attachment authority comes from construction, never a frontend frame. */
   get owner(): Readonly<{ threadId: string; generation: number }> { return this.identity; }
 
+  /** Includes answered requests until the worker response is written (or the
+   * request is aborted). Observer replay intentionally exposes fewer entries. */
+  unresolvedCount(): number { return this.pending.size; }
+
   private key(id: string | number): string { return `${typeof id}:${String(id)}`; }
   private current(): boolean { return this.options.isGenerationCurrent(this.options.generation); }
   private frame(request: AppServerServerRequest): RequestFrame { return structuredClone(request); }

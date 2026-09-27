@@ -120,6 +120,10 @@ export class ManagedWorkerCommandDispatcher {
     return Object.freeze({ inFlight: this.#inFlight.size,
       unconfirmed: this.#journal.hasUnconfirmed() });
   }
+  acceptedReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {
+    this.#authenticate(key);
+    return this.#journal.acceptedReceipts();
+  }
   /**
    * Read-only attested lookup for an immutable native intent. It never calls
    * authorization, reserves a journal row, or writes to the backend.

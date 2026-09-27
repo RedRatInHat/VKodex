@@ -327,6 +327,30 @@ test('inbox observer and independent responder coexist with frontend attachment 
   assert.deepEqual(faults, []);
 });
 
+test('inbox unresolved count includes answered requests until responseWritten or abort retires them', async () => {
+  const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
+    isGenerationCurrent: () => true, allowRequest: () => true, allowAnswer: () => true });
+  const controller = new AbortController(), written = deferred<void>();
+  assert.equal(inbox.unresolvedCount(), 0);
+  const pending = inbox.handle({ id: 7, method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } },
+  { signal: controller.signal, responseWritten: written.promise });
+  assert.equal(inbox.unresolvedCount(), 1);
+  const responder = inbox.createResponder(() => true);
+  assert.equal(responder.answer(7, { answers: {} }), true);
+  assert.deepEqual(await pending, { answers: {} });
+  assert.equal(inbox.unresolvedCount(), 1);
+  written.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(inbox.unresolvedCount(), 0);
+  const pendingAbort = inbox.handle({ id: '8', method: 'item/tool/requestUserInput',
+    params: { threadId: taskId, questions: [] } },
+  { signal: controller.signal, responseWritten: written.promise });
+  assert.equal(inbox.unresolvedCount(), 1);
+  controller.abort(); await assert.rejects(pendingAbort);
+  assert.equal(inbox.unresolvedCount(), 0);
+  responder.detach();
+});
+
 test('faulty pending observers retire alone and frontend EOF leaves typed requests replayable', async () => {
   const inbox = new AppServerRequestInbox({ threadId: taskId, generation: 7,
     isGenerationCurrent: () => true, allowRequest: () => true,

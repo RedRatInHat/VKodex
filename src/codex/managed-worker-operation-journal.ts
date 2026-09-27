@@ -112,6 +112,16 @@ export class ManagedWorkerOperationJournal {
       .get() !== undefined;
   }
 
+  /** Scoped metadata only; callers must compare these receipts with terminal
+   * full history before treating an idle thread as safe to stop. */
+  acceptedReceipts(): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {
+    const rows = this.db.prepare("SELECT method, receipt_id FROM managed_worker_operations WHERE state='accepted' ORDER BY rowid")
+      .all() as Array<{ method: WorkerMutationMethod; receipt_id: string | null }>;
+    if (rows.some(row => typeof row.receipt_id !== 'string' || row.receipt_id.length === 0))
+      throw new Error('Accepted worker receipt unavailable');
+    return Object.freeze(rows.map(row => Object.freeze({ method: row.method, receiptId: row.receipt_id! })));
+  }
+
   get(operationId: string): WorkerOperation | null {
     const id = validUuid(operationId, "operation ID");
     const row = this.db.prepare("SELECT * FROM managed_worker_operations WHERE operation_id=?").get(id) as OperationRow | undefined;

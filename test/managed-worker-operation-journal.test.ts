@@ -132,3 +132,16 @@ test("scoped unconfirmed query tracks dispatching and unknown across reopen with
     assert.equal(c.hasUnconfirmed(), false);
   } finally { c.close(); }
 });
+
+test('accepted receipt IDs are durable metadata for terminal history drain', () => {
+  const scope = fixture(); const journal = new ManagedWorkerOperationJournal(scope);
+  const first = journal.reserve(intent()).operation;
+  journal.accept(first, 'actual-turn');
+  const receipts = journal.acceptedReceipts();
+  assert.deepEqual(receipts, [{ method: 'turn/start', receiptId: 'actual-turn' }]);
+  assert.equal(Object.isFrozen(receipts), true);
+  journal.close();
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try { assert.deepEqual(reopened.acceptedReceipts(), receipts); }
+  finally { reopened.close(); }
+});

@@ -187,6 +187,23 @@ export class ManagedWorkerFrontendHost {
     return this.#commands.quiescence(controlKey);
   }
 
+  /** Durable accepted receipt IDs, not a terminal history proof. */
+  acceptedCommandReceipts(controlKey: object): ReadonlyArray<Readonly<{ method: WorkerCommand['method']; receiptId: string }>> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.acceptedReceipts(controlKey);
+  }
+
+  /** Read-only pending server-request evidence for the live generation. An
+   * answered request remains counted until its responseWritten receipt. */
+  requestQuiescence(controlKey: object): Readonly<{ generation: number; unresolved: number }> {
+    const inbox = this.#inbox, policy = this.#commandPolicy, generation = this.#backendGeneration;
+    if (!inbox || !policy || controlKey !== policy.controlKey || this.#state !== 'running' ||
+        this.#stopRequested || generation === null || inbox.owner.generation !== generation ||
+        !this.#rpc.isSessionCurrent(generation))
+      throw new Error('Worker request control unavailable');
+    return Object.freeze({ generation, unresolved: inbox.unresolvedCount() });
+  }
+
   /** Read-only, HMAC-attested lookup of a previously reserved command intent. */
   commandStatusForIntent(controlKey: object, command: WorkerCommand): WorkerOperation | null {
     if (!this.#commands) throw new Error('Worker command control unavailable');

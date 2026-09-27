@@ -32,11 +32,15 @@ class BackendFixture {
   exposedModel: string | null = null;
   readTurnStatusOverride: string | null = null;
   resumeCount = 0;
+  idOnlyResumeCount = 0;
+  idOnlyApprovalPolicy: string = 'never';
+  onIdOnly: (() => void) | null = null;
   replyError: string | null = null;
   eofMethod: string | null = null;
   malformedMethod: string | null = null;
   wrongIdMethod: string | null = null;
   generationFlipMethod: string | null = null;
+  idOnlyBenignNotifications = false;
   stopCalls = 0;
   constructor() {
     this.server = createServer(socket => {
@@ -64,6 +68,11 @@ class BackendFixture {
           }
           const result = this.respond(method, frame.params as Row);
           if (this.generationFlipMethod === method) this.settings.backendGeneration++;
+          if (this.idOnlyBenignNotifications && method === 'thread/resume' &&
+            (frame.params as Row).threadId === taskId && Object.keys(frame.params as Row).length === 1) {
+            socket.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: taskId } }) + '\n');
+            socket.write(JSON.stringify({ method: 'thread/goal/cleared', params: { threadId: taskId } }) + '\n');
+          }
           socket.write(JSON.stringify({ id: this.wrongIdMethod === method ? 999 : frame.id, result }) + '\n');
         }
       });
@@ -89,9 +98,13 @@ class BackendFixture {
   private respond(method: string, params: Row): Row {
     if (method === 'initialize') return { serverInfo: { name: 'fixture' } };
     if (method === 'thread/resume') {
-      assert.deepEqual(params, resumeParams); this.resumeCount++;
+      if (Object.keys(params).length === 1 && params.threadId === taskId) {
+        this.idOnlyResumeCount++;
+        this.onIdOnly?.();
+      } else { assert.deepEqual(params, resumeParams); this.resumeCount++; }
       return { thread: this.thread('idle'), cwd, model: 'gpt-5.6-sol', reasoningEffort: 'low',
-        approvalPolicy: 'never', activePermissionProfile: { id: ':read-only' },
+        approvalPolicy: this.idOnlyResumeCount ? this.idOnlyApprovalPolicy : 'never',
+        approvalsReviewer: 'user', activePermissionProfile: { id: ':read-only' },
         sandbox: { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [cwd],
         serviceTier: null };
     }
@@ -105,7 +118,7 @@ class BackendFixture {
   }
   private thread(status: string): Row {
     return { id: taskId, sessionId: taskId, createdAt: 100, updatedAt: 101,
-      cwd: this.readCwd, ...(this.exposedModel === null ? {} : { model: this.exposedModel }),
+      cwd: this.readCwd, model: this.exposedModel ?? 'gpt-5.6-sol', reasoningEffort: 'low',
       status: { type: status }, turns: this.turns.map(turn => this.readTurnStatusOverride === null ? turn :
         { ...turn, status: this.readTurnStatusOverride }),
       environments: [{ environmentId: 'local', cwd, runtimeWorkspaceRoots: [cwd] }] };
@@ -189,6 +202,27 @@ test('same generation is required and later idle proof has terminal full history
   } finally { await fixture.close(); }
 });
 
+test('idle proof accounts for every accepted receipt before declaring safe shutdown', async () => {
+  const fixture = new BackendFixture(); await fixture.listen();
+  try {
+    const bootstrap = await bootstrapManagedWorker(options(fixture));
+    await assert.rejects(bootstrap.verifyIdle(['accepted-one']),
+      { name: 'ManagedWorkerIdleProofRefusedError', message: 'accepted-turn-not-terminal' });
+    fixture.turns = [{ id: 'unrelated', status: 'completed', items: [] }];
+    await assert.rejects(bootstrap.verifyIdle(['accepted-one']),
+      { name: 'ManagedWorkerIdleProofRefusedError', message: 'accepted-turn-not-terminal' });
+    fixture.turns.push({ id: 'accepted-one', status: 'completed', items: [] });
+    assert.deepEqual(await bootstrap.verifyIdle(['accepted-one']),
+      { turnCount: 2, latestTurnId: 'accepted-one' });
+    const methodCount = fixture.methods.length;
+    await assert.rejects(bootstrap.verifyIdle(['']), /invalid-expected-turn-ids/);
+    await assert.rejects(bootstrap.verifyIdle(['accepted-one', 'accepted-one']), /invalid-expected-turn-ids/);
+    assert.equal(fixture.methods.length, methodCount);
+    fixture.eofMethod = 'thread/turns/list';
+    await assert.rejects(bootstrap.verifyIdle(['accepted-one']), /frontend-eof/);
+  } finally { await fixture.close(); }
+});
+
 test('re-read rejects actually exposed model drift before first owner start', async () => {
   const fixture = new BackendFixture(); await fixture.listen();
   try {
@@ -238,4 +272,59 @@ test('generation replacement during a read rejects even when the old socket repl
     await fixture.waitDetached();
     assert.equal(fixture.sockets.size, 0);
   } finally { await fixture.close(); }
+});
+
+function ownerFence() {
+  return { threadId: taskId, ownerEpoch: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', backendGeneration: 7,
+    semanticRevision: 12, pendingRequests: 0, queuedFollowUps: 0,
+    inFlightCommands: 0, unconfirmedOperations: false };
+}
+
+test('continuation qualifier accepts bounded completed history and exact ID-only current policy', async () => {
+  for (const count of [1, 2]) {
+    const fixture = new BackendFixture(); await fixture.listen();
+    try {
+      const bootstrap = await bootstrapManagedWorker(options(fixture));
+      fixture.idOnlyBenignNotifications = true;
+      fixture.turns = Array.from({ length: count }, (_, index) =>
+        ({ id: `turn-${index}`, status: 'completed', items: [] }));
+      const evidence = await bootstrap.qualifyContinuation(ownerFence);
+      assert.equal(evidence.turnCount, count);
+      assert.equal(evidence.latestTurnId, `turn-${count - 1}`);
+      assert.equal(evidence.effective.activePermissionProfileId, ':read-only');
+      assert.equal(evidence.effective.approvalPolicy, 'never');
+      assert.equal(fixture.idOnlyResumeCount, 1);
+      assert.equal(fixture.resumeCount, 1);
+      assert.equal(fixture.stopCalls, 0);
+    } finally { await fixture.close(); }
+  }
+});
+
+test('continuation qualifier cannot replace the first-turn bootstrap path', async () => {
+  const fixture = new BackendFixture(); await fixture.listen();
+  try {
+    const bootstrap = await bootstrapManagedWorker(options(fixture));
+    await assert.rejects(bootstrap.qualifyContinuation(ownerFence), /continuation-requires-prior-turn/);
+    assert.equal(fixture.idOnlyResumeCount, 0);
+  } finally { await fixture.close(); }
+});
+
+test('continuation qualifier refuses pending owner state, unsafe policy, history change and semantic drift', async () => {
+  for (const scenario of ['pending', 'unsafe', 'history', 'revision']) {
+    const fixture = new BackendFixture(); await fixture.listen();
+    try {
+      const bootstrap = await bootstrapManagedWorker(options(fixture));
+      fixture.turns = [{ id: 'turn-0', status: 'completed', items: [] }];
+      const fence = ownerFence();
+      if (scenario === 'pending') fence.pendingRequests = 1;
+      if (scenario === 'unsafe') fixture.idOnlyApprovalPolicy = 'untrusted';
+      if (scenario === 'history') fixture.onIdOnly = () => {
+        fixture.turns.push({ id: 'turn-1', status: 'completed', items: [] });
+      };
+      if (scenario === 'revision') fixture.onIdOnly = () => { fence.semanticRevision++; };
+      await assert.rejects(bootstrap.qualifyContinuation(() => fence));
+      if (scenario === 'pending') assert.equal(fixture.idOnlyResumeCount, 0);
+      assert.equal(fixture.stopCalls, 0);
+    } finally { await fixture.close(); }
+  }
 });

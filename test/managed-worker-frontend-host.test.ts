@@ -490,6 +490,33 @@ test('command quiescence is authenticated, read-only and distinguishes in-flight
     f.child.send({ id: f.child.messages.find(frame => frame.method === 'turn/start')!.id,
       result: { turn: { id: 'late-accepted' } } });
     assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+    assert.throws(() => f.managed.acceptedCommandReceipts({}), /control/i);
+    const receipts = f.managed.acceptedCommandReceipts(f.controlKey);
+    assert.deepEqual(receipts, [{ method: 'turn/start', receiptId: 'late-accepted' }]);
+    assert.equal(Object.isFrozen(receipts), true);
+    assert.equal(f.child.messages.length, wireCount);
+    assert.equal(policyCalls, admittedCalls);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('request quiescence is control-key scoped and generation fenced', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  try {
+    assert.throws(() => f.managed.requestQuiescence({}), /control|unavailable/i);
+    const initial = f.managed.requestQuiescence(f.controlKey);
+    assert.deepEqual(initial, { generation: 1, unresolved: 0 });
+    assert.equal(Object.isFrozen(initial), true);
+    f.child.send({ id: 'pending-proof', method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, questions: [] } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.managed.requestQuiescence(f.controlKey), { generation: 1, unresolved: 1 });
+    const responder = f.managed.createRequestResponder(f.controlKey);
+    assert.equal(responder.answer('pending-proof', { answers: {} }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.managed.requestQuiescence(f.controlKey), { generation: 1, unresolved: 0 });
+    responder.detach();
+    f.child.disconnect();
+    assert.throws(() => f.managed.requestQuiescence(f.controlKey), /unavailable|generation/i);
   } finally { await f.managed.stop('test-cleanup'); }
 });
 
