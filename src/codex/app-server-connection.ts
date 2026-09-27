@@ -23,6 +23,8 @@ export interface AppServerRequestOptions {
   /** A dispatched mutation must never be replayed after timeout or disconnect. */
   readonly mutating?: boolean;
   readonly timeoutMs?: number;
+  /** Refuse to launch or dispatch on a different initialized connection. */
+  readonly expectedGeneration?: number;
 }
 
 export interface AppServerEnvelope {
@@ -141,6 +143,8 @@ export class AppServerConnection implements AppServerRpc {
 
   async request(method: string, params: JsonObject = {}, options: AppServerRequestOptions = {}): Promise<JsonObject> {
     if (!method || /[\x00-\x20]/u.test(method)) throw new AppServerRejectedError();
+    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))
+      throw new AppServerUnavailableError();
     await this.start();
     return this.sendRequest(method, params, options);
   }
@@ -169,6 +173,8 @@ export class AppServerConnection implements AppServerRpc {
   }
 
   private sendRequest(method: string, params: JsonObject, options: AppServerRequestOptions): Promise<JsonObject> {
+    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))
+      return Promise.reject(new AppServerUnavailableError());
     const child = this.child;
     if (!child) return Promise.reject(new AppServerUnavailableError());
     const id = this.nextId++;

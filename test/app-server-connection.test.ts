@@ -166,6 +166,99 @@ test("an initialization receipt expires before disconnect callbacks and never cr
   } finally { await connection.close(); }
 });
 
+test("stale expected generation rejects a known-unwritten mutation without launching a child", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild(); children.push(child); return child.asChild();
+  });
+  try {
+    const session = await connection.initializedSession();
+    children[0]!.disconnect();
+    await assert.rejects(connection.request("thread/resume", { threadId: "own" },
+      { mutating: true, expectedGeneration: session.generation }), AppServerUnavailableError);
+    assert.equal(children.length, 1, "a stale attachment must not launch a replacement worker");
+    assert.deepEqual(children[0]!.messages.map(message => message.method), ["initialize", "initialized"]);
+  } finally { await connection.close(); }
+});
+
+test("stale expected generation does not join an already-starting reconnect", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild();
+    if (children.length === 1) child.respond = message => message.method === "initialize" ? null
+      : { id: message.id, result: { ok: true } };
+    children.push(child); return child.asChild();
+  }, undefined, 5_000);
+  let reconnect: Promise<void> | null = null;
+  let stale: Promise<JsonObject> | null = null;
+  try {
+    const session = await connection.initializedSession();
+    children[0]!.disconnect();
+    reconnect = connection.start(); void reconnect.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(children[1]!.messages.map(message => message.method), ["initialize"]);
+    stale = connection.request("thread/resume", { threadId: "own" },
+      { mutating: true, expectedGeneration: session.generation });
+    void stale.catch(() => {});
+    let settled = false;
+    void stale.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, true, "a stale request must reject before the new handshake completes");
+    await assert.rejects(stale, AppServerUnavailableError);
+    assert.deepEqual(children[1]!.messages.map(message => message.method), ["initialize"]);
+  } finally {
+    const second = children[1];
+    if (second?.messages[0]?.method === "initialize")
+      second.send({ id: second.messages[0].id, result: {} });
+    await Promise.allSettled([...(reconnect ? [reconnect] : []), ...(stale ? [stale] : [])]);
+    await connection.close();
+  }
+});
+
+test("expected generation is rechecked after the start await before dispatch", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild(); children.push(child); return child.asChild();
+  });
+  const realStart = connection.start.bind(connection);
+  let releaseStart!: () => void;
+  const startGate = new Promise<void>(resolve => { releaseStart = resolve; });
+  let pending: Promise<JsonObject> | null = null;
+  try {
+    const session = await connection.initializedSession();
+    connection.start = () => startGate;
+    pending = connection.request("thread/resume", { threadId: "own" },
+      { mutating: true, expectedGeneration: session.generation });
+    void pending.catch(() => {});
+    children[0]!.disconnect();
+    await realStart();
+    assert.equal(children.length, 2);
+    releaseStart();
+    await assert.rejects(pending, AppServerUnavailableError);
+    assert.deepEqual(children[1]!.messages.map(message => message.method), ["initialize", "initialized"],
+      "the stale mutation must not be written to the reconnected child");
+  } finally {
+    releaseStart(); connection.start = realStart;
+    if (pending) await Promise.allSettled([pending]);
+    await connection.close();
+  }
+});
+
+test("requests without expected generation retain ordinary reconnect behavior", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild(); children.push(child); return child.asChild();
+  });
+  try {
+    await connection.initializedSession();
+    children[0]!.disconnect();
+    assert.deepEqual(await connection.request("thread/read", { threadId: "own" }), { ok: true });
+    assert.equal(children.length, 2);
+    assert.deepEqual(children[1]!.messages.map(message => message.method),
+      ["initialize", "initialized", "thread/read"]);
+  } finally { await connection.close(); }
+});
+
 test("failed initialization does not expose a session receipt or a live generation", async () => {
   const child = new AppServerChild();
   child.respond = message => ({ id: message.id, error: { code: -32600 } });
