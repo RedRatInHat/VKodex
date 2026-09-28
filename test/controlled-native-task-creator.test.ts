@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import test from 'node:test';
 import type { AppServerRpc } from '../src/codex/app-server-connection.js';
 import { createControlledNativeTask, ControlledNativeCreationUncertainError,
@@ -177,7 +178,7 @@ test('creation journal persists intent, native ID, and qualification across reop
   journal.close();
   journal = new ControlledNativeCreationJournal(f.filePath);
   assert.equal(journal.get(f.intent.operationId)?.qualified?.rolloutPath, rolloutPath);
-  assert.deepEqual(journal.listUncertain(), []);
+  assert.deepEqual(journal.listUncertainPage({ limit: 100 }).items, []);
   journal.close();
 });
 
@@ -193,7 +194,7 @@ test('creation journal rejects duplicate operation and immutable-scope drift wit
   await assert.rejects(journal.persistQualified({ ...f.qualified, creatorNonce: randomUUID() }));
   assert.equal(journal.get(f.intent.operationId)?.state, 'started');
   assert.equal(journal.get(f.intent.operationId)?.started?.threadId, taskId);
-  assert.deepEqual(journal.listUncertain().map(row => row.state), ['started']);
+  assert.deepEqual(journal.listUncertainPage({ limit: 100 }).items.map(row => row.state), ['started']);
   journal.close();
 });
 
@@ -261,5 +262,53 @@ test('qualified native cwd accepts equivalent Windows path spelling', async () =
   await journal.persistStarted(started);
   await journal.persistQualified({ ...f.qualified, selectedEffective: started.selectedEffective });
   assert.equal(journal.get(f.intent.operationId)?.state, 'qualified');
+  journal.close();
+});
+
+test('uncertain journal pages remain bounded and stable across insertion and reopen', async () => {
+  const f = journalFixture();
+  let journal = new ControlledNativeCreationJournal(f.filePath);
+  const ids: string[] = [];
+  for (let index = 0; index < 101; index++) {
+    const operationId = randomUUID(); ids.push(operationId);
+    await journal.persistIntent({ ...f.intent, operationId, creatorNonce: randomUUID() });
+  }
+  const first = journal.listUncertainPage({ limit: 100 });
+  assert.equal(first.items.length, 100);
+  assert.deepEqual(first.items.map(row => row.intent.operationId), ids.slice(0, 100));
+  assert.equal(typeof first.nextCursor, 'number');
+  const inserted = randomUUID();
+  await journal.persistIntent({ ...f.intent, operationId: inserted, creatorNonce: randomUUID() });
+  journal.close();
+  journal = new ControlledNativeCreationJournal(f.filePath);
+  const second = journal.listUncertainPage({ afterSequence: first.nextCursor!, limit: 100 });
+  assert.deepEqual(second.items.map(row => row.intent.operationId), [ids[100], inserted]);
+  assert.equal(second.nextCursor, null);
+  assert.ok(second.items.every(row => row.sequence > first.nextCursor!));
+  assert.throws(() => journal.listUncertainPage({ limit: 101 }));
+  journal.close();
+});
+
+test('published pre-pagination journal schema reopens and paginates without migration', () => {
+  const f = journalFixture();
+  const database = new Database(f.filePath);
+  database.exec(`CREATE TABLE controlled_native_creations (
+    operation_id TEXT PRIMARY KEY, thread_id TEXT UNIQUE, state TEXT NOT NULL
+      CHECK(state IN ('intent','started','qualified')),
+    revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 3),
+    intent_json TEXT NOT NULL, started_json TEXT, qualified_json TEXT,
+    CHECK((state='intent' AND revision=1 AND thread_id IS NULL AND started_json IS NULL AND qualified_json IS NULL)
+      OR (state='started' AND revision=2 AND thread_id IS NOT NULL AND started_json IS NOT NULL AND qualified_json IS NULL)
+      OR (state='qualified' AND revision=3 AND thread_id IS NOT NULL AND started_json IS NOT NULL AND qualified_json IS NOT NULL))
+  )`);
+  database.prepare(`INSERT INTO controlled_native_creations
+    (operation_id,state,revision,intent_json) VALUES (?,'intent',1,?)`)
+    .run(f.intent.operationId, JSON.stringify(f.intent));
+  database.close();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  const page = journal.listUncertainPage({ limit: 100 });
+  assert.deepEqual(page.items.map(item => item.intent.operationId), [f.intent.operationId]);
+  assert.equal(page.items[0]?.sequence, 1);
+  assert.equal(page.nextCursor, null);
   journal.close();
 });

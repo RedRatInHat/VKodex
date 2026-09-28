@@ -8,10 +8,11 @@ import type { ControlledCreationIntent, ControlledCreationStarted,
 
 type State = 'intent' | 'started' | 'qualified';
 interface StoredRow {
-  operation_id: string; thread_id: string | null; state: State; revision: number;
+  sequence: number; operation_id: string; thread_id: string | null; state: State; revision: number;
   intent_json: string; started_json: string | null; qualified_json: string | null;
 }
 export interface ControlledCreationJournalRecord {
+  readonly sequence: number;
   readonly state: State;
   readonly revision: number;
   readonly intent: ControlledCreationIntent;
@@ -148,18 +149,29 @@ export class ControlledNativeCreationJournal {
       validQualified(qualified);
       if (!started || !isDeepStrictEqual(started, startedOf(qualified))) fail();
     }
-    return freezeTree({ state: row.state, revision: row.revision, intent, started, qualified });
+    if (!Number.isSafeInteger(row.sequence) || row.sequence < 1) fail();
+    return freezeTree({ sequence: row.sequence, state: row.state,
+      revision: row.revision, intent, started, qualified });
   }
   get(operationId: string): ControlledCreationJournalRecord | null {
     this.#open(); if (!uuid.test(operationId)) fail();
-    const row = this.#db.prepare('SELECT * FROM controlled_native_creations WHERE operation_id=?')
+    const row = this.#db.prepare('SELECT rowid AS sequence,* FROM controlled_native_creations WHERE operation_id=?')
       .get(operationId) as StoredRow | undefined;
     return row ? this.#decode(row) : null;
   }
-  listUncertain(): readonly ControlledCreationJournalRecord[] {
+  listUncertainPage({ afterSequence = 0, limit }: {
+    readonly afterSequence?: number; readonly limit: number;
+  }): Readonly<{ items: readonly ControlledCreationJournalRecord[]; nextCursor: number | null }> {
     this.#open();
-    return Object.freeze((this.#db.prepare(`SELECT * FROM controlled_native_creations
-      WHERE state IN ('intent','started') ORDER BY rowid`).all() as StoredRow[]).map(row => this.#decode(row)));
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 100) fail();
+    // This journal is append-only: no method deletes rows, so SQLite rowid is
+    // a stable forward cursor without changing the published table schema.
+    const rows = this.#db.prepare(`SELECT rowid AS sequence,* FROM controlled_native_creations
+      WHERE rowid > ? AND state IN ('intent','started') ORDER BY rowid LIMIT ?`)
+      .all(afterSequence, limit + 1) as StoredRow[];
+    const items = Object.freeze(rows.slice(0, limit).map(row => this.#decode(row)));
+    return Object.freeze({ items, nextCursor: rows.length > limit ? items[items.length - 1]!.sequence : null });
   }
   async persistIntent(intent: ControlledCreationIntent): Promise<Readonly<{ isCurrent(): boolean }>> {
     this.#open();
