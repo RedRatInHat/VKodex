@@ -63,6 +63,24 @@ test('managed bridge observation snapshots one native generation and fails close
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('managed owner retains only a bounded category for native IPC refusal diagnosis', async () => {
+  const f = await fixture();
+  try {
+    const initialFailure = f.owner.metadata.lastRequestFailure;
+    assert.equal(initialFailure, undefined);
+    const before = Date.now();
+    f.owner.onRequestFailure('settings-refused');
+    f.owner.onRequestFailure('unclassified');
+    assert.equal(f.owner.metadata.lastRequestFailure?.category, 'unclassified');
+    assert.equal(f.owner.metadata.lastRequestFailure?.count, 2);
+    assert.ok((f.owner.metadata.lastRequestFailure?.atMs ?? 0) >= before);
+    assert.ok((f.owner.metadata.lastRequestFailure?.atMs ?? Infinity) <= Date.now());
+    for (let i = 0; i < 300; i++) f.owner.onRequestFailure('owner-refused');
+    assert.equal(f.owner.metadata.lastRequestFailure?.category, 'owner-refused');
+    assert.equal(f.owner.metadata.lastRequestFailure?.count, 255);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('managed bridge observation continues through frontend EOF without reopening the backend', async () => {
   const f = await fixture();
   try {

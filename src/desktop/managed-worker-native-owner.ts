@@ -7,7 +7,7 @@ import { projectNativeStartIntents } from '../codex/native-start-intent-projecti
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import { applyNotification, projectNativeServerRequest } from '../codex/managed-native-projection.js';
 import { DesktopIpcClient } from './ipc-client.js';
-import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-client.js';
+import type { IpcIncomingRequest, IpcObject, IpcRequestFailureCategory, IpcRequestHandler } from './ipc-client.js';
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
@@ -129,6 +129,8 @@ export interface ManagedWorkerNativeOwnerMetadata {
   readonly bootstrapBoundary: Readonly<{
     stateIsBootstrapping: boolean; hasEvents: boolean; ownerCurrent: boolean | null;
   }> | null;
+  /** Fixed, bounded IPC failure category, never an exception body or request identity. */
+  readonly lastRequestFailure?: Readonly<{ category: IpcRequestFailureCategory; count: number; atMs: number }>;
 }
 
 export interface ManagedWorkerBridgeStateEvent {
@@ -174,6 +176,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       turn: 0, item: 0, other: 0 };
   #bootstrapPendingRequests = 0;
   #bootstrapBoundary: ManagedWorkerNativeOwnerMetadata['bootstrapBoundary'] = null;
+  #lastRequestFailure: ManagedWorkerNativeOwnerMetadata['lastRequestFailure'];
   #detachObserver: (() => void) | null = null;
   #detachRequests: (() => void) | null = null;
   #client: DesktopIpcClient | null = null;
@@ -221,7 +224,13 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       bootstrapEventCount: Math.min(this.#bootstrapEvents, diagnosticCap),
       bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),
       bootstrapPendingRequests: this.#bootstrapPendingRequests,
-      bootstrapBoundary: this.#bootstrapBoundary });
+      bootstrapBoundary: this.#bootstrapBoundary,
+      ...(this.#lastRequestFailure ? { lastRequestFailure: this.#lastRequestFailure } : {}) });
+  }
+
+  onRequestFailure(category: IpcRequestFailureCategory): void {
+    this.#lastRequestFailure = Object.freeze({ category,
+      count: Math.min((this.#lastRequestFailure?.count ?? 0) + 1, diagnosticCap), atMs: Date.now() });
   }
 
   /** Subscribe before capturing the complete same-generation snapshot. Native

@@ -173,17 +173,27 @@ test('versioned diagnosis returns only fixed startup metadata and no private cal
   const diagnosis = { schemaVersion: 1 as const, startupPhase: 'bootstrapping' as const,
     daemonState: 'failed' as const, failureCode: 'startup-unavailable' as const,
     registryState: 'backend_registered' as const, owner: null };
-  let injectRaw = false;
+  const owner = { startupStage: 'ready' as const, bootstrapEventCount: 0,
+    bootstrapNotifications: { status: 0, settings: 0, goal: 0, usage: 0,
+      'startup-or-warning': 0, turn: 0, item: 0, other: 0 },
+    bootstrapPendingRequests: 0, bootstrapBoundary: null,
+    lastRequestFailure: { category: 'settings-refused' as const, count: 2, atMs: 1780000000000 } };
+  let mode: 'normal' | 'category' | 'raw' = 'normal';
   const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
     status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
-    diagnose: () => injectRaw ? { ...diagnosis,
-      bootstrapFailureCode: 'C:/private/secret-token' } as never : diagnosis,
+    diagnose: () => mode === 'raw' ? { ...diagnosis, owner: { ...owner,
+      lastRequestFailure: { category: 'C:/private/secret-token', count: 2, atMs: 1780000000000 } } } as never
+      : mode === 'category' ? { ...diagnosis, owner } : diagnosis,
     requestStop: async () => { throw new ManagedWorkerStopRefusedError(); } });
   const cap = await server.listen(); const client = await peer(cap);
   try {
     client.send({ id: 'd', epoch, method: 'diagnose-v1' });
     assert.deepEqual(await client.read(), { id: 'd', result: { ownerEpoch: epoch, taskId: 'own', ...diagnosis } });
-    injectRaw = true;
+    mode = 'category';
+    client.send({ id: 'category', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'category', result: { ownerEpoch: epoch,
+      taskId: 'own', ...diagnosis, owner } });
+    mode = 'raw';
     client.send({ id: 'raw', epoch, method: 'diagnose-v1' });
     assert.deepEqual(await client.read(), { id: 'raw', error: 'diagnosis-unavailable' });
     client.send({ id: 's', epoch, method: 'stop' });

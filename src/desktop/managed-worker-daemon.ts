@@ -97,7 +97,7 @@ export interface ManagedWorkerDaemonMetadata {
   readonly startupPhase: ManagedWorkerControlDiagnosis['startupPhase'];
   readonly nativeStartup: Pick<ManagedWorkerNativeOwnerMetadata,
     'startupStage' | 'bootstrapEventCount' | 'bootstrapNotifications' |
-    'bootstrapPendingRequests' | 'bootstrapBoundary'> | null;
+    'bootstrapPendingRequests' | 'bootstrapBoundary' | 'lastRequestFailure'> | null;
 }
 
 /** Quiescence evidence for entering handoff_pending only. Retiring the claim
@@ -192,7 +192,8 @@ export class ManagedWorkerDaemon {
         bootstrapEventCount: owner.bootstrapEventCount,
         bootstrapNotifications: owner.bootstrapNotifications,
         bootstrapPendingRequests: owner.bootstrapPendingRequests,
-        bootstrapBoundary: owner.bootstrapBoundary }) : null });
+        bootstrapBoundary: owner.bootstrapBoundary,
+        ...(owner.lastRequestFailure ? { lastRequestFailure: owner.lastRequestFailure } : {}) }) : null });
   }
 
   /** Capability-bound queue ingress, also exposed only by opt-in private control. */

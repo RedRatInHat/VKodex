@@ -3,6 +3,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
 import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from '../core/codex-tasks.js';
+import type { IpcRequestFailureCategory } from './ipc-client.js';
 
 export interface ManagedWorkerControlStatus {
   readonly hostState: string;
@@ -36,6 +37,7 @@ export interface ManagedWorkerControlDiagnosis {
     bootstrapPendingRequests: number;
     bootstrapBoundary: Readonly<{ stateIsBootstrapping: boolean;
       hasEvents: boolean; ownerCurrent: boolean | null }> | null;
+    lastRequestFailure?: Readonly<{ category: IpcRequestFailureCategory; count: number; atMs: number }>;
   }> | null;
 }
 export interface ManagedWorkerControlOptions {
@@ -168,6 +170,11 @@ const startupStages = new Set(['not-started', 'observing', 'reading-initial',
   'validating-initial', 'checking-boundary', 'connecting', 'ready']);
 const notificationKeys = ['status', 'settings', 'goal', 'usage', 'startup-or-warning',
   'turn', 'item', 'other'] as const;
+const requestFailureCategories = new Set<IpcRequestFailureCategory>([
+  'owner-refused', 'queue-gate-refused', 'queue-shape-refused', 'queue-baseline-refused',
+  'settings-refused', 'queue-state-refused',
+  'entry-refused', 'worker-not-written', 'unclassified',
+]);
 const boundedCount = (value: unknown): value is number =>
   Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 255;
 function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis {
@@ -184,13 +191,21 @@ function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis 
     value.registryState !== null && (typeof value.registryState !== 'string' || !registryStates.has(value.registryState))) return false;
   const owner = value.owner;
   if (owner === null) return true;
-  if (!object(owner) || !exact(owner, ['startupStage', 'bootstrapEventCount',
-    'bootstrapNotifications', 'bootstrapPendingRequests', 'bootstrapBoundary']) ||
+  const ownerKeys = ['startupStage', 'bootstrapEventCount',
+    'bootstrapNotifications', 'bootstrapPendingRequests', 'bootstrapBoundary'];
+  if (!object(owner) || !(exact(owner, ownerKeys) || exact(owner, [...ownerKeys, 'lastRequestFailure'])) ||
     typeof owner.startupStage !== 'string' || !startupStages.has(owner.startupStage) ||
     !boundedCount(owner.bootstrapEventCount) ||
     !boundedCount(owner.bootstrapPendingRequests) || !object(owner.bootstrapNotifications) ||
     !exact(owner.bootstrapNotifications, notificationKeys) ||
-    !notificationKeys.every(key => boundedCount((owner.bootstrapNotifications as Record<string, unknown>)[key])))
+    !notificationKeys.every(key => boundedCount((owner.bootstrapNotifications as Record<string, unknown>)[key])) ||
+    Object.hasOwn(owner, 'lastRequestFailure') &&
+      (!object(owner.lastRequestFailure) || !exact(owner.lastRequestFailure, ['category', 'count', 'atMs']) ||
+        typeof owner.lastRequestFailure.category !== 'string' ||
+        !requestFailureCategories.has(owner.lastRequestFailure.category as IpcRequestFailureCategory) ||
+        !boundedCount(owner.lastRequestFailure.count) || owner.lastRequestFailure.count === 0 ||
+        !Number.isSafeInteger(owner.lastRequestFailure.atMs) ||
+        (owner.lastRequestFailure.atMs as number) <= 0))
     return false;
   const boundary = owner.bootstrapBoundary;
   return boundary === null || object(boundary) &&

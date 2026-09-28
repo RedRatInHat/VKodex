@@ -48,7 +48,13 @@ export interface ManagedNativeStockQueueAdapterOptions {
 const object = (value: unknown): value is JsonObject =>
   value !== null && typeof value === 'object' && !Array.isArray(value) &&
   Object.getPrototypeOf(value) === Object.prototype;
-function fail(): never { throw new TypeError('Managed native stock queue request refused'); }
+type QueueRefusalCode = 'request-shape' | 'baseline' | 'owner-fence' | 'other';
+export class ManagedNativeQueueRefusal extends TypeError {
+  constructor(readonly code: QueueRefusalCode) {
+    super('Managed native stock queue request refused');
+  }
+}
+function fail(code: QueueRefusalCode = 'other'): never { throw new ManagedNativeQueueRefusal(code); }
 function strictJson(value: unknown): JsonObject {
   if (!object(value)) fail();
   try {
@@ -201,7 +207,7 @@ export class ManagedNativeStockQueueAdapter {
   }
 
   async accept(request: IpcIncomingRequest, assertIngressCurrent: () => boolean): Promise<{ ok: true }> {
-    if (this.#closed || this.#faulted || typeof assertIngressCurrent !== 'function' ||
+    if (typeof assertIngressCurrent !== 'function' ||
         !object(request) || request.method !== 'thread-follower-set-queued-follow-ups-state' ||
         request.version !== 1 || request.hostId !== undefined && request.hostId !== 'local' ||
         typeof request.requestId !== 'string' || !request.requestId ||
@@ -210,11 +216,11 @@ export class ManagedNativeStockQueueAdapter {
         request.params.conversationId !== this.taskId || !object(request.params.state) ||
         Object.keys(request.params.state).length !== 1 ||
         !Object.hasOwn(request.params.state, this.taskId) ||
-        !Array.isArray(request.params.state[this.taskId]) ||
-        assertIngressCurrent() !== true) fail();
+        !Array.isArray(request.params.state[this.taskId])) fail('request-shape');
+    if (this.#closed || this.#faulted || assertIngressCurrent() !== true) fail('owner-fence');
     if (Object.keys(request).some(key => !['requestId', 'sourceClientId', 'hostId',
         'method', 'version', 'params'].includes(key)) ||
-        Object.keys(request.params).some(key => !['hostId', 'conversationId', 'state'].includes(key))) fail();
+        Object.keys(request.params).some(key => !['hostId', 'conversationId', 'state'].includes(key))) fail('request-shape');
     const sourceClientId = request.sourceClientId, nativeRequestId = request.requestId;
     const snapshot = strictJson(request);
     const params = snapshot.params;
@@ -230,8 +236,8 @@ export class ManagedNativeStockQueueAdapter {
     if (this.#pendingClaims.size + claims.size > 2048) fail();
     for (const id of claims) this.#pendingClaims.set(id, (this.#pendingClaims.get(id) ?? 0) + 1);
     try {
-      if (await this.#assertInitialNativeQueueBaseline(this.#baselineScope) !== true ||
-          assertIngressCurrent() !== true || this.#closed || this.#faulted) fail();
+      if (await this.#assertInitialNativeQueueBaseline(this.#baselineScope) !== true) fail('baseline');
+      if (assertIngressCurrent() !== true || this.#closed || this.#faulted) fail('owner-fence');
       return await this.#admission.acceptFullState({ state: state as Entry[], ownerEpoch: this.ownerEpoch,
         sourceClientId, requestId: nativeRequestId,
         assertIngressCurrent });

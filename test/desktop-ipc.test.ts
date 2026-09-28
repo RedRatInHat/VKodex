@@ -15,6 +15,7 @@ import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompa
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
 import { findAcceptedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
+import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
@@ -1213,8 +1214,10 @@ test("IPC delivers untargeted broadcasts and ignores empty, foreign, or malforme
 test("native owner errors are redacted and late results never reach a replacement connection", async () => {
   const first = new Server(); const second = new Server(); const servers = [first, second];
   let finish!: (result: IpcObject) => void; let receivedSignal: AbortSignal | null = null;
+  const failureCategories: string[] = [];
   const client = new DesktopIpcClient(() => servers.shift()!, 100, {
     canHandle: () => true,
+    onRequestFailure: category => { failureCategories.push(category); },
     handle: async (request, signal) => {
       if (request.params.fail) throw new Error("PRIVATE BACKEND DETAILS");
       receivedSignal = signal;
@@ -1228,6 +1231,7 @@ test("native owner errors are redacted and late results never reach a replacemen
     const error = first.received.find(message => message.requestId === "error");
     assert.equal(error?.error, "error-handling-request");
     assert.equal(JSON.stringify(error).includes("PRIVATE"), false);
+    assert.deepEqual(failureCategories, ["unclassified"]);
     first.send({ ...request, requestId: "late", params: {} });
     await new Promise(resolve => setImmediate(resolve));
     client.close();
@@ -1236,6 +1240,38 @@ test("native owner errors are redacted and late results never reach a replacemen
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(first.received.some(message => message.requestId === "late"), false);
     assert.equal(second.received.some(message => message.requestId === "late"), false);
+  } finally { client.close(); }
+});
+
+test("native owner IPC diagnostics classify fixed admission refusals without exposing request or error data", async () => {
+  const server = new Server();
+  const categories: string[] = [];
+  const client = new DesktopIpcClient(() => server, 100, {
+    canHandle: () => true,
+    onRequestFailure: category => { categories.push(category); },
+    handle: async request => {
+      if (request.params.kind === "settings")
+        throw new Error("Native repeated admission refused: effective settings changed");
+      if (request.params.kind === "owner")
+        throw new Error("Native repeated admission refused: owner not confirmed");
+      if (request.params.kind === "shape") throw new ManagedNativeQueueRefusal('request-shape');
+      if (request.params.kind === "baseline") throw new ManagedNativeQueueRefusal('baseline');
+      throw new Error("PRIVATE C:\\Users\\admin\\secret.txt token=top-secret");
+    },
+  });
+  try {
+    await client.connect();
+    for (const kind of ["settings", "owner", "shape", "baseline", "unexpected"]) {
+      server.send({ type: "request", requestId: kind, sourceClientId: "private-source-id",
+        method: "thread-follower-set-queued-follow-ups-state", version: 1, params: { kind } });
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(categories, ["settings-refused", "owner-refused", "queue-shape-refused",
+      "queue-baseline-refused", "unclassified"]);
+    assert.deepEqual(server.received.filter(message => ["settings", "owner", "shape", "baseline", "unexpected"].includes(String(message.requestId)))
+      .map(message => message.error), Array(5).fill("error-handling-request"));
+    assert.equal(JSON.stringify(categories).includes("PRIVATE"), false);
+    assert.equal(JSON.stringify(server.received).includes("top-secret"), false);
   } finally { client.close(); }
 });
 

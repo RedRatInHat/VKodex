@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import type { Duplex } from "node:stream";
+import { StockAddNotWritten } from "../codex/native-stock-admission.js";
+import { ManagedNativeQueueRefusal } from "./managed-native-stock-queue-adapter.js";
 import { DesktopRequestRejectedError, DesktopUnavailableError, UncertainActionError } from "./contracts.js";
 
 export type IpcObject = Record<string, unknown>;
@@ -102,6 +104,54 @@ export interface DesktopIpcConnectionIdentity {
 export interface IpcRequestHandler {
   canHandle(request: IpcIncomingRequest): boolean;
   handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject>;
+  /** Fixed diagnostic category only; never receives an exception or request data. */
+  onRequestFailure?(category: IpcRequestFailureCategory): void;
+}
+
+export type IpcRequestFailureCategory = 'owner-refused' | 'queue-gate-refused' |
+  'queue-shape-refused' | 'queue-baseline-refused' |
+  'settings-refused' | 'queue-state-refused' | 'entry-refused' |
+  'worker-not-written' | 'unclassified';
+
+/** Compare only exact internal literals. Arbitrary exception text is neither
+ * logged nor forwarded over IPC, even when an exception carries private data. */
+function incomingFailureCategory(error: unknown): IpcRequestFailureCategory {
+  if (error instanceof StockAddNotWritten) return 'worker-not-written';
+  if (error instanceof ManagedNativeQueueRefusal) {
+    switch (error.code) {
+      case 'request-shape': return 'queue-shape-refused';
+      case 'baseline': return 'queue-baseline-refused';
+      case 'owner-fence': return 'owner-refused';
+      default: return 'queue-gate-refused';
+    }
+  }
+  if (!(error instanceof Error)) return 'unclassified';
+  switch (error.message) {
+    case 'Native owner route unavailable':
+    case 'Native repeated admission refused: owner not confirmed':
+    case 'Native repeated admission refused: owner source changed':
+    case 'Native repeated admission refused: owner epoch mismatch':
+    case 'Native repeated admission refused: request ingress changed':
+      return 'owner-refused';
+    case 'Managed native stock queue request refused':
+      return 'queue-gate-refused';
+    case 'Native repeated admission refused: effective settings changed':
+    case 'Native repeated admission refused: in-flight effective settings changed':
+    case 'Native repeated admission refused: post-reserve effective settings changed':
+    case 'Native repeated admission refused: unconfirmed homogeneous qualification':
+      return 'settings-refused';
+    case 'Native repeated admission refused: non-JSON qualification or native entry':
+    case 'Native repeated admission refused: native entry preparation incomplete':
+      return 'entry-refused';
+    case 'Native repeated admission refused: pending snapshot changed':
+    case 'Native repeated admission refused: identity snapshot changed':
+    case 'Native repeated admission refused: classification snapshot changed':
+    case 'Native repeated admission refused: another stock add is unresolved':
+    case 'Native repeated admission refused: dispatch fence changed':
+      return 'queue-state-refused';
+    default:
+      return 'unclassified';
+  }
 }
 
 function incomingRequest(value: unknown): IpcIncomingRequest | null {
@@ -283,8 +333,10 @@ export class DesktopIpcClient {
         response = { type: "response", requestId: request.requestId, resultType: "success",
           method: request.method, handledByClientId: clientId, result };
       }
-    } catch {
+    } catch (error) {
       // Never forward raw backend errors: these can contain private task text.
+      try { this.requestHandler?.onRequestFailure?.(incomingFailureCategory(error)); }
+      catch { /* Diagnostics must not alter the generic IPC refusal. */ }
       response = { type: "response", requestId: message.requestId, resultType: "error", error: "error-handling-request" };
     }
     // A result from the old owner session must never reach a replacement pipe.

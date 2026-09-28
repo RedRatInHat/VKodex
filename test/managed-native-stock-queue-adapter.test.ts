@@ -5,7 +5,7 @@ import { mkdtemp } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { ManagedWorkerCommandDispatcher } from '../src/codex/managed-worker-command-dispatcher.js';
-import { ManagedNativeStockQueueAdapter,
+import { ManagedNativeQueueRefusal, ManagedNativeStockQueueAdapter,
   managedStockCommandId, type ManagedNativeStockQueueAdapterOptions } from '../src/desktop/managed-native-stock-queue-adapter.js';
 import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
 
@@ -135,6 +135,16 @@ test('predispatch refusal leaves durable native reservation with no worker write
   assert.equal(f.calls.length, 0);
   assert.deepEqual(f.adapter.quiescence(), { taskVersion: 1, unresolved: 1, unconsumed: 1 });
   await assert.rejects(f.adapter.accept(f.request(), f.ingress));
+  assert.equal(f.calls.length, 0);
+});
+
+test('stock queue reports fixed shape and baseline refusal codes before any worker write', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.adapter.accept({ ...f.request(), version: 2 }, f.ingress),
+    error => error instanceof ManagedNativeQueueRefusal && error.code === 'request-shape');
+  f.revokeBaseline();
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress),
+    error => error instanceof ManagedNativeQueueRefusal && error.code === 'baseline');
   assert.equal(f.calls.length, 0);
 });
 
