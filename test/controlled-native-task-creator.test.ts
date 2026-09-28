@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -129,11 +129,13 @@ test('controlled creator writes one thread/start after intent, then qualifies ze
 for (const loseRead of [false, true]) test(`opt-in source proof qualifies the only rollout${loseRead ? ' after restart' : ''}`, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-source-'));
   const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  const aliasHome = path.join(root, 'home-alias');
   const preflightReceiptPath = path.join(root, 'preflight.json');
   mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true });
+  symlinkSync(sourceHome, aliasHome, process.platform === 'win32' ? 'junction' : 'dir');
   mkdirSync(workspace);
   const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
-  const nativeReadPath = path.toNamespacedPath(nativePath);
+  const nativeReadPath = path.toNamespacedPath(path.join(aliasHome, 'sessions', `${taskId}.jsonl`));
   const policy = { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] };
   const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
     thread: { ...startResult.thread, cwd: workspace } };
@@ -186,7 +188,7 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
     const result = loseRead ? await reconcileControlledNativeCreation({ journal,
       operationId: options.operationId, rpc, resolveSource: options.resolveSource,
       sourceProof: { sourceHome, preflightReceiptPath } }) : await createControlledNativeTask(options);
-    assert.equal(result.rolloutPath, nativePath);
+    assert.equal(result.rolloutPath, realpathSync(nativePath));
     assert.equal(result.sourceProofRequired, true);
     assert.equal(journal.get(options.operationId)?.qualified?.sourceProofRequired, true);
     assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read'] : ['thread/start']),

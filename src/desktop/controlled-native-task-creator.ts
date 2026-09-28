@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import type { AppServerRpc } from '../codex/app-server-connection.js';
@@ -23,6 +24,15 @@ const row = (value: unknown): value is Row => value !== null && typeof value ===
 const pathEqual = (a: unknown, b: unknown): boolean => typeof a === 'string' && typeof b === 'string' &&
   path.win32.isAbsolute(a) && path.win32.isAbsolute(b) &&
   comparablePath(a) === comparablePath(b);
+async function sameExistingFilePath(a: unknown, b: unknown): Promise<boolean> {
+  if (pathEqual(a, b)) return true;
+  if (typeof a !== 'string' || typeof b !== 'string' ||
+    !path.win32.isAbsolute(a) || !path.win32.isAbsolute(b)) return false;
+  try {
+    const [left, right] = await Promise.all([realpath(a), realpath(b)]);
+    return comparablePath(left) === comparablePath(right);
+  } catch { return false; }
+}
 const refuse = (): never => { throw new Error('Controlled native creation unqualified'); };
 function freezeTree<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
@@ -232,13 +242,13 @@ export function policyFromControlledStarted(started: ControlledCreationStarted):
   return policy;
 }
 
-function qualifyRead(read: Row, threadId: string, rolloutPath: string,
-  policy: ApprovedTaskPolicy): void {
+async function qualifyRead(read: Row, threadId: string, rolloutPath: string,
+  policy: ApprovedTaskPolicy): Promise<void> {
   if (!row(read.thread) || read.thread.id !== threadId ||
     !row(read.thread.status) ||
     !['idle', 'notLoaded'].includes(read.thread.status.type as string) ||
     !Array.isArray(read.thread.turns) || read.thread.turns.length !== 0 ||
-    !pathEqual(read.thread.path, rolloutPath) ||
+    !(await sameExistingFilePath(read.thread.path, rolloutPath)) ||
     !pathEqual(read.thread.cwd, policy.cwd) ||
     read.thread.modelProvider !== policy.modelProvider) refuse();
   const thread = read.thread as Row;
@@ -269,7 +279,7 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
   if (typeof observedPath !== 'string') throw new Error('Controlled native creation unqualified');
   const source = await options.resolveSource(threadId, observedPath);
   if (!source || source.sourceId !== options.sourceId) refuse();
-  qualifyRead(read, threadId, source.rolloutPath, effectivePolicy);
+  await qualifyRead(read, threadId, source.rolloutPath, effectivePolicy);
   const turns = await rpc.request('thread/turns/list', {
     threadId, limit: 100, sortDirection: 'asc', itemsView: 'full' },
     { expectedGeneration: generation });
@@ -280,7 +290,7 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
   if (!Array.isArray(turns.data) || turns.data.length !== 0 || turns.nextCursor !== null ||
     goal.goal !== null || !Array.isArray(queue.data) || queue.data.length !== 0 ||
     queue.nextCursor !== null) refuse();
-  qualifyRead(after, threadId, source.rolloutPath, effectivePolicy);
+  await qualifyRead(after, threadId, source.rolloutPath, effectivePolicy);
   const observedAfterPath = row(after.thread) ? after.thread.path : null;
   if (typeof observedAfterPath !== 'string') throw new Error('Controlled native creation unqualified');
   const sourceAfter = await options.resolveSource(threadId, observedAfterPath);
