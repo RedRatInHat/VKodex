@@ -265,6 +265,13 @@ export class ManagedWorkerOperationJournal {
     return this.transition(expected, "unknown");
   }
 
+  /** A final transport fence proved that no ID, pending request or write was
+   * attempted. This is a local rejection, so it has no native error code. */
+  rejectBeforeWrite(expected: WorkerOperation): WorkerOperation {
+    if (expected.state !== "dispatching") throw new Error("Pre-write refusal requires dispatching operation");
+    return this.transition(expected, "rejected");
+  }
+
   accept(expected: WorkerOperation, receiptId: string): WorkerOperation {
     const receipt = bounded(receiptId, "receipt ID", 256);
     return this.transition(expected, "accepted", receipt);

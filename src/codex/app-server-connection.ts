@@ -66,6 +66,9 @@ export interface AppServerRequestOptions {
   readonly onLateResponseEnvelope?: (envelope: AppServerResponseEnvelope) => void;
   /** Synchronous authority fence after start() and immediately before wire write. */
   readonly assertBeforeWrite?: () => void;
+  /** Called only when that final fence throws before ID allocation or any wire
+   * attempt. The original refusal remains the request error. */
+  readonly onBeforeWriteRefused?: () => void;
 }
 
 export interface AppServerEnvelope {
@@ -228,7 +231,10 @@ export class AppServerConnection implements AppServerRpc {
     if (!child) return Promise.reject(new AppServerUnavailableError());
     const generation = this.generation;
     try { options.assertBeforeWrite?.(); }
-    catch (error) { return Promise.reject(error); }
+    catch (error) {
+      try { options.onBeforeWriteRefused?.(); } catch { /* preserve the original guard refusal */ }
+      return Promise.reject(error);
+    }
     if (this.child !== child || this.generation !== generation ||
       (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration)))
       return Promise.reject(new AppServerUnavailableError());

@@ -82,6 +82,25 @@ test("scope, revision and exact settled outcome are fenced", () => {
   assert.throws(() => new ManagedWorkerOperationJournal({ ...scope, threadId: "thread-2" }), /scope/i);
 });
 
+test('a proven final pre-wire refusal settles without a native error code and unblocks new admission', () => {
+  const scope = fixture(); const first = intent();
+  const journal = new ManagedWorkerOperationJournal(scope);
+  const reserved = journal.reserve(first).operation;
+  try {
+    const rejected = journal.rejectBeforeWrite(reserved);
+    assert.equal(rejected.state, 'rejected');
+    assert.equal(rejected.receiptId, null);
+    assert.equal(rejected.rejectionCode, null);
+    assert.equal(journal.hasUnconfirmed(), false);
+    assert.equal(journal.rejectBeforeWrite(reserved).revision, rejected.revision);
+    assert.throws(() => journal.accept(reserved, 'not-a-wire-receipt'), /settled|conflict/i);
+    assert.equal(journal.reserve(intent()).created, true);
+  } finally { journal.close(); }
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try { assert.deepEqual(reopened.get(first.operationId)?.state, 'rejected'); }
+  finally { reopened.close(); }
+});
+
 test("metadata-only journal rejects raw fields and never persists payload marker", () => {
   const scope = fixture();
   const journal = new ManagedWorkerOperationJournal(scope);

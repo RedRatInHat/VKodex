@@ -424,17 +424,20 @@ export class ManagedWorkerCommandDispatcher {
 
   async #dispatch(command: WorkerCommand, authorize: () => void): Promise<WorkerOperation> {
     const receipt = (envelope: AppServerResponseEnvelope) => this.#receipt(command, envelope);
+    let refusedBeforeWrite = false;
     try {
       await this.backend.request(command.method, structuredClone(command.params), {
         mutating: true, expectedGeneration: this.#scope.backendGeneration,
-        assertBeforeWrite: authorize, onResponseEnvelope: receipt, onLateResponseEnvelope: receipt,
+        assertBeforeWrite: authorize, onBeforeWriteRefused: () => { refusedBeforeWrite = true; },
+        onResponseEnvelope: receipt, onLateResponseEnvelope: receipt,
       });
     } catch { /* RPC failure never justifies replay or stopping the worker. */ }
     const observed = this.#journal.get(command.operationId);
     if (!observed) throw new Error('Worker operation result unavailable');
     // Only durable receipt processing establishes acceptance. Even a successful
     // raw RPC result is unknown if its shape or persistence could not be proven.
-    return observed.state === 'dispatching' ? this.#journal.markUnknown(observed) : observed;
+    return observed.state === 'dispatching' ? refusedBeforeWrite
+      ? this.#journal.rejectBeforeWrite(observed) : this.#journal.markUnknown(observed) : observed;
   }
 
   #settingsAck(command: SettingsCommand, envelope: AppServerResponseEnvelope): void {

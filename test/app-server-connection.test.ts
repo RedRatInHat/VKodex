@@ -1367,6 +1367,24 @@ test("final before-write guard rejects only this request after authority revocat
   } finally { await connection.close(); }
 });
 
+test("final guard refusal callback fires once before RPC allocation and preserves guard error", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    const session = await connection.initializedSession();
+    let refusals = 0;
+    const denied = new Error('scoped-lease-revoked');
+    await assert.rejects(connection.request('turn/start', {}, {
+      mutating: true, expectedGeneration: session.generation,
+      assertBeforeWrite: () => { throw denied; },
+      onBeforeWriteRefused: () => { refusals++; throw new Error('callback-isolated'); },
+    }), error => error === denied);
+    assert.equal(refusals, 1);
+    assert.equal(child.messages.some(message => message.method === 'turn/start'), false);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+  } finally { await connection.close(); }
+});
+
 test("before-write guard reentrant close cannot dispatch onto the old child", async () => {
   const child = new AppServerChild();
   const connection = new AppServerConnection(() => child.asChild(), undefined, 100);

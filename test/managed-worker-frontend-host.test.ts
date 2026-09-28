@@ -839,6 +839,46 @@ test('validated rejection clears command quiescence without a backend read', asy
     assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
   } finally { await f.managed.stop('test-cleanup'); }
 });
+
+test('real final pre-wire lease refusal is durably rejected with no worker frame or hidden replay', async () => {
+  const f = commandFixture(200); await f.managed.start();
+  try {
+    let checks = 0;
+    const denied = await f.managed.executeCommandWithResponse(f.controlKey, f.command, () => {
+      if (++checks === 2) throw new Error('lease-revoked-before-write');
+    });
+    assert.equal(checks, 2);
+    assert.equal(denied.operation.state, 'rejected');
+    assert.equal(denied.operation.rejectionCode, null);
+    assert.equal(denied.response, null);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
+    assert.equal((await f.managed.executeCommandWithResponse(f.controlKey, f.command)).operation.state, 'rejected');
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
+    const next = { ...f.command, operationId: randomUUID(), params: { ...f.command.params,
+      clientUserMessageId: randomUUID() } };
+    const running = f.managed.executeCommandWithResponse(f.controlKey, next);
+    const frame = await sentMutation(f.child);
+    f.child.send({ id: frame.id, result: { turn: { id: 'next-real-turn' } } });
+    assert.equal((await running).operation.receiptId, 'next-real-turn');
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('a written mutation without a response remains unknown and blocks a new command', async () => {
+  const f = commandFixture(20); await f.managed.start();
+  try {
+    const work = f.managed.executeCommandWithResponse(f.controlKey, f.command);
+    await sentMutation(f.child);
+    const outcome = await work;
+    assert.equal(outcome.operation.state, 'unknown');
+    assert.equal(outcome.response, null);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+    const next = { ...f.command, operationId: randomUUID(), params: { ...f.command.params,
+      clientUserMessageId: randomUUID() } };
+    assert.throws(() => f.managed.executeCommandWithResponse(f.controlKey, next), /unsettled/i);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
 async function sentMutation(child: Child, method = 'turn/start'): Promise<Frame> {
   for (let tries = 0; tries < 50; tries++) {
     const frame = child.messages.find(value => value.method === method);
@@ -917,12 +957,13 @@ test('timeout is durable unknown, late receipt settles once without a second mod
   } finally { await f.managed.stop('test-cleanup'); }
 });
 
-test('owner revoked before actual write does not dispatch or close the worker', async () => {
+test('owner revoked before actual write is definitively rejected without closing the worker', async () => {
   const f = commandFixture(); await f.managed.start();
   try {
     const pending = f.managed.executeCommand(f.controlKey, f.command);
     f.authority.current = false;
-    assert.equal((await pending).state, 'unknown');
+    assert.equal((await pending).state, 'rejected');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
     assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
     assert.equal(f.child.stdin.writableEnded, false);
   } finally { await f.managed.stop('test-cleanup'); }
@@ -1094,7 +1135,7 @@ test('response cache eviction and reopened journal never reconstruct native resu
   } finally { await reopened.stop('test-cleanup'); }
 });
 
-test('scoped before-write fence revocation leaves an unknown journal entry without native write', async () => {
+test('scoped before-write fence revocation leaves a rejected journal entry without native write', async () => {
   const f = commandFixture(); await f.managed.start();
   let lease = true; let checks = 0;
   try {
@@ -1104,7 +1145,8 @@ test('scoped before-write fence revocation leaves an unknown journal entry witho
     });
     lease = false;
     const outcome = await pending;
-    assert.equal(outcome.operation.state, 'unknown'); assert.equal(outcome.response, null);
+    assert.equal(outcome.operation.state, 'rejected'); assert.equal(outcome.response, null);
+    assert.equal(outcome.operation.rejectionCode, null);
     assert.equal(checks, 2);
     assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
     assert.equal(f.child.stdin.writableEnded, false);
