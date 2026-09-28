@@ -85,6 +85,13 @@ export interface IpcIncomingRequest {
   readonly params: IpcObject;
 }
 
+/** Opaque routing identity for one live IPC connection. It is neither an
+ * authentication credential nor proof that this client owns a task. */
+export interface DesktopIpcConnectionIdentity {
+  readonly clientId: string;
+  readonly connectionEpoch: number;
+}
+
 /** Explicit opt-in for a native owner endpoint. Scope/version checks belong to
  * canHandle and are repeated on dispatch; discovery alone never grants access.
  * Mutating handlers must reconcile operations in their own durable ledger.
@@ -111,6 +118,7 @@ function incomingRequest(value: unknown): IpcIncomingRequest | null {
 export class DesktopIpcClient {
   private stream: Duplex | null = null;
   private clientId: string | null = null;
+  private connectionEpoch = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly listeners = new Set<(message: IpcObject) => void>();
   private readonly disconnectListeners = new Set<(error: DesktopUnavailableError) => void>();
@@ -128,6 +136,13 @@ export class DesktopIpcClient {
     if (this.connecting) return this.connecting;
     this.connecting = this.initialize();
     try { await this.connecting; } finally { this.connecting = null; }
+  }
+
+  /** Snapshot-only identity for the currently connected broker session.
+   * Reconnecting increments the epoch even if the broker happens to reuse an ID. */
+  get connectionIdentity(): Readonly<DesktopIpcConnectionIdentity> | null {
+    return this.clientId === null || this.stream === null || this.stream.destroyed ? null : Object.freeze({ clientId: this.clientId,
+      connectionEpoch: this.connectionEpoch });
   }
 
   private async initialize(): Promise<void> {
@@ -149,10 +164,11 @@ export class DesktopIpcClient {
     try {
       const reply = await this.request("initialize", 0, { clientType: "vkodex" });
       if (this.stream !== stream || stream.destroyed) throw new DesktopUnavailableError();
-      if (!isObject(reply.result) || typeof reply.result.clientId !== "string") {
+      if (!isObject(reply.result) || typeof reply.result.clientId !== "string" || !reply.result.clientId) {
         throw new DesktopUnavailableError("Десктоп вернул несовместимый ответ подключения.");
       }
       this.clientId = reply.result.clientId;
+      this.connectionEpoch++;
     } catch (error) {
       if (this.stream === stream) this.close();
       throw error;
