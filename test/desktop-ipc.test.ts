@@ -1791,21 +1791,50 @@ test("source matching accepts active and archived rollouts from the same CODEX_H
   try { await subscription.start(100); assert.ok(subscription.current); } finally { subscription.close(); }
 });
 
-test("a transient pathless snapshot refreshes once before accepting the selected task copy", async t => {
+test("a pathless post-edit snapshot refreshes to the catalog rollout and projects rebuilt history without replay", async t => {
   const expected = "C:/profiles/work/sessions/task.jsonl";
-  const server = new Server(); let follows = 0; let updates = 0;
-  server.dataState = { ...state() };
+  const server = new Server(); let follows = 0;
+  const staleHistory = { id: ref.threadId, hostId: ref.hostId, rolloutPath: "C:/profiles/work/sessions/old.jsonl", turns: [{
+    turnId: "old-turn", turnStartedAtMs: 100, status: "completed", items: [
+      { type: "userMessage", id: "old-user", content: [{ type: "text", text: "Original request" }] },
+      { type: "agentMessage", id: "old-final", phase: "final_answer", text: "Previously delivered answer" },
+    ],
+  }] };
+  const attached = projectSnapshot({ id: ref.threadId, hostId: ref.hostId,
+    rolloutPath: "C:/profiles/work/sessions/old.jsonl", turns: [] }, null, 50);
+  const beforeEdit = projectSnapshot(staleHistory, attached.checkpoint, 100);
+  assert.deepEqual(beforeEdit.events.filter(event => event.type !== "status").map(event => event.text),
+    ["Original request", "Previously delivered answer"]);
+
+  server.dataState = { ...staleHistory };
+  delete server.dataState.rolloutPath;
   server.onFollow = () => {
     follows++;
-    if (follows === 2) server.dataState = { ...server.dataState, rolloutPath: "\\\\?\\C:\\Profiles\\WORK\\sessions\\task.jsonl" };
+    if (follows === 2) server.dataState = { id: ref.threadId, hostId: ref.hostId,
+      rolloutPath: "\\\\?\\C:\\Profiles\\WORK\\sessions\\task.jsonl", turns: [{
+        turnId: "rebuilt-turn", turnStartedAtMs: 100, status: "completed", items: [
+          { type: "userMessage", id: "new-user-id", content: [{ type: "text", text: "Original request" }] },
+          { type: "agentMessage", id: "new-final-id", phase: "final_answer", text: "Previously delivered answer" },
+        ],
+      }, {
+        turnId: "edited-turn", turnStartedAtMs: 200, status: "completed", items: [
+          { type: "userMessage", id: "edited-user", content: [{ type: "text", text: "Corrected request" }] },
+          { type: "agentMessage", id: "edited-final", phase: "final_answer", text: "Corrected answer" },
+        ],
+      }] };
     server.snapshot();
   };
   const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
-  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: expected }, () => { updates++; }, () => {});
+  const accepted: IpcObject[] = [];
+  const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: expected }, snapshot => { accepted.push(snapshot); }, () => {});
   try {
     await subscription.start(100);
-    assert.equal(follows, 2); assert.equal(updates, 1);
+    assert.equal(follows, 2); assert.equal(accepted.length, 1);
     assert.equal(subscription.current?.rolloutPath, "\\\\?\\C:\\Profiles\\WORK\\sessions\\task.jsonl");
+    const projected = projectSnapshot(accepted[0]!, beforeEdit.checkpoint, 300);
+    assert.deepEqual(projected.events.filter(event => event.type !== "status").map(event => [event.type, event.text]), [
+      ["user", "Corrected request"], ["final", "Corrected answer"],
+    ]);
   } finally { subscription.close(); }
 });
 
