@@ -28,11 +28,23 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
           start: async () => refuse(), verifyOwner: async () => refuse(), close: () => {} };
         const transport = new ManagedOwnerObservedTaskStateTransport(observer, task);
         observations.add(transport);
-        const stream = transport.subscribe(task, onState, onError);
-        return { task: stream.task, start: timeoutMs => stream.start(timeoutMs),
-          verifyOwner: timeoutMs => stream.verifyOwner(timeoutMs),
-          diagnostic: () => stream.diagnostic?.() ?? { kind: 'unknown' },
-          close: () => { stream.close(); transport.close(); observations.delete(transport); } };
+        let stream: TaskStateStream | null = null;
+        let closed = false;
+        const close = (): void => {
+          if (closed) return;
+          closed = true;
+          stream?.close(); transport.close(); observations.delete(transport);
+        };
+        try { stream = transport.subscribe(task, onState, error => { close(); onError(error); }); }
+        catch (error) { close(); throw error; }
+        if (closed) stream.close();
+        const active = stream;
+        return { task: active.task,
+          start: async timeoutMs => { try { await active.start(timeoutMs); } catch (error) { close(); throw error; } },
+          verifyOwner: async timeoutMs => {
+            try { await active.verifyOwner(timeoutMs); } catch (error) { close(); throw error; }
+          },
+          diagnostic: () => active.diagnostic?.() ?? { kind: 'unknown' }, close };
       },
       close: () => { for (const transport of observations) transport.close(); observations.clear(); },
     });

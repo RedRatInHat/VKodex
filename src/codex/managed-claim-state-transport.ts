@@ -45,7 +45,10 @@ export class ManagedClaimStateTransport implements TaskStateTransport {
     }, error => {
       if (stopped) return;
       stopped = true;
-      if (active) this.#streams.delete(active);
+      if (active) {
+        this.#streams.delete(active);
+        try { active.close(); } catch { /* Report the original state failure. */ }
+      }
       onError(error);
     });
     if (stopped) active.close();

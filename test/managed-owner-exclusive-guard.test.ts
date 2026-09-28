@@ -83,7 +83,7 @@ test('claim for one source never captures another source or thread', async () =>
 
 test('exclusive managed observation uses the exact claim without opening a fallback writer stream', async () => {
   const store = new BridgeStore();
-  let baseStreams = 0, resolved = 0, observed = 0, closed = 0;
+  let baseStreams = 0, resolved = 0, observed = 0, closed = 0, closedSources = 0;
   const baseStates: TaskStateTransport = { subscribe: requested => {
     baseStreams++;
     return { task: requested, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
@@ -96,9 +96,13 @@ test('exclusive managed observation uses the exact claim without opening a fallb
     backendGeneration: 1, registryRevision: 1, endpointRef: randomUUID(),
     host: { pid: 101, birthTicks: '10' }, backend: { pid: 102, birthTicks: '11' },
   });
-  const workerStates: TaskStateTransport = { subscribe: requested => ({ task: requested,
+  let emitError!: () => void; let reported = 0;
+  const workerStates: TaskStateTransport = { subscribe: (requested, _onState, onError) => {
+    emitError = () => onError(new Error('private state stream failed'));
+    return { task: requested,
     start: async () => { observed++; }, verifyOwner: async () => {}, close: () => { closed++; },
-  }), close: () => {} };
+    };
+  }, close: () => { closedSources++; } };
   const resolver: ManagedOwnerRouteObserver = {
     isCurrent: current => store.managedOwner(task())?.revision === current.revision,
     async resolve() { resolved++; return { kind: 'statically-qualified' as const, claim,
@@ -110,15 +114,20 @@ test('exclusive managed observation uses the exact claim without opening a fallb
   const guard = new ManagedOwnerExclusiveRouteGuard(store, resolver);
   const states = new RoutedTaskStateTransport(baseStates, [guard]);
   try {
-    const stream = states.subscribe(task(), () => {}, () => {});
+    const stream = states.subscribe(task(), () => {}, () => { reported++; });
     assert.equal(resolved, 0, 'subscription remains lazy');
     await stream.start(); await stream.verifyOwner();
     assert.equal(resolved, 1); assert.equal(observed, 1); assert.equal(baseStreams, 0);
+    emitError();
+    assert.equal(reported, 1);
+    assert.equal(closedSources, 1, 'stream failure releases the private state source');
     stream.close(); assert.ok(closed >= 1);
     store.transitionManagedOwner(claim, 'unavailable');
     const stale = states.subscribe(task(), () => {}, () => {});
     await assert.rejects(stale.start());
     assert.equal(baseStreams, 0, 'claim loss never falls back to the base writer');
-    stale.close();
+    assert.equal(closedSources, 2, 'failed start closes its source automatically');
+    states.close();
+    assert.equal(closedSources, 2, 'failed stream is no longer retained by the guard');
   } finally { states.close(); store.close(); }
 });

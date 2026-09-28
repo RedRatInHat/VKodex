@@ -82,3 +82,17 @@ test('managed state claim does not open a different task or source', () => {
   assert.equal(base.stream, null);
   transport.close();
 });
+
+test('underlying state failure closes its stream before reporting the failure', async () => {
+  const base = new FakeTransport();
+  const transport = new ManagedClaimStateTransport(base, task, () => true);
+  let closedWhenReported = false;
+  const stream = transport.subscribe(task, () => {}, () => {
+    closedWhenReported = base.stream?.closed === true;
+  });
+  await stream.start();
+  base.onError?.(new Error('private socket failed'));
+  assert.equal(closedWhenReported, true);
+  assert.equal(base.stream?.closed, true);
+  stream.close(); transport.close();
+});
