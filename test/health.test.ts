@@ -382,7 +382,8 @@ test("health detects native queued VK input stranded behind an idle task", async
   status = "idle";
   const stranded = (await monitor.check(true)).checks.find(check => check.name === `codex_native_queue:${binding.id}`)!;
   assert.equal(stranded.state, "failed");
-  assert.match(stranded.detail, /Fixture.*ранее приняты в очередь/u);
+  assert.match(stranded.detail, /Fixture.*локальные подтверждения thread\/queue\/add/u);
+  assert.match(stranded.detail, /Текущее наличие в очереди Codex не проверено/u);
   assert.doesNotMatch(stranded.detail, /остаются в штатной очереди/u);
   store.settleQueuedInput(binding.id, "queued-op");
   assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);
