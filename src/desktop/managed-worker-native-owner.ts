@@ -11,6 +11,7 @@ import type { IpcIncomingRequest, IpcObject, IpcRequestHandler } from './ipc-cli
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
+import { ManagedNativeStockQueueAdapter, type ManagedNativeStockPublish } from './managed-native-stock-queue-adapter.js';
 
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
   'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
@@ -21,6 +22,7 @@ type StartupStage = 'not-started' | 'observing' | 'reading-initial' | 'validatin
 type BootstrapCategory = 'status' | 'settings' | 'goal' | 'usage' | 'startup-or-warning' |
   'turn' | 'item' | 'other';
 const diagnosticCap = 255;
+const queueEventTailCap = 128;
 function bootstrapCategory(method: unknown): BootstrapCategory {
   if (method === 'thread/status/changed') return 'status';
   if (method === 'thread/settings/updated') return 'settings';
@@ -33,6 +35,29 @@ function bootstrapCategory(method: unknown): BootstrapCategory {
   return 'other';
 }
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
+type QueueGrant = { readonly requestId: string; readonly sourceClientId: string;
+  readonly lease: object; revoked: boolean };
+export interface ManagedNativeStockQueueContext {
+  readonly host: Host;
+  readonly controlKey: object;
+  readonly taskId: string;
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  readonly publish: ManagedNativeStockPublish;
+  readonly onStockQueueChanged: () => void;
+  readonly onFailure: (reason: string) => void;
+  readonly captureAuthority: () => ManagedNativeStockQueueAuthority;
+  readonly assertCurrent: (ticket: ManagedNativeStockQueueAuthority) => boolean;
+}
+export interface ManagedNativeStockQueueAuthority {
+  readonly taskId: string;
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  readonly semanticRevision: number;
+  readonly authorityRevision: number;
+  readonly projection: IpcObject;
+  readonly pendingEvents: 0;
+}
 const knownVersions = new Map<string, number>([
   ['thread-owner-discovery', 1], ['thread-follower-start-turn', 2],
   ['thread-follower-steer-turn', 1], ['thread-follower-interrupt-turn', 4],
@@ -51,6 +76,13 @@ const replyMethods = new Set(['thread-follower-submit-user-input',
 const object = (value: unknown): value is IpcObject =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const copy = <T>(value: T): T => structuredClone(value);
+function freezeTree<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const nested of Object.values(value)) freezeTree(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
 const refuse = (): Error => new Error('Native owner route unavailable');
 
 export interface ManagedWorkerNativeOwnerOptions {
@@ -72,6 +104,8 @@ export interface ManagedWorkerNativeOwnerOptions {
   /** Opt-in same-worker current-policy read. Must fence every awaited RPC. */
   readonly qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>;
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
+  /** Explicit previously qualified native queue adapter; never enabled by default. */
+  readonly queueAdapterFactory?: (context: Readonly<ManagedNativeStockQueueContext>) => ManagedNativeStockQueueAdapter;
 }
 export interface ManagedWorkerNativeOwnerMetadata {
   readonly state: OwnerState;
@@ -97,6 +131,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   readonly #options: ManagedWorkerNativeOwnerOptions;
   readonly #followers = new Map<string, object>();
   readonly #grants = new Map<string, Grant>();
+  readonly #queueGrants = new Map<string, QueueGrant>();
+  readonly #queueTickets = new WeakSet<object>();
   readonly #intentCache = new Map<string, NativeStartIntentRecord>();
   readonly #deferredBroadcasts: IpcObject[] = [];
   #state: OwnerState = 'new';
@@ -107,6 +143,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #revision = 0;
   #authorityRevision = 0;
   #semanticRevision = 0;
+  #queueRevision = 0;
   #bootstrapEvents = 0;
   #startupStage: StartupStage = 'not-started';
   #bootstrapNotifications: Record<BootstrapCategory, number> =
@@ -118,6 +155,9 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #detachRequests: (() => void) | null = null;
   #client: DesktopIpcClient | null = null;
   #startHandler: ManagedWorkerNativeStartHandler | null = null;
+  #queueAdapter: ManagedNativeStockQueueAdapter | null = null;
+  #eventTail: Promise<void> = Promise.resolve();
+  #pendingEvents = 0;
   #startPromise: Promise<void> | null = null;
   #reconnectPromise: Promise<void> | null = null;
 
@@ -140,7 +180,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
             typeof options.host.commandQuiescence !== 'function' ||
             typeof options.host.requestQuiescence !== 'function' ||
             typeof options.host.acceptedCommandReceipts !== 'function') ||
-        (options.clientFactory !== undefined && typeof options.clientFactory !== 'function')) throw refuse();
+        (options.clientFactory !== undefined && typeof options.clientFactory !== 'function') ||
+        (options.queueAdapterFactory !== undefined && typeof options.queueAdapterFactory !== 'function')) throw refuse();
     this.#options = Object.freeze({ ...options });
   }
 
@@ -163,6 +204,40 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         meta.backendGeneration === this.#generation &&
         ['running', 'restarting', 'frontend-unavailable'].includes(meta.state) &&
         this.#options.isOwnerCurrent() === true;
+    } catch { return false; }
+  }
+
+  #queueAuthority(): ManagedNativeStockQueueAuthority {
+    if (!this.#queueAdapter || !this.#projection || this.#generation === null ||
+        this.#pendingEvents !== 0 || !this.#ownerCurrent() ||
+        !['connected', 'disconnected'].includes(this.#state)) throw refuse();
+    const ticket = Object.freeze({ taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
+      backendGeneration: this.#generation, semanticRevision: this.#queueRevision,
+      authorityRevision: this.#authorityRevision, projection: freezeTree(copy({
+        id: this.#projection.id, cwd: this.#projection.cwd,
+        latestModel: this.#projection.latestModel,
+        latestReasoningEffort: this.#projection.latestReasoningEffort,
+        latestThreadSettings: this.#projection.latestThreadSettings,
+        currentPermissions: this.#projection.currentPermissions,
+        environments: this.#projection.environments ?? null,
+        threadRuntimeStatus: this.#projection.threadRuntimeStatus,
+        terminalTurnIds: this.#projection.turns.filter(turn =>
+          ['completed', 'interrupted', 'failed'].includes(turn.status)).map(turn => turn.turnId),
+        activeTurnIds: this.#projection.turns.filter(turn =>
+          !['completed', 'interrupted', 'failed'].includes(turn.status)).map(turn => turn.turnId),
+      })), pendingEvents: 0 as const });
+    this.#queueTickets.add(ticket);
+    return ticket;
+  }
+
+  #queueAuthorityCurrent(ticket: ManagedNativeStockQueueAuthority): boolean {
+    try {
+      return this.#queueTickets.has(ticket) &&
+        ticket.taskId === this.#options.taskId && ticket.ownerEpoch === this.#options.ownerEpoch &&
+        ticket.backendGeneration === this.#generation && ticket.pendingEvents === 0 &&
+        this.#pendingEvents === 0 && ticket.semanticRevision === this.#queueRevision &&
+        ticket.authorityRevision === this.#authorityRevision && this.#ownerCurrent() &&
+        ['connected', 'disconnected'].includes(this.#state);
     } catch { return false; }
   }
 
@@ -196,10 +271,11 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #fail(reason: string): void {
     if (this.#state === 'failed' || this.#state === 'closed') return;
     this.#state = 'failed'; this.#failure = reason;
-    this.#followers.clear(); this.#grants.clear(); this.#intentCache.clear(); this.#deferredBroadcasts.length = 0;
+    this.#followers.clear(); this.#grants.clear(); this.#queueGrants.clear();
+    this.#intentCache.clear(); this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
     this.#detachRequests?.(); this.#detachRequests = null;
-    this.#startHandler?.close(); this.#client?.close();
+    this.#queueAdapter?.close(); this.#startHandler?.close(); this.#client?.close();
   }
 
   #observe(event: ManagedWorkerNotification): void {
@@ -220,6 +296,19 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       return;
     }
     if (this.#state !== 'connected' && this.#state !== 'disconnected') return;
+    if (this.#queueAdapter) {
+      if (this.#pendingEvents >= queueEventTailCap) { this.#fail('queue-event-overflow'); return; }
+      // Fence new admissions before asynchronous attribution/projection begins.
+      this.#pendingEvents++;
+      if (event.notification.method !== 'thread/tokenUsage/updated') {
+        this.#semanticRevision++; this.#queueRevision++;
+      }
+      this.#eventTail = this.#eventTail.then(async () => {
+        try { await this.#observeStockEvent(event); }
+        finally { this.#pendingEvents--; }
+      }).catch(() => { this.#fail('queue-projection-failed'); });
+      return;
+    }
     if (!this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
         event.generation !== this.#generation || !this.#projection) {
       this.#fail('owner-changed'); return;
@@ -245,6 +334,52 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     } catch { this.#fail('projection-failed'); }
   }
 
+  async #observeStockEvent(event: ManagedWorkerNotification): Promise<void> {
+    const adapter = this.#queueAdapter;
+    if (!adapter || !this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
+        event.generation !== this.#generation || !this.#projection) { this.#fail('owner-changed'); return; }
+    const current = () => this.#queueAdapter === adapter && this.#ownerCurrent() &&
+      event.taskId === this.#options.taskId && event.generation === this.#generation &&
+      ['connected', 'disconnected'].includes(this.#state);
+    if (adapter.observeBackendNotification(event.notification, current)) return;
+    const notification = event.notification;
+    const params = object(notification.params) ? notification.params : null;
+    if (params && this.#options.qualifyContinuation && notification.method === 'thread/goal/cleared' &&
+        params.threadId === this.#options.taskId &&
+        Object.keys(params).length === 1) return;
+    const items: { clientId: string; turnId: string }[] = [];
+    if (params?.threadId === this.#options.taskId &&
+        (notification.method === 'turn/started' || notification.method === 'turn/completed') &&
+        params && object(params.turn) && typeof params.turn.id === 'string' &&
+        Array.isArray(params.turn.items)) {
+      for (const item of params.turn.items) if (object(item) && item.type === 'userMessage' &&
+          typeof item.clientId === 'string') items.push({ clientId: item.clientId, turnId: params.turn.id });
+    }
+    if (params?.threadId === this.#options.taskId &&
+        (notification.method === 'item/started' || notification.method === 'item/completed') &&
+        params && typeof params.turnId === 'string' && object(params.item) &&
+        params.item.type === 'userMessage' && typeof params.item.clientId === 'string')
+      items.push({ clientId: params.item.clientId, turnId: params.turnId });
+    for (const item of items) await adapter.consumeUserMessage(item.clientId, item.turnId, current);
+    if (!current()) throw refuse();
+    // Reuse the established projection path after attribution, without another tail enqueue.
+    this.#projectNotification(event);
+  }
+
+  #projectNotification(event: ManagedWorkerNotification): void {
+    if (!this.#projection) throw refuse();
+    const next = applyNotification(this.#projection, event.notification);
+    if (next === this.#projection) return;
+    if (event.notification.method !== 'thread/tokenUsage/updated' &&
+        !isDeepStrictEqual(next, this.#projection)) this.#semanticRevision++;
+    const settings = this.#snapshot(next);
+    if (!isDeepStrictEqual(settings, this.#authoritySnapshot)) {
+      this.#authoritySnapshot = settings; this.#authorityRevision++;
+    }
+    this.#projection = next; this.#revision++;
+    for (const source of this.#followers.keys()) this.#sendSnapshot(source);
+  }
+
   #observeRequest(event: { taskId: string; generation: number; request: RequestFrame }): void {
     if (this.#state === 'bootstrapping') {
       this.#bootstrapEvents++;
@@ -252,6 +387,15 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       return;
     }
     if (this.#state !== 'connected' && this.#state !== 'disconnected') return;
+    if (this.#queueAdapter) {
+      if (this.#pendingEvents >= queueEventTailCap) { this.#fail('queue-event-overflow'); return; }
+      this.#pendingEvents++; this.#semanticRevision++; this.#queueRevision++;
+      this.#eventTail = this.#eventTail.then(() => {
+        try { this.#projectRequest(event); }
+        finally { this.#pendingEvents--; }
+      }).catch(() => { this.#fail('request-projection-failed'); });
+      return;
+    }
     if (!this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
         event.generation !== this.#generation || !this.#projection) {
       this.#fail('owner-changed'); return;
@@ -263,6 +407,16 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#projection = next; this.#revision++;
       for (const source of this.#followers.keys()) this.#sendSnapshot(source);
     } catch { this.#fail('request-projection-failed'); }
+  }
+
+  #projectRequest(event: { taskId: string; generation: number; request: RequestFrame }): void {
+    if (!['connected', 'disconnected'].includes(this.#state) ||
+        !this.#ownerCurrent() || event.taskId !== this.#options.taskId ||
+        event.generation !== this.#generation || !this.#projection) throw refuse();
+    const next = projectNativeServerRequest(this.#projection, event.request);
+    if (next === this.#projection) return;
+    this.#semanticRevision++; this.#projection = next; this.#revision++;
+    for (const source of this.#followers.keys()) this.#sendSnapshot(source);
   }
 
   start(): Promise<void> {
@@ -303,6 +457,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#authoritySnapshot = this.#snapshot(initial);
       this.#revision = 1; this.#authorityRevision = 1;
       this.#semanticRevision = 1;
+      this.#queueRevision = 1;
       this.#startHandler = new ManagedWorkerNativeStartHandler({
         host: this.#options.host, controlKey: this.#options.controlKey,
         taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
@@ -321,6 +476,20 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
             for (const source of this.#followers.keys()) this.#sendSnapshot(source);
           } } : {}),
       });
+      if (this.#options.queueAdapterFactory) {
+        const generation = this.#generation!;
+        this.#queueAdapter = this.#options.queueAdapterFactory(Object.freeze({
+          host: this.#options.host, controlKey: this.#options.controlKey,
+          taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
+          backendGeneration: generation,
+          publish: (messages: Parameters<ManagedNativeStockPublish>[0],
+            metadata: Parameters<ManagedNativeStockPublish>[1]) => this.#publishQueue(messages, metadata),
+          onStockQueueChanged: () => { this.#semanticRevision++; this.#queueRevision++; },
+          onFailure: () => this.#fail('queue-attribution-failed'),
+          captureAuthority: () => this.#queueAuthority(),
+          assertCurrent: (ticket: ManagedNativeStockQueueAuthority) => this.#queueAuthorityCurrent(ticket),
+        }));
+      }
       this.#client = (this.#options.clientFactory ??
         (handler => new DesktopIpcClient(undefined, 15_000, handler)))(this);
       this.#client.onBroadcast(message => this.#broadcastReceived(message));
@@ -442,9 +611,29 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       return { revision: this.#revision };
     }
     if (replyMethods.has(request.method)) return this.#answerRequest(request);
+    if (request.method === 'thread-follower-set-queued-follow-ups-state') {
+      const adapter = this.#queueAdapter;
+      const lease = this.#followers.get(request.sourceClientId);
+      if (!adapter || !lease || !this.#followerCurrent(request.sourceClientId) ||
+          this.#queueGrants.size + this.#grants.size >= 128 ||
+          this.#queueGrants.has(request.requestId) || this.#grants.has(request.requestId)) throw refuse();
+      const grant: QueueGrant = { requestId: request.requestId,
+        sourceClientId: request.sourceClientId, lease, revoked: false };
+      this.#queueGrants.set(request.requestId, grant);
+      const current = () => this.#queueAdapter === adapter &&
+        this.#queueGrants.get(request.requestId) === grant && !grant.revoked &&
+        this.#ownerCurrent() && ['connected', 'disconnected'].includes(this.#state);
+      try { return await adapter.accept(request, current); }
+      finally { if (this.#queueGrants.get(request.requestId) === grant)
+        this.#queueGrants.delete(request.requestId); }
+    }
     if (request.method !== 'thread-follower-start-turn') throw refuse();
+    // Stock repeated admission owns command ordering for this opt-in route.
+    // A direct start would bypass its homogeneous settings and queue journal.
+    if (this.#queueAdapter) throw refuse();
     if (!this.#followerCurrent(request.sourceClientId) || !this.#startHandler ||
-        this.#grants.size >= 128 || this.#grants.has(request.requestId)) throw refuse();
+        this.#grants.size + this.#queueGrants.size >= 128 ||
+        this.#grants.has(request.requestId) || this.#queueGrants.has(request.requestId)) throw refuse();
     const grant: Grant = Object.freeze({ requestId: request.requestId,
       sourceClientId: request.sourceClientId });
     this.#grants.set(request.requestId, grant);
@@ -479,6 +668,24 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     try { return lease !== undefined && this.#options.allowFollower(source) === true &&
       this.#followers.get(source) === lease && this.#state === 'connected'; }
     catch { return false; }
+  }
+
+  #publishQueue(messages: readonly IpcObject[], metadata: Parameters<ManagedNativeStockPublish>[1],
+    target?: { source: string; lease: object }): void {
+    if (!this.#client || !this.#ownerCurrent() || this.#state !== 'connected' ||
+        metadata.taskId !== this.#options.taskId || metadata.ownerEpoch !== this.#options.ownerEpoch)
+      throw refuse();
+    const sources = target ? [target.source] : [...this.#followers.keys()];
+    for (const source of sources) {
+      const lease = this.#followers.get(source);
+      if (!lease || target && lease !== target.lease || !this.#followerCurrent(source)) {
+        if (target) throw refuse();
+        continue;
+      }
+      try { this.#client.broadcast('thread-queued-followups-changed', 2,
+        { hostId: 'local', conversationId: this.#options.taskId, messages: copy(messages) }, source); }
+      catch { if (this.#followers.get(source) === lease) this.#followers.delete(source); }
+    }
   }
 
   #sendSnapshot(source: string): boolean {
@@ -540,18 +747,36 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     const source = message.sourceClientId;
     if (params.following) {
       try { if (this.#options.allowFollower(source) !== true) return; } catch { return; }
-      this.#followers.set(source, {});
+      // An explicit follow starts a new source lease even after transport EOF.
+      // EOF itself does not revoke already admitted work.
+      for (const grant of this.#queueGrants.values()) if (grant.sourceClientId === source)
+        grant.revoked = true;
+      const lease = {};
+      this.#followers.set(source, lease);
       this.#sendSnapshot(source);
-    } else this.#followers.delete(source);
+      const adapter = this.#queueAdapter;
+      if (adapter) void adapter.hydrateFollower((messages, metadata) =>
+        this.#publishQueue(messages, metadata, { source, lease }))
+        .catch(() => {
+          if (this.#state === 'closed' || this.#state === 'failed' ||
+              this.#followers.get(source) !== lease) return;
+          this.#fail('queue-hydration-failed');
+        });
+    } else {
+      this.#followers.delete(source);
+      for (const grant of this.#queueGrants.values()) if (grant.sourceClientId === source)
+        grant.revoked = true;
+    }
   }
 
   /** Gateway retirement never calls host.stop or closes the native worker. */
   close(): void {
     if (this.#state === 'closed') return;
-    this.#state = 'closed'; this.#followers.clear(); this.#grants.clear(); this.#intentCache.clear();
+    this.#state = 'closed'; this.#followers.clear(); this.#grants.clear();
+    this.#queueGrants.clear(); this.#intentCache.clear();
     this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
     this.#detachRequests?.(); this.#detachRequests = null;
-    this.#startHandler?.close(); this.#client?.close();
+    this.#queueAdapter?.close(); this.#startHandler?.close(); this.#client?.close();
   }
 }

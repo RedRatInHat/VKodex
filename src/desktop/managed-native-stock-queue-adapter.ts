@@ -10,7 +10,8 @@ import type { IpcIncomingRequest } from './ipc-client.js';
 type JsonObject = Record<string, unknown>;
 type Qualification = NativeStockTextQualification & StockAdmissionQualification;
 type Entry = JsonObject & { id: string };
-type Publish = ConstructorParameters<typeof NativeStockAdmission<Entry, Qualification>>[0]['publish'];
+export type ManagedNativeStockPublish = ConstructorParameters<typeof NativeStockAdmission<Entry, Qualification>>[0]['publish'];
+type Publish = ManagedNativeStockPublish;
 type Host = { executeCommandWithResponse(controlKey: object, command: WorkerCommand,
   beforeWrite?: () => void): Promise<WorkerCommandResponse> };
 export interface ManagedNativeStockQueueAdapterOptions {
@@ -250,11 +251,11 @@ export class ManagedNativeStockQueueAdapter {
     return true;
   }
 
-  async hydrateFollower(): Promise<void> {
+  async hydrateFollower(publish?: Publish): Promise<void> {
     if (this.#closed || this.#faulted) fail();
     if (await this.#assertInitialNativeQueueBaseline(this.#baselineScope) !== true ||
         this.#closed || this.#faulted) fail();
-    return this.#admission.hydrateFollower();
+    return this.#admission.hydrateFollower(publish);
   }
 
   /** Owner calls this before generic native projection. Stock queue change is

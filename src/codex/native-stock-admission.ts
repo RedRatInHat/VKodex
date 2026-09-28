@@ -408,7 +408,7 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
     });
   }
 
-  hydrateFollower(): Promise<void> {
+  hydrateFollower(publish: NativeStockAdmissionDependencies<Entry, Qualification>['publish'] = this.publish): Promise<void> {
     return this.publication(async () => {
       const version = this.journal.readTask().version;
       const messages = this.readQueuePages('current', version);
@@ -416,7 +416,7 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
       await this.ownerConfirmed();
       this.ownerCurrent();
       if (this.journal.readTask().version !== version) fail('hydration snapshot changed');
-      await this.publish(messages, { kind: 'hydrate', taskVersion: version,
+      await publish(messages, { kind: 'hydrate', taskVersion: version,
         taskId: this.taskId, ownerEpoch: this.ownerEpoch });
     });
   }

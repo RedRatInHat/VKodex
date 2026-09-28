@@ -13,6 +13,8 @@ import type { AppServerServerRequest } from '../src/codex/app-server-connection.
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerNativeOwner } from '../src/desktop/managed-worker-native-owner.js';
+import type { ManagedNativeStockQueueContext } from '../src/desktop/managed-worker-native-owner.js';
+import { ManagedNativeStockQueueAdapter } from '../src/desktop/managed-native-stock-queue-adapter.js';
 import type { NativeProjectionState } from '../src/codex/managed-native-projection.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from '../src/desktop/managed-worker-bootstrap.js';
 
@@ -27,6 +29,43 @@ function state(): NativeProjectionState {
       settings: { model: '', reasoning_effort: null, developer_instructions: null } },
     previousTurnModel: null, title: 'Own', threadRuntimeStatus: { type: 'idle' },
     latestTokenUsageInfo: null, hasUnreadTurn: false, updatedAt: 1 };
+}
+function stockQualification(ownerEpoch: string) {
+  const cwd = 'C:/own';
+  const requested = { mode: 'default', settings: { model: 'fixture-model',
+    reasoning_effort: 'medium', developer_instructions: null } };
+  const settings = { cwd, runtimeWorkspaceRoots: [cwd], approvalPolicy: 'never',
+    approvalsReviewer: 'user', permissions: ':danger-full-access',
+    sandboxPolicy: { type: 'dangerFullAccess' }, model: 'fixture-model', serviceTier: null,
+    effort: 'medium', summary: null, personality: 'pragmatic', collaborationMode: {
+      mode: 'default', settings: { model: 'fixture-model', reasoning_effort: 'medium',
+        developer_instructions: 'synthetic built-in' } } };
+  return { taskId, ownerEpoch, confirmed: true as const,
+    completeQueueAndHistory: true, exclusiveLifecycleWriter: true, ambientContextEmpty: true,
+    effectiveSettings: settings, initializationReceipt: { taskId, ownerEpoch, confirmed: true,
+      expansionKind: 'builtin-default-instructions', requestedCollaborationMode: requested,
+      confirmedEffectiveCollaborationMode: settings.collaborationMode,
+      requestedSettings: { ...settings, sandboxPolicy: null, serviceTier: 'default',
+        collaborationMode: requested }, confirmedEffectiveSettings: settings },
+    tierResolution: { taskId, ownerEpoch, requested: 'default', effective: null,
+      fastModeAllowed: false, confirmed: true } };
+}
+function stockEntry(id = randomUUID()) {
+  const text = 'PUBLIC_OK', cwd = 'C:/own';
+  const requested = { mode: 'default', settings: { model: 'fixture-model',
+    reasoning_effort: 'medium', developer_instructions: null } };
+  return { id, text, cwd, createdAt: 1780000000000,
+    context: { prompt: text, turnTrigger: 'composer', workspaceRoots: [cwd],
+      usedDictation: false, existingWorkspaceRoot: null, localProjectId: null,
+      fileAttachments: [], addedFiles: [] },
+    responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' },
+    submissionOptions: { executionHostId: 'local', agentMode: 'full-access',
+      permissionProfileId: ':danger-full-access', serviceTier: 'default',
+      shouldSendPermissionOverrides: false, usePermissionSelection: false,
+      permissionSelection: null, collaborationMode: requested,
+      clientUserMessageId: 'separate-native-option-id' },
+    writingBlockAdditionalContext: null, mentionedBrowserFamilies: [], submissionIntent: 'send-now',
+    submission: { hostId: 'local', status: 'pending', queueModeOverride: 'queue' } };
 }
 class Child extends EventEmitter {
   readonly stdin = new PassThrough(); readonly stdout = new PassThrough(); readonly stderr = new PassThrough();
@@ -74,11 +113,21 @@ async function waitFrame(frames: IpcObject[], predicate: (frame: IpcObject) => b
     if (Date.now() > end) throw new Error('fixture-frame-timeout');
     await new Promise(resolve => setTimeout(resolve, 5)); }
 }
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  const end = Date.now() + 1000;
+  while (!predicate()) {
+    if (Date.now() > end) throw new Error('fixture-condition-timeout');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 async function fixture(readInitialState: () => Promise<NativeProjectionState> = async () => state(),
   allowAnswer: (request: AppServerServerRequest, response: IpcObject) => boolean = () => false,
   allowFollower: (id: string) => boolean = id => id === 'follower', composer = false,
   qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>,
-  isOwnerCurrent: () => boolean = () => true) {
+  isOwnerCurrent: () => boolean = () => true,
+  stock = false,
+  stockHooks: { confirmOwner?: (qualified: boolean) => boolean | Promise<boolean>;
+    baseline?: () => boolean | Promise<boolean> } = {}) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -86,7 +135,8 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     launch: () => child as unknown as ChildProcessWithoutNullStreams,
     commandPolicy: { controlKey, ownerEpoch, fingerprintKey: randomBytes(32),
       journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-owner-')), 'ops.sqlite'),
-      isOwnerCurrent: () => true, authorize: ({ params }) => params.model === 'fixture-model' ||
+      isOwnerCurrent: () => true, authorize: ({ method, params }) =>
+        stock && method === 'thread/queue/add' || params.model === 'fixture-model' ||
         composer && params.model === null && params.permissions === ':read-only' } });
   await host.start();
   const generation = host.metadata.backendGeneration;
@@ -98,6 +148,27 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   let broker = new Broker(); const brokers = [broker];
   const owner = new ManagedWorkerNativeOwner({ host, adapterKey, controlKey, taskId, ownerEpoch,
     isOwnerCurrent, allowFollower, readInitialState,
+    ...(stock ? { queueAdapterFactory: ({ publish, onStockQueueChanged, onFailure,
+      captureAuthority, assertCurrent, host: queueHost, controlKey: queueControl,
+      taskId: queueTask, ownerEpoch: queueEpoch, backendGeneration }: ManagedNativeStockQueueContext) => {
+      let ticket: ReturnType<typeof captureAuthority> | null = null;
+      let ticketEntryId: string | null = null;
+      assert.equal(queueHost, host); assert.equal(queueControl, controlKey);
+      assert.equal(queueTask, taskId); assert.equal(queueEpoch, ownerEpoch);
+      assert.equal(backendGeneration, generation);
+      return new ManagedNativeStockQueueAdapter({ taskId, ownerEpoch, backendGeneration: generation,
+        sourceGeneration: String(generation), controlKey, host,
+        journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-owner-stock-')), 'native.sqlite'),
+        assertInitialNativeQueueBaseline: () => stockHooks.baseline?.() ?? true,
+        qualify: ({ entry }) => {
+          if (entry && entry.id !== ticketEntryId) { ticket = captureAuthority(); ticketEntryId = entry.id; }
+          return stockQualification(ownerEpoch);
+        },
+        confirmOwner: () => stockHooks.confirmOwner?.(ticket !== null) ?? true,
+        assertOwnerCurrent: () => isOwnerCurrent(),
+        assertDispatchCurrent: () => ticket !== null && assertCurrent(ticket),
+        publish, onStockQueueChanged, onFailure });
+    } } : {}),
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     ...(qualifyContinuation ? { qualifyContinuation } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
@@ -168,6 +239,311 @@ function snapshotTurn(frame: IpcObject): IpcObject | null {
   const state = change?.conversationState as IpcObject;
   return ((state?.turns as IpcObject[] | undefined) ?? [])[0] ?? null;
 }
+function followQueue(broker: Broker, source = 'follower', following = true): void {
+  broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+    sourceClientId: source, params: { hostId: 'local', conversationId: taskId, following } });
+}
+function submitQueue(broker: Broker, entry = stockEntry(), requestId = 'queue-one',
+  source = 'follower'): void {
+  broker.send({ type: 'request', requestId, sourceClientId: source, hostId: 'local',
+    method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+    params: { hostId: 'local', conversationId: taskId, state: { [taskId]: [entry] } } });
+}
+
+test('opt-in native queue v1 durably adds on the same worker before acknowledgement', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    f.child.onFrame = frame => {
+      if (frame.method === 'thread/queue/add') queueMicrotask(() => f.child.reply(frame.id,
+        { queuedSubmission: { id: 'stock-receipt',
+          clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+          input: (frame.params as IpcObject).input } }));
+    };
+    await f.owner.start();
+    followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    const entry = stockEntry();
+    submitQueue(f.broker, entry);
+    const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'queue-one');
+    assert.equal(reply.resultType, 'success');
+    assert.deepEqual(reply.result, { ok: true });
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+    f.broker.send(continuationRequest(randomUUID(), 'stock-direct-bypass'));
+    const denied = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'stock-direct-bypass');
+    assert.equal(denied.resultType, 'error');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock queue backend event during qualification invalidates the pending actual write', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let block = false;
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true,
+    { confirmOwner: async qualified => { if (block && qualified) { entered(); await waiting; } return true; } });
+  try {
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    block = true; submitQueue(f.broker, stockEntry(), 'queue-fenced');
+    await started;
+    f.child.send('thread/queue/changed', { threadId: taskId });
+    release();
+    const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'queue-fenced').catch(error => {
+        assert.fail(`queue response absent; owner=${f.owner.metadata.state}; writes=${
+          f.child.frames.filter(frame => frame.method === 'thread/queue/add').length}; replies=${
+          f.broker.frames.filter(frame => frame.type === 'response').length}: ${String(error)}`);
+      });
+    assert.equal(reply.resultType, 'error');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 0);
+    assert.notEqual(f.owner.metadata.state, 'failed');
+  } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('queue ingress survives EOF, while explicit unfollow or re-follow revokes its lease', async () => {
+  for (const disposition of ['eof', 'unfollow', 'refollow', 'eof-refollow'] as const) {
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let block = false;
+    const f = await fixture(async () => state(), () => false, () => true,
+      false, undefined, () => true, true,
+      { confirmOwner: async qualified => { if (block && qualified) { entered(); await waiting; }
+          return true; } });
+    try {
+      f.child.onFrame = frame => { if (frame.method === 'thread/queue/add')
+        queueMicrotask(() => f.child.reply(frame.id, { queuedSubmission: { id: 'r',
+          clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+          input: (frame.params as IpcObject).input } })); };
+      await f.owner.start(); followQueue(f.broker);
+      await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+      await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+      block = true; submitQueue(f.broker, stockEntry(), `queue-${disposition}`);
+      await started;
+      if (disposition === 'unfollow') followQueue(f.broker, 'follower', false);
+      else if (disposition === 'refollow') followQueue(f.broker, 'follower', true);
+      else {
+        f.broker.destroy(); await new Promise(resolve => setImmediate(resolve));
+        if (disposition === 'eof-refollow') {
+          await f.owner.reconnect();
+          followQueue(f.broker, 'follower', true);
+          await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+        }
+      }
+      release();
+      if (disposition === 'unfollow' || disposition === 'refollow') {
+        const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+          frame.requestId === `queue-${disposition}`);
+        assert.equal(reply.resultType, 'error');
+      } else if (disposition === 'eof') await waitFrame(f.child.frames,
+        frame => frame.method === 'thread/queue/add');
+      else await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length,
+        disposition === 'eof' ? 1 : 0);
+    } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
+  }
+});
+
+test('native queue hydrates each follower separately and consumes the authoritative user item', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'thread/queue/add')
+      queueMicrotask(() => f.child.reply(frame.id, { queuedSubmission: { id: 'stock-r',
+        clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+        input: (frame.params as IpcObject).input } })); };
+    await f.owner.start();
+    followQueue(f.broker, 'A');
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed' &&
+      (frame.targetClientIds as string[])[0] === 'A');
+    followQueue(f.broker, 'B');
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed' &&
+      (frame.targetClientIds as string[])[0] === 'B');
+    const hydrated = f.broker.frames.filter(frame => frame.method === 'thread-queued-followups-changed');
+    assert.deepEqual(hydrated.map(frame => frame.targetClientIds), [['A'], ['B']]);
+    const entry = stockEntry();
+    submitQueue(f.broker, entry, 'queue-consume', 'A');
+    const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'queue-consume');
+    assert.equal(reply.resultType, 'success');
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed' &&
+      (frame.targetClientIds as string[])[0] === 'B' &&
+      ((frame.params as IpcObject).messages as unknown[]).length === 1);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'stock-turn', status: 'inProgress', startedAt: 1, items: [
+        { id: 'stock-user', type: 'userMessage', clientId: entry.id,
+          content: [{ type: 'text', text: entry.text }] }] } });
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed' &&
+      (frame.targetClientIds as string[])[0] === 'B' &&
+      ((frame.params as IpcObject).messages as unknown[]).length === 0 &&
+      f.broker.frames.indexOf(frame) > f.broker.frames.indexOf(reply));
+    assert.notEqual(f.owner.metadata.state, 'failed');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('foreign embedded thread cannot consume an owned native queue entry', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'thread/queue/add')
+      queueMicrotask(() => f.child.reply(frame.id, { queuedSubmission: { id: 'r',
+        clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+        input: (frame.params as IpcObject).input } })); };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    const entry = stockEntry(); submitQueue(f.broker, entry, 'owned-queue');
+    await waitFrame(f.broker.frames, frame => frame.type === 'response' && frame.requestId === 'owned-queue');
+    f.child.send('turn/started', { threadId: 'foreign-task',
+      turn: { id: 'foreign-turn', status: 'inProgress', items: [
+        { id: 'foreign-user', type: 'userMessage', clientId: entry.id,
+          content: [{ type: 'text', text: entry.text }] }] } });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    // Host routing drops foreign thread IDs before this observer. Either way,
+    // that event cannot consume our durable queue identity.
+    assert.equal(f.owner.metadata.state, 'connected');
+    const zeroAfterForeign = f.broker.frames.filter(frame => frame.method ===
+      'thread-queued-followups-changed' &&
+      ((frame.params as IpcObject).messages as unknown[]).length === 0).length;
+    assert.equal(zeroAfterForeign, 1); // Initial targeted hydration only.
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock owner accepts host-routed thread started without a top-level threadId', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    await f.owner.start();
+    f.child.send('thread/started', { thread: { id: taskId, cwd: 'C:/own' } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(f.owner.metadata.state, 'connected');
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('native queue unknown receipt never ACKs or repeats the same backend add', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'thread/queue/add')
+      queueMicrotask(() => f.child.reply(frame.id, { queuedSubmission: { id: 'wrong',
+        clientUserMessageId: 'wrong-client-id', input: [] } })); };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    const entry = stockEntry(); submitQueue(f.broker, entry, 'unknown-first');
+    const first = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'unknown-first');
+    assert.equal(first.resultType, 'error');
+    submitQueue(f.broker, entry, 'unknown-repeat');
+    const second = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'unknown-repeat');
+    assert.equal(second.resultType, 'error');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('accepted stock receipt still ACKs after a later same-worker notification', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'thread/queue/add') {
+      queueMicrotask(() => {
+        f.child.reply(frame.id, { queuedSubmission: { id: 'stock-r',
+          clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+          input: (frame.params as IpcObject).input } });
+        const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
+          cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+        f.child.send('thread/tokenUsage/updated', { threadId: taskId, turnId: 'old',
+          tokenUsage: { total: usage, last: usage, modelContextWindow: null } });
+      });
+    } };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    submitQueue(f.broker, stockEntry(), 'receipt-followed-by-event');
+    const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'receipt-followed-by-event');
+    assert.equal(reply.resultType, 'success');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('queue-enabled usage-only notification does not advance owner semantic revision', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true);
+  try {
+    await f.owner.start();
+    const semantic = f.owner.metadata.semanticRevision;
+    const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    f.child.send('thread/tokenUsage/updated', { threadId: taskId, turnId: 'old',
+      tokenUsage: { total: usage, last: usage, modelContextWindow: null } });
+    await waitUntil(() => f.owner.metadata.revision > 1);
+    assert.equal(f.owner.metadata.semanticRevision, semantic);
+    assert.equal(f.owner.metadata.state, 'connected');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('unqualified initial queue baseline retires native owner during hydrate, not backend', async () => {
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true, { baseline: () => false });
+  try {
+    await f.owner.start(); followQueue(f.broker);
+    await waitUntil(() => f.owner.metadata.state === 'failed');
+    assert.equal(f.owner.metadata.failure, 'queue-hydration-failed');
+    assert.equal(f.host.metadata.state, 'running');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 0);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('bounded queue event tail retires only native owner when attribution stalls', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let block = false;
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true,
+    { confirmOwner: async qualified => { if (qualified && block) { entered(); await waiting; }
+        return true; } });
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'thread/queue/add')
+      queueMicrotask(() => f.child.reply(frame.id, { queuedSubmission: { id: 'r',
+        clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+        input: (frame.params as IpcObject).input } })); };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    const entry = stockEntry(); submitQueue(f.broker, entry, 'queue-before-flood');
+    await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'queue-before-flood');
+    block = true;
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'stock-turn', status: 'inProgress', items: [
+        { id: 'stock-user', type: 'userMessage', clientId: entry.id,
+          content: [{ type: 'text', text: entry.text }] }] } });
+    await started;
+    const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    for (let index = 0; index < 129; index++) f.child.send('thread/tokenUsage/updated',
+      { threadId: taskId, turnId: 'stock-turn',
+        tokenUsage: { total: usage, last: usage, modelContextWindow: null } });
+    await waitUntil(() => f.owner.metadata.state === 'failed');
+    assert.equal(f.owner.metadata.failure, 'queue-event-overflow');
+    assert.equal(f.host.metadata.state, 'running');
+    const before = f.broker.frames.filter(frame => frame.method === 'thread-stream-state-changed').length;
+    release(); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(f.broker.frames.filter(frame => frame.method === 'thread-stream-state-changed').length,
+      before);
+  } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
+});
 
 test('semantic fence ignores usage-only changes but advances for turn events and reconnect', async () => {
   const f = await fixture();
