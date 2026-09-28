@@ -4,6 +4,9 @@ import path from 'node:path';
 import type { AppServerRpc } from '../codex/app-server-connection.js';
 import { approveTaskPolicy, assertEffectiveResume, type ApprovedTaskPolicy } from
   '../codex/managed-task-policy.js';
+import { captureControlledNativeSourcePreflight, loadControlledNativeSourcePreflightReceipt,
+  persistControlledNativeSourcePreflightReceipt, proveControlledNativeSource,
+  type ControlledNativeSourceIdentity } from './controlled-native-source-proof.js';
 
 type Row = Record<string, unknown>;
 export type PolicyTemplate = Omit<ApprovedTaskPolicy, 'threadId' | 'serviceTier' | 'environments'> & Readonly<{
@@ -78,11 +81,33 @@ export interface ControlledNativeTaskCreatorOptions {
   readonly persistStarted: (started: ControlledCreationStarted) => Promise<void>;
   /** Saves a qualified, immutable receipt before it is returned to the caller. */
   readonly persistQualified: (receipt: ControlledCreationReceipt) => Promise<void>;
+  /** Opt-in exclusive source proof. The durable receipt must be saved before thread/start. */
+  readonly sourceProof?: ControlledNativeSourceProofOptions;
   /** Independent trusted source mapping; cannot be synthesized from empty history. */
   /** Independently verifies the observed native path in an exclusive source.
    * The optional path argument preserves existing one-argument resolvers. */
   readonly resolveSource: (threadId: string, observedNativePath?: string) =>
     Promise<Readonly<{ sourceId: string; rolloutPath: string }>>;
+}
+
+export interface ControlledNativeSourceProofOptions {
+  readonly sourceHome: string;
+  readonly preflightReceiptPath: string;
+}
+
+/** Binds the observed native path to a pre-start receipt and the durable intent. */
+export function controlledNativeSourceProofResolver(intent: ControlledCreationIntent,
+  options: ControlledNativeSourceProofOptions): ControlledNativeTaskCreatorOptions['resolveSource'] {
+  const identity: ControlledNativeSourceIdentity = { operationId: intent.operationId,
+    sourceId: intent.sourceId, sourceGeneration: intent.sourceGeneration };
+  return async (threadId, observedNativePath) => {
+    if (typeof observedNativePath !== 'string') refuse();
+    const nativePath = observedNativePath as string;
+    const preflight = await loadControlledNativeSourcePreflightReceipt(options.preflightReceiptPath,
+      identity, options.sourceHome, intent.requestedPolicy.cwd);
+    const proof = await proveControlledNativeSource(preflight, nativePath, threadId);
+    return { sourceId: identity.sourceId, rolloutPath: proof.rolloutPath };
+  };
 }
 
 function policyTemplate(value: unknown): PolicyTemplate {
@@ -281,6 +306,17 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
   const reservation = await options.persistIntent(intent);
   if (!reservation || typeof reservation.isCurrent !== 'function' ||
     reservation.isCurrent() !== true) refuse();
+  if (options.sourceProof) {
+    const identity: ControlledNativeSourceIdentity = { operationId: intent.operationId,
+      sourceId: intent.sourceId, sourceGeneration: intent.sourceGeneration };
+    const preflight = await captureControlledNativeSourcePreflight(identity,
+      options.sourceProof.sourceHome, requestedPolicy.cwd);
+    if (reservation.isCurrent() !== true) refuse();
+    await persistControlledNativeSourcePreflightReceipt(options.sourceProof.preflightReceiptPath, preflight);
+    if (reservation.isCurrent() !== true) refuse();
+  }
+  const resolveSource = options.sourceProof
+    ? controlledNativeSourceProofResolver(intent, options.sourceProof) : options.resolveSource;
   let dispatched = false;
   try {
     const session = await options.rpc.initializedSession();
@@ -316,7 +352,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
     assertEffectiveResume(effectivePolicy, start);
     const rolloutPath = await qualifyControlledZeroTurn({ rpc: options.rpc,
       generation: session.generation, threadId, sourceId: intent.sourceId,
-      effectivePolicy, resolveSource: options.resolveSource,
+      effectivePolicy, resolveSource,
       assertCurrent: () => { if (reservation.isCurrent() !== true) refuse(); } });
     const receipt = Object.freeze({ ...started, effectivePolicy, rolloutPath,
       status: 'qualified-zero-turn' as const }) satisfies ControlledCreationReceipt;

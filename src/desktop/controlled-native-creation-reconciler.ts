@@ -1,8 +1,8 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { ControlledNativeCreationJournal } from './controlled-native-creation-journal.js';
-import { policyFromControlledStarted, qualifyControlledZeroTurn,
+import { controlledNativeSourceProofResolver, policyFromControlledStarted, qualifyControlledZeroTurn,
   type ControlledCreationReceipt, type CreatorRpc,
-  type ControlledNativeTaskCreatorOptions } from './controlled-native-task-creator.js';
+  type ControlledNativeTaskCreatorOptions, type ControlledNativeSourceProofOptions } from './controlled-native-task-creator.js';
 
 const refuse = (): never => { throw new Error('Controlled native creation reconciliation unqualified'); };
 
@@ -13,6 +13,7 @@ export async function reconcileControlledNativeCreation(options: Readonly<{
   operationId: string;
   rpc: CreatorRpc;
   resolveSource: ControlledNativeTaskCreatorOptions['resolveSource'];
+  sourceProof?: ControlledNativeSourceProofOptions;
 }>): Promise<ControlledCreationReceipt> {
   const initial = options.journal.get(options.operationId);
   if (initial == null) throw new Error('Controlled native creation reconciliation unqualified');
@@ -30,7 +31,9 @@ export async function reconcileControlledNativeCreation(options: Readonly<{
   };
   const rolloutPath = await qualifyControlledZeroTurn({ rpc: options.rpc,
     generation: session.generation, threadId: started.threadId, sourceId: started.sourceId,
-    effectivePolicy, resolveSource: options.resolveSource, assertCurrent });
+    effectivePolicy, resolveSource: options.sourceProof
+      ? controlledNativeSourceProofResolver(started, options.sourceProof) : options.resolveSource,
+    assertCurrent });
   if (!options.rpc.isSessionCurrent(session.generation)) refuse();
   assertCurrent();
   const receipt = Object.freeze({ ...started, effectivePolicy, rolloutPath,

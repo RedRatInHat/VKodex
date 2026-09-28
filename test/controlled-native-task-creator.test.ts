@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -8,7 +8,7 @@ import test from 'node:test';
 import type { AppServerRpc } from '../src/codex/app-server-connection.js';
 import { createControlledNativeTask, ControlledNativeCreationUncertainError,
   type ControlledCreationIntent, type ControlledCreationStarted,
-  type ControlledCreationReceipt } from '../src/desktop/controlled-native-task-creator.js';
+  type ControlledCreationReceipt, type ControlledNativeTaskCreatorOptions } from '../src/desktop/controlled-native-task-creator.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
 import { reconcileControlledNativeCreation } from '../src/desktop/controlled-native-creation-reconciler.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
@@ -124,6 +124,76 @@ test('controlled creator writes one thread/start after intent, then qualifies ze
   assert.deepEqual(f.calls, ['thread/start', 'thread/read', 'thread/turns/list',
     'thread/goal/get', 'thread/queue/list', 'thread/read']);
   assert.equal(f.calls.includes('turn/start'), false);
+});
+
+for (const loseRead of [false, true]) test(`opt-in source proof qualifies the only rollout${loseRead ? ' after restart' : ''}`, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-source-'));
+  const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  const preflightReceiptPath = path.join(root, 'preflight.json');
+  mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true });
+  mkdirSync(workspace);
+  const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
+  const policy = { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] };
+  const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
+    thread: { ...startResult.thread, cwd: workspace } };
+  const calls: string[] = [];
+  let rejectRead = loseRead;
+  const rpc = {
+    async initializedSession() { return { generation: 1 }; },
+    isSessionCurrent(generation: number) { return generation === 1; },
+    async request(method: string) {
+      calls.push(method);
+      if (method === 'thread/start') {
+        assert.equal(existsSync(preflightReceiptPath), true);
+        writeFileSync(nativePath, `${JSON.stringify({ type: 'session_meta',
+          payload: { id: taskId, session_id: taskId, cwd: workspace } })}\n`);
+        return native;
+      }
+      if (method === 'thread/read') {
+        if (rejectRead) throw new Error('readback unavailable');
+        return { thread: { ...native.thread, path: nativePath } };
+      }
+      if (method === 'thread/turns/list' || method === 'thread/queue/list') return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      throw new Error(`Unexpected ${method}`);
+    },
+  } as unknown as Parameters<typeof createControlledNativeTask>[0]['rpc'];
+  const journal = new ControlledNativeCreationJournal(path.join(root, 'creation.sqlite'));
+  try {
+    const options: ControlledNativeTaskCreatorOptions = { rpc, operationId: randomUUID(), sourceId: 'isolated',
+      requestedPolicy: policy, persistIntent: intent => journal.persistIntent(intent),
+      persistStarted: started => journal.persistStarted(started),
+      persistQualified: receipt => journal.persistQualified(receipt),
+      resolveSource: async () => { throw new Error('legacy resolver must not run'); },
+      sourceProof: { sourceHome, preflightReceiptPath } };
+    if (loseRead) {
+      await assert.rejects(createControlledNativeTask(options), ControlledNativeCreationUncertainError);
+      assert.equal(journal.get(options.operationId)?.state, 'started');
+      rejectRead = false;
+    }
+    const result = loseRead ? await reconcileControlledNativeCreation({ journal,
+      operationId: options.operationId, rpc, resolveSource: options.resolveSource,
+      sourceProof: { sourceHome, preflightReceiptPath } }) : await createControlledNativeTask(options);
+    assert.equal(result.rolloutPath, nativePath);
+    assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read'] : ['thread/start']),
+      'thread/read', 'thread/turns/list',
+      'thread/goal/get', 'thread/queue/list', 'thread/read']);
+  } finally { journal.close(); }
+});
+
+test('opt-in source preflight refuses occupied home before thread/start', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-occupied-'));
+  const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(path.join(sourceHome, 'sessions', `${taskId}.jsonl`),
+    `${JSON.stringify({ type: 'session_meta', payload: { id: taskId, session_id: taskId, cwd: workspace } })}\n`);
+  const f = fixture();
+  await assert.rejects(createControlledNativeTask({ ...f.options,
+    requestedPolicy: { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] },
+    sourceProof: { sourceHome, preflightReceiptPath: path.join(root, 'preflight.json') } }));
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.persisted, ['intent']);
 });
 
 test('selected effective policy remains authoritative when readback is notLoaded', async () => {
