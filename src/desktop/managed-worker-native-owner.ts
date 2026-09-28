@@ -12,6 +12,7 @@ import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.j
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
 import { ManagedNativeStockQueueAdapter, type ManagedNativeStockPublish } from './managed-native-stock-queue-adapter.js';
+import type { NativeStockQueueQuiescence } from '../codex/native-stock-queue-journal.js';
 
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
   'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
@@ -201,6 +202,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),
       bootstrapPendingRequests: this.#bootstrapPendingRequests,
       bootstrapBoundary: this.#bootstrapBoundary });
+  }
+
+  /** Null means native queue drain is unavailable, never an empty queue. */
+  queueQuiescence(): NativeStockQueueQuiescence | null {
+    if (!this.#queueAdapter || !['connected', 'disconnected'].includes(this.#state) ||
+        !this.#ownerCurrent()) return null;
+    try { return this.#queueAdapter.quiescence(); }
+    catch { return null; }
   }
 
   #ownerCurrent(): boolean {

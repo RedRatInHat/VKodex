@@ -254,6 +254,7 @@ test('opt-in native queue v1 durably adds on the same worker before acknowledgem
   const f = await fixture(async () => state(), () => false, () => true,
     false, undefined, () => true, true);
   try {
+    assert.equal(f.owner.queueQuiescence(), null);
     f.child.onFrame = frame => {
       if (frame.method === 'thread/queue/add') queueMicrotask(() => f.child.reply(frame.id,
         { queuedSubmission: { id: 'stock-receipt',
@@ -261,6 +262,7 @@ test('opt-in native queue v1 durably adds on the same worker before acknowledgem
           input: (frame.params as IpcObject).input } }));
     };
     await f.owner.start();
+    assert.deepEqual(f.owner.queueQuiescence(), { taskVersion: 0, unresolved: 0, unconsumed: 0 });
     followQueue(f.broker);
     await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
     const entry = stockEntry();
@@ -270,12 +272,14 @@ test('opt-in native queue v1 durably adds on the same worker before acknowledgem
     assert.equal(reply.resultType, 'success');
     assert.deepEqual(reply.result, { ok: true });
     assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+    assert.equal(f.owner.queueQuiescence()?.unconsumed, 1);
     f.broker.send(continuationRequest(randomUUID(), 'stock-direct-bypass'));
     const denied = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
       frame.requestId === 'stock-direct-bypass');
     assert.equal(denied.resultType, 'error');
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
-  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  } finally { f.owner.close(); assert.equal(f.owner.queueQuiescence(), null);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('stock queue backend event during qualification invalidates the pending actual write', async () => {

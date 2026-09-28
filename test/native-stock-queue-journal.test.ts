@@ -27,6 +27,21 @@ const proof = (id: string, kind: 'queued' | 'started'): PositiveReconciliationPr
     { ...base, kind, turnId: `turn-${id}` };
 };
 
+test('scoped quiescence retains reserved, unknown and unconsumed evidence without publication ACK', async () => {
+  const j = await open();
+  assert.deepEqual(j.quiescence(), { taskVersion: 0, unresolved: 0, unconsumed: 0 });
+  j.reserve(intent('A', 0));
+  assert.deepEqual(j.quiescence(), { taskVersion: 1, unresolved: 1, unconsumed: 1 });
+  j.markUnknown({ opId: 'A', fingerprint: fp('A') });
+  assert.deepEqual(j.quiescence(), { taskVersion: 2, unresolved: 1, unconsumed: 1 });
+  j.consume({ opId: 'A', fingerprint: fp('A'), turnId: 'turn-A', authoritative: true });
+  assert.deepEqual(j.quiescence(), { taskVersion: 3, unresolved: 1, unconsumed: 0 });
+  j.reconcilePositive({ expectedVersion: j.readTask().version, proof: proof('A', 'started'),
+    assertSourceCurrent: () => true });
+  assert.deepEqual(j.quiescence(), { taskVersion: j.readTask().version, unresolved: 0, unconsumed: 0 });
+  j.close();
+});
+
 test('positive queued proof unfreezes exact unknown intent and remains append-only after reopen', async () => {
   const filePath = await filename(); const j = await open(filePath);
   j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });

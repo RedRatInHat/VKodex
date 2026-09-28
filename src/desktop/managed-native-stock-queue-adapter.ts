@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { NativeStockAdmission, type StockAdmissionQualification } from '../codex/native-stock-admission.js';
-import { NativeStockQueueJournal } from '../codex/native-stock-queue-journal.js';
+import { NativeStockQueueJournal, type NativeStockQueueQuiescence } from '../codex/native-stock-queue-journal.js';
 import { prepareNativeStockTextEntry, type NativeStockTextQualification } from '../codex/native-stock-text-entry.js';
 import type { JsonObject as StrictJsonObject } from '../codex/homogeneous-queue-policy.js';
 import type { WorkerCommand, WorkerCommandResponse } from '../codex/managed-worker-command-dispatcher.js';
@@ -268,6 +268,14 @@ export class ManagedNativeStockQueueAdapter {
     this.#onStockQueueChanged();
     if (assertEventCurrent() !== true) fail();
     return true;
+  }
+
+  /** Refuses local ingress claims and unattributed early items even when the
+   * durable journal happens to have no unresolved row yet. */
+  quiescence(): NativeStockQueueQuiescence {
+    if (this.#closed || this.#faulted || this.#pendingClaims.size !== 0 ||
+        this.#earlyItems.size !== 0) fail();
+    return this.#journal.quiescence();
   }
 
   close(): void { if (!this.#closed) { this.#closed = true; this.#journal.close(); } }

@@ -9,7 +9,7 @@ import { ManagedNativeStockQueueAdapter,
   type ManagedNativeStockQueueAdapterOptions } from '../src/desktop/managed-native-stock-queue-adapter.js';
 
 async function fixture(t: TestContext, options: { nullResponse?: boolean; delayed?: boolean;
-  staleReceipt?: boolean; baselineGate?: Promise<void> } = {}) {
+  staleReceipt?: boolean; baselineGate?: Promise<void>; revokeBeforeDispatch?: boolean } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'vkodex-managed-stock-'));
   const taskId = randomUUID(), ownerEpoch = randomUUID(), sourceClientId = randomUUID();
   const cwd = 'C:/isolated';
@@ -45,6 +45,7 @@ async function fixture(t: TestContext, options: { nullResponse?: boolean; delaye
     submission: { hostId: 'local', status: 'pending', queueModeOverride: 'queue' } };
   const controlKey = {}, calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   let owner = true, source = true, settingsCurrent = true, baseline = true;
+  let qualifications = 0;
   let release: (() => void) | null = null;
   let markEntered!: () => void;
   const entered = new Promise<void>(resolve => { markEntered = resolve; });
@@ -86,7 +87,10 @@ async function fixture(t: TestContext, options: { nullResponse?: boolean; delaye
       await options.baselineGate;
       return baseline;
     },
-    qualify: () => qualification,
+    qualify: () => {
+      if (++qualifications === 2 && options.revokeBeforeDispatch) settingsCurrent = false;
+      return qualification;
+    },
     confirmOwner: () => owner,
     assertOwnerCurrent: () => owner,
     assertDispatchCurrent: () => settingsCurrent,
@@ -111,6 +115,40 @@ async function fixture(t: TestContext, options: { nullResponse?: boolean; delaye
     revokeBaseline: () => { baseline = false; }, ingress: () => source,
     queueChanged: () => queueChanged };
 }
+
+test('predispatch refusal leaves durable native reservation with no worker write', async t => {
+  const f = await fixture(t, { revokeBeforeDispatch: true });
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress));
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(f.adapter.quiescence(), { taskVersion: 1, unresolved: 1, unconsumed: 1 });
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress));
+  assert.equal(f.calls.length, 0);
+});
+
+test('pending native ingress is not quiescent before its journal reservation', async t => {
+  let release!: () => void;
+  const baselineGate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(t, { baselineGate });
+  const pending = f.adapter.accept(f.request(), f.ingress);
+  await f.waitForBaseline();
+  assert.throws(() => f.adapter.quiescence());
+  assert.equal(f.calls.length, 0);
+  release();
+  await pending;
+  assert.equal(f.adapter.quiescence().unconsumed, 1);
+});
+
+test('accepted native queue stays unconsumed until authoritative user item', async t => {
+  const f = await fixture(t);
+  assert.deepEqual(f.adapter.quiescence(), { taskVersion: 0, unresolved: 0, unconsumed: 0 });
+  await f.adapter.accept(f.request(), f.ingress);
+  assert.equal(f.adapter.quiescence().unresolved, 0);
+  assert.equal(f.adapter.quiescence().unconsumed, 1);
+  assert.equal(await f.adapter.consumeUserMessage(f.entryId, 'own-turn', () => true), true);
+  assert.equal(f.adapter.quiescence().unconsumed, 0);
+  f.adapter.close();
+  assert.throws(() => f.adapter.quiescence());
+});
 
 test('same-host stock receipt durably accepts full native state; replay and consumption do not write twice', async t => {
   const f = await fixture(t);

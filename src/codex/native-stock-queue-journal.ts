@@ -29,6 +29,12 @@ export interface Page<T> { taskVersion: number; items: T[]; hasMore: boolean; ne
 type InputIdentity = { id: string; seq: number; fingerprint: string;
   phase: StockQueueOperation['phase']; consumed: boolean };
 export interface PublicationItem { seq: number; opId: string; fingerprint: string; nativeEntry: JsonObject }
+/** Metadata-only drain evidence. Publication delivery is not an acceptance gate. */
+export interface NativeStockQueueQuiescence {
+  readonly taskVersion: number;
+  readonly unresolved: number;
+  readonly unconsumed: number;
+}
 type PageArgs = { afterSeq?: number; limit?: number };
 type PublicationPageArgs = PageArgs & { version: number };
 type CurrentQueuePageArgs = PageArgs & { expectedVersion: number };
@@ -99,6 +105,7 @@ export class NativeStockQueueJournal {
   private readonly selectOp: Statement<[string, string], OpRow>;
   private readonly selectIdentity: Statement<[string, string], IdentityRow>;
   private readonly selectUnresolved: Statement<[string], Pick<OpRow, 'phase'>>;
+  private readonly selectQuiescence: Statement<[string], { unresolved: number; unconsumed: number }>;
   private readonly selectNextSeq: Statement<[string], { next_seq: number }>;
   private readonly selectPage: Statement<[string, number, number, number], OpRow>;
   private readonly selectPublicationPage: Statement<[string, number, number], OpRow>;
@@ -186,6 +193,9 @@ export class NativeStockQueueJournal {
       this.selectOp = this.db.prepare<[string, string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND op_id=?');
       this.selectIdentity = this.db.prepare<[string, string], IdentityRow>('SELECT op_id,seq,fingerprint,phase,consumed FROM native_repeated_op WHERE task_id=? AND op_id=?');
       this.selectUnresolved = this.db.prepare<[string], Pick<OpRow, 'phase'>>("SELECT phase FROM native_repeated_op WHERE task_id=? AND phase IN ('reserved','unknown') LIMIT 1");
+      this.selectQuiescence = this.db.prepare<[string], { unresolved: number; unconsumed: number }>(
+        "SELECT COUNT(CASE WHEN phase IN ('reserved','unknown') THEN 1 END) AS unresolved, " +
+        'COUNT(CASE WHEN consumed=0 THEN 1 END) AS unconsumed FROM native_repeated_op WHERE task_id=?');
       this.selectNextSeq = this.db.prepare<[string], { next_seq: number }>('SELECT COALESCE(MAX(seq),0)+1 AS next_seq FROM native_repeated_op WHERE task_id=?');
       this.selectPage = this.db.prepare<[string, number, number, number], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND consumed=? AND seq>? ORDER BY seq LIMIT ?');
       this.selectPublicationPage = this.db.prepare<[string, number, number], OpRow>("SELECT * FROM native_repeated_op WHERE task_id=? AND phase='accepted' AND consumed=0 AND seq>? ORDER BY seq LIMIT ?");
@@ -217,6 +227,18 @@ export class NativeStockQueueJournal {
     return row;
   }
   readTask(): TaskView { return taskView(this.taskRow(), this.taskId, this.ownerEpoch, this.sourceGeneration); }
+  quiescence(): NativeStockQueueQuiescence {
+    return this.snapshot(() => {
+      const taskVersion = this.taskRow()?.version ?? 0;
+      const counts = this.selectQuiescence.get(this.taskId);
+      if (!Number.isSafeInteger(taskVersion) || taskVersion < 0 || !counts ||
+          !Number.isSafeInteger(counts.unresolved) || counts.unresolved < 0 ||
+          !Number.isSafeInteger(counts.unconsumed) || counts.unconsumed < 0) {
+        return fail('invalid scoped quiescence');
+      }
+      return Object.freeze({ taskVersion, unresolved: counts.unresolved, unconsumed: counts.unconsumed });
+    });
+  }
   readOperation(opId: string): StockQueueOperation | null {
     if (!nonempty(opId)) fail('operation ID required');
     return this.snapshot(() => {
