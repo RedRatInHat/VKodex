@@ -133,6 +133,7 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
   mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true });
   mkdirSync(workspace);
   const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
+  const nativeReadPath = path.toNamespacedPath(nativePath);
   const policy = { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] };
   const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
     thread: { ...startResult.thread, cwd: workspace } };
@@ -151,14 +152,15 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
       }
       if (method === 'thread/read') {
         if (rejectRead) throw new Error('readback unavailable');
-        return { thread: { ...native.thread, path: nativePath } };
+        return { thread: { ...native.thread, path: nativeReadPath } };
       }
       if (method === 'thread/turns/list' || method === 'thread/queue/list') return { data: [], nextCursor: null };
       if (method === 'thread/goal/get') return { goal: null };
       throw new Error(`Unexpected ${method}`);
     },
   } as unknown as Parameters<typeof createControlledNativeTask>[0]['rpc'];
-  const journal = new ControlledNativeCreationJournal(path.join(root, 'creation.sqlite'));
+  const journalPath = path.join(root, 'creation.sqlite');
+  let journal = new ControlledNativeCreationJournal(journalPath);
   try {
     const options: ControlledNativeTaskCreatorOptions = { rpc, operationId: randomUUID(), sourceId: 'isolated',
       requestedPolicy: policy, persistIntent: intent => journal.persistIntent(intent),
@@ -169,12 +171,24 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
     if (loseRead) {
       await assert.rejects(createControlledNativeTask(options), ControlledNativeCreationUncertainError);
       assert.equal(journal.get(options.operationId)?.state, 'started');
+      assert.equal(journal.get(options.operationId)?.intent.sourceProofRequired, true);
+      assert.equal(journal.get(options.operationId)?.started?.sourceProofRequired, true);
+      journal.close();
+      journal = new ControlledNativeCreationJournal(journalPath);
+      const beforeBypass = calls.length;
+      await assert.rejects(reconcileControlledNativeCreation({ journal,
+        operationId: options.operationId, rpc,
+        resolveSource: async () => ({ sourceId: 'isolated', rolloutPath: nativePath }) }));
+      assert.equal(calls.length, beforeBypass);
+      assert.equal(journal.get(options.operationId)?.state, 'started');
       rejectRead = false;
     }
     const result = loseRead ? await reconcileControlledNativeCreation({ journal,
       operationId: options.operationId, rpc, resolveSource: options.resolveSource,
       sourceProof: { sourceHome, preflightReceiptPath } }) : await createControlledNativeTask(options);
     assert.equal(result.rolloutPath, nativePath);
+    assert.equal(result.sourceProofRequired, true);
+    assert.equal(journal.get(options.operationId)?.qualified?.sourceProofRequired, true);
     assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read'] : ['thread/start']),
       'thread/read', 'thread/turns/list',
       'thread/goal/get', 'thread/queue/list', 'thread/read']);
@@ -299,6 +313,22 @@ test('creation journal rejects duplicate operation and immutable-scope drift wit
   assert.equal(journal.get(f.intent.operationId)?.state, 'started');
   assert.equal(journal.get(f.intent.operationId)?.started?.threadId, taskId);
   assert.deepEqual(journal.listUncertainPage({ limit: 100 }).items.map(row => row.state), ['started']);
+  journal.close();
+});
+
+test('journal preserves source proof requirement across stages and rejects downgrade', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  const intent = { ...f.intent, sourceProofRequired: true as const };
+  const started = { ...f.started, sourceProofRequired: true as const };
+  await assert.rejects(journal.persistIntent({ ...f.intent,
+    sourceProofRequired: false } as unknown as ControlledCreationIntent));
+  await journal.persistIntent(intent);
+  await assert.rejects(journal.persistStarted(f.started));
+  await journal.persistStarted(started);
+  await assert.rejects(journal.persistQualified(f.qualified));
+  await journal.persistQualified({ ...f.qualified, sourceProofRequired: true });
+  assert.equal(journal.get(f.intent.operationId)?.qualified?.sourceProofRequired, true);
   journal.close();
 });
 

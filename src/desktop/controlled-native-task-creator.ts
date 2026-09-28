@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { AppServerRpc } from '../codex/app-server-connection.js';
 import { approveTaskPolicy, assertEffectiveResume, type ApprovedTaskPolicy } from
   '../codex/managed-task-policy.js';
+import { comparablePath } from '../core/paths.js';
 import { captureControlledNativeSourcePreflight, loadControlledNativeSourcePreflightReceipt,
   persistControlledNativeSourcePreflightReceipt, proveControlledNativeSource,
   type ControlledNativeSourceIdentity } from './controlled-native-source-proof.js';
@@ -21,7 +22,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const row = (value: unknown): value is Row => value !== null && typeof value === 'object' && !Array.isArray(value);
 const pathEqual = (a: unknown, b: unknown): boolean => typeof a === 'string' && typeof b === 'string' &&
   path.win32.isAbsolute(a) && path.win32.isAbsolute(b) &&
-  path.win32.normalize(a).toLowerCase() === path.win32.normalize(b).toLowerCase();
+  comparablePath(a) === comparablePath(b);
 const refuse = (): never => { throw new Error('Controlled native creation unqualified'); };
 function freezeTree<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
@@ -42,6 +43,8 @@ export interface ControlledCreationIntent {
   /** Producer-issued source instance ID, not a native monotonic source revision. */
   readonly sourceGeneration: string;
   readonly sourceId: string;
+  /** Requires the opt-in source proof protocol during creation and reconciliation. */
+  readonly sourceProofRequired?: true;
   readonly requestedPolicy: PolicyTemplate;
 }
 export interface ControlledCreationStarted extends ControlledCreationIntent {
@@ -302,6 +305,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
   const requestedPolicy = policyTemplate(options.requestedPolicy);
   const intent = Object.freeze({ operationId: options.operationId,
     creatorNonce: randomUUID(), sourceGeneration: randomUUID(), sourceId: options.sourceId,
+    ...(options.sourceProof ? { sourceProofRequired: true as const } : {}),
     requestedPolicy }) satisfies ControlledCreationIntent;
   const reservation = await options.persistIntent(intent);
   if (!reservation || typeof reservation.isCurrent !== 'function' ||

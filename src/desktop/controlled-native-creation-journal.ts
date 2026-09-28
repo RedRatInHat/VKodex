@@ -20,6 +20,8 @@ export interface ControlledCreationJournalRecord {
   readonly qualified: ControlledCreationReceipt | null;
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const intentKeys = ['operationId', 'creatorNonce', 'sourceGeneration', 'sourceId',
+  'requestedPolicy'] as const;
 const legacySelectedKeys = ['model', 'modelProvider', 'reasoningEffort',
   'serviceTier', 'cwd', 'approvalPolicy', 'environments'] as const;
 const fullSelectedKeys = [...legacySelectedKeys, 'runtimeWorkspaceRoots',
@@ -55,7 +57,8 @@ function strictJson<T>(value: T): { snapshot: T; json: string } {
   } catch { return fail(); }
 }
 function validIntent(value: ControlledCreationIntent): void {
-  if (!keys(value, ['operationId', 'creatorNonce', 'sourceGeneration', 'sourceId', 'requestedPolicy']) ||
+  if (!(keys(value, intentKeys) || keys(value, [...intentKeys, 'sourceProofRequired'])) ||
+    Object.hasOwn(value, 'sourceProofRequired') && value.sourceProofRequired !== true ||
     !uuid.test(value.operationId) || !uuid.test(value.creatorNonce) ||
     !uuid.test(value.sourceGeneration) || typeof value.sourceId !== 'string' ||
     !value.sourceId || value.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(value.sourceId) ||
@@ -77,14 +80,17 @@ function validIntent(value: ControlledCreationIntent): void {
 function intentOf(value: ControlledCreationStarted): ControlledCreationIntent {
   return { operationId: value.operationId, creatorNonce: value.creatorNonce,
     sourceGeneration: value.sourceGeneration, sourceId: value.sourceId,
+    ...(Object.hasOwn(value, 'sourceProofRequired')
+      ? { sourceProofRequired: value.sourceProofRequired } : {}),
     requestedPolicy: value.requestedPolicy };
 }
 function startedOf(value: ControlledCreationReceipt): ControlledCreationStarted {
   return { ...intentOf(value), threadId: value.threadId, selectedEffective: value.selectedEffective };
 }
 function validStarted(value: ControlledCreationStarted): void {
-  if (!keys(value, ['operationId', 'creatorNonce', 'sourceGeneration', 'sourceId',
-    'requestedPolicy', 'threadId', 'selectedEffective']) || !uuid.test(value.threadId) ||
+  if (!(keys(value, [...intentKeys, 'threadId', 'selectedEffective']) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'threadId', 'selectedEffective'])) ||
+    !uuid.test(value.threadId) ||
     !keys(value.selectedEffective, legacySelectedKeys) &&
     !keys(value.selectedEffective, fullSelectedKeys) &&
     !keys(value.selectedEffective, reconcilableSelectedKeys)) fail();
@@ -95,9 +101,10 @@ function validStarted(value: ControlledCreationStarted): void {
   validIntent(intentOf(value));
 }
 function validQualified(value: ControlledCreationReceipt): void {
-  if (!keys(value, ['operationId', 'creatorNonce', 'sourceGeneration', 'sourceId',
-    'requestedPolicy', 'threadId', 'selectedEffective', 'effectivePolicy',
-    'rolloutPath', 'status']) || value.status !== 'qualified-zero-turn' ||
+  if (!(keys(value, [...intentKeys, 'threadId', 'selectedEffective', 'effectivePolicy',
+    'rolloutPath', 'status']) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'threadId', 'selectedEffective',
+      'effectivePolicy', 'rolloutPath', 'status'])) || value.status !== 'qualified-zero-turn' ||
     typeof value.rolloutPath !== 'string' || !path.win32.isAbsolute(value.rolloutPath) ||
     /[\x00-\x1f\x7f]/u.test(value.rolloutPath) || value.rolloutPath.length > 4096) fail();
   validStarted(startedOf(value));

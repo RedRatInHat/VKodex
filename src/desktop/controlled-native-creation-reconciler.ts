@@ -20,6 +20,7 @@ export async function reconcileControlledNativeCreation(options: Readonly<{
   if (initial.state !== 'started' || initial.qualified) refuse();
   const started = initial.started;
   if (started == null) throw new Error('Controlled native creation reconciliation unqualified');
+  if (started.sourceProofRequired === true && !options.sourceProof) refuse();
   const effectivePolicy = policyFromControlledStarted(started);
   const session = await options.rpc.initializedSession();
   if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
