@@ -409,6 +409,23 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     }
     finally { db?.close(); }
   }
+  async archivedRolloutPath(task: TaskRef): Promise<string | null> {
+    let db: DatabaseConstructor.Database | undefined;
+    try {
+      const home = this.sourceHome(task);
+      db = new DatabaseConstructor(path.join(home, "state_5.sqlite"), { readonly: true, fileMustExist: true });
+      db.pragma("query_only = ON");
+      const row = db.prepare("SELECT archived, rollout_path FROM threads WHERE id = ?").get(task.threadId) as
+        { archived: number; rollout_path: string } | undefined;
+      if (!row || row.archived === 0) return null;
+      if (row.archived !== 1 || typeof row.rollout_path !== "string") throw new Error("Invalid archived rollout");
+      const relative = path.relative(home, row.rollout_path);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid archived rollout path");
+      return row.rollout_path;
+    } catch (error) {
+      throw new DesktopUnavailableError("Исходный каталог не подтвердил путь архивной истории задачи.");
+    } finally { db?.close(); }
+  }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
     const home = this.sourceHome(task);
     await preflightLegacyProjectAssignment(home, task.threadId, projectId);

@@ -342,10 +342,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     if (!this.live?.transfer?.verifyTarget) throw new ActionRejectedError("Проверка переноса недоступна.");
     return this.live.transfer.verifyTarget(request, target);
   }
-  async verifyLegacyArchivedPair(source: TaskRef, target: import("./contracts.js").DesktopTask,
+  async verifyArchivedPair(source: TaskRef, target: import("./contracts.js").DesktopTask,
     checkpoint: import("./contracts.js").TransferCheckpoint): Promise<void> {
-    if (!this.live?.transfer?.verifyLegacyArchivedPair) throw new ActionRejectedError("Проверка старой архивной копии недоступна.");
-    return this.live.transfer.verifyLegacyArchivedPair(source, target, checkpoint);
+    if (!this.live?.transfer?.verifyArchivedPair) throw new ActionRejectedError("Проверка архивной копии недоступна.");
+    return this.live.transfer.verifyArchivedPair(source, target, checkpoint);
   }
 
   async exportMarkdown(task: TaskRef): Promise<string> {

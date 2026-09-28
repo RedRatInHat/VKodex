@@ -166,7 +166,7 @@ class Desktop implements DesktopTasks {
   async archiveTask(ref: TaskRef): Promise<void> { this.archives.push(ref); this.tasks = this.tasks.filter(task => task.threadId !== ref.threadId); }
   async archiveTransferredSource(ref: TaskRef): Promise<void> { await this.archiveTask(ref); }
   archiveRetryReady?: (ref: TaskRef) => Promise<boolean>;
-  verifyLegacyArchivedPair?: (source: TaskRef, target: DesktopTask, checkpoint: import("../src/desktop/contracts.js").TransferCheckpoint) => Promise<void>;
+  verifyArchivedPair?: (source: TaskRef, target: DesktopTask, checkpoint: import("../src/desktop/contracts.js").TransferCheckpoint) => Promise<void>;
   async isTaskArchived(ref: TaskRef, _checkpoint?: import("../src/desktop/contracts.js").TransferCheckpoint): Promise<boolean> {
     return this.archives.some(task => task.threadId === ref.threadId);
   }
@@ -1660,7 +1660,7 @@ test("a legacy archived source can finish after semantic comparison with the swi
     return archived;
   };
   s.desktop.archiveTransferredSource = async () => { archived = true; };
-  s.desktop.verifyLegacyArchivedPair = async (source, target, checkpoint) => {
+  s.desktop.verifyArchivedPair = async (source, target, checkpoint) => {
     pairChecks++;
     assert.equal(source.threadId, task.threadId);
     assert.notEqual(target.threadId, source.threadId);
@@ -1673,6 +1673,45 @@ test("a legacy archived source can finish after semantic comparison with the swi
   assert.equal(s.desktop.transfers.length, 1);
 });
 
+test("a switched semantic transfer completes only after archived-pair reconciliation", async t => {
+  const s = setup(t); const record = { ...transferFixture(s), checkpoint: { lastTurnId: "boundary", rolloutPath: "/source.jsonl", size: 1, mtimeMs: 1,
+    semanticDigest: "before-archive", semanticDigestVersion: 3 as const }, goal: null };
+  let archived = false; let pairChecks = 0;
+  s.desktop.isTaskArchived = async (_ref, checkpoint) => {
+    if (!archived) return false;
+    if (checkpoint) throw new TransferConflictError("archived projection digest changed");
+    return true;
+  };
+  s.desktop.archiveTransferredSource = async () => { archived = true; };
+  s.desktop.verifyArchivedPair = async (source, target, checkpoint) => {
+    pairChecks++;
+    assert.equal(source.threadId, task.threadId);
+    assert.notEqual(target.threadId, source.threadId);
+    assert.equal(checkpoint.semanticDigestVersion, 3);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(pairChecks, 1);
+});
+
+test("an archived-pair mismatch blocks completion without another archive write", async t => {
+  const s = setup(t); const record = { ...transferFixture(s), checkpoint: { lastTurnId: "boundary", rolloutPath: "/source.jsonl", size: 1, mtimeMs: 1,
+    semanticDigest: "before-archive", semanticDigestVersion: 3 as const }, goal: null };
+  let archived = false;
+  s.desktop.isTaskArchived = async (_ref, checkpoint) => archived && checkpoint
+    ? Promise.reject(new TransferConflictError("archived projection digest changed")) : archived;
+  s.desktop.archiveTransferredSource = async () => { archived = true; };
+  s.desktop.verifyArchivedPair = async () => { throw new TransferConflictError("archive and target differ"); };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  const saved = s.store.transfer(record.bindingId)!;
+  assert.equal(saved.phase, "switched");
+  assert.equal(saved.blocked, true);
+  assert.equal(saved.blockedReason, null);
+  assert.match(saved.detail ?? "", /archive and target differ/u);
+});
+
 test("an older blocked switched transfer reconciles an archived source without retrying its write", async t => {
   const s = setup(t); const record = transferFixture(s);
   let writes = 0; let archived = false;
@@ -1681,7 +1720,7 @@ test("an older blocked switched transfer reconciles an archived source without r
     if (archived && checkpoint) throw new TransferConflictError("Rollout moved during archival");
     return archived;
   };
-  s.desktop.verifyLegacyArchivedPair = async () => {};
+  s.desktop.verifyArchivedPair = async () => {};
   const transfers = new TaskTransfers(s.store, s.desktop, s.now);
   transfers.start(record); await transfers.idle();
   assert.equal(s.store.transfer(record.bindingId)?.blockedReason, null);

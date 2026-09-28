@@ -2372,16 +2372,50 @@ test("legacy archived transfer verifies the source and target history prefix", a
       : [{ id: "boundary", status: "completed", items: [{ id: params.threadId === "source" ? "source-item" : "target-item",
         type: "userMessage", text: params.threadId === "source" ? "Original" : targetText }] },
         ...(params.threadId === "target" ? [{ id: "later", status: "inProgress", items: [] }] : [])], nextCursor: null } }) as never);
-  await transfer.verifyLegacyArchivedPair(source, target, checkpoint);
+  await transfer.verifyArchivedPair(source, target, checkpoint);
   ancestor = "unrelated";
-  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
   ancestor = "source";
   targetText = "Changed";
-  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
   targetText = "Original"; sourceNewTurn = true;
-  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
   sourceNewTurn = false; archived = false;
-  await assert.rejects(transfer.verifyLegacyArchivedPair(source, target, checkpoint), TransferConflictError);
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+});
+
+test("archived v3 transfer reconciles a stale pre-archive digest only against an exact copied pair", async () => {
+  const sourceHome = "C:\\source"; const targetHome = "C:\\target";
+  const sourcePath = path.join(sourceHome, "archived.jsonl"); const targetPath = path.join(targetHome, "target.jsonl");
+  const source = { hostId: "local", threadId: "source", sourceId: "work", rolloutPath: sourcePath };
+  const target = { hostId: "local", threadId: "target", sourceId: "", title: "Copied", workspace: "D:\\GitStorageG\\RaceLineCalc", rolloutPath: targetPath, updatedAt: 1 };
+  const checkpoint = { lastTurnId: "boundary", rolloutPath: path.join(sourceHome, "before-archive.jsonl"), size: 1, mtimeMs: 1,
+    semanticDigest: "stale-before-archive-projection", semanticDigestVersion: 3 as const,
+    workspace: "D:\\GitStorageG\\RaceLineCalc", model: "gpt-6-astra", effort: "high" };
+  let archived = true; let ancestor: string | undefined = "source"; let targetText = "Original";
+  let sourceContext = { model: "gpt-6-astra", effort: "high", cwd: "D:\\GitStorageG\\RaceLineCalc" };
+  const targetContext = { model: "gpt-6-astra", effort: "high", cwd: "D:\\GitStorageG\\RaceLineCalc" };
+  const transfer = new AppServerTaskTransfer({ sourceHome: (task: typeof source) => task.sourceId === "work" ? sourceHome : targetHome } as never, {
+    isArchived: async () => archived,
+    archivedRolloutPath: async () => sourcePath,
+  } as never, (_home: string) => ({ call: async (method: string, params: IpcObject) => method === "thread/read"
+    ? { thread: { id: "target", forkedFromId: ancestor } }
+    : { data: params.itemsView === "summary"
+      ? [{ id: "boundary", status: "completed", items: [] }]
+      : [{ id: "boundary", status: "completed", items: [{ id: params.threadId === "source" ? "s" : "t", type: "userMessage",
+        text: params.threadId === "source" ? "Original" : targetText }] }], nextCursor: null } }) as never,
+    undefined, undefined, async rollout => rollout === sourcePath ? sourceContext : targetContext);
+  await transfer.verifyArchivedPair(source, target, checkpoint);
+  sourceContext = { ...sourceContext, model: "gpt-6-sol" };
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  sourceContext = { ...sourceContext, model: "gpt-6-astra" }; ancestor = "unrelated";
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  ancestor = "source"; targetText = "Changed";
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  targetText = "Original"; ancestor = undefined;
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  archived = false;
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
 });
 
 test("accepted input reconciliation finds the native client ID across paginated turns", async () => {

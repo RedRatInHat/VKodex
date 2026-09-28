@@ -361,6 +361,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     private readonly createRpc: (home: string) => Pick<TransferRpc, "call"> = home => new TransferRpc(home),
     private readonly stage: typeof stageTransferRollout = stageTransferRollout,
     private readonly hasSourceThread: (rolloutPath: string, threadId: string) => Promise<boolean> = rolloutContainsThread,
+    private readonly readContext: typeof readTransferContext = readTransferContext,
   ) {}
 
   async fork(request: TransferTaskRequest): Promise<DesktopTask> {
@@ -579,18 +580,51 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     }
   }
 
-  async verifyLegacyArchivedPair(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void> {
-    if (checkpoint.semanticDigest || !this.metadata.isArchived || source.threadId === target.threadId
+  /** Archived repair needs positive ancestry, not merely the absence of a
+   * contradictory `forkedFromId`: the source can no longer be re-forked. */
+  private async verifyArchivedLineage(source: TaskRef, target: DesktopTask): Promise<void> {
+    const native = await this.createRpc(this.catalog.sourceHome(target)).call("thread/read", { threadId: target.threadId, includeTurns: false });
+    if (!isObject(native.thread) || native.thread.id !== target.threadId) {
+      throw new DesktopUnavailableError("Codex не подтвердил идентичность целевой задачи.");
+    }
+    if (native.thread.forkedFromId === source.threadId) return;
+    if (target.rolloutPath && await lastInheritedThread(target.rolloutPath, target.threadId) === source.threadId) return;
+    throw new TransferConflictError("Архивная копия не подтверждает происхождение от исходной задачи.");
+  }
+
+  async verifyArchivedPair(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void> {
+    if (!this.metadata.isArchived || source.threadId === target.threadId
       || comparablePath(this.catalog.sourceHome(source)) === comparablePath(this.catalog.sourceHome(target))) {
-      throw new TransferConflictError("Старая архивная копия не соответствует межкаталожному переносу.");
+      throw new TransferConflictError("Архивная копия не соответствует межкаталожному переносу.");
     }
     if (!await this.metadata.isArchived(source)) throw new TransferConflictError("Источник ещё не архивирован.");
     const sourceHome = this.catalog.sourceHome(source);
     const targetHome = this.catalog.sourceHome(target);
     try {
-      await this.verifyLineage(source, target);
+      await this.verifyArchivedLineage(source, target);
       if (await this.lastTerminalTurn(sourceHome, source.threadId) !== checkpoint.lastTurnId) {
         throw new TransferConflictError("После снимка у источника появились новые ходы.");
+      }
+      // Archiving can migrate a paginated source to another rollout and
+      // rebuild its projection. The saved digest is still mandatory before
+      // switching, but is no longer authoritative after that confirmed
+      // relocation. Compare the archived source and the switched target at
+      // the exact saved boundary instead.
+      if (checkpoint.semanticDigest) {
+        if ((checkpoint.semanticDigestVersion ?? 1) !== 3 || !this.metadata.archivedRolloutPath || !target.rolloutPath) {
+          throw new TransferConflictError("Архивная проверка истории недоступна для этой версии переноса.");
+        }
+        const sourceRollout = await this.metadata.archivedRolloutPath(source);
+        if (!sourceRollout || !inside(sourceHome, sourceRollout) || !inside(targetHome, target.rolloutPath)) {
+          throw new TransferConflictError("Архивная история источника или копии недоступна для сверки.");
+        }
+        const [sourceContext, targetContext] = await Promise.all([
+          this.readContext(sourceRollout, checkpoint.lastTurnId),
+          this.readContext(target.rolloutPath, checkpoint.lastTurnId),
+        ]);
+        if (contextChanged(checkpoint, sourceContext) || contextChanged(checkpoint, targetContext)) {
+          throw new TransferConflictError("Настройки архивного источника или копии не совпадают со снимком переноса.");
+        }
       }
       const [sourceDigest, targetDigest] = await Promise.all([
         completedHistoryDigest(source.threadId, checkpoint.lastTurnId,

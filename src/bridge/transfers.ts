@@ -174,12 +174,13 @@ export class TaskTransfers {
     if (!this.desktop.isTaskArchived) return false;
     try { return await this.desktop.isTaskArchived(record.source, record.checkpoint); }
     catch (error) {
-      // Old transfers stored file size/mtime but not a semantic digest. Once
-      // archived, Codex may relocate or rewrite that file. Reconcile only a
-      // genuinely archived source against the target's exact copied prefix.
-      if (!record.checkpoint || record.checkpoint.semanticDigest || !record.target
-        || !this.desktop.verifyLegacyArchivedPair) throw error;
-      await this.desktop.verifyLegacyArchivedPair(record.source, record.target, record.checkpoint);
+      // Once an archive is confirmed, Codex may relocate/reproject the source.
+      // A digest mismatch against the pre-archive checkpoint is not enough to
+      // erase a proven target; accept it only after a separate exact pair
+      // comparison of archive and target through that saved boundary.
+      if (!(error instanceof TransferConflictError) || !record.checkpoint || !record.target
+        || !this.desktop.verifyArchivedPair) throw error;
+      await this.desktop.verifyArchivedPair(record.source, record.target, record.checkpoint);
       return true;
     }
   }

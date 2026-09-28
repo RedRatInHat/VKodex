@@ -203,6 +203,8 @@ export interface DesktopMetadata {
   /** Native persisted state, not a project inferred by the display catalog. */
   read?(task: TaskRef): Promise<{ readonly title: string | null; readonly projectId: string | null }>;
   isArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
+  /** Exact relocated rollout for an already archived local task. */
+  archivedRolloutPath?(task: TaskRef): Promise<string | null>;
   /** Read-only check before retrying a previously rejected source archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
   /** Read-only native owner probe for transfer readiness. */
@@ -251,8 +253,8 @@ export interface DesktopTaskTransfer {
   checkpoint?(task: TaskRef): Promise<TransferCheckpoint>;
   verifySource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
   verifyTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
-  /** Reconcile a legacy archived source against the exact copied history prefix. */
-  verifyLegacyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
+  /** Reconcile a confirmed archived source against the exact copied history prefix. */
+  verifyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
 }
 
 /** Events from the atomic first turn that materializes a new Codex task. */
@@ -296,7 +298,7 @@ export interface CodexTasks {
   transferCheckpoint?(task: TaskRef): Promise<TransferCheckpoint>;
   verifyTransferSource?(task: TaskRef, checkpoint: TransferCheckpoint): Promise<void>;
   verifyTransferTarget?(request: TransferTaskRequest, target: DesktopTask): Promise<void>;
-  verifyLegacyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
+  verifyArchivedPair?(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void>;
   isTaskArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
   /** Read-only check used to resume a previously rejected archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;

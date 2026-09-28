@@ -187,10 +187,10 @@ export class RoutedCodexTasks implements CodexTasks {
     this.refuseExclusive(request.task); this.refuseExclusive(target);
     if (!this.base.verifyTransferTarget) throw new ActionRejectedError("Проверка назначения переноса недоступна."); return this.base.verifyTransferTarget(request, target);
   }
-  async verifyLegacyArchivedPair(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void> {
+  async verifyArchivedPair(source: TaskRef, target: DesktopTask, checkpoint: TransferCheckpoint): Promise<void> {
     this.refuseExclusive(source); this.refuseExclusive(target);
-    if (!this.base.verifyLegacyArchivedPair) throw new ActionRejectedError("Проверка старого переноса недоступна.");
-    return this.base.verifyLegacyArchivedPair(source, target, checkpoint);
+    if (!this.base.verifyArchivedPair) throw new ActionRejectedError("Проверка архивного переноса недоступна.");
+    return this.base.verifyArchivedPair(source, target, checkpoint);
   }
   async isTaskArchived(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean> {
     this.refuseExclusive(task);
