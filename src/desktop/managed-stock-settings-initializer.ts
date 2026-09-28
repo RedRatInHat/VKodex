@@ -37,6 +37,27 @@ function copy<T>(value: T): T {
   return freezeTree(cloned);
 }
 
+/** Internal projection builders retain absent optional object properties as
+ * undefined. Match their JSON IPC representation without relaxing the strict
+ * native settings/notice copier or converting undefined array slots to null. */
+function copyInitialProjection(value: NativeProjectionState): NativeProjectionState {
+  const projection = structuredClone(value);
+  let nodes = 0;
+  const omitAbsent = (item: unknown, depth: number): void => {
+    if (++nodes > 10_000 || depth > 32) fail();
+    if (Array.isArray(item)) {
+      for (const child of item) omitAbsent(child, depth + 1);
+    } else if (object(item) && Object.getPrototypeOf(item) === Object.prototype) {
+      for (const [key, child] of Object.entries(item)) {
+        if (child === undefined) delete item[key];
+        else omitAbsent(child, depth + 1);
+      }
+    }
+  };
+  omitAbsent(projection, 0);
+  return copy(projection);
+}
+
 export interface ManagedStockSettingsInitializerOptions {
   readonly host: Host;
   readonly adapterKey: object;
@@ -109,7 +130,7 @@ export class ManagedStockSettingsInitializer {
     this.#host = options.host; this.#adapterKey = options.adapterKey;
     this.#controlKey = options.controlKey;
     this.#bootstrap = Object.freeze({ generation: options.bootstrap.generation,
-      initialState: copy(options.bootstrap.initialState),
+      initialState: copyInitialProjection(options.bootstrap.initialState),
       composerDefaults: defaults,
       readStockState: options.bootstrap.readStockState.bind(options.bootstrap) });
     this.#observeNotifications = options.host.observeNotifications.bind(options.host);

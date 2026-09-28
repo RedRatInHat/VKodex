@@ -71,7 +71,9 @@ test(`stock settings initializer confirms actual notification plus readback for 
     },
   };
   const bootstrap = {
-    generation: 7, initialState: { ...initial, latestModel: model, latestReasoningEffort: effort },
+    generation: 7, initialState: { ...initial, latestModel: model, latestReasoningEffort: effort,
+      shellEnvironmentPolicy: undefined,
+      latestThreadSettings: { ...initial.latestThreadSettings, summary: undefined } },
     composerDefaults: { taskId, cwd, summary: null, personality: 'pragmatic' as const },
     async readStockState() {
       assert.equal(initializer.authorizesSettingsCommand({ operationId,
@@ -88,8 +90,16 @@ test(`stock settings initializer confirms actual notification plus readback for 
   const initializer = createManagedStockSettingsInitializer({ host, adapterKey: {}, controlKey: {},
     bootstrap, taskId, ownerEpoch: epoch, operationId, approvedTaskPolicy: selectedPolicy,
     assertOwnerCurrent: () => {} });
+  for (const invalid of [[undefined], Number.NaN, new Date(0)]) {
+    assert.throws(() => createManagedStockSettingsInitializer({ host, adapterKey: {}, controlKey: {},
+      bootstrap: { ...bootstrap, initialState: { ...bootstrap.initialState, unsupported: invalid } },
+      taskId, ownerEpoch: epoch, operationId, approvedTaskPolicy: selectedPolicy,
+      assertOwnerCurrent: () => {} }), /initialization unavailable/);
+  }
   qualifier = (context, current) => initializer.qualifySettingsEffect(context as never, current);
   const result = await initializer.initialize();
+  assert.equal(Object.hasOwn(result.initialState, 'shellEnvironmentPolicy'), false);
+  assert.equal(Object.hasOwn(bootstrap.initialState, 'shellEnvironmentPolicy'), true);
   assert.equal(writes, 1);
   assert.ok(reads >= 1);
   assert.equal(result.effectiveSettings.permissions, ':danger-full-access');
