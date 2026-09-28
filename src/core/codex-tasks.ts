@@ -316,7 +316,7 @@ export interface CodexTasks {
   healthGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
-  continueGoal?(task: TaskRef): Promise<void>;
+  continueGoal?(task: TaskRef, operationId: string): Promise<void>;
   /** Bring the configured Codex client to the foreground after an explicit user action. */
   revealTask?(task: TaskRef): Promise<void>;
   /** One-time handoff used after a task or transfer is first linked to VK. */

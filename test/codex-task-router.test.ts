@@ -55,14 +55,14 @@ test("metadata and goals use the selected profile owner", async () => {
   assert.equal(await f.routed.getGoal!(work), null);
   assert.equal((await f.routed.setGoal!(work, { objective: "Goal", status: "paused" })).objective, "Goal");
   assert.equal(await f.routed.clearGoal!(work), true);
-  await assert.rejects(f.routed.continueGoal!(work), /Автоматическое продолжение цели недоступно/u);
+  await assert.rejects(f.routed.continueGoal!(work, "resume-exclusive"), /Автоматическое продолжение цели недоступно/u);
   assert.deepEqual(f.calls, ["owner:rename", "owner:move", "owner:clear-goal"]);
 });
 
 test("goal continuation uses only an owner that can confirm it", async () => {
   const f = fixture();
   f.owner.continueGoal = async () => { f.calls.push("owner:continue-goal"); };
-  await f.routed.continueGoal!(work);
+  await f.routed.continueGoal!(work, "resume-routed");
   assert.deepEqual(f.calls, ["owner:continue-goal"]);
 });
 

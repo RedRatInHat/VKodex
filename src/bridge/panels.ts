@@ -40,6 +40,22 @@ interface RenameState {
   retryAt?: number;
 }
 
+interface GoalContinuationState {
+  operationId: string;
+  taskKey: string;
+  goalCreatedAt: number | null;
+  phase: "activating" | "sending" | "accepted" | "rejected" | "uncertain";
+}
+
+function validGoalContinuation(value: unknown): value is GoalContinuationState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.operationId === "string" && record.operationId.length > 0
+    && typeof record.taskKey === "string" && record.taskKey.length > 0
+    && (record.goalCreatedAt === null || typeof record.goalCreatedAt === "number" && Number.isFinite(record.goalCreatedAt))
+    && ["activating", "sending", "accepted", "rejected", "uncertain"].includes(String(record.phase));
+}
+
 const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
 const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ или подтверждение", unavailable: "Нет связи с задачей" };
 const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ").trim().slice(0, length);
@@ -513,10 +529,17 @@ export class TaskPanels {
         if (state.view !== "goal") throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
         const current = await this.goal(binding);
         if (!current || !["paused", "blocked", "usageLimited", "budgetLimited"].includes(current.status)) throw new ActionRejectedError("Эту цель сейчас нельзя возобновить. Обнови /goal.");
+        const attempt = this.beginGoalContinuation(binding, current);
         this.consume(input);
-        const updated = await this.desktop.setGoal!(binding, { status: "active" });
-        if (updated.status !== "active") throw new UncertainActionError();
-        const note = await this.goalContinuationNote(binding, "Цель возобновлена. Новый ход запущен или уже выполняется.");
+        let updated: TaskGoal;
+        try {
+          updated = await this.desktop.setGoal!(binding, { status: "active" });
+          if (updated.status !== "active") throw new UncertainActionError();
+        } catch (error) {
+          this.markGoalContinuation(binding, attempt, "uncertain");
+          throw error;
+        }
+        const note = await this.goalContinuationNote(binding, updated, attempt, "Цель возобновлена. Новый ход запущен или уже выполняется.");
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, note);
         break;
@@ -533,6 +556,9 @@ export class TaskPanels {
         if (["running", "approval"].includes(this.details(binding.id).status)) throw new ActionRejectedError("Сначала дождись завершения хода или отправь /stop, затем сними цель.");
         this.consume(input);
         if (!await this.desktop.clearGoal!(binding)) throw new ActionRejectedError("Цель уже была снята. Обнови /goal.");
+        const continuation = this.goalContinuationMarker(binding);
+        if (!continuation || continuation !== "malformed" && ["accepted", "rejected"].includes(continuation.phase))
+          this.store.setValue(`goal-continuation:${binding.id}`, null);
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, "Цель снята. История задачи и VK-беседа сохранены.");
         break;
@@ -631,7 +657,15 @@ export class TaskPanels {
     const previous = this.store.getValue<TransferredGoalUsage>(`transferred-goal:${taskKey(binding)}`);
     const carry = goal && previous?.objective === goal.objective && previous.targetCreatedAt === goal.createdAt ? previous : null;
     const history = carry ? `До переноса: ${number(carry.tokensUsed)} токенов, ${elapsed(carry.timeUsedSeconds)}. Этот расход сохранён в VKodex; Codex не умеет импортировать счётчики. Бюджет выше относится к оставшейся работе в этом каталоге.` : "";
-    this.show(binding.peerId!, state, { text: [taskGoalText(goal), history, note].filter(Boolean).join("\n\n"), buttons });
+    const continuation = this.goalContinuationMarker(binding);
+    const pending = continuation === "malformed"
+      ? "Запись о запуске цели повреждена. Новый запуск заблокирован до проверки исхода в Codex."
+      : continuation && ["activating", "sending", "uncertain"].includes(continuation.phase)
+      ? continuation.taskKey === taskKey(binding)
+        ? "Запуск следующего хода не подтверждён. Проверь состояние задачи в Codex; не повторяй команду вслепую."
+        : "Запуск в прежнем каталоге задачи не подтверждён. Новый запуск заблокирован до проверки в Codex."
+      : "";
+    this.show(binding.peerId!, state, { text: [taskGoalText(goal), history, note, pending && !note?.includes("не подтверждён") ? pending : ""].filter(Boolean).join("\n\n"), buttons });
   }
 
   private async renderTransferProjects(binding: Binding, sourceId: string, sourceLabel: string, requestedPage: number): Promise<void> {
@@ -679,24 +713,67 @@ export class TaskPanels {
   private async applyGoal(binding: Binding, objective: string, tokenBudget: number | null): Promise<void> {
     const current = await this.goal(binding);
     const update = { objective, tokenBudget, ...(!current || current.status === "complete" ? { status: "active" as const } : {}) };
-    const updated = await this.desktop.setGoal!(binding, update);
-    if (updated.objective !== objective.trim() || updated.tokenBudget !== tokenBudget || ((!current || current.status === "complete") && updated.status !== "active")) throw new UncertainActionError();
+    const activating = !current || current.status === "complete";
+    const attempt = activating ? this.beginGoalContinuation(binding, current) : null;
+    let updated: TaskGoal;
+    try {
+      updated = await this.desktop.setGoal!(binding, update);
+      if (updated.objective !== objective.trim() || updated.tokenBudget !== tokenBudget || (activating && updated.status !== "active")) throw new UncertainActionError();
+    } catch (error) {
+      if (attempt) this.markGoalContinuation(binding, attempt, "uncertain");
+      throw error;
+    }
     const activationNote = !current || current.status === "complete"
-      ? await this.goalContinuationNote(binding, "Цель сохранена и активирована. Новый ход запущен или уже выполняется.")
+      ? await this.goalContinuationNote(binding, updated, attempt!, "Цель сохранена и активирована. Новый ход запущен или уже выполняется.")
       : null;
     const next = this.newState(binding.peerId!, binding.id, "goal");
     const note = activationNote ?? (current?.status === "active" ? "Активная цель обновлена." : "Цель обновлена; её прежний статус сохранён.");
     await this.renderGoal(binding, next, note);
   }
 
-  private async goalContinuationNote(binding: Binding, success: string): Promise<string> {
-    if (!this.desktop.continueGoal) return "Цель активна, но следующий ход не запущен: продолжение недоступно в этом подключении.";
+  private beginGoalContinuation(binding: Binding, goal: TaskGoal | null): GoalContinuationState {
+    return this.store.atomic(() => {
+      const existing = this.goalContinuationMarker(binding);
+      if (existing === "malformed" || existing && !["accepted", "rejected"].includes(existing.phase)) {
+        throw new ActionRejectedError("Предыдущий запуск цели не подтверждён. Проверь его исход в Codex; повторный запуск остаётся заблокированным.");
+      }
+      const attempt: GoalContinuationState = { operationId: randomUUID(), taskKey: taskKey(binding), goalCreatedAt: goal?.status === "complete" ? null : goal?.createdAt ?? null, phase: "activating" };
+      this.store.setValue(`goal-continuation:${binding.id}`, attempt);
+      return attempt;
+    });
+  }
+
+  private markGoalContinuation(binding: Binding, attempt: GoalContinuationState, phase: GoalContinuationState["phase"], goal?: TaskGoal): void {
+    this.store.atomic(() => {
+      const current = this.goalContinuationMarker(binding);
+      if (current === "malformed" || current?.operationId !== attempt.operationId) throw new UncertainActionError();
+      this.store.setValue(`goal-continuation:${binding.id}`, { ...attempt, goalCreatedAt: goal?.createdAt ?? attempt.goalCreatedAt, phase } satisfies GoalContinuationState);
+    });
+  }
+
+  private goalContinuationMarker(binding: Binding): GoalContinuationState | "malformed" | null {
+    let raw: unknown;
+    try { raw = this.store.getValue<unknown>(`goal-continuation:${binding.id}`); }
+    catch { return "malformed"; }
+    return raw === null ? null : validGoalContinuation(raw) ? raw : "malformed";
+  }
+
+  private async goalContinuationNote(binding: Binding, goal: TaskGoal, attempt: GoalContinuationState, success: string): Promise<string> {
+    if (!this.desktop.continueGoal) {
+      this.markGoalContinuation(binding, attempt, "rejected", goal);
+      return "Цель активна, но следующий ход не запущен: продолжение недоступно в этом подключении.";
+    }
+    this.markGoalContinuation(binding, attempt, "sending", goal);
     try {
-      await this.desktop.continueGoal(binding);
+      await this.desktop.continueGoal(binding, attempt.operationId);
+      this.markGoalContinuation(binding, attempt, "accepted", goal);
       return success;
     } catch (error) {
-      if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError)
+      if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
+        this.markGoalContinuation(binding, attempt, "rejected", goal);
         return `Цель активна, но следующий ход не запущен: ${error.message}`;
+      }
+      this.markGoalContinuation(binding, attempt, "uncertain", goal);
       if (error instanceof DesktopUnavailableError || error instanceof UncertainActionError)
         return "Цель активна, но запуск следующего хода не подтверждён. Проверь состояние задачи в Codex; не повторяй команду вслепую.";
       throw error;

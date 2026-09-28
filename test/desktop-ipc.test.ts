@@ -3195,7 +3195,7 @@ test("resuming a goal wakes an idle live owner with an empty inherited turn and 
     const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: status === "inProgress" ? "active" : "idle" } };
     const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
-    await adapter.continueGoal(ref);
+    await adapter.continueGoal(ref, `goal-resume-${status}`);
     const starts = server.received.filter(message => message.method === "thread-follower-start-turn");
     assert.equal(starts.length, status === "completed" ? 1 : 0);
     if (status === "completed") {
@@ -3217,7 +3217,7 @@ test("goal continuation does not report success when no live owner accepts a tur
   const task = { ...ref, title: "Unloaded goal", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
     () => new DesktopIpcClient(() => server, 100));
-  await assert.rejects(adapter.continueGoal(task), TaskNotOpenError);
+  await assert.rejects(adapter.continueGoal(task, "goal-resume-absent"), TaskNotOpenError);
   assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
 });
 
@@ -3232,7 +3232,7 @@ test("goal continuation waits for the same safe native admission state as a norm
     const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
       () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { stateSettleMs: 5 });
-    await assert.rejects(adapter.continueGoal(task), ActionRejectedError);
+    await assert.rejects(adapter.continueGoal(task, "goal-resume-unready"), ActionRejectedError);
     assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
     assert.ok(server.destroyed);
   }
@@ -3253,7 +3253,7 @@ test("goal continuation starts once after a live owner finishes restoring its st
   const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
     () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined, { stateSettleMs: 100 });
-  await adapter.continueGoal(task);
+  await adapter.continueGoal(task, "goal-resume-restored");
   assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
   assert.ok(server.destroyed);
 });
@@ -3265,8 +3265,20 @@ test("lost goal-start acknowledgment remains uncertain and is not retried", asyn
   const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
     () => new DesktopIpcClient(() => server, 50));
-  await assert.rejects(adapter.continueGoal(task), UncertainActionError);
+  await assert.rejects(adapter.continueGoal(task, "goal-resume-uncertain"), UncertainActionError);
   assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});
+
+test("goal continuation sends the caller's stable operation ID to the native owner", async () => {
+  const server = new Server();
+  server.dataState = { ...state([], "completed"), resumeState: "resumed", threadRuntimeStatus: { type: "idle" } };
+  const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50));
+  await adapter.continueGoal(task, "goal-resume-fixture");
+  const starts = server.received.filter(message => message.method === "thread-follower-start-turn");
+  assert.equal(starts.length, 1);
+  assert.equal((((starts[0]!.params as IpcObject).turnStart as IpcObject).request as IpcObject).clientUserMessageId, "goal-resume-fixture");
 });
 
 test("starting placeholders without a turn ID are steered rather than mistaken for idle tasks", async () => {

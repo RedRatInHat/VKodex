@@ -4,7 +4,6 @@ import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { taskDetails } from "./details.js";
 import { activeTurnsFromState, inProgressState, turnsFromState } from "./projector.js";
-import { randomUUID } from "node:crypto";
 import { asyncQuestionReply, pendingCodexQuestions, type CodexQuestions } from "./questions.js";
 import { taskInput, type PreparedTaskInput } from "../core/task-input.js";
 
@@ -138,7 +137,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.goals.clear(task);
   }
 
-  async continueGoal(task: TaskRef): Promise<void> {
+  async continueGoal(task: TaskRef, operationId: string): Promise<void> {
     await this.follow(task, async (subscription, client) => {
       // A resumed goal belongs to an existing history. Wait for the live
       // owner's settled snapshot, then recheck it immediately before writing.
@@ -148,7 +147,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
         const reply = await client.request("thread-follower-start-turn", 2, {
           conversationId: task.threadId,
           turnStart: {
-            request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
+            request: { threadId: task.threadId, clientUserMessageId: operationId, input: [] },
             context: { inheritThreadSettings: true },
           },
         }, { targetClientId: owner, timeoutMs: 30_000, mutating: true });
