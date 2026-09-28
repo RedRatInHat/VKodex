@@ -25,7 +25,7 @@
     "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-windows-task.ps1",
     "service:controlled-restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/controlled-restart.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=4 test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

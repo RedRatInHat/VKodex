@@ -157,7 +157,23 @@ test('heartbeat does not advance sequence and revocation closes the idle stream'
   assert.equal(heartbeat.kind, 'heartbeat'); assert.equal(heartbeat.seq, 0);
   assert.equal(Object.hasOwn(heartbeat, 'state'), false);
   f.revoke();
-  await assert.rejects(c.reader.next(), /closed/);
+  // A heartbeat may already be queued in the socket when ownership is
+  // revoked. Consume those frames, then require the stream to close without
+  // publishing a changed state or advancing its sequence.
+  let closed = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    let frame: Record<string, unknown>;
+    try { frame = await c.reader.next() as Record<string, unknown>; }
+    catch (error) {
+      assert.match(String(error), /closed/);
+      closed = true;
+      break;
+    }
+    assert.equal(frame.kind, 'heartbeat');
+    assert.equal(frame.seq, 0);
+    assert.equal(Object.hasOwn(frame, 'state'), false);
+  }
+  assert.equal(closed, true, 'revoked owner must close the idle stream');
   assert.equal(f.detached, 1);
 });
 

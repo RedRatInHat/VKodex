@@ -17,6 +17,13 @@ const frame = (kind: 'snapshot' | 'changed', seq: number, extra: Record<string, 
   backendGeneration: scope.backendGeneration, seq, historyComplete: true, state: state(), ...extra,
 });
 const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 
 const opened: Array<{ server: Server; sockets: Set<Socket> }> = [];
 afterEach(async () => {
@@ -64,7 +71,7 @@ test('authenticates, subscribes exact scope, and delivers full initial and chang
   const client = transport(port);
   const stream = client.subscribe(task, (value, initial) => seen.push({ state: value, initial }), error => errors.push(error));
   await stream.start();
-  await new Promise(resolve => setImmediate(resolve));
+  await waitFor(() => seen.length === 2, 'initial and changed states');
   assert.deepEqual(seen.map(item => item.initial), [true, false]);
   assert.deepEqual(seen[0]?.state, state());
   assert.deepEqual(errors, []);
@@ -106,7 +113,7 @@ test('sequence gap, wrong epoch, malformed change, and unknown frame fields fail
     const errors: Error[] = []; const seen: boolean[] = [];
     const stream = client.subscribe(task, (_value, initial) => seen.push(initial), error => errors.push(error));
     await stream.start();
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await waitFor(() => errors.length === 1, 'invalid change failure');
     assert.deepEqual(seen, [true]);
     assert.equal(errors.length, 1);
     await assert.rejects(stream.verifyOwner());
@@ -123,7 +130,7 @@ test('EOF after snapshot fails stream, while local close is silent', async () =>
   const client = transport(port); const errors: Error[] = [];
   const stream = client.subscribe(task, () => {}, error => errors.push(error));
   await stream.start();
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitFor(() => errors.length === 1, 'EOF failure');
   assert.equal(errors.length, 1);
   client.close();
 });
@@ -146,7 +153,7 @@ test('exclusive TaskStateConnections route drops a gapped stream without legacy 
   const seen: boolean[] = []; const failures: Error[] = [];
   await connections.connect('bridge-task', task, (_state, initial) => seen.push(initial),
     failure => failures.push(failure.error));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitFor(() => failures.length === 1, 'exclusive route failure');
   assert.deepEqual(seen, [true]);
   assert.equal(failures.length, 1);
   assert.equal(connections.has('bridge-task'), false);
@@ -176,7 +183,7 @@ test('heartbeat retains sequence without creating a state update', async () => {
   const client = transport(port); const seen: boolean[] = [];
   const stream = client.subscribe(task, (_value, initial) => seen.push(initial), () => {});
   await stream.start();
-  await new Promise(resolve => setImmediate(resolve));
+  await waitFor(() => seen.length === 2, 'state following heartbeat');
   assert.deepEqual(seen, [true, false]);
   await stream.verifyOwner();
   client.close();

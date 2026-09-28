@@ -13,6 +13,13 @@ const taskId = randomUUID();
 const token = 'A'.repeat(43);
 const generation = 1;
 const task = { hostId: 'local', threadId: taskId };
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 const native = (): NativeProjectionState => createProjection({ thread: { id: taskId, turns: [] },
   cwd: 'C:/owned', model: 'gpt-6-sol', reasoningEffort: 'low', approvalPolicy: 'never',
   sandbox: { type: 'readOnly' }, activePermissionProfile: null, runtimeWorkspaceRoots: [], serviceTier: null },
@@ -65,7 +72,7 @@ test('real worker stream feeds TaskStateConnections with exact initial and chang
       { id: 'user-1', type: 'userMessage', clientId: 'vk-operation',
         content: [{ type: 'text', text: 'hello' }] },
     ] } } }));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitFor(() => states.length === 2, 'changed bridge state');
   assert.equal(states.length, 2);
   assert.equal(states[1]?.initial, false);
   const turns = states[1]?.state.turns as Array<{ id: string; items: Array<{ clientId?: string }> }>;
@@ -92,7 +99,7 @@ test('real worker source gap and owner loss each fail the client stream without 
     const stream = client.subscribe(task, () => {}, error => errors.push(error));
     await stream.start();
     if (failure === 'gap') fixture.gap(); else fixture.loseOwner();
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await waitFor(() => errors.length === 1, `${failure} stream failure`);
     assert.equal(errors.length, 1);
     await assert.rejects(stream.verifyOwner());
     client.close(); await server.close();

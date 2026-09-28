@@ -22,6 +22,13 @@ const state = () => ({ kind: 'app-server', threadId: task.threadId, title: null,
   model: 'gpt-6-sol', effort: 'low', runtimeStatus: 'idle', context: null, questions: [], turns: [],
   createdAt: 1, updatedAt: 1 });
 const line = (value: unknown): string => `${JSON.stringify(value)}\n`;
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 const frame = (kind: 'snapshot' | 'changed', seq: number) => ({ schemaVersion: 1, kind, epoch,
   taskId: task.threadId, backendGeneration: 2, seq, historyComplete: true, state: state() });
 
@@ -148,7 +155,7 @@ test('old frames are fenced after a durable claim transition, and failed status 
   const stream = transport.subscribe(task, (_value, initial) => seen.push(initial), error => failures.push(error));
   await stream.start(); current = false;
   for (const entry of opened) for (const socket of entry.sockets) socket.write(line(frame('changed', 1)));
-  await new Promise(resolve => setImmediate(resolve));
+  await waitFor(() => failures.length === 1, 'revoked claim failure');
   assert.deepEqual(seen, [true]); assert.equal(failures.length, 1); transport.close();
 
   const refused = new ManagedOwnerObservedTaskStateTransport(resolver(port, () => true, async () => {
