@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { BridgeStore } from '../src/bridge/store.js';
 import { ManagedOwnerExclusiveRouteGuard } from '../src/bridge/managed-owner-exclusive-guard.js';
+import type { ManagedOwnerRouteObserver } from '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { RoutedCodexTasks } from '../src/core/codex-task-router.js';
 import { ActionRejectedError, type CodexTasks, type TaskRef } from '../src/core/codex-tasks.js';
 import { RoutedTaskStateTransport, type TaskStateTransport } from '../src/core/task-state.js';
@@ -78,4 +79,46 @@ test('claim for one source never captures another source or thread', async () =>
     assert.equal(guard.owns({ ...task(), threadId: 'other-thread' }), false);
     assert.equal(guard.owns({ ...task(), hostId: 'remote' }), false);
   } finally { store.close(); }
+});
+
+test('exclusive managed observation uses the exact claim without opening a fallback writer stream', async () => {
+  const store = new BridgeStore();
+  let baseStreams = 0, resolved = 0, observed = 0, closed = 0;
+  const baseStates: TaskStateTransport = { subscribe: requested => {
+    baseStreams++;
+    return { task: requested, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
+  }, close: () => {} };
+  const binding = store.ensureBinding({ ...task(), title: 'Managed', workspace: 'C:\\ManagedFixture', updatedAt: 1 });
+  const epoch = randomUUID();
+  const registering = store.claimManagedOwner(binding.id, { ownerEpoch: epoch,
+    canonicalHome: 'C:\\ManagedFixture', familyRoot: 'managed-thread' });
+  const claim = store.transitionManagedOwner(registering, 'ready', {
+    backendGeneration: 1, registryRevision: 1, endpointRef: randomUUID(),
+    host: { pid: 101, birthTicks: '10' }, backend: { pid: 102, birthTicks: '11' },
+  });
+  const workerStates: TaskStateTransport = { subscribe: requested => ({ task: requested,
+    start: async () => { observed++; }, verifyOwner: async () => {}, close: () => { closed++; },
+  }), close: () => {} };
+  const resolver: ManagedOwnerRouteObserver = {
+    isCurrent: current => store.managedOwner(task())?.revision === current.revision,
+    async resolve() { resolved++; return { kind: 'statically-qualified' as const, claim,
+      controlStatus: async () => ({ ownerEpoch: epoch, taskId: task().threadId,
+        hostState: 'running' as const, backendGeneration: 1,
+        nativeState: 'connected' as const, nativeRevision: 1 }),
+      states: workerStates }; },
+  };
+  const guard = new ManagedOwnerExclusiveRouteGuard(store, resolver);
+  const states = new RoutedTaskStateTransport(baseStates, [guard]);
+  try {
+    const stream = states.subscribe(task(), () => {}, () => {});
+    assert.equal(resolved, 0, 'subscription remains lazy');
+    await stream.start(); await stream.verifyOwner();
+    assert.equal(resolved, 1); assert.equal(observed, 1); assert.equal(baseStreams, 0);
+    stream.close(); assert.ok(closed >= 1);
+    store.transitionManagedOwner(claim, 'unavailable');
+    const stale = states.subscribe(task(), () => {}, () => {});
+    await assert.rejects(stale.start());
+    assert.equal(baseStreams, 0, 'claim loss never falls back to the base writer');
+    stale.close();
+  } finally { states.close(); store.close(); }
 });

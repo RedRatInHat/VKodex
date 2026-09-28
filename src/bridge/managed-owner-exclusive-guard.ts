@@ -5,6 +5,8 @@ import { ActionRejectedError, type QueuedSubmissionOutcome, type SubmitTaskRecei
 import type { CodexTaskOwner } from '../core/codex-task-router.js';
 import type { TaskStateOwnerRoute, TaskStateStream, TaskStateTransport } from '../core/task-state.js';
 import type { BridgeStore } from './store.js';
+import { ManagedOwnerObservedTaskStateTransport,
+  type ManagedOwnerRouteObserver } from './managed-owner-observed-task-state-transport.js';
 
 const refuse = (): never => {
   throw new ActionRejectedError('Управляемый маршрут задачи пока недоступен.');
@@ -16,13 +18,23 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
   readonly routingPolicy = 'exclusive' as const;
   readonly states: TaskStateTransport;
 
-  constructor(private readonly store: Pick<BridgeStore, 'managedOwner'>) {
+  constructor(private readonly store: Pick<BridgeStore, 'managedOwner'>,
+    observer?: ManagedOwnerRouteObserver) {
+    const observations = new Set<ManagedOwnerObservedTaskStateTransport>();
     this.states = Object.freeze({
-      subscribe: (task: TaskRef): TaskStateStream => ({
-        task: { ...task }, start: async () => refuse(),
-        verifyOwner: async () => refuse(), close: () => {},
-      }),
-      close: () => {},
+      subscribe: (task: TaskRef, onState: Parameters<TaskStateTransport['subscribe']>[1],
+        onError: Parameters<TaskStateTransport['subscribe']>[2]): TaskStateStream => {
+        if (!observer || !this.owns(task)) return { task: { ...task },
+          start: async () => refuse(), verifyOwner: async () => refuse(), close: () => {} };
+        const transport = new ManagedOwnerObservedTaskStateTransport(observer, task);
+        observations.add(transport);
+        const stream = transport.subscribe(task, onState, onError);
+        return { task: stream.task, start: timeoutMs => stream.start(timeoutMs),
+          verifyOwner: timeoutMs => stream.verifyOwner(timeoutMs),
+          diagnostic: () => stream.diagnostic?.() ?? { kind: 'unknown' },
+          close: () => { stream.close(); transport.close(); observations.delete(transport); } };
+      },
+      close: () => { for (const transport of observations) transport.close(); observations.clear(); },
     });
   }
 

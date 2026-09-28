@@ -7,6 +7,7 @@ import { ManagedOwnerObservedTaskStateTransport, type ManagedOwnerRouteObserver 
   '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { ManagedWorkerStateTransport } from '../src/codex/managed-worker-state-transport.js';
 import type { TaskRef } from '../src/core/codex-tasks.js';
+import type { TaskStateTransport } from '../src/core/task-state.js';
 
 const task: TaskRef = { hostId: 'local', threadId: randomUUID(), sourceId: 'vk' };
 const epoch = randomUUID();
@@ -109,7 +110,7 @@ test('outer transport close during status proof also closes the pending private 
     taskId: task.threadId, hostState: 'running', backendGeneration: 2,
     nativeState: 'connected', nativeRevision: 1 }); });
   const base = resolver(port, () => true, () => pending);
-  let source: ManagedWorkerStateTransport | null = null;
+  let source: TaskStateTransport | null = null;
   const observed: ManagedOwnerRouteObserver = { ...base, async resolve(ref) {
     const value = await base.resolve(ref);
     if (value.kind === 'statically-qualified') source = value.states;

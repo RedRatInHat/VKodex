@@ -4,6 +4,7 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import DatabaseConstructor from 'better-sqlite3';
 import type { TaskRef } from '../core/codex-tasks.js';
+import type { TaskStateTransport } from '../core/task-state.js';
 import type { BridgeStore, ManagedOwnerBinding, ManagedOwnerProcessIdentity } from './store.js';
 import { ManagedWorkerStateTransport } from '../codex/managed-worker-state-transport.js';
 import { ManagedWorkerControlClient, type ManagedWorkerScopedControlStatus } from
@@ -41,7 +42,7 @@ export type ManagedOwnerRouteResolution =
   | Readonly<{ kind: 'unavailable'; claim: ManagedOwnerBinding }>
   | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding;
       controlStatus: () => Promise<ManagedWorkerScopedControlStatus>;
-      states: ManagedWorkerStateTransport }>;
+      states: TaskStateTransport }>;
 
 interface RegistryReadyRow {
   epoch: string; revision: number; canonical_home: string; family_root: string; state: string;
