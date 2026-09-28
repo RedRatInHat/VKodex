@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import type { AppServerRpc } from '../codex/app-server-connection.js';
@@ -281,7 +282,22 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
   };
   current();
   const readParams = { threadId, includeTurns: true };
-  const read = await rpc.request('thread/read', readParams, { expectedGeneration: generation });
+  // A newly accepted thread can briefly reject its first read. Retry only
+  // this read-only RPC while the original session and reservation still hold.
+  const firstReadDelaysMs = [150, 500] as const;
+  let read: Row | undefined;
+  for (let attempt = 0; attempt <= firstReadDelaysMs.length; attempt++) {
+    current();
+    try {
+      read = await rpc.request('thread/read', readParams, { expectedGeneration: generation });
+      break;
+    } catch {
+      if (attempt === firstReadDelaysMs.length) refuse();
+      current();
+      await delay(firstReadDelaysMs[attempt]);
+    }
+  }
+  if (!read) throw new Error('Controlled native creation unqualified');
   const observedPath = row(read.thread) ? read.thread.path : null;
   if (typeof observedPath !== 'string') throw new Error('Controlled native creation unqualified');
   const source = await options.resolveSource(threadId, observedPath);

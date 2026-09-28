@@ -31,7 +31,8 @@ const startResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
 
 function fixture(failure: 'none' | 'unknown' | 'invalid-start-response' | 'started-persist' |
   'qualified-persist' | 'source-mismatch' |
-  'read-fail' | 'unloaded' | 'idle-to-unloaded' | 'provider-mismatch' |
+  'read-fail' | 'read-once' | 'read-once-lost-reservation' | 'second-read-fail' |
+  'unloaded' | 'idle-to-unloaded' | 'provider-mismatch' |
   'cwd-mismatch' | 'policy-mismatch' | 'start-active' | 'start-turn' |
   'profile-extra' | 'sandbox-extra' | 'environment-extra' = 'none') {
   const calls: string[] = [], persisted: string[] = [];
@@ -69,8 +70,15 @@ function fixture(failure: 'none' | 'unknown' | 'invalid-start-response' | 'start
         return startResult;
       }
       if (method === 'thread/read') {
+        assert.equal(options?.expectedGeneration, 1);
         readCount++;
         if (failure === 'read-fail') throw new Error('readback unavailable');
+        if (failure === 'read-once' && readCount === 1) throw new Error('readback unavailable');
+        if (failure === 'read-once-lost-reservation' && readCount === 1) {
+          reserved = false;
+          throw new Error('readback unavailable');
+        }
+        if (failure === 'second-read-fail' && readCount === 2) throw new Error('readback unavailable');
         return { thread: failure === 'unloaded' || failure === 'idle-to-unloaded' && readCount === 2
           ? { ...startResult.thread, status: { type: 'notLoaded' }, model: null,
             reasoningEffort: null, environments: null, path: rolloutPath }
@@ -128,6 +136,30 @@ test('controlled creator writes one thread/start after intent, then qualifies ze
   assert.deepEqual(f.calls, ['thread/start', 'thread/read', 'thread/turns/list',
     'thread/goal/get', 'thread/queue/list', 'thread/read']);
   assert.equal(f.calls.includes('turn/start'), false);
+});
+
+test('first read RPC error retries read-only and qualifies the same native task', async () => {
+  const f = fixture('read-once');
+  const receipt = await createControlledNativeTask(f.options);
+  assert.equal(receipt.threadId, taskId);
+  assert.deepEqual(f.persisted, ['intent', 'started', 'qualified']);
+  assert.deepEqual(f.calls, ['thread/start', 'thread/read', 'thread/read',
+    'thread/turns/list', 'thread/goal/get', 'thread/queue/list', 'thread/read']);
+});
+
+test('first read RPC error does not retry after the creator reservation changes', async () => {
+  const f = fixture('read-once-lost-reservation');
+  await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.calls, ['thread/start', 'thread/read']);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
+});
+
+test('second read RPC error is not retried', async () => {
+  const f = fixture('second-read-fail');
+  await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.calls, ['thread/start', 'thread/read', 'thread/turns/list',
+    'thread/goal/get', 'thread/queue/list', 'thread/read']);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
 });
 
 for (const loseRead of [false, true]) test(`opt-in source proof qualifies the only rollout${loseRead ? ' after restart' : ''}`, async () => {
@@ -195,7 +227,8 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
     assert.equal(await realpath(result.rolloutPath), await realpath(nativePath));
     assert.equal(result.sourceProofRequired, true);
     assert.equal(journal.get(options.operationId)?.qualified?.sourceProofRequired, true);
-    assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read'] : ['thread/start']),
+    assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read', 'thread/read',
+      'thread/read'] : ['thread/start']),
       'thread/read', 'thread/turns/list',
       'thread/goal/get', 'thread/queue/list', 'thread/read']);
   } finally { journal.close(); }
@@ -242,7 +275,8 @@ for (const [failure, phase, expectedCalls, expectedPersisted] of [
   ['invalid-start-response', 'start-response', ['thread/start'], ['intent']],
   ['started-persist', 'persist-started', ['thread/start'], ['intent', 'started']],
   ['policy-mismatch', 'policy', ['thread/start'], ['intent', 'started']],
-  ['read-fail', 'readback', ['thread/start', 'thread/read'], ['intent', 'started']],
+  ['read-fail', 'readback', ['thread/start', 'thread/read', 'thread/read',
+    'thread/read'], ['intent', 'started']],
   ['qualified-persist', 'persist-qualified', ['thread/start', 'thread/read',
     'thread/turns/list', 'thread/goal/get', 'thread/queue/list', 'thread/read'],
   ['intent', 'started', 'qualified']],
@@ -264,7 +298,9 @@ for (const failure of ['source-mismatch', 'read-fail', 'provider-mismatch', 'cwd
   test(`${failure} after native acceptance refuses qualification without replay`, async () => {
   const f = fixture(failure);
   await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
-  assert.deepEqual(f.calls, ['thread/start', 'thread/read']);
+  assert.deepEqual(f.calls, failure === 'read-fail'
+    ? ['thread/start', 'thread/read', 'thread/read', 'thread/read']
+    : ['thread/start', 'thread/read']);
   assert.deepEqual(f.persisted, ['intent', 'started']);
   });
 
