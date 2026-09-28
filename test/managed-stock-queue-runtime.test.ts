@@ -58,7 +58,8 @@ test('runtime queue factory qualifies current same-worker state and refuses drif
         const receiptId = randomUUID();
         return { operation: { operationId: command.operationId, ownerEpoch, backendGeneration: 1,
           threadId: taskId, method: command.method, clientUserMessageId: command.params.clientUserMessageId,
-          state: 'accepted', receiptId }, response: { queuedSubmission: { id: receiptId,
+          fingerprint: 'a'.repeat(64), revision: 1, state: 'accepted', receiptId,
+          rejectionCode: null }, response: { queuedSubmission: { id: receiptId,
           clientUserMessageId: command.params.clientUserMessageId, input: command.params.input } } } as never;
       } },
     publish: () => {}, onStockQueueChanged: () => { revision++; }, onFailure: () => {},

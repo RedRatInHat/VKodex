@@ -42,6 +42,35 @@ test('scoped quiescence retains reserved, unknown and unconsumed evidence withou
   j.close();
 });
 
+test('proven not-written disposition is scoped, immutable, unresolved and persists after reopen', async () => {
+  const filePath = await filename();
+  const j = await open(filePath);
+  j.reserve(intent('A', 0));
+  const evidence = { expectedVersion: 1, opId: 'A', fingerprint: fp('A'),
+    sourceClientId: 'native-client-1', requestId: 'native-request-1',
+    workerOperationId: randomUUID(), workerFingerprint: fp('W'),
+    workerRevision: 1, backendGeneration: 1 };
+  assert.throws(() => j.markNotWritten({ ...evidence, expectedVersion: 3 }), /stale/);
+  assert.equal(j.markNotWritten(evidence).phase, 'not-written');
+  assert.throws(() => j.markNotWritten({ ...evidence, expectedVersion: 2,
+    workerOperationId: randomUUID() }), /reserved/);
+  assert.deepEqual(j.quiescence(), { taskVersion: 2, unresolved: 1, unconsumed: 1 });
+  assert.throws(() => j.markUnknown({ opId: 'A', fingerprint: fp('A') }), /not-written/);
+  assert.throws(() => j.markAccepted({ opId: 'A', fingerprint: fp('A'), stockId: 'stock-A' }), /not-written/);
+  assert.throws(() => j.consume({ opId: 'A', fingerprint: fp('A'), turnId: 'turn-A', authoritative: true }), /not-written/);
+  assert.throws(() => j.reconcilePositive({ expectedVersion: 2, proof: proof('A', 'queued'),
+    assertSourceCurrent: () => true }), /not-written/);
+  assert.throws(() => j.confirmReplay({ expectedVersion: 2, ownerEpoch }), /unresolved/);
+  assert.throws(() => j.currentQueuePage({ expectedVersion: 2 }), /not-written/);
+  assert.equal(j.lookupIncomingIdentities({ ids: ['A'] }).items[0]?.phase, 'not-written');
+  j.close();
+  const reopened = await open(filePath);
+  assert.equal(reopened.readOperation('A')?.phase, 'not-written');
+  assert.equal(reopened.readOperation('A')?.notWritten?.workerOperationId, evidence.workerOperationId);
+  assert.deepEqual(reopened.quiescence(), { taskVersion: 2, unresolved: 1, unconsumed: 1 });
+  reopened.close();
+});
+
 test('positive queued proof unfreezes exact unknown intent and remains append-only after reopen', async () => {
   const filePath = await filename(); const j = await open(filePath);
   j.reserve(intent('A', 0)); j.markUnknown({ opId: 'A', fingerprint: fp('A') });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { NativeStockAdmission, type StockAdmissionQualification } from '../codex/native-stock-admission.js';
+import { NativeStockAdmission, StockAddNotWritten,
+  type StockAdmissionQualification } from '../codex/native-stock-admission.js';
 import { NativeStockQueueJournal, type NativeStockQueueQuiescence } from '../codex/native-stock-queue-journal.js';
 import { prepareNativeStockTextEntry, type NativeStockTextQualification } from '../codex/native-stock-text-entry.js';
 import type { JsonObject as StrictJsonObject } from '../codex/homogeneous-queue-policy.js';
@@ -40,7 +41,8 @@ export interface ManagedNativeStockQueueAdapterOptions {
   readonly onStockQueueChanged: () => void;
   /** Retire the native route if an early authoritative item cannot be mapped. */
   readonly onFailure: (reason: 'early-user-message-unattributed' |
-    'early-user-message-before-dispatch') => void;
+    'early-user-message-before-dispatch' | 'not-written-persistence-failed' |
+    'not-written-user-message-conflict') => void;
 }
 
 const object = (value: unknown): value is JsonObject =>
@@ -155,6 +157,7 @@ export class ManagedNativeStockQueueAdapter {
           this.#fault('early-user-message-before-dispatch');
           fail();
         },
+        onNotWrittenPersistenceFailure: () => this.#fault('not-written-persistence-failed'),
         queueAdd: async (request, assertBeforeWrite) => {
           const command: WorkerCommand = { operationId: managedStockCommandId(ownerEpoch,
             taskId, request.clientUserMessageId), method: 'thread/queue/add',
@@ -163,11 +166,25 @@ export class ManagedNativeStockQueueAdapter {
           const observed = await executeCommandWithResponse(controlKey,
             command, assertBeforeWrite);
           const operation = observed?.operation, response = observed?.response;
+          const exactWorker = operation &&
+            operation.ownerEpoch === ownerEpoch &&
+            operation.backendGeneration === backendGeneration &&
+            operation.threadId === taskId &&
+            operation.operationId === command.operationId &&
+            operation.method === 'thread/queue/add' &&
+            operation.clientUserMessageId === request.clientUserMessageId &&
+            typeof operation.fingerprint === 'string' &&
+            /^[a-f0-9]{64}$/u.test(operation.fingerprint) &&
+            Number.isSafeInteger(operation.revision) && operation.revision >= 1;
+          if (exactWorker && operation.state === 'rejected' &&
+              operation.receiptId === null && operation.rejectionCode === null &&
+              response === null) {
+            throw new StockAddNotWritten({ operationId: operation.operationId,
+              fingerprint: operation.fingerprint, revision: operation.revision,
+              backendGeneration: operation.backendGeneration });
+          }
           if (!operation || operation.state !== 'accepted' || !object(response) ||
-              operation.ownerEpoch !== ownerEpoch || operation.backendGeneration !== backendGeneration ||
-              operation.threadId !== taskId || operation.operationId !== command.operationId ||
-              operation.method !== 'thread/queue/add' ||
-              operation.clientUserMessageId !== request.clientUserMessageId ||
+              !exactWorker ||
               !object(response.queuedSubmission) ||
               typeof response.queuedSubmission.id !== 'string' ||
               response.queuedSubmission.id !== operation.receiptId ||
@@ -198,6 +215,7 @@ export class ManagedNativeStockQueueAdapter {
     if (Object.keys(request).some(key => !['requestId', 'sourceClientId', 'hostId',
         'method', 'version', 'params'].includes(key)) ||
         Object.keys(request.params).some(key => !['hostId', 'conversationId', 'state'].includes(key))) fail();
+    const sourceClientId = request.sourceClientId, nativeRequestId = request.requestId;
     const snapshot = strictJson(request);
     const params = snapshot.params;
     if (!object(params) || !object(params.state) ||
@@ -215,6 +233,7 @@ export class ManagedNativeStockQueueAdapter {
       if (await this.#assertInitialNativeQueueBaseline(this.#baselineScope) !== true ||
           assertIngressCurrent() !== true || this.#closed || this.#faulted) fail();
       return await this.#admission.acceptFullState({ state: state as Entry[], ownerEpoch: this.ownerEpoch,
+        sourceClientId, requestId: nativeRequestId,
         assertIngressCurrent });
     } finally {
       for (const id of claims) {
@@ -237,7 +256,8 @@ export class ManagedNativeStockQueueAdapter {
     assertEventCurrent: () => boolean): Promise<boolean> {
     if (this.#closed || this.#faulted || typeof clientId !== 'string' || !clientId ||
         typeof turnId !== 'string' || !turnId || typeof assertEventCurrent !== 'function') fail();
-    if (!this.#journal.readOperation(clientId)) {
+    const operation = this.#journal.readOperation(clientId);
+    if (!operation) {
       if (!this.#pendingClaims.has(clientId)) return false;
       if (assertEventCurrent() !== true) fail();
       if (!this.#earlyItems.has(clientId) && this.#earlyItems.size >= 128) fail();
@@ -245,6 +265,10 @@ export class ManagedNativeStockQueueAdapter {
       if (existing && existing.turnId !== turnId) fail();
       this.#earlyItems.set(clientId, { turnId, assertEventCurrent });
       return true;
+    }
+    if (operation.phase === 'not-written') {
+      this.#fault('not-written-user-message-conflict');
+      fail();
     }
     await this.#admission.consumeUserMessage({ taskId: this.taskId, ownerEpoch: this.ownerEpoch,
       clientId, turnId, authoritative: true, assertEventCurrent });

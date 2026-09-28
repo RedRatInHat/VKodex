@@ -12,17 +12,26 @@ export interface StockQueueOperation {
   opId: string; seq: number; fingerprint: string; nativeEntry: JsonObject;
   effectiveSettings: JsonObject; admissionEvidence: JsonObject;
   stockInput: readonly JsonValue[]; forwardedUpstream: JsonObject;
-  phase: 'reserved' | 'accepted' | 'unknown'; stockId: string | null;
+  phase: 'reserved' | 'accepted' | 'unknown' | 'not-written'; stockId: string | null;
   acceptedTurnId: string | null; consumed: boolean;
+  notWritten: NotWrittenEvidence | null;
+}
+export interface NotWrittenEvidence {
+  readonly sourceClientId: string; readonly requestId: string;
+  readonly workerOperationId: string; readonly workerFingerprint: string;
+  readonly workerRevision: number; readonly backendGeneration: number;
 }
 interface TaskRow { task_id: string; owner_epoch: string; source_generation: string; version: number; settings_json: string | null;
   publication_version: number; publication_acked_version: number }
 interface OpRow { task_id: string; op_id: string; seq: number; fingerprint: string;
   native_entry_json: string; admission_evidence_json: string;
   stock_input_json: string; forwarded_json: string;
-  phase: StockQueueOperation['phase']; stock_id: string | null;
-  accepted_turn_id: string | null; consumed: number }
-type IdentityRow = Pick<OpRow, 'op_id' | 'seq' | 'fingerprint' | 'phase' | 'consumed'>;
+  phase: Exclude<StockQueueOperation['phase'], 'not-written'>; stock_id: string | null;
+  accepted_turn_id: string | null; consumed: number;
+  source_client_id?: string | null; request_id?: string | null;
+  worker_operation_id?: string | null; worker_fingerprint?: string | null;
+  worker_revision?: number | null; backend_generation?: number | null }
+type IdentityRow = Pick<OpRow, 'op_id' | 'seq' | 'fingerprint' | 'phase' | 'consumed' | 'worker_operation_id'>;
 interface TaskView { taskId: string; ownerEpoch: string; sourceGeneration: string; version: number;
   effectiveSettings: JsonObject | null; publicationVersion: number; publicationAckedVersion: number }
 export interface Page<T> { taskVersion: number; items: T[]; hasMore: boolean; nextCursor: number }
@@ -91,8 +100,17 @@ const opView = (row: OpRow, effectiveSettings: JsonObject | null): StockQueueOpe
   nativeEntry: JSON.parse(row.native_entry_json) as JsonObject, effectiveSettings: copy(effectiveSettings ?? fail('missing settings')),
   admissionEvidence: JSON.parse(row.admission_evidence_json) as JsonObject,
   stockInput: JSON.parse(row.stock_input_json) as JsonValue[],
-  forwardedUpstream: JSON.parse(row.forwarded_json) as JsonObject, phase: row.phase,
+  forwardedUpstream: JSON.parse(row.forwarded_json) as JsonObject,
+  phase: row.worker_operation_id ? 'not-written' : row.phase,
   stockId: row.stock_id, acceptedTurnId: row.accepted_turn_id, consumed: row.consumed === 1,
+  notWritten: row.worker_operation_id ? {
+    sourceClientId: row.source_client_id ?? fail('missing native source client'),
+    requestId: row.request_id ?? fail('missing native request ID'),
+    workerOperationId: row.worker_operation_id,
+    workerFingerprint: row.worker_fingerprint ?? fail('missing worker fingerprint'),
+    workerRevision: row.worker_revision ?? fail('missing worker revision'),
+    backendGeneration: row.backend_generation ?? fail('missing backend generation'),
+  } : null,
 });
 
 export class NativeStockQueueJournal {
@@ -114,9 +132,11 @@ export class NativeStockQueueJournal {
   private readonly bumpTask: Statement<[string, number]>;
   private readonly bumpPublication: Statement<[string, number]>;
   private readonly insertOp: Statement<[string, string, number, string, string, string, string, string,
-    StockQueueOperation['phase'], string | null, string | null, number]>;
+    OpRow['phase'], string | null, string | null, number]>;
   private readonly acceptOp: Statement<[string, string, string]>;
   private readonly unknownOp: Statement<[string, string]>;
+  private readonly insertNotWritten: Statement<[string, string, string, string, string, string, number, number]>;
+  private readonly selectNotWritten: Statement<[string], { op_id: string }>;
   private readonly consumeOp: Statement<[string, string, string]>;
   private readonly ackPublication: Statement<[number, string, number, number]>;
   private readonly insertEvidence: Statement<[string, string, ReconciliationEvidence['kind'], string]>;
@@ -171,7 +191,15 @@ export class NativeStockQueueJournal {
       );
       CREATE INDEX IF NOT EXISTS native_repeated_pending_idx ON native_repeated_op(task_id,consumed,seq);
       CREATE INDEX IF NOT EXISTS native_repeated_phase_idx ON native_repeated_op(task_id,phase);
-      CREATE UNIQUE INDEX IF NOT EXISTS native_repeated_stock_idx ON native_repeated_op(task_id,stock_id) WHERE stock_id IS NOT NULL;`);
+      CREATE UNIQUE INDEX IF NOT EXISTS native_repeated_stock_idx ON native_repeated_op(task_id,stock_id) WHERE stock_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS native_stock_not_written (
+        task_id TEXT NOT NULL, op_id TEXT NOT NULL,
+        source_client_id TEXT NOT NULL, request_id TEXT NOT NULL,
+        worker_operation_id TEXT NOT NULL, worker_fingerprint TEXT NOT NULL,
+        worker_revision INTEGER NOT NULL, backend_generation INTEGER NOT NULL,
+        PRIMARY KEY(task_id,op_id),
+        FOREIGN KEY(task_id,op_id) REFERENCES native_repeated_op(task_id,op_id)
+      );`);
       this.db.exec(`CREATE TABLE IF NOT EXISTS native_stock_reconciliation_evidence (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL,
@@ -190,23 +218,31 @@ export class NativeStockQueueJournal {
       }
       this.db.pragma('user_version = 2');
       this.selectTask = this.db.prepare<[string], TaskRow>('SELECT * FROM native_repeated_task WHERE task_id=?');
-      this.selectOp = this.db.prepare<[string, string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND op_id=?');
-      this.selectIdentity = this.db.prepare<[string, string], IdentityRow>('SELECT op_id,seq,fingerprint,phase,consumed FROM native_repeated_op WHERE task_id=? AND op_id=?');
+      const joined = ' FROM native_repeated_op o LEFT JOIN native_stock_not_written d ON d.task_id=o.task_id AND d.op_id=o.op_id ';
+      const projected = 'SELECT o.*,d.source_client_id,d.request_id,d.worker_operation_id,d.worker_fingerprint,d.worker_revision,d.backend_generation';
+      this.selectOp = this.db.prepare<[string, string], OpRow>(projected + joined + 'WHERE o.task_id=? AND o.op_id=?');
+      this.selectIdentity = this.db.prepare<[string, string], IdentityRow>(
+        'SELECT o.op_id,o.seq,o.fingerprint,o.phase,o.consumed,d.worker_operation_id' + joined +
+        'WHERE o.task_id=? AND o.op_id=?');
       this.selectUnresolved = this.db.prepare<[string], Pick<OpRow, 'phase'>>("SELECT phase FROM native_repeated_op WHERE task_id=? AND phase IN ('reserved','unknown') LIMIT 1");
       this.selectQuiescence = this.db.prepare<[string], { unresolved: number; unconsumed: number }>(
         "SELECT COUNT(CASE WHEN phase IN ('reserved','unknown') THEN 1 END) AS unresolved, " +
         'COUNT(CASE WHEN consumed=0 THEN 1 END) AS unconsumed FROM native_repeated_op WHERE task_id=?');
       this.selectNextSeq = this.db.prepare<[string], { next_seq: number }>('SELECT COALESCE(MAX(seq),0)+1 AS next_seq FROM native_repeated_op WHERE task_id=?');
-      this.selectPage = this.db.prepare<[string, number, number, number], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? AND consumed=? AND seq>? ORDER BY seq LIMIT ?');
+      this.selectPage = this.db.prepare<[string, number, number, number], OpRow>(projected + joined + 'WHERE o.task_id=? AND o.consumed=? AND o.seq>? ORDER BY o.seq LIMIT ?');
       this.selectPublicationPage = this.db.prepare<[string, number, number], OpRow>("SELECT * FROM native_repeated_op WHERE task_id=? AND phase='accepted' AND consumed=0 AND seq>? ORDER BY seq LIMIT ?");
-      this.selectAll = this.db.prepare<[string], OpRow>('SELECT * FROM native_repeated_op WHERE task_id=? ORDER BY seq');
+      this.selectAll = this.db.prepare<[string], OpRow>(projected + joined + 'WHERE o.task_id=? ORDER BY o.seq');
       this.insertTask = this.db.prepare<[string, string, string, number, string, number, number]>('INSERT INTO native_repeated_task VALUES(?,?,?,?,?,?,?)');
       this.bumpTask = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1 WHERE task_id=? AND version=?');
       this.bumpPublication = this.db.prepare<[string, number]>('UPDATE native_repeated_task SET version=version+1,publication_version=publication_version+1 WHERE task_id=? AND version=?');
       this.insertOp = this.db.prepare<[string, string, number, string, string, string, string, string,
-        StockQueueOperation['phase'], string | null, string | null, number]>('INSERT INTO native_repeated_op VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+        OpRow['phase'], string | null, string | null, number]>('INSERT INTO native_repeated_op VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
       this.acceptOp = this.db.prepare<[string, string, string]>("UPDATE native_repeated_op SET phase='accepted',stock_id=? WHERE task_id=? AND op_id=? AND phase='reserved'");
       this.unknownOp = this.db.prepare<[string, string]>("UPDATE native_repeated_op SET phase='unknown' WHERE task_id=? AND op_id=? AND phase='reserved'");
+      this.insertNotWritten = this.db.prepare<[string, string, string, string, string, string, number, number]>(
+        'INSERT INTO native_stock_not_written VALUES(?,?,?,?,?,?,?,?)');
+      this.selectNotWritten = this.db.prepare<[string], { op_id: string }>(
+        'SELECT op_id FROM native_stock_not_written WHERE task_id=? LIMIT 1');
       this.consumeOp = this.db.prepare<[string, string, string]>('UPDATE native_repeated_op SET accepted_turn_id=?,consumed=1 WHERE task_id=? AND op_id=? AND accepted_turn_id IS NULL');
       this.ackPublication = this.db.prepare<[number, string, number, number]>('UPDATE native_repeated_task SET publication_acked_version=?,version=version+1 WHERE task_id=? AND version=? AND publication_version=?');
       this.insertEvidence = this.db.prepare<[string, string, ReconciliationEvidence['kind'], string]>(
@@ -269,7 +305,8 @@ export class NativeStockQueueJournal {
       const items = ids.map(id => {
         const row = this.selectIdentity.get(this.taskId, id);
         return row ? { id: row.op_id, seq: row.seq, fingerprint: row.fingerprint,
-          phase: row.phase, consumed: row.consumed === 1 } : null;
+          phase: row.worker_operation_id ? 'not-written' as const : row.phase,
+          consumed: row.consumed === 1 } : null;
       });
       return { taskVersion: task.version, items };
     });
@@ -284,6 +321,7 @@ export class NativeStockQueueJournal {
     return this.snapshot(() => {
       const status = this.publicationStatus();
       if (!status.pending || version !== status.version) fail('stale publication snapshot');
+      if (this.selectNotWritten.get(this.taskId)) fail('not-written entry blocks publication');
       const rows = this.selectPublicationPage.all(this.taskId, afterSeq, limit + 1);
       const items = rows.slice(0, limit).map(row => ({ seq: row.seq, opId: row.op_id,
         fingerprint: row.fingerprint, nativeEntry: JSON.parse(row.native_entry_json) as JsonObject }));
@@ -297,6 +335,7 @@ export class NativeStockQueueJournal {
     return this.snapshot(() => {
       const task = this.readTask();
       if (task.version !== expectedVersion) fail('stale task version');
+      if (this.selectNotWritten.get(this.taskId)) fail('not-written entry blocks hydration');
       const rows = this.selectPublicationPage.all(this.taskId, afterSeq, limit + 1);
       const items = rows.slice(0, limit).map(row => ({ seq: row.seq, opId: row.op_id,
         fingerprint: row.fingerprint, nativeEntry: JSON.parse(row.native_entry_json) as JsonObject }));
@@ -319,6 +358,7 @@ export class NativeStockQueueJournal {
     return this.snapshot(() => {
       const status = this.publicationStatus();
       if (!status.pending) return null;
+      if (this.selectNotWritten.get(this.taskId)) fail('not-written entry blocks publication');
       const rows = this.selectPublicationPage.all(this.taskId, 0, -1);
       return { version: status.version, pendingIds: rows.map(row => row.op_id),
         messages: rows.map(row => JSON.parse(row.native_entry_json) as JsonObject) };
@@ -406,6 +446,7 @@ export class NativeStockQueueJournal {
       const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
       if (!task || !op) return fail('operation identity conflict');
       if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.worker_operation_id) fail('not-written result cannot become accepted');
       if (op.phase === 'unknown') fail('unknown requires explicit authoritative reconciliation');
       if (op.phase === 'accepted') {
         if (op.stock_id === null && op.consumed === 1) {
@@ -472,6 +513,7 @@ export class NativeStockQueueJournal {
       const op = this.selectOp.get(this.taskId, proof.clientUserMessageId);
       if (!task || !op) return fail('reconciliation operation absent');
       if (task.version !== expectedVersion) fail('stale reconciliation version');
+      if (op.worker_operation_id) fail('not-written result conflicts with positive proof');
       if (!isDeepStrictEqual(proof.input, JSON.parse(op.stock_input_json)) ||
           !isDeepStrictEqual(proof.admissionEvidence, JSON.parse(op.admission_evidence_json)) ||
           !isDeepStrictEqual(proof.effectiveSettings, JSON.parse(task.settings_json ?? 'null'))) {
@@ -504,12 +546,44 @@ export class NativeStockQueueJournal {
       const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
       if (!task || !op) return fail('operation identity conflict');
       if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.worker_operation_id) fail('not-written result cannot become unknown');
       if (op.phase === 'accepted') fail('accepted result cannot downgrade');
       if (op.phase === 'unknown') return this.readOperation(opId) ?? fail('unknown operation absent');
       const changed = this.unknownOp.run(this.taskId, opId);
       if (changed.changes !== 1) fail('unknown phase conflict');
       this.bump(task, false);
       return this.readOperation(opId) ?? fail('unknown operation absent');
+    });
+  }
+
+  /** Final worker before-write fence is durable proof that this native entry
+   * was not sent. The reserved row remains visible and blocks replay/hydration
+   * until a separately qualified native UI transition can resolve it. */
+  markNotWritten({ expectedVersion, opId, fingerprint: hash, sourceClientId, requestId,
+    workerOperationId, workerFingerprint, workerRevision, backendGeneration }: {
+    expectedVersion: number; opId: string; fingerprint: string;
+    sourceClientId: string; requestId: string; workerOperationId: string;
+    workerFingerprint: string; workerRevision: number; backendGeneration: number;
+  }): StockQueueOperation {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1 ||
+        !nonempty(opId) || !fingerprint(hash) || !nonempty(sourceClientId) ||
+        !nonempty(requestId) || !nonempty(workerOperationId) ||
+        !fingerprint(workerFingerprint) || !Number.isSafeInteger(workerRevision) ||
+        workerRevision < 1 || !Number.isSafeInteger(backendGeneration) ||
+        backendGeneration < 1) fail('incomplete not-written proof');
+    return this.transaction(() => {
+      const task = this.taskRow() ?? fail('not-written task absent');
+      const op = this.selectOp.get(this.taskId, opId) ?? fail('not-written operation identity conflict');
+      if (op.fingerprint !== hash) fail('not-written operation identity conflict');
+      if (task.version !== expectedVersion) fail('stale not-written task version');
+      if (op.phase !== 'reserved' || op.consumed !== 0 || op.stock_id !== null ||
+          op.accepted_turn_id !== null || op.worker_operation_id) {
+        fail('not-written requires unconsumed reserved operation');
+      }
+      this.insertNotWritten.run(this.taskId, opId, sourceClientId, requestId,
+        workerOperationId, workerFingerprint, workerRevision, backendGeneration);
+      this.bump(task, false);
+      return this.readOperation(opId) ?? fail('not-written operation absent');
     });
   }
 
@@ -522,6 +596,7 @@ export class NativeStockQueueJournal {
       const task = this.taskRow(); const op = this.selectOp.get(this.taskId, opId);
       if (!task || !op) return fail('operation identity conflict');
       if (op.fingerprint !== hash) return fail('operation identity conflict');
+      if (op.worker_operation_id) fail('not-written entry conflicts with authoritative user message');
       if (op.accepted_turn_id !== null) {
         if (op.accepted_turn_id !== turnId) fail('turn identity conflict');
         return this.readOperation(opId) ?? fail('consumed operation absent');

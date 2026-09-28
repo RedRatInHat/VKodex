@@ -14,6 +14,14 @@ export interface StockAdmissionQualification {
 export interface PreparedStockEntry { readonly input: readonly unknown[]; readonly forwardedUpstream: unknown }
 export interface StockQueuedSubmission { readonly id: string; readonly clientUserMessageId: string;
   readonly input: readonly JsonObject[] }
+/** Only the worker's durable final before-write refusal may construct this.
+ * It carries identity metadata, never prompt content or a synthetic receipt. */
+export class StockAddNotWritten extends Error {
+  constructor(readonly worker: Readonly<{ operationId: string; fingerprint: string;
+    revision: number; backendGeneration: number }>) {
+    super('stock queue/add was not written');
+  }
+}
 type OwnerScope = { readonly taskId: string; readonly ownerEpoch: string };
 type DispatchScope = OwnerScope & { readonly effectiveSettings: JsonObject };
 export interface NativeStockAdmissionDependencies<Entry extends { readonly id: string },
@@ -31,12 +39,15 @@ export interface NativeStockAdmissionDependencies<Entry extends { readonly id: s
   /** Synchronous hook after durable reserve, before dispatch, for an item
    * observed during asynchronous qualification. Throw leaves a reserved intent. */
   readonly onReserved?: (identity: Readonly<{ opId: string; fingerprint: string }>) => void;
+  readonly onNotWrittenPersistenceFailure?: () => void;
   readonly publish: (messages: readonly JsonObject[], metadata: {
     readonly kind: 'outbox' | 'hydrate'; readonly version?: number;
     readonly taskVersion?: number; readonly taskId: string; readonly ownerEpoch: string;
   }) => void | Promise<void>;
 }
 interface Flight<Entry> { readonly opId: string; readonly fingerprint: string;
+  readonly reservedVersion: number; readonly sourceClientId: string | null;
+  readonly requestId: string | null;
   readonly incoming: readonly QueueEntryIdentity[]; readonly entry: Entry;
   readonly ingressCurrent: () => void; readonly effectiveSettings: JsonObject;
   readonly input: readonly JsonObject[]; readonly promise: Promise<{ ok: true }>;
@@ -70,25 +81,31 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
   private readonly assertDispatchCurrent: NativeStockAdmissionDependencies<Entry, Qualification>['assertDispatchCurrent'];
   private readonly queueAdd: NativeStockAdmissionDependencies<Entry, Qualification>['queueAdd'];
   private readonly onReserved: NativeStockAdmissionDependencies<Entry, Qualification>['onReserved'];
+  private readonly onNotWrittenPersistenceFailure:
+    NativeStockAdmissionDependencies<Entry, Qualification>['onNotWrittenPersistenceFailure'];
   private readonly publish: NativeStockAdmissionDependencies<Entry, Qualification>['publish'];
   private taskTail: Promise<unknown> = Promise.resolve();
   private publicationTail: Promise<unknown> = Promise.resolve();
   private inFlight: Flight<Entry> | null = null;
 
   constructor({ taskId, ownerEpoch, journal, identifyEntry, prepareEntry,
-    qualify, confirmOwner, assertOwnerCurrent, assertDispatchCurrent, queueAdd, onReserved, publish }:
+    qualify, confirmOwner, assertOwnerCurrent, assertDispatchCurrent, queueAdd, onReserved,
+    onNotWrittenPersistenceFailure, publish }:
     NativeStockAdmissionDependencies<Entry, Qualification>) {
     if (!nonempty(taskId) || !nonempty(ownerEpoch) || !journal ||
         ![identifyEntry, prepareEntry, qualify, confirmOwner, assertOwnerCurrent,
           assertDispatchCurrent, queueAdd, publish]
           .every(value => typeof value === 'function') ||
-        onReserved !== undefined && typeof onReserved !== 'function') fail('dependencies required');
+        onReserved !== undefined && typeof onReserved !== 'function' ||
+        onNotWrittenPersistenceFailure !== undefined &&
+          typeof onNotWrittenPersistenceFailure !== 'function') fail('dependencies required');
     if (journal.taskId !== taskId || journal.ownerEpoch !== ownerEpoch) fail('journal scope differs');
     this.taskId = taskId; this.ownerEpoch = ownerEpoch; this.journal = journal;
     this.identifyEntry = identifyEntry; this.prepareEntry = prepareEntry; this.qualify = qualify;
     this.confirmOwner = confirmOwner; this.assertOwnerCurrent = assertOwnerCurrent;
     this.assertDispatchCurrent = assertDispatchCurrent; this.queueAdd = queueAdd; this.publish = publish;
     this.onReserved = onReserved;
+    this.onNotWrittenPersistenceFailure = onNotWrittenPersistenceFailure;
   }
 
   private task<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -163,8 +180,10 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
       classification: classifyNativeQueueState({ currentPending, consumed, incoming }) };
   }
 
-  async acceptFullState({ state, ownerEpoch = this.ownerEpoch, assertIngressCurrent = null }: {
+  async acceptFullState({ state, ownerEpoch = this.ownerEpoch, assertIngressCurrent = null,
+    sourceClientId = null, requestId = null }: {
     state: readonly Entry[]; ownerEpoch?: string; assertIngressCurrent?: (() => boolean) | null;
+    sourceClientId?: string | null; requestId?: string | null;
   }): Promise<{ ok: true }> {
     if (ownerEpoch !== this.ownerEpoch) fail('owner epoch mismatch');
     if (assertIngressCurrent !== null && typeof assertIngressCurrent !== 'function') {
@@ -220,6 +239,8 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
       void promise.catch(() => {});
       const flight: Flight<Entry> = { opId: classification.newId,
         fingerprint: incoming.find(row => row.id === classification.newId)?.fingerprint ?? fail('new fingerprint absent'),
+        reservedVersion: version + 1,
+        sourceClientId, requestId,
         incoming, entry, ingressCurrent, effectiveSettings: clone(settings),
         input: clone(stockInput), promise, resolve, reject };
       this.inFlight = flight;
@@ -264,7 +285,8 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
       if (!queued || !nonempty(queued.id) || queued.clientUserMessageId !== flight.opId ||
           !isDeepStrictEqual(queued.input, flight.input)) return fail('stock queue/add receipt uncertain');
     } catch (error) {
-      await this.finishUnknown(flight, error);
+      if (error instanceof StockAddNotWritten) await this.finishNotWritten(flight, error);
+      else await this.finishUnknown(flight, error);
       return;
     }
     try {
@@ -303,6 +325,30 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
     } catch (persistError) {
       if (this.inFlight === flight) this.inFlight = null;
       flight.reject(new Error('stock outcome and unknown-intent persistence need review', { cause: persistError }));
+    }
+  }
+
+  private async finishNotWritten(flight: Flight<Entry>, error: StockAddNotWritten): Promise<void> {
+    try {
+      await this.task(() => {
+        const sourceClientId = flight.sourceClientId ?? fail('native source attribution required');
+        const requestId = flight.requestId ?? fail('native request attribution required');
+        if (!nonempty(sourceClientId) || !nonempty(requestId))
+          fail('native source attribution required for not-written proof');
+        this.journal.markNotWritten({ expectedVersion: flight.reservedVersion,
+          opId: flight.opId, fingerprint: flight.fingerprint,
+          sourceClientId, requestId,
+          workerOperationId: error.worker.operationId,
+          workerFingerprint: error.worker.fingerprint,
+          workerRevision: error.worker.revision,
+          backendGeneration: error.worker.backendGeneration });
+        if (this.inFlight === flight) this.inFlight = null;
+      });
+      flight.reject(error);
+    } catch (persistError) {
+      if (this.inFlight === flight) this.inFlight = null;
+      try { this.onNotWrittenPersistenceFailure?.(); } catch { /* still reject the native request */ }
+      flight.reject(new Error('not-written proof persistence needs review', { cause: persistError }));
     }
   }
 

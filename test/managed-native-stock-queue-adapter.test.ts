@@ -6,10 +6,12 @@ import path from 'node:path';
 import os from 'node:os';
 import { ManagedWorkerCommandDispatcher } from '../src/codex/managed-worker-command-dispatcher.js';
 import { ManagedNativeStockQueueAdapter,
-  type ManagedNativeStockQueueAdapterOptions } from '../src/desktop/managed-native-stock-queue-adapter.js';
+  managedStockCommandId, type ManagedNativeStockQueueAdapterOptions } from '../src/desktop/managed-native-stock-queue-adapter.js';
+import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
 
 async function fixture(t: TestContext, options: { nullResponse?: boolean; delayed?: boolean;
-  staleReceipt?: boolean; baselineGate?: Promise<void>; revokeBeforeDispatch?: boolean } = {}) {
+  staleReceipt?: boolean; baselineGate?: Promise<void>; revokeBeforeDispatch?: boolean;
+  workerPrewriteRefusal?: boolean; numericRejection?: boolean } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'vkodex-managed-stock-'));
   const taskId = randomUUID(), ownerEpoch = randomUUID(), sourceClientId = randomUUID();
   const cwd = 'C:/isolated';
@@ -54,12 +56,23 @@ async function fixture(t: TestContext, options: { nullResponse?: boolean; delaye
   const gate = options.delayed ? new Promise<void>(resolve => { release = resolve; }) : Promise.resolve();
   const backend = { isSessionCurrent: (generation: number) => generation === 1,
     async request(method: string, params: Record<string, unknown>, rpcOptions: {
-      assertBeforeWrite?: () => void; onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+      assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> } |
+        { error: { code: number; message: string } }) => void;
+      onBeforeWriteRefused?: () => void;
     }) {
       markEntered();
       await gate;
+      if (options.workerPrewriteRefusal) {
+        rpcOptions.onBeforeWriteRefused?.();
+        throw new Error('final worker fence refused before write');
+      }
       rpcOptions.assertBeforeWrite?.();
       calls.push({ method, params });
+      if (options.numericRejection) {
+        rpcOptions.onResponseEnvelope?.({ error: { code: -32602, message: 'invalid params' } });
+        throw new Error('numeric native server rejection');
+      }
       if (options.nullResponse) return {};
       const result = { queuedSubmission: { id: randomUUID(),
         clientUserMessageId: params.clientUserMessageId, input: params.input } };
@@ -104,7 +117,7 @@ async function fixture(t: TestContext, options: { nullResponse?: boolean; delaye
     method: 'thread-follower-set-queued-follow-ups-state', version: 1,
     hostId: 'local', params: { hostId: 'local', conversationId: taskId,
       state: { [taskId]: state } } });
-  return { adapter, adapterOptions, dispatcher, taskId, ownerEpoch, entryId, entry, calls,
+  return { adapter, adapterOptions, dispatcher, controlKey, taskId, ownerEpoch, entryId, entry, calls,
     published, failures,
     request, release: () => release?.(), revokeSource: () => { source = false; },
     waitForBackend: () => Promise.race([entered, new Promise<void>((_, reject) =>
@@ -123,6 +136,45 @@ test('predispatch refusal leaves durable native reservation with no worker write
   assert.deepEqual(f.adapter.quiescence(), { taskVersion: 1, unresolved: 1, unconsumed: 1 });
   await assert.rejects(f.adapter.accept(f.request(), f.ingress));
   assert.equal(f.calls.length, 0);
+});
+
+test('proven final worker pre-write refusal is durable not-written, never ACKed or republished empty', async t => {
+  const f = await fixture(t, { workerPrewriteRefusal: true });
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress), /not written/i);
+  assert.equal(f.calls.length, 0);
+  const worker = f.dispatcher.get(f.controlKey,
+    managedStockCommandId(f.ownerEpoch, f.taskId, f.entryId));
+  assert.equal(worker?.state, 'rejected');
+  assert.equal(worker?.receiptId, null);
+  assert.equal(worker?.rejectionCode, null);
+  const durable = new NativeStockQueueJournal({ filePath: f.adapterOptions.journalPath,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch,
+    sourceGeneration: f.adapterOptions.sourceGeneration });
+  assert.equal(durable.readOperation(f.entryId)?.phase, 'not-written');
+  assert.equal(durable.readOperation(f.entryId)?.notWritten?.workerOperationId, worker?.operationId);
+  durable.close();
+  assert.deepEqual(f.adapter.quiescence(), { taskVersion: 2, unresolved: 1, unconsumed: 1 });
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress));
+  const changed = structuredClone(f.entry);
+  changed.text = 'CHANGED_PUBLIC_SENTINEL'; changed.context.prompt = changed.text;
+  await assert.rejects(f.adapter.accept(f.request([changed]), f.ingress));
+  await assert.rejects(f.adapter.hydrateFollower());
+  assert.deepEqual(f.published, []);
+  assert.equal(f.calls.length, 0);
+  await assert.rejects(f.adapter.consumeUserMessage(f.entryId, 'unexpected-turn', () => true));
+  assert.deepEqual(f.failures, ['not-written-user-message-conflict']);
+});
+
+test('numeric native server rejection after write remains unknown, not proven not-written', async t => {
+  const f = await fixture(t, { numericRejection: true });
+  await assert.rejects(f.adapter.accept(f.request(), f.ingress), /outcome unknown/);
+  assert.equal(f.calls.length, 1);
+  const durable = new NativeStockQueueJournal({ filePath: f.adapterOptions.journalPath,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch,
+    sourceGeneration: f.adapterOptions.sourceGeneration });
+  assert.equal(durable.readOperation(f.entryId)?.phase, 'unknown');
+  assert.equal(durable.readOperation(f.entryId)?.notWritten, null);
+  durable.close();
 });
 
 test('pending native ingress is not quiescent before its journal reservation', async t => {
