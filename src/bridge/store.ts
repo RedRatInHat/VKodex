@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
@@ -38,6 +39,49 @@ export function migrateInboxJournal(db: Database): void {
 }
 
 interface BindingRow { id: string; host_id: string; thread_id: string; title: string; peer_id: number | null; chat_id: number | null; chat_state: Binding["chatState"]; attached: number; paused: number; source_id: string; source_label: string | null; rollout_path: string | null }
+export type ManagedOwnerBindingState = "registering" | "ready" | "unavailable" | "handoff_pending" | "retired";
+export interface ManagedOwnerProcessIdentity { readonly pid: number; readonly birthTicks: string; }
+export interface ManagedOwnerBindingEvidence {
+  readonly backendGeneration?: number;
+  readonly registryRevision?: number;
+  readonly endpointRef?: string;
+  readonly host?: ManagedOwnerProcessIdentity;
+  readonly backend?: ManagedOwnerProcessIdentity;
+}
+export interface ManagedOwnerBindingClaim {
+  readonly ownerEpoch: string;
+  readonly canonicalHome: string;
+  readonly familyRoot: string;
+  readonly evidence?: ManagedOwnerBindingEvidence;
+}
+export interface ManagedOwnerBinding {
+  readonly id: string;
+  readonly bindingId: string;
+  readonly hostId: string;
+  readonly threadId: string;
+  readonly sourceId: string;
+  readonly ownerEpoch: string;
+  readonly canonicalHome: string;
+  readonly familyRoot: string;
+  readonly state: ManagedOwnerBindingState;
+  readonly revision: number;
+  readonly evidence: Readonly<{
+    readonly backendGeneration: number | null;
+    readonly registryRevision: number | null;
+    readonly endpointRef: string | null;
+    readonly host: ManagedOwnerProcessIdentity | null;
+    readonly backend: ManagedOwnerProcessIdentity | null;
+  }>;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+interface ManagedOwnerBindingRow {
+  id: string; binding_id: string; host_id: string; thread_id: string; source_id: string;
+  owner_epoch: string; canonical_home: string; family_root: string; state: ManagedOwnerBindingState;
+  revision: number; backend_generation: number | null; registry_revision: number | null; endpoint_ref: string | null;
+  host_pid: number | null; host_birth: string | null; backend_pid: number | null; backend_birth: string | null;
+  created_at: number; updated_at: number;
+}
 export interface DeliveryFailure {
   readonly at: number;
   readonly type: "rate_limit" | "transient";
@@ -96,6 +140,78 @@ function binding(row: BindingRow): Binding {
     ...(row.source_id ? { sourceId: row.source_id } : {}), ...(row.source_label ? { sourceLabel: row.source_label } : {}), ...(row.rollout_path ? { rolloutPath: row.rollout_path } : {}) };
 }
 
+const managedOwnerStates = new Set<ManagedOwnerBindingState>(["registering", "ready", "unavailable", "handoff_pending", "retired"]);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const endpointRef = uuid;
+
+function managedText(value: unknown, name: string, maximum = 256): string {
+  if (typeof value !== "string" || !value || value.length > maximum || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value))
+    throw new Error(`Invalid managed owner ${name}`);
+  return value;
+}
+function managedCanonicalHome(value: unknown): string {
+  const home = managedText(value, "canonical home", 4096);
+  if (!(path.isAbsolute(home) || path.win32.isAbsolute(home))) throw new Error("Invalid managed owner canonical home");
+  return comparablePath(home);
+}
+function managedIdentity(value: unknown, name: string): ManagedOwnerProcessIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid managed owner ${name}`);
+  const item = value as Record<string, unknown>;
+  const pid = item.pid, birthTicks = item.birthTicks;
+  if (Object.keys(item).length !== 2 || typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 ||
+    typeof birthTicks !== "string" || !/^[1-9]\d{0,23}$/u.test(birthTicks))
+    throw new Error(`Invalid managed owner ${name}`);
+  return Object.freeze({ pid, birthTicks });
+}
+function optionalManagedIdentity(value: number | null, birth: string | null): ManagedOwnerProcessIdentity | null {
+  if (value === null && birth === null) return null;
+  return managedIdentity({ pid: value, birthTicks: birth }, "stored identity");
+}
+function managedEvidence(value: unknown): ManagedOwnerBindingEvidence {
+  if (value === undefined) return Object.freeze({});
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid managed owner evidence");
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some(key => !["backendGeneration", "registryRevision", "endpointRef", "host", "backend"].includes(key)))
+    throw new Error("Invalid managed owner evidence");
+  const result: { backendGeneration?: number; registryRevision?: number; endpointRef?: string;
+    host?: ManagedOwnerProcessIdentity; backend?: ManagedOwnerProcessIdentity } = {};
+  if (Object.hasOwn(item, "backendGeneration")) {
+    const backendGeneration = item.backendGeneration;
+    if (typeof backendGeneration !== "number" || !Number.isSafeInteger(backendGeneration) || backendGeneration <= 0) throw new Error("Invalid managed owner backend generation");
+    result.backendGeneration = backendGeneration;
+  }
+  if (Object.hasOwn(item, "registryRevision")) {
+    const registryRevision = item.registryRevision;
+    if (typeof registryRevision !== "number" || !Number.isSafeInteger(registryRevision) || registryRevision < 0) throw new Error("Invalid managed owner registry revision");
+    result.registryRevision = registryRevision;
+  }
+  if (Object.hasOwn(item, "endpointRef")) {
+    if (typeof item.endpointRef !== "string" || !endpointRef.test(item.endpointRef)) throw new Error("Invalid managed owner endpoint reference");
+    result.endpointRef = item.endpointRef;
+  }
+  if (Object.hasOwn(item, "host")) result.host = managedIdentity(item.host, "host identity");
+  if (Object.hasOwn(item, "backend")) result.backend = managedIdentity(item.backend, "backend identity");
+  return Object.freeze(result);
+}
+function sameManagedIdentity(left: ManagedOwnerProcessIdentity | null, right: ManagedOwnerProcessIdentity | undefined): boolean {
+  return left === null || right === undefined || left.pid === right.pid && left.birthTicks === right.birthTicks;
+}
+function sameClaimEvidence(stored: ManagedOwnerBinding["evidence"], claimed: ManagedOwnerBindingEvidence): boolean {
+  return (claimed.backendGeneration === undefined || stored.backendGeneration === claimed.backendGeneration) &&
+    (claimed.registryRevision === undefined || stored.registryRevision === claimed.registryRevision) &&
+    (claimed.endpointRef === undefined || stored.endpointRef === claimed.endpointRef) &&
+    (claimed.host === undefined || stored.host !== null && stored.host.pid === claimed.host.pid && stored.host.birthTicks === claimed.host.birthTicks) &&
+    (claimed.backend === undefined || stored.backend !== null && stored.backend.pid === claimed.backend.pid && stored.backend.birthTicks === claimed.backend.birthTicks);
+}
+function managedBinding(row: ManagedOwnerBindingRow): ManagedOwnerBinding {
+  return Object.freeze({ id: row.id, bindingId: row.binding_id, hostId: row.host_id, threadId: row.thread_id,
+    sourceId: row.source_id, ownerEpoch: row.owner_epoch, canonicalHome: row.canonical_home, familyRoot: row.family_root,
+    state: row.state, revision: row.revision, evidence: Object.freeze({ backendGeneration: row.backend_generation,
+      registryRevision: row.registry_revision, endpointRef: row.endpoint_ref,
+      host: optionalManagedIdentity(row.host_pid, row.host_birth), backend: optionalManagedIdentity(row.backend_pid, row.backend_birth) }),
+    createdAt: row.created_at, updatedAt: row.updated_at });
+}
+
 export class BridgeStore {
   private readonly db: Database;
 
@@ -132,6 +248,18 @@ export class BridgeStore {
         revision INTEGER NOT NULL DEFAULT 1, delivered_revision INTEGER NOT NULL DEFAULT 0,
         priority_revision INTEGER NOT NULL DEFAULT 0, turn_id TEXT
       );
+      CREATE TABLE IF NOT EXISTS managed_owner_bindings (
+        id TEXT PRIMARY KEY, binding_id TEXT NOT NULL REFERENCES bridge_bindings(id),
+        host_id TEXT NOT NULL, thread_id TEXT NOT NULL, source_id TEXT NOT NULL,
+        owner_epoch TEXT NOT NULL, canonical_home TEXT NOT NULL, family_root TEXT NOT NULL,
+        state TEXT NOT NULL, revision INTEGER NOT NULL,
+        backend_generation INTEGER, registry_revision INTEGER, endpoint_ref TEXT,
+        host_pid INTEGER, host_birth TEXT, backend_pid INTEGER, backend_birth TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS managed_owner_active_task
+        ON managed_owner_bindings(host_id, thread_id, source_id) WHERE state <> 'retired';
+      CREATE INDEX IF NOT EXISTS managed_owner_by_binding ON managed_owner_bindings(binding_id, created_at DESC);
     `);
     migrateBindingSources(this.db);
     migrateInboxJournal(this.db);
@@ -204,6 +332,112 @@ export class BridgeStore {
       ON CONFLICT(host_id, thread_id, source_id) DO UPDATE SET title = excluded.title, source_label = excluded.source_label,
         rollout_path = COALESCE(excluded.rollout_path, bridge_bindings.rollout_path)`).run(randomUUID(), task.hostId, task.threadId, task.title, task.sourceId ?? "", task.sourceLabel ?? null, task.rolloutPath ?? null);
     return binding(this.db.prepare("SELECT * FROM bridge_bindings WHERE host_id = ? AND thread_id = ? AND source_id = ?").get(task.hostId, task.threadId, task.sourceId ?? "") as BindingRow);
+  }
+
+  /** Persist an explicit, task-scoped managed route claim. This method does not
+   * start a worker or make the route available to a router. */
+  claimManagedOwner(bindingId: string, claim: ManagedOwnerBindingClaim, now = Date.now()): ManagedOwnerBinding {
+    const id = managedText(bindingId, "binding ID");
+    if (!claim || typeof claim !== "object" || Array.isArray(claim) ||
+      Object.keys(claim).some(key => !["ownerEpoch", "canonicalHome", "familyRoot", "evidence"].includes(key)) ||
+      !uuid.test(claim.ownerEpoch)) throw new Error("Invalid managed owner claim");
+    const ownerEpoch = claim.ownerEpoch.toLowerCase();
+    const canonicalHome = managedCanonicalHome(claim.canonicalHome);
+    const familyRoot = managedText(claim.familyRoot, "family root");
+    const evidence = managedEvidence(claim.evidence);
+    return this.atomic(() => {
+      const bindingRow = this.db.prepare("SELECT * FROM bridge_bindings WHERE id = ?").get(id) as BindingRow | undefined;
+      if (!bindingRow) throw new Error("Managed owner binding does not exist");
+      const existing = this.db.prepare(`SELECT * FROM managed_owner_bindings
+        WHERE host_id = ? AND thread_id = ? AND source_id = ? AND state <> 'retired'`).get(
+          bindingRow.host_id, bindingRow.thread_id, bindingRow.source_id) as ManagedOwnerBindingRow | undefined;
+      if (existing) {
+        if (existing.binding_id === id && existing.owner_epoch === ownerEpoch &&
+          existing.canonical_home === canonicalHome && existing.family_root === familyRoot &&
+          sameClaimEvidence(managedBinding(existing).evidence, evidence))
+          return managedBinding(existing);
+        throw new Error("Exact task already has an active managed owner claim");
+      }
+      const claimId = randomUUID();
+      this.db.prepare(`INSERT INTO managed_owner_bindings(
+        id, binding_id, host_id, thread_id, source_id, owner_epoch, canonical_home, family_root,
+        state, revision, backend_generation, registry_revision, endpoint_ref, host_pid, host_birth,
+        backend_pid, backend_birth, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'registering', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        claimId, id, bindingRow.host_id, bindingRow.thread_id, bindingRow.source_id, ownerEpoch, canonicalHome, familyRoot,
+        evidence.backendGeneration ?? null, evidence.registryRevision ?? null, evidence.endpointRef ?? null,
+        evidence.host?.pid ?? null, evidence.host?.birthTicks ?? null,
+        evidence.backend?.pid ?? null, evidence.backend?.birthTicks ?? null, now, now);
+      return managedBinding(this.db.prepare("SELECT * FROM managed_owner_bindings WHERE id = ?").get(claimId) as ManagedOwnerBindingRow);
+    });
+  }
+
+  managedOwner(task: TaskRef): ManagedOwnerBinding | null {
+    if (!task || typeof task.hostId !== "string" || typeof task.threadId !== "string") return null;
+    const row = this.db.prepare(`SELECT * FROM managed_owner_bindings
+      WHERE host_id = ? AND thread_id = ? AND source_id = ? AND state <> 'retired'`).get(
+      task.hostId, task.threadId, task.sourceId ?? "") as ManagedOwnerBindingRow | undefined;
+    return row ? managedBinding(row) : null;
+  }
+
+  /** Revision-CAS transition. Existing process/endpoint identity can only be
+   * filled in, never replaced; endpoint loss therefore retains the claim. */
+  transitionManagedOwner(expected: ManagedOwnerBinding, state: Exclude<ManagedOwnerBindingState, "retired">,
+    evidenceInput: ManagedOwnerBindingEvidence = {}, now = Date.now()): ManagedOwnerBinding {
+    if (!expected || !managedOwnerStates.has(state)) throw new Error("Invalid managed owner transition");
+    const evidence = managedEvidence(evidenceInput);
+    return this.atomic(() => {
+      const row = this.db.prepare("SELECT * FROM managed_owner_bindings WHERE id = ?").get(expected.id) as ManagedOwnerBindingRow | undefined;
+      if (!row || row.revision !== expected.revision || row.state !== expected.state || row.state === "retired")
+        throw new Error("Stale managed owner claim");
+      const allowed: Readonly<Record<Exclude<ManagedOwnerBindingState, "retired">, readonly ManagedOwnerBindingState[]>> = {
+        registering: ["ready", "unavailable", "handoff_pending"],
+        ready: ["ready", "unavailable", "handoff_pending"],
+        unavailable: ["ready", "unavailable", "handoff_pending"],
+        handoff_pending: ["handoff_pending"],
+      };
+      if (!allowed[row.state].includes(state)) throw new Error("Invalid managed owner state transition");
+      const prior = managedBinding(row).evidence;
+      if (prior.backendGeneration !== null && evidence.backendGeneration !== undefined && prior.backendGeneration !== evidence.backendGeneration ||
+        prior.endpointRef !== null && evidence.endpointRef !== undefined && prior.endpointRef !== evidence.endpointRef ||
+        !sameManagedIdentity(prior.host, evidence.host) || !sameManagedIdentity(prior.backend, evidence.backend) ||
+        prior.registryRevision !== null && evidence.registryRevision !== undefined && evidence.registryRevision < prior.registryRevision)
+        throw new Error("Managed owner proof mismatch");
+      const next = {
+        backendGeneration: evidence.backendGeneration ?? prior.backendGeneration,
+        registryRevision: evidence.registryRevision ?? prior.registryRevision,
+        endpointRef: evidence.endpointRef ?? prior.endpointRef,
+        host: evidence.host ?? prior.host,
+        backend: evidence.backend ?? prior.backend,
+      };
+      if (state === "ready" && (next.backendGeneration === null || next.registryRevision === null || next.endpointRef === null ||
+        next.host === null || next.backend === null)) throw new Error("Managed owner ready proof is incomplete");
+      const result = this.db.prepare(`UPDATE managed_owner_bindings SET state = ?, revision = revision + 1,
+        backend_generation = ?, registry_revision = ?, endpoint_ref = ?, host_pid = ?, host_birth = ?,
+        backend_pid = ?, backend_birth = ?, updated_at = ? WHERE id = ? AND revision = ? AND state = ?`).run(
+        state, next.backendGeneration, next.registryRevision, next.endpointRef, next.host?.pid ?? null,
+        next.host?.birthTicks ?? null, next.backend?.pid ?? null, next.backend?.birthTicks ?? null,
+        now, row.id, row.revision, row.state);
+      if (result.changes !== 1) throw new Error("Stale managed owner claim");
+      return managedBinding(this.db.prepare("SELECT * FROM managed_owner_bindings WHERE id = ?").get(row.id) as ManagedOwnerBindingRow);
+    });
+  }
+
+  retireManagedOwner(expected: ManagedOwnerBinding, now = Date.now()): ManagedOwnerBinding {
+    // Retirement changes routing authority. It may only follow an explicit
+    // handoff fence; the caller must separately verify the worker family and
+    // pending operations are quiescent before using this transition.
+    if (!expected || expected.state !== "handoff_pending")
+      throw new Error("Managed owner retirement requires handoff");
+    return this.atomic(() => {
+      const row = this.db.prepare("SELECT * FROM managed_owner_bindings WHERE id = ?").get(expected.id) as ManagedOwnerBindingRow | undefined;
+      if (!row || row.revision !== expected.revision || row.state !== expected.state || row.state === "retired")
+        throw new Error("Stale managed owner claim");
+      const result = this.db.prepare(`UPDATE managed_owner_bindings SET state = 'retired', revision = revision + 1,
+        updated_at = ? WHERE id = ? AND revision = ? AND state = ?`).run(now, row.id, row.revision, row.state);
+      if (result.changes !== 1) throw new Error("Stale managed owner claim");
+      return managedBinding(this.db.prepare("SELECT * FROM managed_owner_bindings WHERE id = ?").get(row.id) as ManagedOwnerBindingRow);
+    });
   }
 
   getBinding(id: string): Binding | null {
