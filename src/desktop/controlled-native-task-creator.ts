@@ -43,8 +43,15 @@ function freezeTree<T>(value: T): T {
 }
 
 /** The native thread may already exist. Reconciliation is required; never retry thread/start. */
+export type ControlledNativeCreationUncertainPhase = 'start-response' | 'persist-started' |
+  'policy' | 'readback' | 'persist-qualified';
 export class ControlledNativeCreationUncertainError extends Error {
-  constructor() { super('Controlled native creation result is uncertain'); this.name = 'ControlledNativeCreationUncertainError'; }
+  readonly phase: ControlledNativeCreationUncertainPhase;
+  constructor(phase: ControlledNativeCreationUncertainPhase = 'start-response') {
+    super('Controlled native creation result is uncertain');
+    this.name = 'ControlledNativeCreationUncertainError';
+    this.phase = phase;
+  }
 }
 
 export interface ControlledCreationIntent {
@@ -332,6 +339,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
   const resolveSource = options.sourceProof
     ? controlledNativeSourceProofResolver(intent, options.sourceProof) : options.resolveSource;
   let dispatched = false;
+  let phase: ControlledNativeCreationUncertainPhase = 'start-response';
   try {
     const session = await options.rpc.initializedSession();
     if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
@@ -355,25 +363,29 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
     const threadId = candidateId as string;
     const started = Object.freeze({ ...intent, threadId,
       selectedEffective: selectedEffective(start) }) satisfies ControlledCreationStarted;
+    phase = 'persist-started';
     await options.persistStarted(started);
     // Persist native acceptance first, then require the saved projection to
     // reproduce the initial idle, zero-turn, exact-shape policy evidence.
+    phase = 'policy';
     const effectivePolicy = policyFromControlledStarted(started);
     const selectedTier = start.serviceTier;
     const selectedEnvironments = row(start.thread) ? start.thread.environments : null;
     if (!requestedPolicy.allowedServiceTiers.some(tier => tier === selectedTier) ||
       !requestedPolicy.allowedEnvironments.some(allowed => isDeepStrictEqual(allowed, selectedEnvironments))) refuse();
     assertEffectiveResume(effectivePolicy, start);
+    phase = 'readback';
     const rolloutPath = await qualifyControlledZeroTurn({ rpc: options.rpc,
       generation: session.generation, threadId, sourceId: intent.sourceId,
       effectivePolicy, resolveSource,
       assertCurrent: () => { if (reservation.isCurrent() !== true) refuse(); } });
     const receipt = Object.freeze({ ...started, effectivePolicy, rolloutPath,
       status: 'qualified-zero-turn' as const }) satisfies ControlledCreationReceipt;
+    phase = 'persist-qualified';
     await options.persistQualified(receipt);
     return receipt;
   } catch (error) {
-    if (dispatched) throw new ControlledNativeCreationUncertainError();
+    if (dispatched) throw new ControlledNativeCreationUncertainError(phase);
     throw error;
   }
 }

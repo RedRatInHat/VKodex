@@ -29,7 +29,8 @@ const startResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
   activePermissionProfile: template.activePermissionProfile, sandbox: template.sandbox,
   serviceTier: 'default' };
 
-function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-mismatch' |
+function fixture(failure: 'none' | 'unknown' | 'invalid-start-response' | 'started-persist' |
+  'qualified-persist' | 'source-mismatch' |
   'read-fail' | 'unloaded' | 'idle-to-unloaded' | 'provider-mismatch' |
   'cwd-mismatch' | 'policy-mismatch' | 'start-active' | 'start-turn' |
   'profile-extra' | 'sandbox-extra' | 'environment-extra' = 'none') {
@@ -52,6 +53,7 @@ function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-misma
           permissions: template.activePermissionProfile.id,
           approvalPolicy: template.approvalPolicy, runtimeWorkspaceRoots: [cwd], ephemeral: false });
         if (failure === 'unknown') throw new Error('connection lost after write');
+        if (failure === 'invalid-start-response') return { thread: { id: 'invalid' } };
         if (failure === 'policy-mismatch') return { ...startResult, serviceTier: 'unapproved' };
         if (failure === 'start-active') return { ...startResult,
           thread: { ...startResult.thread, status: { type: 'active' } } };
@@ -108,6 +110,7 @@ function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-misma
     },
     persistQualified: async (receipt: ControlledCreationReceipt) => {
       assert.equal(receipt.threadId, taskId); persisted.push('qualified');
+      if (failure === 'qualified-persist') throw new Error('sensitive storage detail');
     },
     resolveSource: async () => ({ sourceId: 'source-a', rolloutPath }),
   };
@@ -232,6 +235,29 @@ for (const failure of ['unknown', 'started-persist'] as const) test(`${failure} 
   await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
   assert.deepEqual(f.calls, ['thread/start']);
   assert.deepEqual(f.persisted, failure === 'unknown' ? ['intent'] : ['intent', 'started']);
+});
+
+for (const [failure, phase, expectedCalls, expectedPersisted] of [
+  ['unknown', 'start-response', ['thread/start'], ['intent']],
+  ['invalid-start-response', 'start-response', ['thread/start'], ['intent']],
+  ['started-persist', 'persist-started', ['thread/start'], ['intent', 'started']],
+  ['policy-mismatch', 'policy', ['thread/start'], ['intent', 'started']],
+  ['read-fail', 'readback', ['thread/start', 'thread/read'], ['intent', 'started']],
+  ['qualified-persist', 'persist-qualified', ['thread/start', 'thread/read',
+    'thread/turns/list', 'thread/goal/get', 'thread/queue/list', 'thread/read'],
+  ['intent', 'started', 'qualified']],
+] as const) test(`${failure} reports safe uncertain phase without replay`, async () => {
+  const f = fixture(failure);
+  await assert.rejects(createControlledNativeTask(f.options), error => {
+    assert.ok(error instanceof ControlledNativeCreationUncertainError);
+    assert.equal(error.phase, phase);
+    assert.equal(error.message, 'Controlled native creation result is uncertain');
+    assert.equal('cause' in error, false);
+    assert.equal(JSON.stringify(error).includes('sensitive storage detail'), false);
+    return true;
+  });
+  assert.deepEqual(f.calls, expectedCalls);
+  assert.deepEqual(f.persisted, expectedPersisted);
 });
 
 for (const failure of ['source-mismatch', 'read-fail', 'provider-mismatch', 'cwd-mismatch'] as const)
