@@ -14,6 +14,10 @@ import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
 import type { ManagedWorkerNotification } from '../src/codex/managed-worker-frontend-host.js';
 import type { WorkerCommand, WorkerCommandPolicy } from '../src/codex/managed-worker-command-dispatcher.js';
+import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
+import { createManagedStockSettingsInitializer } from '../src/desktop/managed-stock-settings-initializer.js';
+import type { ManagedStockSettingsInitializer } from '../src/desktop/managed-stock-settings-initializer.js';
+import type { NativeProjectionState } from '../src/codex/managed-native-projection.js';
 
 type Frame = Record<string, unknown>;
 const taskId = 'own-thread';
@@ -445,7 +449,8 @@ test('explicit stop during startup cannot publish a late listener', async () => 
 });
 
 function commandFixture(timeout = 100, enableSettings = false,
-  qualifier?: WorkerCommandPolicy['qualifySettingsEffect']) {
+  qualifier?: WorkerCommandPolicy['qualifySettingsEffect'],
+  settingsModel = 'qualified-settings-model', scopedTaskId = taskId) {
   const child = new Child(); const adapterKey = {}; const controlKey = {};
   const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-command-host-'));
   const journalPath = path.join(directory, 'operations.sqlite');
@@ -456,9 +461,9 @@ function commandFixture(timeout = 100, enableSettings = false,
       authority.onAuthorize();
       return authority.admit && params.model === 'qualified-fixture-model';
     }, ...(enableSettings ? { authorizeSettings: ({ params }: { params: Record<string, unknown> }) =>
-      authority.admit && params.model === 'qualified-settings-model' } : {}),
+      authority.admit && params.model === settingsModel } : {}),
     ...(qualifier ? { qualifySettingsEffect: qualifier } : {}) };
-  const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
+  const managed = new ManagedWorkerFrontendHost({ taskId: scopedTaskId, ownCwd: 'C:/own',
     initializeRequest: init, adapterKey, bootstrapReadMethods: [], backendTimeoutMs: timeout,
     allowRequest: () => true, allowAnswer: () => true, commandPolicy: policy,
     launch: () => child.asChild() });
@@ -646,6 +651,104 @@ test('owner loss during effect read cannot confirm an ACKed settings operation',
     assert.equal(f.managed.settingsCommandStatus(f.controlKey, settings.operationId)?.state, 'unknown');
     assert.equal(f.managed.commandQuiescence(f.controlKey).unconfirmed, true);
   } finally { release(); await f.managed.stop('test-cleanup'); }
+});
+
+function stockInitializerFixture(noticeTimeoutMs = 100) {
+  const scopedTaskId = randomUUID(), operationId = randomUUID(), cwd = 'C:/own';
+  const profile = { id: ':danger-full-access', extends: null };
+  const approvedTaskPolicy = approveTaskPolicy({ threadId: scopedTaskId,
+    model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'medium', cwd,
+    runtimeWorkspaceRoots: [cwd], environments: [], approvalPolicy: 'never',
+    approvalsReviewer: 'user', activePermissionProfile: profile,
+    sandbox: { type: 'dangerFullAccess' }, serviceTier: null });
+  const initialState = { id: scopedTaskId, hostId: 'local', turns: [], requests: [], cwd,
+    currentPermissions: { activePermissionProfile: profile,
+      sandboxPolicy: approvedTaskPolicy.sandbox, runtimeWorkspaceRoots: [cwd],
+      approvalPolicy: 'never', approvalsReviewer: 'user' },
+    latestThreadSettings: { cwd, model: approvedTaskPolicy.model,
+      modelProvider: 'openai', effort: 'medium',
+      collaborationMode: { mode: 'default', settings: { model: approvedTaskPolicy.model,
+        reasoning_effort: 'medium', developer_instructions: null } }, serviceTier: null },
+    latestModel: approvedTaskPolicy.model, latestReasoningEffort: 'medium',
+    modelProvider: 'openai', latestCollaborationMode: { mode: 'default', settings: {
+      model: approvedTaskPolicy.model, reasoning_effort: 'medium', developer_instructions: null } },
+    previousTurnModel: null, title: null, threadRuntimeStatus: { type: 'idle' },
+    latestTokenUsageInfo: null, hasUnreadTurn: false, updatedAt: 1,
+    turnsPagination: { hasLoadedOldest: true, olderCursor: null }, environments: [],
+  } as NativeProjectionState;
+  let initializer!: ManagedStockSettingsInitializer;
+  const f = commandFixture(200, true,
+    (context, assertCurrent) => initializer.qualifySettingsEffect(context, assertCurrent),
+    approvedTaskPolicy.model, scopedTaskId);
+  const bootstrap = { generation: 1, initialState,
+    composerDefaults: { taskId: scopedTaskId, cwd, summary: null,
+      personality: 'pragmatic' as const },
+    async readStockState(assertCurrent: () => void) {
+      assertCurrent();
+      return { threadId: scopedTaskId, generation: 1, turnCount: 0, terminalTurnIds: [],
+        historyDigest: 'a'.repeat(64), model: approvedTaskPolicy.model,
+        modelProvider: 'openai', reasoningEffort: 'medium', cwd, environments: [],
+        updatedAt: 1, fastModeAllowed: false };
+    } };
+  initializer = createManagedStockSettingsInitializer({ host: f.managed,
+    adapterKey: f.adapterKey, controlKey: f.controlKey, bootstrap, taskId: scopedTaskId,
+    ownerEpoch: f.policy.ownerEpoch, operationId, approvedTaskPolicy,
+    assertOwnerCurrent: () => { if (!f.authority.current) throw new Error('owner lost'); },
+    noticeTimeoutMs });
+  const nativeSettings = { cwd, model: approvedTaskPolicy.model, modelProvider: 'openai',
+    effort: 'medium', activePermissionProfile: profile,
+    sandboxPolicy: { type: 'dangerFullAccess' }, approvalPolicy: 'never',
+    approvalsReviewer: 'user', serviceTier: null, summary: null, personality: 'pragmatic',
+    disabledPluginIds: [], multiAgentMode: 'explicitRequestOnly',
+    collaborationMode: { mode: 'default', settings: { model: approvedTaskPolicy.model,
+      reasoning_effort: 'medium', developer_instructions: 'built-in instructions' } } };
+  return { ...f, scopedTaskId, operationId, initializer, nativeSettings };
+}
+
+test('stock initializer uses actual managed host wire, notification, journal ACK and effect CAS', async () => {
+  const f = stockInitializerFixture(); await f.managed.start();
+  try {
+    const work = f.initializer.initialize();
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    f.child.send({ method: 'thread/settings/updated', params: {
+      threadId: f.scopedTaskId, threadSettings: f.nativeSettings } });
+    f.child.send({ id: wire.id, result: {} });
+    const result = await work;
+    assert.equal(result.effectiveSettings.model, 'gpt-5.6-sol');
+    assert.equal(result.initializationReceipt?.expansionKind, 'builtin-default-instructions');
+    const durable = f.managed.settingsCommandStatus(f.controlKey, f.operationId);
+    assert.equal(durable?.state, 'confirmed');
+    assert.equal(durable.rpcAck, true);
+    assert.match(durable.effectiveFingerprint ?? '', /^[a-f0-9]{64}$/);
+    assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+    const exact = { operationId: f.operationId, method: 'thread/settings/update' as const,
+      params: wire.params as Record<string, unknown> };
+    assert.equal((await f.managed.executeSettingsCommand(f.controlKey, exact)).state, 'confirmed');
+    assert.deepEqual(f.child.messages.filter(frame => frame.method === 'thread/settings/update').length, 1);
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start' ||
+      frame.method === 'thread/queue/add'), false);
+  } finally { f.initializer.close(); await f.managed.stop('test-cleanup'); }
+});
+
+test('stock initializer cannot turn settings ACK without notice into confirmation or replay', async () => {
+  const f = stockInitializerFixture(20); await f.managed.start();
+  try {
+    const work = f.initializer.initialize();
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    f.child.send({ id: wire.id, result: {} });
+    await assert.rejects(work, /notification unavailable/i);
+    const durable = f.managed.settingsCommandStatus(f.controlKey, f.operationId);
+    assert.equal(durable?.state, 'unknown');
+    assert.equal(durable.rpcAck, true);
+    assert.equal(durable.effectiveFingerprint, null);
+    assert.equal(f.managed.commandQuiescence(f.controlKey).unconfirmed, true);
+    assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
+    const exact = { operationId: f.operationId, method: 'thread/settings/update' as const,
+      params: wire.params as Record<string, unknown> };
+    assert.equal((await f.managed.executeSettingsCommand(f.controlKey, exact)).state, 'unknown');
+    assert.equal(f.child.messages.filter(frame => frame.method === 'thread/settings/update').length, 1);
+  } finally { f.initializer.close(); await f.managed.stop('test-cleanup'); }
 });
 
 test('settings before-write lease revocation persists unknown without a backend write', async () => {

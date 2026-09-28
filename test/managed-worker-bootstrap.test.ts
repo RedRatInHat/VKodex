@@ -27,6 +27,12 @@ class BackendFixture {
   turns: Row[] = [];
   goal: unknown = null;
   queue: Row[] = [];
+  fastModeAllowed: boolean | null = false;
+  requirementsWithoutFastMode = false;
+  onTurnsList: ((count: number) => void) | null = null;
+  turnsListCount = 0;
+  onThreadRead: ((count: number) => void) | null = null;
+  threadReadCount = 0;
   nextCursor: string | null = null;
   beforeStatus: string = 'notLoaded';
   readCwd: string = cwd;
@@ -112,17 +118,28 @@ class BackendFixture {
         sandbox: { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [cwd],
         serviceTier: null, ...(this.effectiveOverride ?? {}) };
     }
-    if (method === 'thread/read') return { thread: this.thread(this.resumeCount ? 'idle' : this.beforeStatus) };
-    if (method === 'thread/turns/list') return { data: this.turns.map(turn => ({ ...turn, itemsView: 'full' })),
-      nextCursor: this.nextCursor };
+    if (method === 'thread/read') {
+      const thread = this.thread(this.resumeCount ? 'idle' : this.beforeStatus);
+      this.threadReadCount++; this.onThreadRead?.(this.threadReadCount);
+      return { thread };
+    }
+    if (method === 'thread/turns/list') {
+      const data = this.turns.map(turn => ({ ...turn, itemsView: 'full' }));
+      this.turnsListCount++; this.onTurnsList?.(this.turnsListCount);
+      return { data, nextCursor: this.nextCursor };
+    }
     if (method === 'thread/goal/get') return { goal: this.goal };
     if (method === 'thread/queue/list') return { data: this.queue, nextCursor: null };
     if (method === 'config/read') return { config: { model_reasoning_summary: null, personality: 'pragmatic' } };
+    if (method === 'configRequirements/read') return { requirements: this.fastModeAllowed === null ? null :
+      { featureRequirements: this.requirementsWithoutFastMode ? {} :
+        { fast_mode: this.fastModeAllowed } } };
     throw new Error('unallowed test RPC');
   }
   private thread(status: string): Row {
     return { id: taskId, sessionId: taskId, createdAt: 100, updatedAt: 101,
-      cwd: this.readCwd, model: this.exposedModel ?? 'gpt-5.6-sol', reasoningEffort: 'low',
+      cwd: this.readCwd, model: this.exposedModel ?? 'gpt-5.6-sol', modelProvider: 'openai',
+      reasoningEffort: 'low',
       status: { type: status }, turns: this.turns.map(turn => this.readTurnStatusOverride === null ? turn :
         { ...turn, status: this.readTurnStatusOverride }),
       environments: [{ environmentId: 'local', cwd, runtimeWorkspaceRoots: [cwd] }],
@@ -246,6 +263,40 @@ test('qualified bootstrap returns exact first-turn compiler inputs and fresh att
     assert.equal(fixture.stopCalls, 0);
     assert.equal(fixture.methods.filter(method => method === 'thread/resume').length, 1);
     assert.equal(fixture.methods.some(method => method === 'turn/start'), false);
+  } finally { await fixture.close(); }
+});
+
+test('stock reader proves same-worker terminal history, empty queue and explicit tier requirements', async () => {
+  const fixture = new BackendFixture(); await fixture.listen();
+  try {
+    const bootstrap = await bootstrapManagedWorker(options(fixture));
+    const stock = await bootstrap.readStockState(() => {});
+    assert.deepEqual(stock.terminalTurnIds, []);
+    assert.equal(stock.turnCount, 0);
+    assert.equal(stock.fastModeAllowed, false);
+    assert.equal(stock.model, 'gpt-5.6-sol');
+    assert.equal(stock.reasoningEffort, 'low');
+    assert.equal(fixture.methods.filter(method => method === 'configRequirements/read').length, 1);
+    fixture.requirementsWithoutFastMode = true;
+    assert.equal((await bootstrap.readStockState(() => {})).fastModeAllowed, null);
+    fixture.requirementsWithoutFastMode = false;
+    fixture.queue = [{ id: 'unrelated-queued' }];
+    await assert.rejects(bootstrap.readStockState(() => {}), /goal-or-queue-not-empty/);
+    fixture.queue = [];
+    fixture.turns = [{ id: 'active', status: 'inProgress', items: [] }];
+    await assert.rejects(bootstrap.readStockState(() => {}), /nonterminal/);
+    fixture.turns = [{ id: 'same-id', status: 'completed', items: [{ id: 'i', type: 'userMessage',
+      content: [{ type: 'text', text: 'before' }] }] }];
+    const mutateOn = fixture.threadReadCount + 2;
+    fixture.onThreadRead = count => { if (count === mutateOn) fixture.turns = [{ id: 'same-id',
+      status: 'completed', items: [{ id: 'i', type: 'userMessage',
+        content: [{ type: 'text', text: 'after' }] }] }]; };
+    await assert.rejects(bootstrap.readStockState(() => {}), /stock-history-unstable-or-nonterminal/);
+    const queueOn = fixture.threadReadCount + 2;
+    fixture.onThreadRead = count => { if (count === queueOn) fixture.queue = [
+      { id: 'late-queue' }]; };
+    fixture.turns = []; fixture.queue = [];
+    await assert.rejects(bootstrap.readStockState(() => {}), /goal-or-queue-not-empty/);
   } finally { await fixture.close(); }
 });
 

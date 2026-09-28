@@ -11,7 +11,8 @@ import { approveTaskPolicy, assertApprovedResumeIntent, assertEffectiveResume,
   type ApprovedTaskPolicy } from '../codex/managed-task-policy.js';
 
 type Row = Record<string, unknown>;
-type ReadMethod = 'thread/read' | 'thread/turns/list' | 'thread/goal/get' | 'thread/queue/list' | 'config/read';
+type ReadMethod = 'thread/read' | 'thread/turns/list' | 'thread/goal/get' | 'thread/queue/list' |
+  'config/read' | 'configRequirements/read';
 const MAX_FRAME_BYTES = 2_000_000;
 const RPC_TIMEOUT_MS = 10_000;
 const PAGE_LIMIT = 100;
@@ -45,6 +46,23 @@ export interface ManagedWorkerBootstrap {
   verifyIdle(expectedTurnIds?: readonly string[]): Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
   /** Actual current policy on the same loaded worker; no turn/model write. */
   qualifyContinuation(ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence>;
+  /** Exhaustive current terminal/idle stock evidence on this same worker; no writes. */
+  readStockState(assertCurrent: () => void): Promise<StockReadState>;
+}
+export interface StockReadState {
+  readonly threadId: string;
+  readonly generation: number;
+  readonly turnCount: number;
+  readonly terminalTurnIds: readonly string[];
+  readonly historyDigest: string;
+  readonly model: string;
+  readonly modelProvider: string;
+  readonly reasoningEffort: string | null;
+  readonly cwd: string;
+  readonly environments: readonly Row[];
+  readonly updatedAt: number;
+  /** Null means requirements were not explicit, never evidence that fast mode is disabled. */
+  readonly fastModeAllowed: boolean | null;
 }
 export interface ContinuationOwnerFence {
   readonly threadId: string;
@@ -547,6 +565,45 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
         historyDigest: after.historyDigest, effective, composerDefaults: defaults });
     }, checkOwner);
   };
+  const readStockState = async (assertCurrent: () => void): Promise<StockReadState> => {
+    if (typeof assertCurrent !== 'function') fail('stock-current-fence-required');
+    return withReader(async reader => {
+      const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
+        taskId, cwd, ['idle']);
+      const turns = await fullHistory(reader, taskId);
+      await noGoalOrQueue(reader, taskId);
+      const requirements = await reader.request('configRequirements/read', {});
+      const last = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
+        taskId, cwd, ['idle']);
+      const finalTurns = await fullHistory(reader, taskId);
+      await noGoalOrQueue(reader, taskId);
+      if (!isDeepStrictEqual(first, last) || (last.turns as unknown[]).length !== turns.length ||
+          !isDeepStrictEqual(turns, finalTurns) ||
+          !turns.every((turn, index) => {
+            const observed = (last.turns as unknown[])[index];
+            return terminalStatuses.has(turn.status as string) && object(observed) &&
+              terminalStatuses.has(observed.status as string) && observed.status === turn.status &&
+              observed.id === turn.id;
+          })) fail('stock-history-unstable-or-nonterminal');
+      if (typeof last.model !== 'string' || !last.model ||
+          typeof last.modelProvider !== 'string' || !last.modelProvider ||
+          !(last.reasoningEffort === null || typeof last.reasoningEffort === 'string') ||
+          !samePath(last.cwd, cwd) || !Array.isArray(last.environments) ||
+          !Number.isFinite(last.updatedAt)) fail('stock-thread-tuple-unqualified');
+      const feature = object(requirements.requirements) &&
+        object(requirements.requirements.featureRequirements)
+        ? requirements.requirements.featureRequirements.fast_mode ?? null : null;
+      if (feature !== null && feature !== true && feature !== false) fail('stock-tier-requirement-unqualified');
+      return freezeTree({ threadId: taskId, generation, turnCount: turns.length,
+        terminalTurnIds: turns.map(turn => turn.id as string),
+        historyDigest: createHash('sha256').update(JSON.stringify(turns)).digest('hex'),
+        model: last.model as string, modelProvider: last.modelProvider as string,
+        reasoningEffort: last.reasoningEffort as string | null, cwd,
+        environments: jsonCopy(last.environments as Row[]),
+        updatedAt: last.updatedAt as number, fastModeAllowed: feature as boolean | null });
+    }, assertCurrent);
+  };
   return Object.freeze({ generation, initialState: qualified.state,
-    composerDefaults: qualified.defaults, readInitialState, verifyIdle, qualifyContinuation });
+    composerDefaults: qualified.defaults, readInitialState, verifyIdle, qualifyContinuation,
+    readStockState });
 }
