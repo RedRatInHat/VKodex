@@ -18,9 +18,9 @@ import { observeTaskState } from "./desktop/task-observation.js";
 import { RolloutTaskHistoryRecovery } from "./desktop/history-recovery.js";
 import { createAppServerProfileOwner } from "./codex/app-server-profile-owner.js";
 import { observeAppServerTaskState } from "./codex/app-server-task-state.js";
-import { RoutedCodexTasks } from "./core/codex-task-router.js";
-import { RoutedTaskStateTransport } from "./core/task-state.js";
 import { inspectThroughOwner } from "./desktop/owner-channel.js";
+import { ManagedOwnerRouteResolver } from "./bridge/managed-owner-route-resolver.js";
+import { createDesktopRouting } from "./desktop/desktop-routing.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -52,14 +52,17 @@ const appServerOwners = config.codexSources.flatMap((source, index) => source.ow
     const resolved = await catalog.resolveProject(projectId);
     return { rawProjectId: resolved.rawProjectId, ...(resolved.sourceId ? { sourceId: resolved.sourceId } : {}) };
   })] : []);
-const tasks = appServerOwners.length ? new RoutedCodexTasks(desktop, appServerOwners) : desktop;
 const desktopStates = new DesktopTaskStateTransport();
-const states = appServerOwners.length ? new RoutedTaskStateTransport(desktopStates, appServerOwners,
-  async task => (await inspectThroughOwner(catalog.sourceHome(task), task.threadId)) !== null) : desktopStates;
-const observe = appServerOwners.length ? ((state: import("./core/task-state.js").TaskState,
+// The private base is reserved for managed workers; an absent endpoint or
+// unqualified claim stays exclusive but unavailable. No worker is launched here.
+const managedResolver = new ManagedOwnerRouteResolver({ store,
+  privateBaseDirectory: path.resolve(config.dataDir, "managed-workers") });
+const { tasks, states } = createDesktopRouting(desktop, desktopStates, appServerOwners, store,
+  managedResolver, async task => (await inspectThroughOwner(catalog.sourceHome(task), task.threadId)) !== null);
+const observe = (state: import("./core/task-state.js").TaskState,
   previous: import("./core/task-observation.js").TaskObservationCheckpoint | null, now?: number,
   options?: import("./core/task-observation.js").TaskObservationOptions) => state.kind === "app-server"
-    ? observeAppServerTaskState(state, previous, now, options) : observeTaskState(state, previous, now, options)) : observeTaskState;
+    ? observeAppServerTaskState(state, previous, now, options) : observeTaskState(state, previous, now, options);
 const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
   { states, observe, history: new RolloutTaskHistoryRecovery(),
     inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId) }, undefined,
