@@ -188,11 +188,141 @@ test('stock daemon refuses uncontrolled baseline or foreign owner discovery befo
   }
 });
 
+test('failed stock owner discovery requires explicit authenticated zero-work stop', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, 'discovery');
+  try {
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.exitCode, null);
+    assert.equal(own.backend.writes, 0);
+    assert.equal(own.backend.queueWrites, 0);
+    const locator = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'startup-control.v1.json'), 'utf8')) as {control:{port:number}};
+    const disconnected = await controlRequest(locator.control.port, own.reserved.epoch,
+      'failed-status', 'status');
+    assert.ok(disconnected.result);
+    assert.equal(own.backend.exitCode, null, 'control EOF did not stop the worker');
+    const stopped = await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'explicit-failed-stop', 'stop');
+    assert.deepEqual(stopped.result, { stopped: true });
+    assert.equal(own.daemon.metadata.state, 'stopped');
+    assert.equal(own.backend.exitCode, 0);
+  } finally {
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+  }
+});
+
+test('failed-start stop refuses unconfirmed settings while preserving control and backend', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: false, early: false },
+    'normal', true, 'notice');
+  try {
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.settingsWrites, 1);
+    assert.equal(own.backend.writes, 0);
+    const refused = await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'unknown-settings-stop', 'stop');
+    assert.equal(refused.error, 'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.exitCode, null);
+    assert.ok((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'unknown-settings-status', 'status')).result);
+  } finally {
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    own.backend.stdin.end();
+  }
+});
+
+test('failed-start family refusal is definitive and a later explicit stop can succeed', async () => {
+  const family: { allow: boolean; beforeReturn?: () => void } = { allow: false };
+  const own = await readyFixture(family, { enabled: true, early: false },
+    'normal', true, 'discovery');
+  try {
+    assert.equal((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-busy', 'stop')).error, 'stop-refused');
+    assert.equal(own.backend.exitCode, null);
+    assert.equal(own.daemon.metadata.state, 'failed');
+    family.allow = true;
+    family.beforeReturn = () => { throw new Error('test-only family proof unavailable'); };
+    assert.equal((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-family-error', 'stop')).error, 'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'failed');
+    delete family.beforeReturn;
+    assert.deepEqual((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-idle', 'stop')).result, { stopped: true });
+  } finally {
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+  }
+});
+
+test('failed-start stop refuses a backend birth change during family proof', async () => {
+  const family: {allow:boolean;beforeReturn?:()=>void} = { allow: true };
+  const own = await readyFixture(family, { enabled: true, early: false },
+    'normal', true, 'discovery');
+  try {
+    family.beforeReturn = () => { own.backend.birthDrift = true; };
+    assert.equal((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-birth-drift', 'stop')).error, 'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.exitCode, null);
+    assert.ok((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-birth-status', 'status')).result);
+  } finally {
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    own.backend.stdin.end();
+  }
+});
+
+test('failed-start stop refuses a new unresolved server request during family proof', async () => {
+  const family: {allow:boolean;beforeReturn?:()=>void} = { allow: true };
+  const own = await readyFixture(family, { enabled: true, early: false },
+    'normal', true, 'discovery');
+  try {
+    family.beforeReturn = () => {
+      own.backend.stdout.write(JSON.stringify({ id: 'pending-question',
+        method: 'item/tool/requestUserInput', params: { threadId: own.taskId,
+          turnId: 'none', questions: [] } }) + '\n');
+    };
+    assert.equal((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-pending-request', 'stop')).error, 'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.exitCode, null);
+  } finally {
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    own.backend.stdin.end();
+  }
+});
+
+test('failed-start stop refuses a durable accepted queue receipt even with zero visible turns', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, 'discovery');
+  const generation = own.daemon.metadata.generation;
+  assert.ok(generation);
+  const journal = new ManagedWorkerOperationJournal({ filePath: path.join(own.privateDirectory,
+    'operations.sqlite'), ownerEpoch: own.reserved.epoch, backendGeneration: generation,
+  threadId: own.taskId });
+  try {
+    const operation = journal.reserve({ operationId: randomUUID(),
+      clientUserMessageId: randomUUID(), method: 'thread/queue/add',
+      fingerprint: 'a'.repeat(64) }).operation;
+    journal.accept(operation, 'retained-queue-submission');
+    assert.equal((await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'failed-accepted-queue', 'stop')).error, 'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'failed');
+    assert.equal(own.backend.exitCode, null);
+  } finally {
+    journal.close();
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+    own.backend.stdin.end();
+  }
+});
+
 class Backend extends EventEmitter {
   readonly stdin = new PassThrough(); readonly stdout = new PassThrough(); readonly stderr = new PassThrough();
   readonly pid = 42424; exitCode: number | null = null; signalCode: NodeJS.Signals | null = null;
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
-  stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true;
+  stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true; birthDrift = false;
   readonly frames: Record<string, unknown>[] = [];
   failBootstrap = false;
   terminalQueueClients: string[] | null = null;
@@ -367,7 +497,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   expectedTurnCount?: number } = { allow: true },
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal',
-  stock = false, stockFailure: 'baseline' | 'discovery' | null = null) {
+  stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -382,6 +512,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
     handlerErrors: string[] = [];
   const ownerId = stock ? randomUUID() : 'local-owner';
   backend.stock = stock;
+  backend.emitSettingsNotice = stockFailure !== 'notice';
   backend.failBootstrap = startup === 'bootstrap-fail';
   let control: ManagedWorkerControlServer | null = null;
   let launches = 0, observations = 0;
@@ -438,11 +569,11 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         intentKey: Buffer.alloc(32, 2).toString('base64'),
         controlToken: Buffer.alloc(32, 3).toString('base64') }, privateDirectory }),
       observeProcess: pid => { observations++; return pid === backend.pid && backend.exitCode !== null ? null :
-        { pid, birthTicks: String(pid + 100) }; },
+        { pid, birthTicks: String(pid + 100 + (pid === backend.pid && backend.birthDrift ? 1 : 0)) }; },
       launch: () => { launches++; return backend as unknown as ChildProcessWithoutNullStreams; },
     },
   });
-  if (stockFailure === 'discovery') {
+  if (stockFailure === 'discovery' || stockFailure === 'notice') {
     try {
       await daemon.start();
       throw new Error(`stock ${stockFailure} unexpectedly reached ready`);
@@ -621,8 +752,10 @@ test('post-owner ready endpoint collision retires native gateway but preserves b
       schemaVersion: 1, startupPhase: 'publishing-ready', daemonState: 'failed',
       failureCode: 'startup-unavailable', registryState: 'backend_registered',
       owner: daemon.metadata.nativeStartup });
-    assert.equal((await startupControlRequest(privateDirectory, reserved.epoch, 'stop', 'stop')).error,
-      'stop-refused');
+    assert.deepEqual((await startupControlRequest(privateDirectory, reserved.epoch, 'stop', 'stop')).result,
+      { stopped: true });
+    assert.equal(daemon.metadata.state, 'stopped');
+    assert.equal(backend.exitCode, 0);
     assert.equal(backend.writes, 0);
   } finally {
     await (control as ManagedWorkerControlServer | null)?.close();

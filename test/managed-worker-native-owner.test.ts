@@ -250,6 +250,25 @@ function submitQueue(broker: Broker, entry = stockEntry(), requestId = 'queue-on
     params: { hostId: 'local', conversationId: taskId, state: { [taskId]: [entry] } } });
 }
 
+test('cold retirement proof permits readonly follow but never an admitted native mutation', async () => {
+  for (const stock of [false, true]) {
+    const f = await fixture(async () => state(), () => false, () => true,
+      false, undefined, () => true, stock);
+    try {
+      assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+      await f.owner.start();
+      followQueue(f.broker);
+      await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+      if (stock) await waitFrame(f.broker.frames,
+        frame => frame.method === 'thread-queued-followups-changed');
+      f.owner.close();
+      assert.equal(f.owner.retiredWithoutNativeIngress(), true);
+      f.owner.close();
+      assert.equal(f.owner.retiredWithoutNativeIngress(), true);
+    } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  }
+});
+
 test('opt-in native queue v1 durably adds on the same worker before acknowledgement', async () => {
   const f = await fixture(async () => state(), () => false, () => true,
     false, undefined, () => true, true);
@@ -278,7 +297,8 @@ test('opt-in native queue v1 durably adds on the same worker before acknowledgem
       frame.requestId === 'stock-direct-bypass');
     assert.equal(denied.resultType, 'error');
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
-  } finally { f.owner.close(); assert.equal(f.owner.queueQuiescence(), null);
+  } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    assert.equal(f.owner.queueQuiescence(), null);
     await f.host.stop('test-cleanup'); }
 });
 
@@ -298,6 +318,7 @@ test('stock queue backend event during qualification invalidates the pending act
     block = true; submitQueue(f.broker, stockEntry(), 'queue-fenced');
     await started;
     assert.equal(f.owner.metadata.pendingNativeOperations, 1);
+    assert.equal(f.owner.retiredWithoutNativeIngress(), false);
     assert.equal(f.owner.metadata.pendingEvents, 0);
     f.child.send('thread/queue/changed', { threadId: taskId });
     release();
@@ -311,7 +332,8 @@ test('stock queue backend event during qualification invalidates the pending act
     assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 0);
     assert.equal(f.owner.metadata.pendingNativeOperations, 0);
     assert.notEqual(f.owner.metadata.state, 'failed');
-  } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
+  } finally { release(); f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('queue ingress survives EOF, while explicit unfollow or re-follow revokes its lease', async () => {
@@ -455,7 +477,8 @@ test('native queue unknown receipt never ACKs or repeats the same backend add', 
       frame.requestId === 'unknown-repeat');
     assert.equal(second.resultType, 'error');
     assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
-  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('accepted stock receipt still ACKs after a later same-worker notification', async () => {
@@ -508,7 +531,9 @@ test('unqualified initial queue baseline retires native owner during hydrate, no
     assert.equal(f.owner.metadata.failure, 'queue-hydration-failed');
     assert.equal(f.host.metadata.state, 'running');
     assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 0);
-  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+    assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+  } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('bounded queue event tail retires only native owner when attribution stalls', async () => {
@@ -876,7 +901,8 @@ test('admitted direct start survives owner IPC EOF before final worker write; re
       { turn: { id: 'native-turn', status: 'inProgress', extra: true } });
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     assert.equal(f.host.metadata.state, 'running');
-  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('Composer intent overlays only its accepted observed turn and retries after first-turn eligibility is gone', async () => {
@@ -1083,7 +1109,8 @@ test('pending user question survives IPC EOF, answers once, completes only on na
     assert.equal((latest().requests as IpcObject[]).length, 0);
     assert.equal((((latest().turns as IpcObject[])[0]!.items as IpcObject[])[0]!).completed, true);
     assert.equal(f.host.metadata.state, 'running');
-  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
+    await f.host.stop('test-cleanup'); }
 });
 
 test('final follower policy cannot retire Gateway and still authorize an answer', async () => {

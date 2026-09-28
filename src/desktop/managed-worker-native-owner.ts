@@ -163,6 +163,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #queueAdapter: ManagedNativeStockQueueAdapter | null = null;
   #eventTail: Promise<void> = Promise.resolve();
   #pendingEvents = 0;
+  #everAdmittedNativeMutation = false;
+  #coldRetirementProof: boolean | null = null;
   #startPromise: Promise<void> | null = null;
   #reconnectPromise: Promise<void> | null = null;
 
@@ -210,6 +212,32 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         !this.#ownerCurrent()) return null;
     try { return this.#queueAdapter.quiescence(); }
     catch { return null; }
+  }
+
+  /** Captured once before retirement clears ingress grants or closes the
+   * native queue journal. This proves only that this owner admitted no native
+   * mutation; it is not backend idle or process-family evidence. */
+  retiredWithoutNativeIngress(): boolean {
+    return (this.#state === 'closed' || this.#state === 'failed') &&
+      this.#coldRetirementProof === true;
+  }
+
+  #captureColdRetirementProof(reason?: string): void {
+    if (this.#coldRetirementProof !== null) return;
+    // A failed initial hydrate may mean the native FWE queue was never
+    // qualified empty, regardless of our local journal's zero version.
+    if (reason === 'queue-hydration-failed' || this.#everAdmittedNativeMutation ||
+        this.#grants.size !== 0 ||
+        this.#queueGrants.size !== 0 || this.#pendingEvents !== 0) {
+      this.#coldRetirementProof = false;
+      return;
+    }
+    if (!this.#queueAdapter) { this.#coldRetirementProof = true; return; }
+    try {
+      const proof = this.#queueAdapter.quiescence();
+      this.#coldRetirementProof = proof.taskVersion === 0 && proof.unresolved === 0 &&
+        proof.unconsumed === 0;
+    } catch { this.#coldRetirementProof = false; }
   }
 
   #ownerCurrent(): boolean {
@@ -285,6 +313,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
 
   #fail(reason: string): void {
     if (this.#state === 'failed' || this.#state === 'closed') return;
+    this.#captureColdRetirementProof(reason);
     this.#state = 'failed'; this.#failure = reason;
     this.#followers.clear(); this.#grants.clear(); this.#queueGrants.clear();
     this.#intentCache.clear(); this.#deferredBroadcasts.length = 0;
@@ -634,6 +663,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
           this.#queueGrants.has(request.requestId) || this.#grants.has(request.requestId)) throw refuse();
       const grant: QueueGrant = { requestId: request.requestId,
         sourceClientId: request.sourceClientId, lease, revoked: false };
+      this.#everAdmittedNativeMutation = true;
       this.#queueGrants.set(request.requestId, grant);
       const current = () => this.#queueAdapter === adapter &&
         this.#queueGrants.get(request.requestId) === grant && !grant.revoked &&
@@ -651,6 +681,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         this.#grants.has(request.requestId) || this.#queueGrants.has(request.requestId)) throw refuse();
     const grant: Grant = Object.freeze({ requestId: request.requestId,
       sourceClientId: request.sourceClientId });
+    this.#everAdmittedNativeMutation = true;
     this.#grants.set(request.requestId, grant);
     try {
       // The incoming IPC signal controls response delivery only. Once admitted,
@@ -671,6 +702,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#state === 'connected' && this.#ownerCurrent() && this.#followerCurrent(request.sourceClientId) &&
       this.#projection?.requests.some(value => value.id === pending.id && value.method === pending.method) === true);
     try {
+      this.#everAdmittedNativeMutation = true;
       if (!responder.answer(pending.id, response)) throw refuse();
       // Native IPC acknowledges local submission. Only serverRequest/resolved
       // may remove the projected request or mark its transcript completed.
@@ -787,6 +819,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   /** Gateway retirement never calls host.stop or closes the native worker. */
   close(): void {
     if (this.#state === 'closed') return;
+    this.#captureColdRetirementProof();
     this.#state = 'closed'; this.#followers.clear(); this.#grants.clear();
     this.#queueGrants.clear(); this.#intentCache.clear();
     this.#deferredBroadcasts.length = 0;

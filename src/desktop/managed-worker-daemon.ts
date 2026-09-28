@@ -91,6 +91,7 @@ export class ManagedWorkerDaemon {
   #intentStore: NativeStartIntentStore | null = null;
   #stockInitializer: ManagedStockSettingsInitializer | null = null;
   #admissionOpen = false;
+  #everReady = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
   #reconnectPending = false;
   #reconnectDelayMs = 1_000;
@@ -389,6 +390,7 @@ export class ManagedWorkerDaemon {
       if (!readyCurrent()) throw new Error('Native owner changed before registry publication');
       this.#attempt = this.#registry.markReady(this.#attempt, self, this.#backend, endpointRef);
       this.#endpointRef = endpointRef;
+      this.#everReady = true;
       this.#state = 'ready';
       this.#startupPhase = 'ready';
       this.#admissionOpen = true;
@@ -473,6 +475,8 @@ export class ManagedWorkerDaemon {
 
   async #requestStop(controlKey: object, home: string, familyRoot: string,
     observe: typeof readWindowsProcessIdentity): Promise<void> {
+    if (this.#state === 'failed')
+      return this.#requestFailedStartStop(controlKey, home, familyRoot, observe);
     if (this.#state !== 'ready' || !this.#host || !this.#owner || !this.#bootstrap ||
       !this.#registry || !this.#attempt || !this.#self || !this.#backend)
       throw new ManagedWorkerStopRefusedError();
@@ -555,6 +559,74 @@ export class ManagedWorkerDaemon {
     } catch (error) {
       if (!stopIssued && error instanceof ManagedWorkerStopRefusedError) this.#admissionOpen = true;
       else { this.#state = 'failed'; this.#failure = 'stop-unconfirmed'; }
+      throw error;
+    }
+  }
+
+  /** Explicit authenticated cleanup of a never-ready, qualified zero-work
+   * backend. It never infers safety from a closed native socket or an empty
+   * stock queue alone. Ambiguous outcomes retain the backend for review. */
+  async #requestFailedStartStop(controlKey: object, home: string, familyRoot: string,
+    observe: typeof readWindowsProcessIdentity): Promise<void> {
+    if (this.#state !== 'failed' || this.#failure !== 'startup-unavailable' || this.#everReady ||
+      this.#admissionOpen || !this.#host || !this.#bootstrap || !this.#registry ||
+      !this.#attempt || !this.#self || !this.#backend || this.#generation === null ||
+      this.#endpointRef !== null) throw new ManagedWorkerStopRefusedError();
+    const host = this.#host, owner = this.#owner, generation = this.#generation;
+    let stopIssued = false;
+    const identityCurrent = (): boolean => {
+      const row = this.#registry!.get(home, familyRoot);
+      const meta = host.metadata;
+      return this.#state === 'failed' && this.#failure === 'startup-unavailable' &&
+        !this.#everReady && !this.#admissionOpen && this.#endpointRef === null &&
+        !!row && row.epoch === this.#options.epoch && row.state === 'backend_registered' &&
+        row.revision === this.#attempt!.revision && same(row.host, this.#self) &&
+        same(row.backend, this.#backend) && row.backend?.generation === generation &&
+        same(observe(process.pid), this.#self) && same(observe(this.#backend!.pid), this.#backend) &&
+        meta.state === 'running' && meta.taskId === this.#taskId &&
+        meta.backendGeneration === generation;
+    };
+    const quiescent = (): boolean => {
+      try {
+        if (!identityCurrent()) return false;
+        if (owner && (!owner.retiredWithoutNativeIngress() ||
+            owner.metadata.pendingNativeOperations !== 0 || owner.metadata.pendingEvents !== 0)) return false;
+        const receipts = host.acceptedCommandReceipts(controlKey);
+        const queueInputs = host.acceptedQueueInputs(controlKey);
+        const commands = host.commandQuiescence(controlKey);
+        const requests = host.requestQuiescence(controlKey);
+        return receipts.length === 0 && queueInputs.length === 0 &&
+          commands.inFlight === 0 && !commands.unconfirmed &&
+          requests.generation === generation && requests.unresolved === 0 && identityCurrent();
+      } catch { return false; }
+    };
+    try {
+      if (!quiescent()) throw new ManagedWorkerStopRefusedError();
+      let idle: Readonly<{ turnCount: number; latestTurnId: string | null }>;
+      try { idle = await this.#bootstrap.verifyIdle([], []); }
+      catch { throw new ManagedWorkerStopRefusedError(); }
+      if (idle.turnCount !== 0 || idle.latestTurnId !== null || !quiescent())
+        throw new ManagedWorkerStopRefusedError();
+      let familyQuiescent = false;
+      try { familyQuiescent = await this.#options.verifyFamilyQuiescent({
+        taskId: this.#taskId!, generation, idle }); }
+      catch { throw new ManagedWorkerStopRefusedError(); }
+      if (familyQuiescent !== true || !quiescent()) throw new ManagedWorkerStopRefusedError();
+      this.#state = 'stopping';
+      this.#clearReconnect();
+      stopIssued = true;
+      owner?.close();
+      await host.stop('owner-request');
+      if (same(observe(this.#backend.pid), this.#backend))
+        throw new Error('Worker shutdown unconfirmed');
+      this.#state = 'stopped';
+      this.#intentStore?.close(); this.#registry?.close();
+      const retireControl = setTimeout(() => { void this.#control?.close().catch(() => {}); }, 250);
+      retireControl.unref();
+    } catch (error) {
+      if (!stopIssued) throw error instanceof ManagedWorkerStopRefusedError ?
+        error : new ManagedWorkerStopRefusedError();
+      this.#state = 'failed'; this.#failure = 'stop-unconfirmed';
       throw error;
     }
   }
