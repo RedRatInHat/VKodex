@@ -411,6 +411,8 @@ The **Task menu:** line and **Menu** button are appended to the final Codex answ
 
 An unknown slash command from the owner opens the relevant help and is not sent to the agent. Messages from other participants, including text starting with `/`, remain ordinary prompts.
 
+When resuming a goal, VKodex saves the attempt ID before changing the goal status and sends that same ID when starting the turn. If acknowledgment of activation or start is lost, `/goal` shows an unknown outcome and does not start the turn again. Clearing the goal or moving the task to another source does not remove this safeguard: first verify the outcome in Codex. Automatic reconciliation of an empty-input turn is not yet qualified by the native protocol.
+
 Context usage is the latest Codex estimate, not cumulative tokens spent over the task's lifetime. Missing values are not guessed. A deep link is useful on a device with the desktop application installed; the bot cannot modify your phone's clipboard.
 
 **Title synchronization:** renaming through VK saves the title in the Codex catalog and changes the linked conversation to `[VKodex] <title>`. A rename through the standard Codex interface is detected during catalog refresh and copied to VK, including after a bridge restart. Temporary VK failures are retried with backoff, and **Retry for VK** retries immediately. A stale confirmation cannot run the operation twice or overwrite a newer title.
