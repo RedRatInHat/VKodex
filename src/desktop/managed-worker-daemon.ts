@@ -9,7 +9,7 @@ import type { WorkerCommandScope, WorkerCommand } from '../codex/managed-worker-
 import { NativeStartIntentStore } from '../codex/native-start-intent-store.js';
 import { compileNativeRequestResponse } from '../codex/native-request-response.js';
 import type { AppServerServerRequest } from '../codex/app-server-connection.js';
-import { bootstrapManagedWorker, ManagedWorkerIdleProofRefusedError,
+import { bootstrapManagedWorker,
   type ManagedWorkerBootstrap, type ContinuationOwnerFence } from './managed-worker-bootstrap.js';
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
@@ -376,7 +376,7 @@ export class ManagedWorkerDaemon {
     this.#admissionOpen = false;
     let stopIssued = false;
     try {
-      const stable = () => {
+      const identityCurrent = () => {
         const row = this.#registry!.get(home, familyRoot);
         return !!row && row.epoch === this.#options.epoch && row.state === 'ready' &&
           row.revision === this.#attempt!.revision && same(row.host, this.#self) &&
@@ -385,23 +385,39 @@ export class ManagedWorkerDaemon {
           host.metadata.state === 'running' && host.metadata.backendGeneration === generation &&
           (owner.metadata.state === 'connected' || owner.metadata.state === 'disconnected');
       };
+      const stable = () => identityCurrent() && owner.metadata.pendingNativeOperations === 0 &&
+        owner.metadata.pendingEvents === 0;
       if (!stable() || generation === null) throw new ManagedWorkerStopRefusedError();
       // Usage counters can advance while these read-only checks run. Fence
       // conversation/authority changes, not an unrelated display revision.
       const semanticRevision = owner.metadata.semanticRevision;
       const receipts = host.acceptedCommandReceipts(controlKey);
-      if (receipts.some(receipt => receipt.method !== 'turn/start'))
+      const queueInputs = host.acceptedQueueInputs(controlKey);
+      if (receipts.some(receipt => receipt.method !== 'turn/start' &&
+          receipt.method !== 'thread/queue/add'))
         throw new ManagedWorkerStopRefusedError();
-      const expectedTurnIds = receipts.map(receipt => receipt.receiptId);
+      const expectedTurnIds = receipts.filter(receipt => receipt.method === 'turn/start')
+        .map(receipt => receipt.receiptId);
+      const submissionIds = receipts.filter(receipt => receipt.method === 'thread/queue/add')
+        .map(receipt => receipt.receiptId);
+      const queueClientIds = queueInputs.map(input => input.clientUserMessageId);
       if (new Set(expectedTurnIds).size !== expectedTurnIds.length)
+        throw new ManagedWorkerStopRefusedError();
+      if (new Set(submissionIds).size !== submissionIds.length ||
+          new Set(queueClientIds).size !== queueClientIds.length ||
+          !isDeepStrictEqual(submissionIds, queueInputs.map(input => input.submissionId)))
         throw new ManagedWorkerStopRefusedError();
       const before = host.commandQuiescence(controlKey), requests = host.requestQuiescence(controlKey);
       if (before.inFlight || before.unconfirmed || requests.unresolved || requests.generation !== generation)
         throw new ManagedWorkerStopRefusedError();
       let idle: Readonly<{ turnCount: number; latestTurnId: string | null }>;
-      try { idle = await this.#bootstrap.verifyIdle(expectedTurnIds); }
+      try { idle = await this.#bootstrap.verifyIdle(expectedTurnIds, queueClientIds); }
       catch (error) {
-        if (error instanceof ManagedWorkerIdleProofRefusedError) throw new ManagedWorkerStopRefusedError();
+        // A read-only proof may fail because a turn is active, queue is busy,
+        // or its frontend read detached. None issued a stop. Preserve the
+        // worker only while the exact registered backend is still current;
+        // actual backend loss remains a failed lifecycle, not a retryable stop.
+        if (identityCurrent()) throw new ManagedWorkerStopRefusedError();
         throw error;
       }
       if (await this.#options.verifyFamilyQuiescent({ taskId: this.#taskId!, generation, idle }) !== true)
@@ -409,6 +425,7 @@ export class ManagedWorkerDaemon {
       const after = host.commandQuiescence(controlKey), pending = host.requestQuiescence(controlKey);
       if (after.inFlight || after.unconfirmed || pending.unresolved || pending.generation !== generation ||
         !isDeepStrictEqual(host.acceptedCommandReceipts(controlKey), receipts) ||
+        !isDeepStrictEqual(host.acceptedQueueInputs(controlKey), queueInputs) ||
         owner.metadata.semanticRevision !== semanticRevision || !stable()) throw new ManagedWorkerStopRefusedError();
       // Retire admitted grants before the last synchronous host-stop boundary.
       this.#state = 'stopping';

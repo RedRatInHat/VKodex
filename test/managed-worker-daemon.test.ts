@@ -9,6 +9,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
+import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-operation-journal.js';
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
@@ -27,6 +28,11 @@ class Backend extends EventEmitter {
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
   readonly frames: Record<string, unknown>[] = [];
   failBootstrap = false;
+  terminalQueueClients: string[] | null = null;
+  queueEntries: Record<string, unknown>[] = [];
+  readStatusOverride: string | null = null;
+  holdIdOnlyResume = false;
+  heldIdOnlyResume: unknown = null;
   readonly taskId: string; readonly cwd: string;
   constructor(taskId: string, cwd: string) {
     super(); this.taskId = taskId; this.cwd = cwd;
@@ -42,6 +48,10 @@ class Backend extends EventEmitter {
           queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
             result: { turn: { id: 'accepted-composer-turn', status: 'inProgress', extra: true } } }) + '\n'));
           continue; }
+        if (method === 'thread/resume' && this.holdIdOnlyResume &&
+            Object.keys(frame.params as Record<string, unknown>).length === 1) {
+          this.holdIdOnlyResume = false; this.heldIdOnlyResume = frame.id; continue;
+        }
         queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
           result: this.answer(method) }) + '\n'));
       }
@@ -53,16 +63,17 @@ class Backend extends EventEmitter {
   answer(method: string): Record<string, unknown> {
     const thread = () => ({ id: this.taskId, sessionId: this.taskId,
       createdAt: 100, updatedAt: 101, cwd: this.cwd,
-      status: { type: this.resumed ? 'idle' : 'notLoaded' },
-      turns: this.writes && this.materializeTurn ? [{ id: 'accepted-composer-turn', status: 'completed', items: [] }] : [],
+      model: 'gpt-5.6-sol', modelProvider: 'openai', reasoningEffort: 'low',
+      status: { type: this.readStatusOverride ?? (this.resumed ? 'idle' : 'notLoaded') },
+      turns: this.terminalTurns(),
       environments: [{ environmentId: 'local', cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }] });
     if (method === 'initialize') return { serverInfo: { name: 'fixture' } };
     if (method === 'thread/read') return { thread: this.failBootstrap && this.resumed ?
       { ...thread(), status: { type: 'inProgress' } } : thread() };
-    if (method === 'thread/turns/list') return { data: this.writes && this.materializeTurn ?
-      [{ id: 'accepted-composer-turn', status: 'completed', items: [], itemsView: 'full' }] : [], nextCursor: null };
+    if (method === 'thread/turns/list') return { data: this.terminalTurns().map(turn =>
+      ({ ...turn, itemsView: 'full' })), nextCursor: null };
     if (method === 'thread/goal/get') return { goal: null };
-    if (method === 'thread/queue/list') return { data: [], nextCursor: null };
+    if (method === 'thread/queue/list') return { data: this.queueEntries, nextCursor: null };
     if (method === 'thread/resume') {
       this.resumed = true;
       return { thread: thread(), cwd: this.cwd, model: 'gpt-5.6-sol', reasoningEffort: 'low',
@@ -75,6 +86,19 @@ class Backend extends EventEmitter {
     throw new Error(`unexpected method ${method}`);
   }
   kill(): boolean { this.exitCode = 0; this.emit('close', 0, null); return true; }
+  rejectHeldIdOnlyResume(): void {
+    assert.notEqual(this.heldIdOnlyResume, null);
+    this.stdout.write(JSON.stringify({ id: this.heldIdOnlyResume,
+      error: { code: -32001, message: 'fixture-current-read-unavailable' } }) + '\n');
+    this.heldIdOnlyResume = null;
+  }
+  terminalTurns(): Record<string, unknown>[] {
+    if (this.terminalQueueClients !== null) return [{ id: 'queue-terminal-turn', status: 'completed',
+      items: this.terminalQueueClients.map((clientId, index) => ({ id: `queue-user-${index}`,
+        type: 'userMessage', clientId, content: [{ type: 'text', text: 'fixture only' }] })) }];
+    return this.writes && this.materializeTurn ?
+      [{ id: 'accepted-composer-turn', status: 'completed', items: [] }] : [];
+  }
 }
 class Broker extends Duplex {
   readonly decoder = new FrameDecoder();
@@ -117,7 +141,8 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
       responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
-async function readyFixture(family: { allow: boolean; beforeReturn?: () => void } = { allow: true },
+async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
+  expectedTurnCount?: number } = { allow: true },
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
@@ -147,6 +172,8 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void 
       } }),
     verifyFamilyQuiescent: async ({ idle }) => {
       family.beforeReturn?.();
+      if (family.expectedTurnCount !== undefined)
+        return family.allow && idle.turnCount === family.expectedTurnCount;
       return family.allow && (native.enabled && backend.writes && backend.materializeTurn ?
         idle.turnCount === 1 && idle.latestTurnId === 'accepted-composer-turn' :
         idle.turnCount === 0 && idle.latestTurnId === null);
@@ -620,6 +647,7 @@ test('accepted turn absent from terminal full history refuses stop until it appe
     assert.equal(broker.frames.find(frame => frame.requestId === 'accepted-before-history')?.resultType, 'success');
     assert.equal(backend.writes, 1);
     assert.equal((await controlStop(privateDirectory, reserved.epoch, 'not-terminal')).error, 'stop-refused');
+    assert.equal(daemon.metadata.state, 'ready');
     assert.equal(backend.exitCode, null);
     backend.materializeTurn = true;
     assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'now-terminal')).result,
@@ -627,6 +655,142 @@ test('accepted turn absent from terminal full history refuses stop until it appe
     assert.equal(daemon.metadata.state, 'stopped');
   } finally {
     if (backend.exitCode === null) { backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null); }
+  }
+});
+
+test('temporary read-only idle proof refusal keeps an exact live worker ready', async () => {
+  const { daemon, backend, reserved, privateDirectory } = await readyFixture();
+  try {
+    backend.queueEntries = [{ id: 'still-queued' }];
+    assert.equal((await controlStop(privateDirectory, reserved.epoch, 'queue-busy')).error,
+      'stop-refused');
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(backend.exitCode, null);
+    backend.queueEntries = [];
+    backend.readStatusOverride = 'inProgress';
+    assert.equal((await controlStop(privateDirectory, reserved.epoch, 'not-idle')).error,
+      'stop-refused');
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(backend.exitCode, null);
+    backend.readStatusOverride = null;
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'now-idle')).result,
+      { stopped: true });
+  } finally {
+    if (backend.exitCode === null) {
+      backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null);
+    }
+  }
+});
+
+test('stop refuses a native continuation still qualifying before any second worker RPC', async () => {
+  const { daemon, backend, brokers, reserved, privateDirectory, home } = await readyFixture(
+    { allow: true }, { enabled: true, early: false });
+  const broker = brokers[0]!;
+  const until = Date.now() + 2500;
+  try {
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: 'own-zero-turn',
+        hostId: 'local', following: true } });
+    while (!broker.frames.some(frame => frame.method === 'thread-stream-state-changed') && Date.now() < until)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    broker.send(composerRequest('own-zero-turn', home, 'first-composer'));
+    while (!broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'first-composer') &&
+      Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'first-composer')?.resultType, 'success');
+    assert.equal(backend.writes, 1);
+    backend.stdout.write(JSON.stringify({ method: 'turn/started', params: { threadId: 'own-zero-turn',
+      turn: { id: 'accepted-composer-turn', status: 'inProgress', startedAt: 2, items: [] } } }) + '\n');
+    backend.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'own-zero-turn',
+      turn: { id: 'accepted-composer-turn', status: 'completed', startedAt: 2, items: [] } } }) + '\n');
+    await new Promise(resolve => setImmediate(resolve));
+    backend.holdIdOnlyResume = true;
+    broker.send(composerRequest('own-zero-turn', home, 'second-qualifying'));
+    while (backend.heldIdOnlyResume === null && Date.now() < until)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.notEqual(backend.heldIdOnlyResume, null,
+      JSON.stringify({ methods: backend.methods, responses: broker.frames.filter(frame =>
+        frame.type === 'response').map(frame => ({ id: frame.requestId, type: frame.resultType })) }));
+    assert.equal(backend.writes, 1);
+    assert.equal((await controlStop(privateDirectory, reserved.epoch, 'native-before-rpc')).error,
+      'stop-refused');
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(backend.exitCode, null);
+    backend.rejectHeldIdOnlyResume();
+    while (!broker.frames.some(frame => frame.type === 'response' &&
+      frame.requestId === 'second-qualifying') && Date.now() < until)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'second-qualifying')?.resultType, 'error');
+    assert.equal(backend.writes, 1);
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'native-drained')).result,
+      { stopped: true });
+  } finally {
+    if (backend.heldIdOnlyResume !== null) backend.rejectHeldIdOnlyResume();
+    if (backend.exitCode === null) {
+      backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null);
+    }
+  }
+});
+
+test('accepted queue input stops only after exact unique terminal user client identity', async () => {
+  for (const observed of [['queue-client'], ['other-client'], ['queue-client', 'queue-client']]) {
+    const { daemon, backend, reserved, privateDirectory } = await readyFixture(
+      { allow: true, expectedTurnCount: 1 });
+    const generation = daemon.metadata.generation;
+    assert.ok(generation);
+    const journal = new ManagedWorkerOperationJournal({
+      filePath: path.join(privateDirectory, 'operations.sqlite'), ownerEpoch: reserved.epoch,
+      backendGeneration: generation, threadId: 'own-zero-turn' });
+    try {
+      const operation = journal.reserve({ operationId: randomUUID(),
+        clientUserMessageId: 'queue-client', method: 'thread/queue/add',
+        fingerprint: 'a'.repeat(64) }).operation;
+      journal.accept(operation, 'actual-queue-submission');
+      backend.terminalQueueClients = observed;
+      const first = await controlStop(privateDirectory, reserved.epoch, `queue-stop-${observed.length}`);
+      if (observed.length === 1 && observed[0] === 'queue-client') {
+        assert.deepEqual(first.result, { stopped: true });
+      } else {
+        assert.equal(first.error, 'stop-refused');
+        assert.equal(daemon.metadata.state, 'ready');
+        assert.equal(backend.exitCode, null);
+        backend.terminalQueueClients = ['queue-client'];
+        assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'queue-terminal-proven')).result,
+          { stopped: true });
+      }
+    } finally {
+      journal.close();
+      if (backend.exitCode === null) {
+        backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null);
+      }
+    }
+  }
+});
+
+test('duplicate accepted queue submission IDs refuse stop even with distinct terminal clients', async () => {
+  const { daemon, backend, reserved, privateDirectory, control } = await readyFixture(
+    { allow: true, expectedTurnCount: 1 });
+  const generation = daemon.metadata.generation;
+  assert.ok(generation);
+  const journal = new ManagedWorkerOperationJournal({
+    filePath: path.join(privateDirectory, 'operations.sqlite'), ownerEpoch: reserved.epoch,
+    backendGeneration: generation, threadId: 'own-zero-turn' });
+  try {
+    for (const clientUserMessageId of ['queue-one', 'queue-two']) {
+      const operation = journal.reserve({ operationId: randomUUID(), clientUserMessageId,
+        method: 'thread/queue/add', fingerprint: 'a'.repeat(64) }).operation;
+      journal.accept(operation, 'same-submission-id');
+    }
+    backend.terminalQueueClients = ['queue-one', 'queue-two'];
+    assert.equal((await controlStop(privateDirectory, reserved.epoch, 'duplicate-queue-receipt')).error,
+      'stop-refused');
+    assert.equal(daemon.metadata.state, 'ready');
+    assert.equal(backend.exitCode, null);
+  } finally {
+    journal.close();
+    if (backend.exitCode === null) {
+      backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null);
+    }
+    await (control as ManagedWorkerControlServer | null)?.close();
   }
 });
 

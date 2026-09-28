@@ -293,6 +293,8 @@ test('stock queue backend event during qualification invalidates the pending act
     await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
     block = true; submitQueue(f.broker, stockEntry(), 'queue-fenced');
     await started;
+    assert.equal(f.owner.metadata.pendingNativeOperations, 1);
+    assert.equal(f.owner.metadata.pendingEvents, 0);
     f.child.send('thread/queue/changed', { threadId: taskId });
     release();
     const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
@@ -303,6 +305,7 @@ test('stock queue backend event during qualification invalidates the pending act
       });
     assert.equal(reply.resultType, 'error');
     assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 0);
+    assert.equal(f.owner.metadata.pendingNativeOperations, 0);
     assert.notEqual(f.owner.metadata.state, 'failed');
   } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
 });
@@ -530,6 +533,7 @@ test('bounded queue event tail retires only native owner when attribution stalls
         { id: 'stock-user', type: 'userMessage', clientId: entry.id,
           content: [{ type: 'text', text: entry.text }] }] } });
     await started;
+    assert.ok(f.owner.metadata.pendingEvents > 0);
     const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
       cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
     for (let index = 0; index < 129; index++) f.child.send('thread/tokenUsage/updated',

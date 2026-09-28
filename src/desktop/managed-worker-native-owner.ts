@@ -114,6 +114,10 @@ export interface ManagedWorkerNativeOwnerMetadata {
   readonly authorityRevision: number;
   readonly semanticRevision: number;
   readonly followerCount: number;
+  /** Accepted native requests that may still qualify before any worker RPC. */
+  readonly pendingNativeOperations: number;
+  /** Scoped notifications/requests awaiting ordered projection. */
+  readonly pendingEvents: number;
   readonly failure: string | null;
   readonly startupStage: StartupStage;
   /** Count of bootstrap events that invalidate the initial-read boundary. */
@@ -189,7 +193,9 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     return Object.freeze({ state: this.#state, connected: this.#state === 'connected',
       revision: this.#revision, authorityRevision: this.#authorityRevision,
       semanticRevision: this.#semanticRevision,
-      followerCount: this.#followers.size, failure: this.#failure,
+      followerCount: this.#followers.size,
+      pendingNativeOperations: this.#grants.size + this.#queueGrants.size,
+      pendingEvents: this.#pendingEvents, failure: this.#failure,
       startupStage: this.#startupStage,
       bootstrapEventCount: Math.min(this.#bootstrapEvents, diagnosticCap),
       bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),

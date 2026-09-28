@@ -300,6 +300,34 @@ test('stock reader proves same-worker terminal history, empty queue and explicit
   } finally { await fixture.close(); }
 });
 
+test('idle proof joins accepted queue client IDs to exactly one terminal user message', async () => {
+  const fixture = new BackendFixture(); await fixture.listen();
+  try {
+    const bootstrap = await bootstrapManagedWorker(options(fixture));
+    const user = (clientId: string | null) => ({ id: `item-${clientId ?? 'null'}`,
+      type: 'userMessage', clientId, content: [{ type: 'text', text: 'fixture only' }] });
+    fixture.turns = [{ id: 'terminal-queue-turn', status: 'completed', items: [user('queued-client')] }];
+    assert.deepEqual(await bootstrap.verifyIdle([], ['queued-client']),
+      { turnCount: 1, latestTurnId: 'terminal-queue-turn' });
+    fixture.turns = [{ id: 'terminal-queue-turn', status: 'completed', items: [
+      { id: 'older-user', type: 'userMessage', content: [{ type: 'text', text: 'legacy' }] },
+      user('queued-client')] }];
+    assert.deepEqual(await bootstrap.verifyIdle([], ['queued-client']),
+      { turnCount: 1, latestTurnId: 'terminal-queue-turn' });
+    await assert.rejects(bootstrap.verifyIdle([], ['queued-client', 'queued-client']),
+      /invalid-expected-queue-clients/);
+    await assert.rejects(bootstrap.verifyIdle([], ['missing-client']), /queue|terminal/i);
+    fixture.turns = [{ id: 'terminal-queue-turn', status: 'completed', items: [user(null)] }];
+    await assert.rejects(bootstrap.verifyIdle([], ['queued-client']), /queue|terminal/i);
+    fixture.turns = [{ id: 'terminal-queue-turn', status: 'completed',
+      items: [user('queued-client'), { ...user('queued-client'), id: 'second' }] }];
+    await assert.rejects(bootstrap.verifyIdle([], ['queued-client']), /queue|terminal/i);
+    fixture.turns = [{ id: 'terminal-queue-turn', status: 'completed', items: [user('queued-client')] }];
+    fixture.queue = [{ id: 'still-queued' }];
+    await assert.rejects(bootstrap.verifyIdle([], ['queued-client']), /goal-or-queue-not-empty/);
+  } finally { await fixture.close(); }
+});
+
 test('pre-resume history, pending queue/goal, unknown status and mismatched cwd fail closed', async () => {
   for (const mutation of ['history', 'queue', 'goal', 'cwd', 'unknown-status']) {
     const fixture = new BackendFixture(); await fixture.listen();

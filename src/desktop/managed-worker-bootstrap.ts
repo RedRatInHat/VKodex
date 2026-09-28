@@ -43,7 +43,8 @@ export interface ManagedWorkerBootstrap {
   /** Re-read the same worker before a first owner start; never resumes or writes. */
   readInitialState(): Promise<NativeProjectionState>;
   /** Current idle evidence only; does not recertify historical permissions. */
-  verifyIdle(expectedTurnIds?: readonly string[]): Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
+  verifyIdle(expectedTurnIds?: readonly string[], expectedQueueClientIds?: readonly string[]):
+    Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
   /** Actual current policy on the same loaded worker; no turn/model write. */
   qualifyContinuation(ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence>;
   /** Exhaustive current terminal/idle stock evidence on this same worker; no writes. */
@@ -77,9 +78,11 @@ export interface ContinuationOwnerFence {
 }
 /** Definite idle-history evidence insufficient for an accepted start; not a transport failure. */
 export class ManagedWorkerIdleProofRefusedError extends Error {
-  readonly reason = 'accepted-turn-not-terminal' as const;
-  constructor() {
-    super('accepted-turn-not-terminal');
+  readonly reason: 'accepted-turn-not-terminal' | 'accepted-queue-input-not-terminal';
+  constructor(reason: 'accepted-turn-not-terminal' | 'accepted-queue-input-not-terminal' =
+    'accepted-turn-not-terminal') {
+    super(reason);
+    this.reason = reason;
     this.name = 'ManagedWorkerIdleProofRefusedError';
   }
 }
@@ -507,11 +510,15 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
       !isDeepStrictEqual(state.environments, qualified.state.environments)) fail('initial-settings-drift');
     return freezeTree(state);
   });
-  const verifyIdle = async (expectedTurnIds: readonly string[] = []):
+  const verifyIdle = async (expectedTurnIds: readonly string[] = [],
+    expectedQueueClientIds: readonly string[] = []):
     Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>> => {
     const expected = jsonCopy(expectedTurnIds);
     if (!Array.isArray(expected) || expected.some(id => typeof id !== 'string' || !id) ||
       new Set(expected).size !== expected.length) fail('invalid-expected-turn-ids');
+    const queueClients = jsonCopy(expectedQueueClientIds);
+    if (!Array.isArray(queueClients) || queueClients.some(id => typeof id !== 'string' || !id) ||
+        new Set(queueClients).size !== queueClients.length) fail('invalid-expected-queue-clients');
     return withReader(async reader => {
       const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
@@ -519,7 +526,10 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
       await noGoalOrQueue(reader, taskId);
       const last = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
+      const finalTurns = await fullHistory(reader, taskId);
+      await noGoalOrQueue(reader, taskId);
       if (!isDeepStrictEqual(first.turns, last.turns) || first.updatedAt !== last.updatedAt ||
+        !isDeepStrictEqual(turns, finalTurns) ||
         (last.turns as unknown[]).length !== turns.length ||
         !turns.every((turn, index) => {
           const observed = (last.turns as unknown[])[index];
@@ -530,6 +540,16 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
         fail('idle-history-unstable-or-nonterminal');
       const terminalIds = new Set(turns.map(turn => turn.id));
       if (expected.some(id => !terminalIds.has(id))) throw new ManagedWorkerIdleProofRefusedError();
+      if (queueClients.length) {
+        const clientCounts = new Map<string, number>();
+        for (const turn of turns) for (const item of turn.items as unknown[]) {
+          if (!object(item) || item.type !== 'userMessage') continue;
+          if (typeof item.clientId === 'string' && item.clientId.length > 0)
+            clientCounts.set(item.clientId, (clientCounts.get(item.clientId) ?? 0) + 1);
+        }
+        if (queueClients.some(id => clientCounts.get(id) !== 1))
+          throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
+      }
       return Object.freeze({ turnCount: turns.length, latestTurnId: turns.at(-1)?.id as string | undefined ?? null });
     });
   };
