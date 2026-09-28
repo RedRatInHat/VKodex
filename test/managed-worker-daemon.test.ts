@@ -15,6 +15,8 @@ import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
+import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
+import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
 
 test('daemon requires explicit follower and IPC policy before private state is read', () => {
   assert.throws(() => new ManagedWorkerDaemon({
@@ -22,13 +24,179 @@ test('daemon requires explicit follower and IPC policy before private state is r
   } as never), /explicit.*polic/i);
 });
 
+test('stock daemon confirms one settings write on its own backend before readiness', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal', true);
+  try {
+    assert.equal(own.daemon.metadata.state, 'ready');
+    assert.equal(own.backend.settingsWrites, 1);
+    assert.equal(own.backend.queueWrites, 0);
+    assert.equal(own.backend.writes, 0);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, 1);
+    assert.equal(own.brokers.length, 1);
+    assert.ok(own.brokers[0]?.frames.some(frame => frame.method === 'thread-queued-followups-changed'));
+    assert.ok(own.probeBrokers.some(broker => broker.frames.some(frame =>
+      frame.method === 'thread-owner-discovery')));
+    const journal = new Database(path.join(own.privateDirectory, 'operations.sqlite'), { readonly: true });
+    try {
+      const settings = journal.prepare('SELECT state,rpc_ack,effective_fingerprint FROM managed_worker_settings_operations')
+        .all() as Array<{state:string;rpc_ack:number;effective_fingerprint:string|null}>;
+      assert.equal(settings.length, 1);
+      assert.equal(settings[0]?.rpc_ack, 1);
+      assert.match(settings[0]?.effective_fingerprint ?? '', /^[0-9a-f]{64}$/u);
+      assert.equal((journal.prepare('SELECT count(*) AS n FROM managed_worker_operations').get() as {n:number}).n, 0);
+    } finally { journal.close(); }
+  } finally {
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'stock-stop')).result,
+      { stopped: true });
+  }
+});
+
+test('stock daemon routes two native queue sends through one journaled backend and stops after terminal proof', async () => {
+  const own = await readyFixture({ allow: true, expectedTurnCount: 2 },
+    { enabled: true, early: false }, 'normal', true);
+  const broker = own.brokers[0]!;
+  const wait = async (check: () => boolean) => {
+    const deadline = Date.now() + 3_000;
+    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(check(), JSON.stringify({ methods: own.backend.methods,
+      native: own.daemon.metadata.nativeState, errors: own.handlerErrors }));
+  };
+  try {
+    await wait(() => broker.frames.some(frame => frame.method === 'thread-queued-followups-changed'));
+    broker.send(composerRequest(own.taskId, own.home, 'stock-direct-denied'));
+    await wait(() => broker.frames.some(frame => frame.type === 'response' &&
+      frame.requestId === 'stock-direct-denied'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'stock-direct-denied')?.resultType, 'error');
+    assert.equal(own.backend.writes, 0);
+    for (let index = 1; index <= 2; index++) {
+      const entry = stockEntry(own.home);
+      broker.send({ type: 'request', requestId: `stock-${index}`, sourceClientId: 'follower',
+        targetClientId: broker.ownerId, hostId: 'local',
+        method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+        params: { hostId: 'local', conversationId: own.taskId,
+          state: { [own.taskId]: [entry] } } });
+      await wait(() => broker.frames.some(frame => frame.type === 'response' &&
+        frame.requestId === `stock-${index}`));
+      assert.equal(broker.frames.find(frame => frame.requestId === `stock-${index}`)?.resultType,
+        'success', JSON.stringify({ errors: own.handlerErrors }));
+      assert.equal(own.backend.queueWrites, index);
+      assert.equal(own.backend.writes, 0);
+      const userItem = { id: `stock-user-${index}`, type: 'userMessage', clientId: entry.id,
+        content: [{ type: 'text', text: 'PUBLIC_OK' }] };
+      const turn = { id: `stock-turn-${index}`, status: 'inProgress', startedAt: index, items: [] };
+      own.backend.stdout.write(JSON.stringify({ method: 'turn/started',
+        params: { threadId: own.taskId, turn } }) + '\n');
+      own.backend.stdout.write(JSON.stringify({ method: 'item/started',
+        params: { threadId: own.taskId, turnId: turn.id, item: userItem } }) + '\n');
+      own.backend.stockCompletedClients.push(entry.id as string);
+      own.backend.stdout.write(JSON.stringify({ method: 'turn/completed',
+        params: { threadId: own.taskId, turn: { ...turn, status: 'completed',
+          completedAt: index + 1, itemsView: 'full', items: [userItem] } } }) + '\n');
+      await wait(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+        JSON.stringify(frame).includes(`stock-turn-${index}`) && JSON.stringify(frame).includes('completed')));
+    }
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, 1);
+    assert.equal(own.backend.settingsWrites, 1);
+    assert.equal(own.backend.queueWrites, 2);
+    assert.equal(own.backend.writes, 0);
+    const queueJournal = new Database(path.join(own.privateDirectory, 'native-stock.sqlite'), { readonly: true });
+    try {
+      const rows = queueJournal.prepare('SELECT phase,consumed FROM native_repeated_op ORDER BY seq')
+        .all() as Array<{phase:string;consumed:number}>;
+      assert.deepEqual(rows, [{ phase: 'accepted', consumed: 1 },
+        { phase: 'accepted', consumed: 1 }]);
+    } finally { queueJournal.close(); }
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'stock-two-stop')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('stock stop refuses native intents missing from the worker journal, including a late family-proof reservation', async () => {
+  for (const phase of ['reserved', 'unknown', 'accepted', 'during-family'] as const) {
+    const family: { allow: boolean; beforeReturn?: () => void } = { allow: true };
+    const own = await readyFixture(family, { enabled: false, early: false }, 'normal', true);
+    const journal = new NativeStockQueueJournal({ filePath: path.join(own.privateDirectory, 'native-stock.sqlite'),
+      taskId: own.taskId, ownerEpoch: own.reserved.epoch, sourceGeneration: 'qualified-stock-v1' });
+    const id = randomUUID(), fingerprint = 'a'.repeat(64);
+    const input = [{ type: 'text', text: 'PUBLIC_PENDING', text_elements: [] }];
+    const reserve = () => journal.reserve({ expectedVersion: journal.readTask().version,
+      opId: id, fingerprint, nativeEntry: { id, text: 'PUBLIC_PENDING' },
+      effectiveSettings: { model: 'gpt-5.6-sol', effort: 'medium' },
+      admissionEvidence: { taskId: own.taskId, ownerEpoch: own.reserved.epoch },
+      stockInput: input, forwardedUpstream: {} });
+    try {
+      if (phase === 'during-family') family.beforeReturn = () => { reserve(); };
+      else {
+        reserve();
+        if (phase === 'unknown') journal.markUnknown({ opId: id, fingerprint });
+        if (phase === 'accepted') journal.markAccepted({ opId: id, fingerprint, stockId: 'own-submission',
+          input, sourceGeneration: 'qualified-stock-v1', clientUserMessageId: id,
+          threadId: own.taskId, assertSourceCurrent: () => true });
+      }
+      assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch, `native-${phase}`)).error,
+        'stop-refused');
+      assert.equal(own.backend.exitCode, null);
+      assert.equal(own.daemon.metadata.state, 'ready');
+      assert.equal(own.backend.queueWrites, 0);
+      assert.equal(own.backend.writes, 0);
+    } finally {
+      journal.close();
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      own.backend.stdin.end();
+    }
+  }
+});
+
+test('stock daemon refuses uncontrolled baseline or foreign owner discovery before queue writes', async () => {
+  for (const failure of ['baseline', 'discovery'] as const) {
+    const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+      'normal', true, failure);
+    try {
+      if (failure === 'baseline') {
+        assert.equal(own.daemon.metadata.state, 'ready');
+        const broker = own.brokers[0]!;
+        broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+          sourceClientId: 'follower', params: { hostId: 'local', conversationId: own.taskId,
+            following: true } });
+        broker.send({ type: 'request', requestId: 'uncontrolled-queue',
+          sourceClientId: 'follower', targetClientId: broker.ownerId, hostId: 'local',
+          method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+          params: { hostId: 'local', conversationId: own.taskId,
+            state: { [own.taskId]: [stockEntry(own.home)] } } });
+        const deadline = Date.now() + 2_000;
+        const refused = () => broker.frames.some(frame => frame.type === 'response' &&
+          frame.requestId === 'uncontrolled-queue' && frame.resultType === 'error') ||
+          own.daemon.metadata.nativeState === 'failed';
+        while (!refused() && Date.now() < deadline)
+          await new Promise(resolve => setTimeout(resolve, 5));
+        assert.ok(refused(), 'uncontrolled native queue request did not reach a refusal');
+      } else assert.equal(own.daemon.metadata.state, 'failed');
+      assert.equal(own.backend.settingsWrites, 1);
+      assert.equal(own.backend.queueWrites, 0);
+      assert.equal(own.backend.writes, 0);
+      assert.equal(own.backend.exitCode, null);
+      assert.ok(own.probeBrokers.some(broker => broker.frames.some(frame =>
+        frame.method === 'thread-owner-discovery')));
+    } finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      own.backend.stdin.end();
+    }
+  }
+});
+
 class Backend extends EventEmitter {
   readonly stdin = new PassThrough(); readonly stdout = new PassThrough(); readonly stderr = new PassThrough();
   readonly pid = 42424; exitCode: number | null = null; signalCode: NodeJS.Signals | null = null;
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
+  stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true;
   readonly frames: Record<string, unknown>[] = [];
   failBootstrap = false;
   terminalQueueClients: string[] | null = null;
+  stockCompletedClients: string[] = [];
   queueEntries: Record<string, unknown>[] = [];
   readStatusOverride: string | null = null;
   holdIdOnlyResume = false;
@@ -48,6 +216,26 @@ class Backend extends EventEmitter {
           queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
             result: { turn: { id: 'accepted-composer-turn', status: 'inProgress', extra: true } } }) + '\n'));
           continue; }
+        if (method === 'thread/settings/update') {
+          this.settingsWrites++;
+          queueMicrotask(() => {
+            this.stdout.write(JSON.stringify({ id: frame.id, result: {} }) + '\n');
+            if (this.emitSettingsNotice) this.stdout.write(JSON.stringify({
+              method: 'thread/settings/updated', params: { threadId: this.taskId,
+                threadSettings: { ...(frame.params as Record<string, unknown>),
+                  modelProvider: 'openai', sandboxPolicy: { type: 'dangerFullAccess' },
+                  activePermissionProfile: { id: ':danger-full-access', extends: null },
+                  disabledPluginIds: [], multiAgentMode: 'explicitRequestOnly' } } }) + '\n');
+          });
+          continue;
+        }
+        if (method === 'thread/queue/add') { this.queueWrites++;
+          const params = frame.params as Record<string, unknown>;
+          queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
+            result: { queuedSubmission: { id: `submission-${this.queueWrites}`,
+              clientUserMessageId: params.clientUserMessageId, input: params.input } } }) + '\n'));
+          continue;
+        }
         if (method === 'thread/resume' && this.holdIdOnlyResume &&
             Object.keys(frame.params as Record<string, unknown>).length === 1) {
           this.holdIdOnlyResume = false; this.heldIdOnlyResume = frame.id; continue;
@@ -63,10 +251,10 @@ class Backend extends EventEmitter {
   answer(method: string): Record<string, unknown> {
     const thread = () => ({ id: this.taskId, sessionId: this.taskId,
       createdAt: 100, updatedAt: 101, cwd: this.cwd,
-      model: 'gpt-5.6-sol', modelProvider: 'openai', reasoningEffort: 'low',
+      model: 'gpt-5.6-sol', modelProvider: 'openai', reasoningEffort: this.stock ? 'medium' : 'low',
       status: { type: this.readStatusOverride ?? (this.resumed ? 'idle' : 'notLoaded') },
       turns: this.terminalTurns(),
-      environments: [{ environmentId: 'local', cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }] });
+      environments: this.stock ? [] : [{ environmentId: 'local', cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }] });
     if (method === 'initialize') return { serverInfo: { name: 'fixture' } };
     if (method === 'thread/read') return { thread: this.failBootstrap && this.resumed ?
       { ...thread(), status: { type: 'inProgress' } } : thread() };
@@ -76,13 +264,18 @@ class Backend extends EventEmitter {
     if (method === 'thread/queue/list') return { data: this.queueEntries, nextCursor: null };
     if (method === 'thread/resume') {
       this.resumed = true;
-      return { thread: thread(), cwd: this.cwd, model: 'gpt-5.6-sol', reasoningEffort: 'low',
-        approvalPolicy: 'never', activePermissionProfile: { id: ':read-only' },
-        sandbox: { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [this.cwd],
+      return { thread: thread(), cwd: this.cwd, model: 'gpt-5.6-sol', modelProvider: 'openai',
+        reasoningEffort: this.stock ? 'medium' : 'low',
+        approvalPolicy: 'never', activePermissionProfile: this.stock ?
+          { id: ':danger-full-access', extends: null } : { id: ':read-only' },
+        sandbox: this.stock ? { type: 'dangerFullAccess' } :
+          { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [this.cwd],
         serviceTier: null, approvalsReviewer: 'user', disabledPluginIds: [],
         multiAgentMode: 'explicitRequestOnly', collaborationMode: null };
     }
     if (method === 'config/read') return { config: { model_reasoning_summary: null, personality: 'pragmatic' } };
+    if (method === 'configRequirements/read') return { requirements: {
+      featureRequirements: { fast_mode: false } } };
     throw new Error(`unexpected method ${method}`);
   }
   kill(): boolean { this.exitCode = 0; this.emit('close', 0, null); return true; }
@@ -93,6 +286,11 @@ class Backend extends EventEmitter {
     this.heldIdOnlyResume = null;
   }
   terminalTurns(): Record<string, unknown>[] {
+    if (this.stock && this.stockCompletedClients.length) return this.stockCompletedClients.map((clientId, index) =>
+      ({ id: `stock-turn-${index + 1}`, status: 'completed', items: [
+        { id: `stock-user-${index + 1}`, type: 'userMessage', clientId,
+          content: [{ type: 'text', text: 'PUBLIC_OK' }] },
+        { id: `stock-agent-${index + 1}`, type: 'agentMessage', text: 'done' } ] }));
     if (this.terminalQueueClients !== null) return [{ id: 'queue-terminal-turn', status: 'completed',
       items: this.terminalQueueClients.map((clientId, index) => ({ id: `queue-user-${index}`,
         type: 'userMessage', clientId, content: [{ type: 'text', text: 'fixture only' }] })) }];
@@ -104,7 +302,8 @@ class Broker extends Duplex {
   readonly decoder = new FrameDecoder();
   readonly frames: Record<string, unknown>[] = [];
   constructor(readonly early: Record<string, unknown> | null = null, readonly taskId = '',
-    readonly rejectInitialize = false) { super(); }
+    readonly rejectInitialize = false, readonly probe = false,
+    readonly ownerId = 'local-owner', readonly initialFollow = false) { super(); }
   override _read(): void {}
   override _write(chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
     for (const frame of this.decoder.push(chunk)) {
@@ -112,12 +311,18 @@ class Broker extends Duplex {
       if (frame.method === 'initialize') {
         if (this.rejectInitialize) { queueMicrotask(() => this.destroy()); continue; }
         const reply = encodeFrame({ type: 'response', requestId: frame.requestId,
-          resultType: 'success', result: { clientId: 'local-owner' } });
+          resultType: 'success', result: { clientId: this.probe ? 'probe' : this.ownerId } });
         if (this.early) this.push(Buffer.concat([reply, encodeFrame({ type: 'broadcast',
           method: 'thread-stream-following-changed', version: 1, sourceClientId: 'follower',
           params: { conversationId: this.taskId, hostId: 'local', following: true } }), encodeFrame(this.early)]));
+        else if (this.initialFollow) this.push(Buffer.concat([reply, encodeFrame({ type: 'broadcast',
+          method: 'thread-stream-following-changed', version: 1, sourceClientId: 'follower',
+          params: { conversationId: this.taskId, hostId: 'local', following: true } })]));
         else this.push(reply);
       }
+      if (frame.method === 'thread-owner-discovery') this.push(encodeFrame({ type: 'response',
+        requestId: frame.requestId, resultType: 'success', handledByClientId: this.ownerId,
+        result: { supportsUntrustedAppInput: false } }));
     }
     done();
   }
@@ -141,10 +346,28 @@ function composerRequest(taskId: string, cwd: string, requestId: string): Record
       responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
+function stockEntry(cwd: string, id = randomUUID()): Record<string, unknown> {
+  const mode = { mode: 'default', settings: { model: 'gpt-5.6-sol',
+    reasoning_effort: 'medium', developer_instructions: null } };
+  return { id, text: 'PUBLIC_OK', cwd, createdAt: 1780000000000,
+    context: { prompt: 'PUBLIC_OK', turnTrigger: 'composer', workspaceRoots: [cwd],
+      usedDictation: false, existingWorkspaceRoot: null, localProjectId: null,
+      fileAttachments: [], addedFiles: [] },
+    responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' },
+    submissionOptions: { executionHostId: 'local', agentMode: 'full-access',
+      permissionProfileId: ':danger-full-access', serviceTier: 'default',
+      shouldSendPermissionOverrides: false, usePermissionSelection: false,
+      permissionSelection: null, collaborationMode: mode,
+      clientUserMessageId: randomUUID() },
+    writingBlockAdditionalContext: null, mentionedBrowserFamilies: [], submissionIntent: 'send-now',
+    submission: { hostId: 'local', status: 'pending', queueModeOverride: 'queue' } };
+}
+
 async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   expectedTurnCount?: number } = { allow: true },
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
-  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal') {
+  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal',
+  stock = false, stockFailure: 'baseline' | 'discovery' | null = null) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -154,16 +377,27 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   await writeFile(cliPath, 'pinned-code');
   const registry = new ManagedWorkerRegistry(registryPath);
   const reserved = registry.reserve(home, 'own-family'); registry.close();
-  const taskId = 'own-zero-turn';
-  const backend = new Backend(taskId, home), brokers: Broker[] = [], handlerErrors: string[] = [];
+  const taskId = stock ? randomUUID() : 'own-zero-turn';
+  const backend = new Backend(taskId, home), brokers: Broker[] = [], probeBrokers: Broker[] = [],
+    handlerErrors: string[] = [];
+  const ownerId = stock ? randomUUID() : 'local-owner';
+  backend.stock = stock;
   backend.failBootstrap = startup === 'bootstrap-fail';
   let control: ManagedWorkerControlServer | null = null;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
+    ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
+      assertControlledNativeBaseline: () => stockFailure !== 'baseline',
+      createProbeClient: () => new DesktopIpcClient(() => {
+        const probe = new Broker(null, taskId, false, true,
+          stockFailure === 'discovery' ? 'foreign-owner' : ownerId);
+        probeBrokers.push(probe); return probe;
+      }, 500) } } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       const broker = new Broker(native.early && brokers.length === 0 ?
-        composerRequest(taskId, home, 'before-ready') : null, taskId, native.available === false);
+        composerRequest(taskId, home, 'before-ready') : null, taskId, native.available === false,
+        false, ownerId, stock && stockFailure !== 'baseline');
       brokers.push(broker); return broker;
     }, 500, { canHandle: request => handler.canHandle(request),
       handle: async (request, signal) => {
@@ -193,8 +427,13 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         home, cwd: home, cliPath, cliSha256: createHash('sha256').update('pinned-code').digest('hex'),
         initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
         resumeParams: { threadId: taskId, cwd: home, model: 'gpt-5.6-sol',
-          permissions: ':read-only', approvalPolicy: 'never', runtimeWorkspaceRoots: [home],
-          config: { model_reasoning_effort: 'low' } }, registryPath,
+          permissions: stock ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
+          runtimeWorkspaceRoots: [home], config: { model_reasoning_effort: stock ? 'medium' : 'low' } },
+        ...(stock ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
+          model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'medium', cwd: home,
+          runtimeWorkspaceRoots: [home], environments: [], approvalPolicy: 'never',
+          approvalsReviewer: 'user', activePermissionProfile: { id: ':danger-full-access', extends: null },
+          sandbox: { type: 'dangerFullAccess' }, serviceTier: null }) } : {}), registryPath,
       }, keys: { fingerprintKey: Buffer.alloc(32, 1).toString('base64'),
         intentKey: Buffer.alloc(32, 2).toString('base64'),
         controlToken: Buffer.alloc(32, 3).toString('base64') }, privateDirectory }),
@@ -203,9 +442,26 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
       launch: () => { launches++; return backend as unknown as ChildProcessWithoutNullStreams; },
     },
   });
-  if (startup === 'normal') await daemon.start();
+  if (stockFailure === 'discovery') {
+    try {
+      await daemon.start();
+      throw new Error(`stock ${stockFailure} unexpectedly reached ready`);
+    } catch (error) {
+      if (daemon.metadata.state !== 'failed') {
+        await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end();
+        throw error;
+      }
+    }
+  }
+  else if (startup === 'normal') {
+    try { await daemon.start(); }
+    catch (error) {
+      if (stock) { await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end(); }
+      throw error;
+    }
+  }
   else await assert.rejects(daemon.start(), /startup unavailable/);
-  return { daemon, backend, brokers, handlerErrors, reserved, home, registryPath,
+  return { daemon, backend, brokers, probeBrokers, handlerErrors, reserved, home, taskId, registryPath,
     privateDirectory, launches, observations, control };
 }
 

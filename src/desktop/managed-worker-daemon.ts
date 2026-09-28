@@ -17,6 +17,10 @@ import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
+import { createManagedStockSettingsInitializer, type ManagedStockSettingsInitializer } from './managed-stock-settings-initializer.js';
+import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
+import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
+import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 
 type State = 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
@@ -35,6 +39,13 @@ export interface ManagedWorkerDaemonOptions {
   /** Separate trusted family evidence. A folder or single idle thread is insufficient. */
   readonly verifyFamilyQuiescent: (scope: Readonly<{ taskId: string; generation: number;
     idle: Readonly<{ turnCount: number; latestTurnId: string | null }> }>) => Promise<boolean>;
+  /** Explicit, controlled native stock queue route. Absent preserves the legacy canary. */
+  readonly nativeStockQueue?: Readonly<{
+    sourceGeneration: string;
+    assertControlledNativeBaseline: (scope: Readonly<{ taskId: string; ownerEpoch: string;
+      backendGeneration: number; sourceGeneration: string }>) => boolean | Promise<boolean>;
+    createProbeClient: () => DesktopIpcClient;
+  }>;
   /** Injectable seams for isolated tests, not remote control methods. */
   readonly dependencies?: Readonly<{
     loadPrivateState?: typeof loadManagedWorkerPrivateState;
@@ -57,8 +68,9 @@ export interface ManagedWorkerDaemonMetadata {
     'bootstrapPendingRequests' | 'bootstrapBoundary'> | null;
 }
 
-/** Explicit, single-use read-only canary composition. Neither parent EOF nor frontend EOF stops its worker.
- * The caller supplies a separately qualified local peer policy and family proof. */
+/** Explicit single-use managed worker. The optional native stock queue route
+ * requires its own approved task policy, owner discovery and controlled baseline.
+ * Neither parent EOF nor frontend EOF stops the worker. */
 export class ManagedWorkerDaemon {
   readonly #options: ManagedWorkerDaemonOptions;
   #state: State = 'new';
@@ -77,6 +89,7 @@ export class ManagedWorkerDaemon {
   #self: ProcessIdentity | null = null;
   #backend: BackendIdentity | null = null;
   #intentStore: NativeStartIntentStore | null = null;
+  #stockInitializer: ManagedStockSettingsInitializer | null = null;
   #admissionOpen = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
   #reconnectPending = false;
@@ -88,7 +101,17 @@ export class ManagedWorkerDaemon {
       typeof options.allowFollower !== 'function' || typeof options.clientFactory !== 'function' ||
       typeof options.verifyFamilyQuiescent !== 'function')
       throw new TypeError('Daemon requires explicit local follower, IPC, and family policies');
-    this.#options = Object.freeze({ ...options });
+    const stock = options.nativeStockQueue;
+    if (stock !== undefined && (!object(stock) ||
+      !isDeepStrictEqual(Object.keys(stock).sort(),
+        ['assertControlledNativeBaseline', 'createProbeClient', 'sourceGeneration'].sort()) ||
+      typeof stock.sourceGeneration !== 'string' || !stock.sourceGeneration ||
+      stock.sourceGeneration.length > 128 || /[\x00-\x1f\x7f]/u.test(stock.sourceGeneration) ||
+      typeof stock.assertControlledNativeBaseline !== 'function' ||
+      typeof stock.createProbeClient !== 'function'))
+      throw new TypeError('Explicit managed native stock queue policy invalid');
+    this.#options = Object.freeze({ ...options,
+      ...(stock ? { nativeStockQueue: Object.freeze({ ...stock }) } : {}) });
   }
 
   get metadata(): ManagedWorkerDaemonMetadata {
@@ -122,6 +145,8 @@ export class ManagedWorkerDaemon {
       if (manifest.epoch !== this.#options.epoch || !path.isAbsolute(manifest.registryPath) ||
         !path.isAbsolute(manifest.cliPath) || !path.isAbsolute(manifest.cwd) || !path.isAbsolute(manifest.home))
         throw new Error('Private manifest scope invalid');
+      if (this.#options.nativeStockQueue && !manifest.approvedTaskPolicy)
+        throw new Error('Managed native stock queue requires explicit approved task policy');
       this.#taskId = manifest.taskId;
       this.#startupPhase = 'private-loaded';
       this.#registry = new ManagedWorkerRegistry(manifest.registryPath);
@@ -176,8 +201,26 @@ export class ManagedWorkerDaemon {
       this.#startupPhase = 'control-listening';
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
         if (!ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
-          scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId ||
-          scope.method !== 'turn/start') return false;
+          scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
+        if (this.#options.nativeStockQueue) {
+          const p = scope.params;
+          if (!stockInitialized || scope.method !== 'thread/queue/add' ||
+              p.threadId !== manifest.taskId || typeof p.clientUserMessageId !== 'string' ||
+              !uuid.test(p.clientUserMessageId) || !Array.isArray(p.input) || p.input.length !== 1 ||
+              !object(p.input[0]) || p.input[0].type !== 'text' ||
+              typeof p.input[0].text !== 'string' || !p.input[0].text ||
+              !isDeepStrictEqual(Object.keys(p).sort(),
+                ['threadId', 'clientUserMessageId', 'input'].sort()) ||
+              scope.operationId !== managedStockCommandId(manifest.epoch, manifest.taskId,
+                p.clientUserMessageId)) return false;
+          if (!this.#admissionOpen) {
+            const admitted = this.#host?.commandStatusForIntent(controlKey, {
+              operationId: scope.operationId, method: scope.method, params: scope.params });
+            return admitted?.state === 'dispatching';
+          }
+          return true;
+        }
+        if (scope.method !== 'turn/start') return false;
         const p = scope.params;
         const environment = this.#bootstrap?.initialState.environments;
         const inheritedEnvironment = Array.isArray(environment) && environment.length === 1 &&
@@ -203,6 +246,7 @@ export class ManagedWorkerDaemon {
         }
         return true;
       };
+      let stockInitialized = false;
       const allowAnswer = (request: AppServerServerRequest, result: Row): boolean => {
         const routes: Record<string, string> = {
           'item/tool/requestUserInput': 'thread-follower-submit-user-input',
@@ -221,7 +265,9 @@ export class ManagedWorkerDaemon {
       };
       this.#host = new ManagedWorkerFrontendHost({
         taskId: manifest.taskId, ownCwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
-        bootstrapReadMethods: ['thread/turns/list', 'config/read'],
+        bootstrapReadMethods: this.#options.nativeStockQueue ?
+          ['thread/turns/list', 'config/read', 'configRequirements/read'] :
+          ['thread/turns/list', 'config/read'],
         launch: () => {
           launchAttempted = true;
           this.#startupPhase = 'launching';
@@ -236,7 +282,16 @@ export class ManagedWorkerDaemon {
         commandPolicy: { controlKey, ownerEpoch: manifest.epoch,
           journalPath: path.join(state.privateDirectory, 'operations.sqlite'),
           fingerprintKey: Buffer.from(state.keys.fingerprintKey, 'base64'),
-          authorize: policy, isOwnerCurrent: ownerCurrent },
+          authorize: policy, isOwnerCurrent: ownerCurrent,
+          ...(this.#options.nativeStockQueue ? {
+            authorizeSettings: (scope: Parameters<ManagedStockSettingsInitializer['authorizesSettingsCommand']>[0]) =>
+              this.#stockInitializer?.authorizesSettingsCommand(scope) === true,
+            qualifySettingsEffect: (scope: Parameters<ManagedStockSettingsInitializer['qualifySettingsEffect']>[0],
+              assertCurrent: () => void) => {
+              if (!this.#stockInitializer) throw new Error('Managed stock initializer unavailable');
+              return this.#stockInitializer.qualifySettingsEffect(scope, assertCurrent);
+            },
+          } : {}) },
       });
       await this.#host.start();
       const meta = this.#host.metadata;
@@ -253,17 +308,53 @@ export class ManagedWorkerDaemon {
         taskId: manifest.taskId, cwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
         resumeParams: manifest.resumeParams,
         ...(manifest.approvedTaskPolicy ? { approvedTaskPolicy: manifest.approvedTaskPolicy } : {}) });
+      let initialized: Awaited<ReturnType<ManagedStockSettingsInitializer['initialize']>> | null = null;
+      if (this.#options.nativeStockQueue) {
+        this.#stockInitializer = createManagedStockSettingsInitializer({ host: this.#host,
+          adapterKey, controlKey, bootstrap: this.#bootstrap, taskId: manifest.taskId,
+          ownerEpoch: manifest.epoch, approvedTaskPolicy: manifest.approvedTaskPolicy!,
+          assertOwnerCurrent: () => { if (!ownerCurrent()) throw new Error('Worker owner changed'); } });
+        initialized = await this.#stockInitializer.initialize();
+        stockInitialized = true;
+      }
       this.#intentStore = new NativeStartIntentStore({ filePath: path.join(state.privateDirectory, 'start-intents.sqlite'),
         ownerEpoch: manifest.epoch, backendGeneration: meta.backendGeneration, threadId: manifest.taskId,
         encryptionKey: Buffer.from(state.keys.intentKey, 'base64') });
+      let ownedClient: DesktopIpcClient | null = null;
+      const confirmStockOwner = async (scope: Readonly<{taskId: string; ownerEpoch: string}>): Promise<boolean> => {
+        if (!this.#options.nativeStockQueue || scope.taskId !== manifest.taskId ||
+            scope.ownerEpoch !== manifest.epoch || !ownedClient || !ownerCurrent()) return false;
+        try {
+          await confirmManagedNativeOwner({ ownedClient, createProbeClient: this.#options.nativeStockQueue.createProbeClient,
+            taskId: manifest.taskId, assertOwnerCurrent: () => {
+              if (!ownerCurrent()) throw new Error('Worker owner changed');
+            } });
+          return ownerCurrent();
+        } catch { return false; }
+      };
+      const stock = this.#options.nativeStockQueue;
+      const queueAdapterFactory = stock && initialized ? createManagedStockQueueRuntimeFactory({
+        journalPath: path.join(state.privateDirectory, 'native-stock.sqlite'),
+        sourceGeneration: stock.sourceGeneration, bootstrap: this.#bootstrap,
+        initialized, approvedTaskPolicy: manifest.approvedTaskPolicy!,
+        assertControlledNativeBaseline: stock.assertControlledNativeBaseline,
+        confirmNativeOwner: confirmStockOwner, isOwnerCurrent: ownerCurrent,
+        admissionOpen: () => this.#admissionOpen,
+      }) : undefined;
       this.#owner = new ManagedWorkerNativeOwner({ host: this.#host, adapterKey, controlKey,
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, isOwnerCurrent: ownerCurrent,
-        allowFollower: this.#options.allowFollower, readInitialState: this.#bootstrap.readInitialState,
+        allowFollower: this.#options.allowFollower,
+        readInitialState: initialized ? initialized.readInitialState : this.#bootstrap.readInitialState,
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
+        ...(queueAdapterFactory ? { queueAdapterFactory } : {}),
         ...(manifest.approvedTaskPolicy ? {} : {
           qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),
         }),
-        clientFactory: this.#options.clientFactory });
+        clientFactory: handler => {
+          if (ownedClient) throw new Error('Native owner client already created');
+          ownedClient = this.#options.clientFactory(handler);
+          return ownedClient;
+        } });
       this.#startupPhase = 'owner-starting';
       try { await this.#owner.start(); }
       catch {
@@ -274,10 +365,20 @@ export class ManagedWorkerDaemon {
         if (native.state !== 'disconnected' || native.startupStage !== 'connecting' ||
           native.failure !== null) throw new Error('Native owner unavailable');
       }
-      const hostNow = this.#host.metadata;
-      if (!['connected', 'disconnected'].includes(this.#owner.metadata.state) ||
-        hostNow.state !== 'running' || hostNow.taskId !== manifest.taskId ||
-        hostNow.backendGeneration !== this.#generation || !ownerCurrent())
+      this.#stockInitializer?.close();
+      this.#stockInitializer = null;
+      const nativeOwnerConfirmed = stock ?
+        this.#owner.metadata.state === 'connected' &&
+          await confirmStockOwner({ taskId: manifest.taskId, ownerEpoch: manifest.epoch }) :
+        ['connected', 'disconnected'].includes(this.#owner.metadata.state);
+      const readyCurrent = (): boolean => {
+        const hostNow = this.#host!.metadata, nativeNow = this.#owner!.metadata;
+        return (stock ? nativeNow.state === 'connected' :
+          ['connected', 'disconnected'].includes(nativeNow.state)) &&
+          hostNow.state === 'running' && hostNow.taskId === manifest.taskId &&
+          hostNow.backendGeneration === this.#generation && ownerCurrent();
+      };
+      if (!nativeOwnerConfirmed || !readyCurrent())
         throw new Error('Native owner unavailable');
       this.#startupPhase = 'publishing-ready';
       if (!ownerCurrent()) throw new Error('Worker owner changed before publication');
@@ -285,6 +386,7 @@ export class ManagedWorkerDaemon {
       await writeEndpoint(state, { schemaVersion: 1, epoch: manifest.epoch, endpointRef,
         host: self, backend: this.#backend,
         control: { host: controlEndpoint.host, port: controlEndpoint.port } });
+      if (!readyCurrent()) throw new Error('Native owner changed before registry publication');
       this.#attempt = this.#registry.markReady(this.#attempt, self, this.#backend, endpointRef);
       this.#endpointRef = endpointRef;
       this.#state = 'ready';
@@ -292,6 +394,7 @@ export class ManagedWorkerDaemon {
       this.#admissionOpen = true;
       this.#scheduleReconnect();
     } catch {
+      this.#stockInitializer?.close(); this.#stockInitializer = null;
       this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
       // A native owner may already be connected when ready publication fails.
       // Retire only that gateway; the owned backend and diagnostic control stay available.
@@ -306,6 +409,7 @@ export class ManagedWorkerDaemon {
   }
 
   #backendExited(): void {
+    this.#stockInitializer?.close(); this.#stockInitializer = null;
     if (this.#state === 'stopping' || this.#state === 'stopped' || !this.#registry ||
       !this.#attempt || !this.#self || !this.#backend) return;
     this.#admissionOpen = false;
@@ -388,6 +492,12 @@ export class ManagedWorkerDaemon {
       const stable = () => identityCurrent() && owner.metadata.pendingNativeOperations === 0 &&
         owner.metadata.pendingEvents === 0;
       if (!stable() || generation === null) throw new ManagedWorkerStopRefusedError();
+      // Native reservation can precede every worker command. Empty backend
+      // receipts therefore cannot prove that the native journal is drained.
+      const nativeQueue = this.#options.nativeStockQueue ? owner.queueQuiescence() : null;
+      if (this.#options.nativeStockQueue && (!nativeQueue ||
+          nativeQueue.unresolved !== 0 || nativeQueue.unconsumed !== 0))
+        throw new ManagedWorkerStopRefusedError();
       // Usage counters can advance while these read-only checks run. Fence
       // conversation/authority changes, not an unrelated display revision.
       const semanticRevision = owner.metadata.semanticRevision;
@@ -426,9 +536,11 @@ export class ManagedWorkerDaemon {
       if (after.inFlight || after.unconfirmed || pending.unresolved || pending.generation !== generation ||
         !isDeepStrictEqual(host.acceptedCommandReceipts(controlKey), receipts) ||
         !isDeepStrictEqual(host.acceptedQueueInputs(controlKey), queueInputs) ||
+        this.#options.nativeStockQueue && !isDeepStrictEqual(owner.queueQuiescence(), nativeQueue) ||
         owner.metadata.semanticRevision !== semanticRevision || !stable()) throw new ManagedWorkerStopRefusedError();
       // Retire admitted grants before the last synchronous host-stop boundary.
       this.#state = 'stopping';
+      this.#stockInitializer?.close(); this.#stockInitializer = null;
       this.#clearReconnect();
       owner.close(); stopIssued = true;
       await host.stop('owner-request');
