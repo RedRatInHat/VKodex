@@ -3212,6 +3212,15 @@ test("resuming a goal wakes an idle live owner with an empty inherited turn and 
   }
 });
 
+test("goal continuation does not report success when no live owner accepts a turn", async () => {
+  const server = new Server(); server.rejectDiscovery = true;
+  const task = { ...ref, title: "Unloaded goal", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100));
+  await assert.rejects(adapter.continueGoal(task), TaskNotOpenError);
+  assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
+});
+
 test("starting placeholders without a turn ID are steered rather than mistaken for idle tasks", async () => {
   for (const canonical of [true, false]) {
     const server = new Server();

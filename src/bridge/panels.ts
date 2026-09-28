@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -516,9 +516,9 @@ export class TaskPanels {
         this.consume(input);
         const updated = await this.desktop.setGoal!(binding, { status: "active" });
         if (updated.status !== "active") throw new UncertainActionError();
-        await this.desktop.continueGoal?.(binding);
+        const note = await this.goalContinuationNote(binding, "Цель возобновлена. Новый ход запущен или уже выполняется.");
         const next = this.newState(input.peerId, binding.id, "goal");
-        await this.renderGoal(binding, next, "Цель возобновлена. Codex продолжит её автоматически.");
+        await this.renderGoal(binding, next, note);
         break;
       }
       case "goalClear": {
@@ -681,10 +681,26 @@ export class TaskPanels {
     const update = { objective, tokenBudget, ...(!current || current.status === "complete" ? { status: "active" as const } : {}) };
     const updated = await this.desktop.setGoal!(binding, update);
     if (updated.objective !== objective.trim() || updated.tokenBudget !== tokenBudget || ((!current || current.status === "complete") && updated.status !== "active")) throw new UncertainActionError();
-    if (!current || current.status === "complete") await this.desktop.continueGoal?.(binding);
+    const activationNote = !current || current.status === "complete"
+      ? await this.goalContinuationNote(binding, "Цель сохранена и активирована. Новый ход запущен или уже выполняется.")
+      : null;
     const next = this.newState(binding.peerId!, binding.id, "goal");
-    const note = !current || current.status === "complete" ? "Цель сохранена и активирована." : current.status === "active" ? "Активная цель обновлена." : "Цель обновлена; её прежний статус сохранён.";
+    const note = activationNote ?? (current?.status === "active" ? "Активная цель обновлена." : "Цель обновлена; её прежний статус сохранён.");
     await this.renderGoal(binding, next, note);
+  }
+
+  private async goalContinuationNote(binding: Binding, success: string): Promise<string> {
+    if (!this.desktop.continueGoal) return "Цель активна, но следующий ход не запущен: продолжение недоступно в этом подключении.";
+    try {
+      await this.desktop.continueGoal(binding);
+      return success;
+    } catch (error) {
+      if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError)
+        return `Цель активна, но следующий ход не запущен: ${error.message}`;
+      if (error instanceof DesktopUnavailableError || error instanceof UncertainActionError)
+        return "Цель активна, но запуск следующего хода не подтверждён. Проверь состояние задачи в Codex; не повторяй команду вслепую.";
+      throw error;
+    }
   }
 
   private async models(binding: Binding, requestedPage: number): Promise<void> {

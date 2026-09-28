@@ -529,6 +529,18 @@ test("task goals can be inspected, budgeted, paused, resumed and cleared without
   assert.equal(s.desktop.submissions.length, 0);
 });
 
+test("goal resume reports active state without claiming a turn started when the owner is absent", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.continueGoal = async () => { throw new TaskNotOpenError(); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(s.desktop.goal?.status, "active");
+  assert.match(panelView(s).text, /следующий ход не запущен/u);
+  assert.doesNotMatch(panelView(s).text, /продолжит её автоматически/u);
+});
+
 test("custom goal budgets are validated and preserve a paused goal while editing", async t => {
   const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Old", status: "paused", tokenBudget: 50_000, tokensUsed: 12_500, timeUsedSeconds: 3_700, createdAt: 1_788_000_000, updatedAt: 1_788_000_100 };

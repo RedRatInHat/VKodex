@@ -22,6 +22,8 @@ export interface CodexTaskOwner {
   getGoal(task: TaskRef): Promise<TaskGoal | null>;
   setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal(task: TaskRef): Promise<boolean>;
+  /** Must confirm a continuation turn or an already running turn. */
+  continueGoal?(task: TaskRef): Promise<void>;
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]>;
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
@@ -266,8 +268,12 @@ export class RoutedCodexTasks implements CodexTasks {
   async continueGoal(task: TaskRef): Promise<void> {
     const owner = this.owner(task);
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
-    if (owner) return Promise.resolve();
-    return this.base.continueGoal?.(task) ?? Promise.resolve();
+    if (owner) {
+      if (!owner.continueGoal) throw new ActionRejectedError("Автоматическое продолжение цели недоступно для этого владельца задачи.");
+      return owner.continueGoal(task);
+    }
+    if (!this.base.continueGoal) throw new ActionRejectedError("Автоматическое продолжение цели недоступно в этом подключении.");
+    return this.base.continueGoal(task);
   }
   async revealTask(task: TaskRef): Promise<void> { this.refuseExclusive(task); return this.base.revealTask?.(task) ?? Promise.resolve(); }
   async ensureOpen(task: TaskRef): Promise<void> {

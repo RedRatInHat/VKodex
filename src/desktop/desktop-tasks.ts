@@ -139,25 +139,19 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
 
   async continueGoal(task: TaskRef): Promise<void> {
-    try {
-      await this.follow(task, async (subscription, client) => {
-        const state = subscription.current!;
-        if (submissionMode(state) === "steer") return;
-        const reply = await client.request("thread-follower-start-turn", 2, {
-          conversationId: task.threadId,
-          turnStart: {
-            request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
-            context: { inheritThreadSettings: true },
-          },
-        }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
-        const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
-        if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
-      });
-    } catch (error) {
-      // A goal set through app-server is persistent and can resume an unloaded
-      // task itself. The empty live turn above only wakes an already open owner.
-      if (!(error instanceof TaskNotOpenError)) throw error;
-    }
+    await this.follow(task, async (subscription, client) => {
+      const state = subscription.current!;
+      if (submissionMode(state) === "steer") return;
+      const reply = await client.request("thread-follower-start-turn", 2, {
+        conversationId: task.threadId,
+        turnStart: {
+          request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
+          context: { inheritThreadSettings: true },
+        },
+      }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
+      const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+      if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+    });
   }
 
   /** Connect only to an owner that is already online. This method must never
