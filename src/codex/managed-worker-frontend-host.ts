@@ -211,6 +211,11 @@ export class ManagedWorkerFrontendHost {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.acceptedReceipts(controlKey);
   }
+  /** Accepted queue identities only. The caller must prove their terminal consumption. */
+  acceptedQueueInputs(controlKey: object): ReadonlyArray<Readonly<{ clientUserMessageId: string; submissionId: string }>> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.acceptedQueueInputs(controlKey);
+  }
 
   /** Read-only pending server-request evidence for the live generation. An
    * answered request remains counted until its responseWritten receipt. */

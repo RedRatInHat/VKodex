@@ -147,6 +147,27 @@ test('accepted receipt IDs are durable metadata for terminal history drain', () 
   finally { reopened.close(); }
 });
 
+test('accepted queue input identities survive reopen without being treated as turn IDs', () => {
+  const scope = fixture(), journal = new ManagedWorkerOperationJournal(scope);
+  const first = journal.reserve({ ...intent(), method: 'thread/queue/add' }).operation;
+  assert.deepEqual(journal.acceptedQueueInputs(), []);
+  journal.accept(first, 'native-submission-id');
+  const direct = journal.reserve(intent()).operation;
+  journal.accept(direct, 'native-turn-id');
+  const unknown = journal.reserve({ ...intent(), method: 'thread/queue/add' }).operation;
+  journal.markUnknown(unknown);
+  journal.close();
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try {
+    const inputs = reopened.acceptedQueueInputs();
+    assert.deepEqual(inputs, [{ clientUserMessageId: first.clientUserMessageId,
+      submissionId: 'native-submission-id' }]);
+    assert.equal(Object.isFrozen(inputs), true);
+    assert.equal(Object.isFrozen(inputs[0]), true);
+    assert.equal(reopened.hasUnconfirmed(), true);
+  } finally { reopened.close(); }
+});
+
 test('settings intent uses the same scoped journal and atomically blocks turn admission without a receipt', () => {
   const scope = fixture(), settingsId = randomUUID();
   const a = new ManagedWorkerOperationJournal(scope);

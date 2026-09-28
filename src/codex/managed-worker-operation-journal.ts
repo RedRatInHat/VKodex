@@ -159,6 +159,19 @@ export class ManagedWorkerOperationJournal {
     return Object.freeze(rows.map(row => Object.freeze({ method: row.method, receiptId: row.receipt_id! })));
   }
 
+  /** Accepted queue submissions require a separate terminal-history join on
+   * client identity. A submission ID is never a turn ID or a drain proof. */
+  acceptedQueueInputs(): ReadonlyArray<Readonly<{ clientUserMessageId: string; submissionId: string }>> {
+    const rows = this.db.prepare(`SELECT client_user_message_id,receipt_id
+      FROM managed_worker_operations WHERE state='accepted' AND method='thread/queue/add' ORDER BY rowid`)
+      .all() as Array<{ client_user_message_id: string; receipt_id: string | null }>;
+    if (rows.some(row => typeof row.client_user_message_id !== 'string' || !row.client_user_message_id ||
+        typeof row.receipt_id !== 'string' || !row.receipt_id))
+      throw new Error('Accepted queue identity unavailable');
+    return Object.freeze(rows.map(row => Object.freeze({ clientUserMessageId: row.client_user_message_id,
+      submissionId: row.receipt_id! })));
+  }
+
   get(operationId: string): WorkerOperation | null {
     const id = validUuid(operationId, "operation ID");
     const row = this.db.prepare("SELECT * FROM managed_worker_operations WHERE operation_id=?").get(id) as OperationRow | undefined;

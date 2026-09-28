@@ -215,6 +215,10 @@ export class ManagedWorkerCommandDispatcher {
     this.#authenticate(key);
     return this.#journal.acceptedReceipts();
   }
+  acceptedQueueInputs(key: object): ReadonlyArray<Readonly<{ clientUserMessageId: string; submissionId: string }>> {
+    this.#authenticate(key);
+    return this.#journal.acceptedQueueInputs();
+  }
   /**
    * Read-only attested lookup for an immutable native intent. It never calls
    * authorization, reserves a journal row, or writes to the backend.
