@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
+import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
 
 
 
@@ -25,6 +26,7 @@ export interface ManagedWorkerPrivateManifest {
   readonly cliSha256: string;
   readonly initializeRequest: JsonObject;
   readonly resumeParams: JsonObject;
+  readonly approvedTaskPolicy?: ApprovedTaskPolicy;
   readonly registryPath: string;
 }
 
@@ -107,12 +109,27 @@ function exactKey(value: unknown): string {
 function manifest(value: unknown): ManagedWorkerPrivateManifest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail();
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).length !== 11 || item.schemaVersion !== 1) fail();
+  const legacyKeys = ["schemaVersion", "epoch", "taskId", "familyRoot", "home", "cwd", "cliPath",
+    "cliSha256", "initializeRequest", "resumeParams", "registryPath"];
+  const withPolicy = Object.hasOwn(item, "approvedTaskPolicy");
+  const expected = withPolicy ? [...legacyKeys, "approvedTaskPolicy"] : legacyKeys;
+  if (Object.keys(item).length !== expected.length || expected.some(key => !Object.hasOwn(item, key)) ||
+    item.schemaVersion !== 1) fail();
   const epoch = bounded(item.epoch, 36); if (!UUID.test(epoch)) fail();
   const cliSha256 = bounded(item.cliSha256, 64); if (!SHA256.test(cliSha256)) fail();
+  const taskId = bounded(item.taskId, 256), cwd = absolute(item.cwd);
+  const resumeParams = object(item.resumeParams);
+  let approvedTaskPolicy: ApprovedTaskPolicy | undefined;
+  if (withPolicy) {
+    try {
+      approvedTaskPolicy = approveTaskPolicy(item.approvedTaskPolicy);
+      assertApprovedResumeIntent(approvedTaskPolicy, resumeParams, taskId, cwd);
+    } catch { fail(); }
+  }
   return Object.freeze({ schemaVersion: 1, epoch, taskId: bounded(item.taskId, 256), familyRoot: bounded(item.familyRoot, 256),
-    home: absolute(item.home), cwd: absolute(item.cwd), cliPath: absolute(item.cliPath), cliSha256: cliSha256.toLowerCase(),
-    initializeRequest: object(item.initializeRequest), resumeParams: object(item.resumeParams), registryPath: absolute(item.registryPath) });
+    home: absolute(item.home), cwd, cliPath: absolute(item.cliPath), cliSha256: cliSha256.toLowerCase(),
+    initializeRequest: object(item.initializeRequest), resumeParams, registryPath: absolute(item.registryPath),
+    ...(approvedTaskPolicy ? { approvedTaskPolicy } : {}) });
 }
 function keyBundle(value: unknown): ManagedWorkerPrivateKeyBundle {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail();

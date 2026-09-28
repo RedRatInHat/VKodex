@@ -16,7 +16,8 @@ export interface ApprovedTaskPolicy {
   readonly activePermissionProfile: Readonly<{ id: string; extends: string | null }>;
   readonly sandbox: Readonly<{ type: 'readOnly'; networkAccess: boolean } |
     { type: 'workspaceWrite'; writableRoots: readonly string[]; networkAccess: boolean;
-      excludeTmpdirEnvVar: boolean; excludeSlashTmp: boolean }>;
+      excludeTmpdirEnvVar: boolean; excludeSlashTmp: boolean } |
+    { type: 'dangerFullAccess' }>;
   readonly serviceTier: string | null;
 }
 
@@ -68,6 +69,7 @@ function environments(value: unknown, cwd: string, roots: readonly string[]): bo
 }
 function sandbox(value: unknown, cwd: string): boolean {
   if (!row(value)) return false;
+  if (value.type === 'dangerFullAccess') return keys(value, ['type']);
   if (value.type === 'readOnly') return keys(value, ['type', 'networkAccess']) &&
     typeof value.networkAccess === 'boolean';
   if (value.type === 'workspaceWrite') return keys(value, ['type', 'writableRoots',
@@ -79,6 +81,7 @@ function sandbox(value: unknown, cwd: string): boolean {
 }
 function sameSandbox(value: unknown, approved: ApprovedTaskPolicy['sandbox']): boolean {
   if (!row(value) || value.type !== approved.type) return false;
+  if (approved.type === 'dangerFullAccess') return keys(value, ['type']);
   if (approved.type === 'readOnly') return keys(value, ['type', 'networkAccess']) &&
     value.networkAccess === approved.networkAccess;
   return keys(value, ['type', 'writableRoots', 'networkAccess',
@@ -114,6 +117,22 @@ export function approveTaskPolicy(input: unknown): ApprovedTaskPolicy {
   const cloned: unknown = structuredClone(input);
   if (!row(cloned) || !isDeepStrictEqual(input, cloned)) invalid();
   return freezeTree(cloned) as unknown as ApprovedTaskPolicy;
+}
+
+/** Validates the sole explicit initial thread/resume request before any worker RPC or reservation. */
+export function assertApprovedResumeIntent(policy: ApprovedTaskPolicy, resume: unknown,
+  threadId: string, cwd: string): void {
+  if (!row(resume) || !keys(resume, ['threadId', 'cwd', 'model', 'permissions',
+    'approvalPolicy', 'runtimeWorkspaceRoots', 'config']) ||
+    policy.threadId !== threadId || !samePath(policy.cwd, cwd) ||
+    !samePaths(policy.runtimeWorkspaceRoots, [cwd]) ||
+    resume.threadId !== threadId || !samePath(resume.cwd, cwd) ||
+    resume.model !== policy.model ||
+    resume.permissions !== policy.activePermissionProfile.id ||
+    resume.approvalPolicy !== policy.approvalPolicy ||
+    !samePaths(resume.runtimeWorkspaceRoots, policy.runtimeWorkspaceRoots) ||
+    !row(resume.config) || !keys(resume.config, ['model_reasoning_effort']) ||
+    resume.config.model_reasoning_effort !== policy.effort) mismatch();
 }
 
 /** Compares a native v2 thread/resume effective result; it never admits a command.

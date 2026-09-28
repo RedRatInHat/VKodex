@@ -7,6 +7,8 @@ import path from 'node:path';
 import { createProjection } from '../codex/managed-native-projection.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import type { ManagedWorkerFrontendHost } from '../codex/managed-worker-frontend-host.js';
+import { approveTaskPolicy, assertApprovedResumeIntent, assertEffectiveResume,
+  type ApprovedTaskPolicy } from '../codex/managed-task-policy.js';
 
 type Row = Record<string, unknown>;
 type ReadMethod = 'thread/read' | 'thread/turns/list' | 'thread/goal/get' | 'thread/queue/list' | 'config/read';
@@ -24,6 +26,8 @@ export interface ManagedWorkerBootstrapOptions {
   readonly initializeRequest: Row;
   /** Exact owner-authorized, immutable read-only resume params; no inferred defaults. */
   readonly resumeParams: Row;
+  /** Owner-approved, immutable opt-in. Omission preserves the legacy canary policy. */
+  readonly approvedTaskPolicy?: ApprovedTaskPolicy;
 }
 export interface ComposerDefaults {
   readonly taskId: string;
@@ -85,6 +89,18 @@ function samePath(a: unknown, b: string): boolean {
   return typeof a === 'string' &&
     path.win32.normalize(a).toLowerCase() === path.win32.normalize(b).toLowerCase();
 }
+function samePaths(a: unknown, b: readonly string[]): boolean {
+  return Array.isArray(a) && a.length === b.length &&
+    a.every((value, index) => samePath(value, b[index]!));
+}
+function sameEnvironments(a: unknown, policy: ApprovedTaskPolicy): boolean {
+  return Array.isArray(a) && a.length === policy.environments.length &&
+    a.every((value, index) => object(value) &&
+      strictKeys(value, ['environmentId', 'cwd', 'runtimeWorkspaceRoots']) &&
+      value.environmentId === policy.environments[index]!.environmentId &&
+      samePath(value.cwd, policy.environments[index]!.cwd) &&
+      samePaths(value.runtimeWorkspaceRoots, policy.environments[index]!.runtimeWorkspaceRoots));
+}
 function jsonCopy<T>(value: T): T {
   let decoded: unknown;
   try {
@@ -108,23 +124,28 @@ function freezeTree<T>(value: T): T {
 function strictKeys(value: Row, keys: readonly string[]): boolean {
   return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
-function scope(options: ManagedWorkerBootstrapOptions): { generation: number; resume: Row; initialize: Row } {
+function scope(options: ManagedWorkerBootstrapOptions): { generation: number; resume: Row; initialize: Row;
+  policy: ApprovedTaskPolicy | undefined } {
   if (!options || !options.host || !options.adapterKey || typeof options.adapterKey !== 'object' ||
     typeof options.taskId !== 'string' || !options.taskId || typeof options.cwd !== 'string' || !options.cwd ||
     !object(options.resumeParams) || !object(options.initializeRequest)) fail('invalid-options');
   const resume = jsonCopy(options.resumeParams), initialize = jsonCopy(options.initializeRequest);
-  if (!strictKeys(resume, ['threadId', 'cwd', 'model', 'permissions', 'approvalPolicy', 'runtimeWorkspaceRoots', 'config']) ||
+  const policy = Object.hasOwn(options, 'approvedTaskPolicy')
+    ? approveTaskPolicy(options.approvedTaskPolicy) : undefined;
+  if (policy) assertApprovedResumeIntent(policy, resume, options.taskId, options.cwd);
+  if (!policy && (!strictKeys(resume, ['threadId', 'cwd', 'model', 'permissions', 'approvalPolicy', 'runtimeWorkspaceRoots', 'config']) ||
     resume.threadId !== options.taskId || !samePath(resume.cwd, options.cwd) ||
     resume.model !== 'gpt-5.6-sol' || resume.permissions !== ':read-only' ||
     resume.approvalPolicy !== 'never' || !isDeepStrictEqual(resume.runtimeWorkspaceRoots, [options.cwd]) ||
     !object(resume.config) || !strictKeys(resume.config, ['model_reasoning_effort']) ||
-    resume.config.model_reasoning_effort !== 'low' || !object(initialize.clientInfo) ||
+    resume.config.model_reasoning_effort !== 'low') ||
+    !object(initialize.clientInfo) ||
     !object(initialize.capabilities)) fail('unqualified-resume-policy');
   const metadata = options.host.metadata;
   if (metadata.state !== 'running' || metadata.taskId !== options.taskId ||
     !Number.isSafeInteger(metadata.backendGeneration) || (metadata.backendGeneration ?? 0) < 1)
     fail('host-generation-unavailable');
-  return { generation: metadata.backendGeneration as number, resume, initialize };
+  return { generation: metadata.backendGeneration as number, resume, initialize, policy };
 }
 function current(host: ManagedWorkerBootstrapOptions['host'], taskId: string, generation: number): void {
   const metadata = host.metadata;
@@ -273,7 +294,9 @@ async function noGoalOrQueue(client: FrontendReader, taskId: string): Promise<vo
   if (goal.goal !== null || !Array.isArray(queue.data) || queue.data.length !== 0 || queue.nextCursor !== null)
     fail('goal-or-queue-not-empty');
 }
-function qualifiedStart(start: Row, taskId: string, cwd: string): void {
+function qualifiedStart(start: Row, taskId: string, cwd: string,
+  policy?: ApprovedTaskPolicy): void {
+  if (policy) { assertEffectiveResume(policy, start); return; }
   if (!object(start.thread) || start.thread.id !== taskId || !samePath(start.cwd, cwd) ||
     start.model !== 'gpt-5.6-sol' || start.reasoningEffort !== 'low' ||
     start.approvalPolicy !== 'never' || !object(start.activePermissionProfile) ||
@@ -281,7 +304,11 @@ function qualifiedStart(start: Row, taskId: string, cwd: string): void {
     start.sandbox.type !== 'readOnly' || start.sandbox.networkAccess !== false ||
     !isDeepStrictEqual(start.runtimeWorkspaceRoots, [cwd])) fail('resume-settings-unqualified');
 }
-function exposedInitialSettings(thread: Row, start: Row, cwd: string): void {
+function exposedInitialSettings(thread: Row, start: Row, cwd: string,
+  policy?: ApprovedTaskPolicy): void {
+  if (policy && (thread.model !== policy.model || thread.modelProvider !== policy.modelProvider ||
+    thread.reasoningEffort !== policy.effort || !samePath(thread.cwd, cwd) ||
+    !sameEnvironments(thread.environments, policy))) fail('actual-thread-settings-drift');
   if ((Object.hasOwn(thread, 'model') && thread.model !== start.model) ||
     (Object.hasOwn(thread, 'reasoningEffort') && thread.reasoningEffort !== start.reasoningEffort) ||
     (Object.hasOwn(thread, 'cwd') && !samePath(thread.cwd, cwd)) ||
@@ -304,11 +331,32 @@ function defaultsOf(configResult: Row, taskId: string, cwd: string): ComposerDef
   return Object.freeze({ taskId, cwd, summary: summary as ComposerDefaults['summary'],
     personality: personality as ComposerDefaults['personality'] });
 }
-function initialProjection(start: Row, read: Row, taskId: string, cwd: string): NativeProjectionState {
+function initialProjection(start: Row, read: Row, taskId: string, cwd: string,
+  policy?: ApprovedTaskPolicy): NativeProjectionState {
   const thread = threadOf(read, taskId, cwd, ['idle']);
   if ((thread.turns as unknown[]).length !== 0) fail('initial-history-not-empty');
   const state = createProjection(start, { thread: { ...thread, turns: [] } },
     { hostId: 'local', workspaceKind: 'projectless', environments: [] });
+  if (policy) {
+    const permissions = state.currentPermissions, settings = state.latestThreadSettings;
+    if (state.id !== taskId || state.resumeState !== 'resumed' || !samePath(state.cwd, cwd) ||
+      state.latestModel !== policy.model || state.latestReasoningEffort !== policy.effort ||
+      state.modelProvider !== policy.modelProvider ||
+      settings.model !== policy.model || settings.effort !== policy.effort ||
+      settings.approvalPolicy !== policy.approvalPolicy ||
+      settings.approvalsReviewer !== policy.approvalsReviewer ||
+      settings.serviceTier !== policy.serviceTier ||
+      !isDeepStrictEqual(settings.activePermissionProfile, policy.activePermissionProfile) ||
+      !isDeepStrictEqual(settings.sandboxPolicy, start.sandbox) ||
+      !isDeepStrictEqual(permissions.activePermissionProfile, policy.activePermissionProfile) ||
+      !isDeepStrictEqual(permissions.runtimeWorkspaceRoots, start.runtimeWorkspaceRoots) ||
+      permissions.approvalPolicy !== policy.approvalPolicy ||
+      permissions.approvalsReviewer !== policy.approvalsReviewer ||
+      !isDeepStrictEqual(permissions.sandboxPolicy, start.sandbox) ||
+      !sameEnvironments(state.environments, policy))
+      fail('initial-projection-unqualified');
+    return state;
+  }
   if (state.id !== taskId || state.resumeState !== 'resumed' || !samePath(state.cwd, cwd) ||
     state.latestModel !== 'gpt-5.6-sol' || state.latestReasoningEffort !== 'low' ||
     !object(state.currentPermissions.activePermissionProfile) ||
@@ -402,7 +450,7 @@ async function continuationPhase(reader: FrontendReader, taskId: string, cwd: st
 
 /** Qualifies one already-running, owner-scoped backend. Never launches or stops it. */
 export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOptions): Promise<ManagedWorkerBootstrap> {
-  const { generation, resume, initialize } = scope(options);
+  const { generation, resume, initialize, policy } = scope(options);
   const host = options.host, adapterKey = options.adapterKey, taskId = options.taskId, cwd = options.cwd;
   const guard = () => current(host, taskId, generation);
   const withReader = async <T>(work: (reader: FrontendReader) => Promise<T>,
@@ -420,22 +468,22 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
       fail('pre-resume-history-not-empty');
     await noGoalOrQueue(reader, taskId);
     const start = await reader.request('thread/resume', resume);
-    qualifiedStart(start, taskId, cwd);
+    qualifiedStart(start, taskId, cwd, policy);
     const defaults = defaultsOf(await reader.request('config/read', { cwd, includeLayers: false }),
       taskId, cwd);
     const read = await reader.request('thread/read', { threadId: taskId, includeTurns: true });
-    exposedInitialSettings(threadOf(read, taskId, cwd, ['idle']), start, cwd);
+    exposedInitialSettings(threadOf(read, taskId, cwd, ['idle']), start, cwd, policy);
     await noGoalOrQueue(reader, taskId);
     if ((await fullHistory(reader, taskId)).length !== 0) fail('initial-history-not-empty');
     return { start: freezeTree(jsonCopy(start)), defaults,
-      state: freezeTree(initialProjection(start, read, taskId, cwd)) };
+      state: freezeTree(initialProjection(start, read, taskId, cwd, policy)) };
   });
   const readInitialState = async (): Promise<NativeProjectionState> => withReader(async reader => {
     const read = await reader.request('thread/read', { threadId: taskId, includeTurns: true });
-    exposedInitialSettings(threadOf(read, taskId, cwd, ['idle']), qualified.start, cwd);
+    exposedInitialSettings(threadOf(read, taskId, cwd, ['idle']), qualified.start, cwd, policy);
     await noGoalOrQueue(reader, taskId);
     if ((await fullHistory(reader, taskId)).length !== 0) fail('initial-history-not-empty');
-    const state = initialProjection(qualified.start, read, taskId, cwd);
+    const state = initialProjection(qualified.start, read, taskId, cwd, policy);
     if (!isDeepStrictEqual(state.latestThreadSettings, qualified.state.latestThreadSettings) ||
       !isDeepStrictEqual(state.currentPermissions, qualified.state.currentPermissions) ||
       !isDeepStrictEqual(state.environments, qualified.state.environments)) fail('initial-settings-drift');
@@ -468,6 +516,8 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
     });
   };
   const qualifyContinuation = async (ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence> => {
+    // The typed continuation compiler still admits the legacy read-only tuple only.
+    if (policy) fail('opt-in-continuation-not-qualified');
     if (typeof ownerFence !== 'function') fail('continuation-owner-fence-required');
     // The caller owns this semantic counter: settings, turn, pending-request,
     // queue and owner-reconnect transitions must advance it. Token usage and

@@ -8,6 +8,7 @@ import test from 'node:test';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { launchManagedWorker, ManagedWorkerLaunchError } from '../src/desktop/managed-worker-launcher.js';
 import { buildManagedWorkerEnvironment, buildDetachedWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
+import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), 'vkodex-launcher-'));
@@ -73,6 +74,32 @@ test('launch reserves before protecting state and detaches without secret argume
   assert.deepEqual(order, ['protect', 'spawn', 'unref']);
   assert.deepEqual(result, { epoch, state: 'dispatched', pid: 1234 });
   await assert.rejects(launchManagedWorker(options, { protectState: async () => { throw new Error('should not run'); } }), /already reserved/);
+});
+
+test('opt-in launch snapshots explicit policy and rejects changed resume before reservation', async () => {
+  const { options } = fixture();
+  const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21c';
+  const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+    effort: 'high', cwd: options.cwd, runtimeWorkspaceRoots: [options.cwd], environments: [],
+    approvalPolicy: 'never', approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':danger-full-access', extends: null },
+    sandbox: { type: 'dangerFullAccess' }, serviceTier: null });
+  const resumeParams = { threadId: taskId, cwd: options.cwd, model: policy.model,
+    permissions: policy.activePermissionProfile.id, approvalPolicy: policy.approvalPolicy,
+    runtimeWorkspaceRoots: [options.cwd], config: { model_reasoning_effort: policy.effort } };
+  let protectedManifest: unknown;
+  const input = { ...options, taskId, familyRoot: taskId, approvedTaskPolicy: policy, resumeParams };
+  await assert.rejects(launchManagedWorker({ ...input,
+    resumeParams: { ...resumeParams, model: 'unapproved' } }, {
+    protectState: async () => { throw new Error('must not protect'); },
+  }), /effective resume differs/i);
+  const db = new ManagedWorkerRegistry(options.registryPath);
+  try { assert.equal(db.get(options.home, taskId), null); } finally { db.close(); }
+  await launchManagedWorker(input, { protectState: async manifest => { protectedManifest = manifest; },
+    spawn: () => { const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
+      queueMicrotask(() => child.emit('spawn')); return child; } });
+  assert.deepEqual((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy, policy);
+  assert.equal(Object.isFrozen((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy), true);
 });
 
 test('private-state failure keeps reservation and never starts a worker or leaks error content', async () => {

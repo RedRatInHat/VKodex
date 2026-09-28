@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createManagedWorkerPrivateState, loadManagedWorkerPrivateState, type ManagedWorkerPrivateManifest, type ManagedWorkerPrivateStateFilesystem, type ManagedWorkerPrivateStateProtector, type ManagedWorkerPrivateStatePowerShellRunner } from "../src/desktop/managed-worker-private-state.js";
+import { approveTaskPolicy } from "../src/codex/managed-task-policy.js";
 
 const epoch = "11111111-1111-4111-8111-111111111111";
 const fixturePath = (...parts: string[]): string => process.platform === "win32" ? path.win32.join("C:\\fixture", ...parts) : path.join("/fixture", ...parts);
@@ -32,6 +33,33 @@ class MemoryFilesystem implements ManagedWorkerPrivateStateFilesystem {
 }
 
 const options = (filesystem: MemoryFilesystem) => ({ baseDirectory: fixturePath("private", "managed"), protector: new IdentityProtector(), filesystem });
+
+test("optional approved policy roundtrips immutably; unknown and mismatched policy fields fail closed", async () => {
+  const filesystem = new MemoryFilesystem();
+  const taskId = "01a0e498-4fa0-74c0-a795-c5047a06d21c";
+  const base = { ...manifest(), taskId, familyRoot: taskId,
+    resumeParams: { threadId: taskId, cwd: fixturePath("workspace"), model: "gpt-6-luna",
+      permissions: ":danger-full-access", approvalPolicy: "never",
+      runtimeWorkspaceRoots: [fixturePath("workspace")], config: { model_reasoning_effort: "high" } } };
+  const policy = approveTaskPolicy({ threadId: taskId, model: "gpt-6-luna", modelProvider: "openai",
+    effort: "high", cwd: base.cwd, runtimeWorkspaceRoots: [base.cwd], environments: [],
+    approvalPolicy: "never", approvalsReviewer: "user",
+    activePermissionProfile: { id: ":danger-full-access", extends: null },
+    sandbox: { type: "dangerFullAccess" }, serviceTier: null });
+  const created = await createManagedWorkerPrivateState({ ...base, approvedTaskPolicy: policy }, options(filesystem));
+  assert.equal(Object.isFrozen(created.manifest.approvedTaskPolicy?.sandbox), true);
+  const loaded = await loadManagedWorkerPrivateState({ ...options(filesystem), epoch });
+  assert.deepEqual(loaded.manifest.approvedTaskPolicy, policy);
+  const [filePath, encoded] = [...filesystem.values.entries()][0]!;
+  const payload = JSON.parse(Buffer.from(encoded).toString("utf8")) as { manifest: Record<string, unknown> };
+  payload.manifest.approvedTaskPolicy = { ...policy, model: "different" };
+  filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
+  await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
+  payload.manifest.approvedTaskPolicy = policy;
+  payload.manifest.unreviewed = true;
+  filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
+  await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
+});
 
 test("private state is scoped, immutable, and directory protection precedes exclusive write", async () => {
   const filesystem = new MemoryFilesystem();

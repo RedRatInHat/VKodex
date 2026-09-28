@@ -5,9 +5,10 @@ import { once } from 'node:events';
 import test from 'node:test';
 import { bootstrapManagedWorker } from '../src/desktop/managed-worker-bootstrap.js';
 import { compileNativeReadOnlyComposerStart } from '../src/codex/native-composer-start.js';
+import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 
 type Row = Record<string, unknown>;
-const taskId = 'own-zero-turn';
+const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21c';
 const cwd = 'C:/own-workspace';
 const initializeRequest: Row = { clientInfo: { name: 'fixture', version: '1' },
   capabilities: { experimentalApi: true } };
@@ -42,6 +43,9 @@ class BackendFixture {
   generationFlipMethod: string | null = null;
   idOnlyBenignNotifications = false;
   stopCalls = 0;
+  effectiveOverride: Row | null = null;
+  threadOverrides: Row = {};
+  expectedResume: Row = resumeParams;
   constructor() {
     this.server = createServer(socket => {
       this.sockets.add(socket); socket.once('close', () => this.sockets.delete(socket));
@@ -101,12 +105,12 @@ class BackendFixture {
       if (Object.keys(params).length === 1 && params.threadId === taskId) {
         this.idOnlyResumeCount++;
         this.onIdOnly?.();
-      } else { assert.deepEqual(params, resumeParams); this.resumeCount++; }
+      } else { assert.deepEqual(params, this.expectedResume); this.resumeCount++; }
       return { thread: this.thread('idle'), cwd, model: 'gpt-5.6-sol', reasoningEffort: 'low',
         approvalPolicy: this.idOnlyResumeCount ? this.idOnlyApprovalPolicy : 'never',
         approvalsReviewer: 'user', activePermissionProfile: { id: ':read-only' },
         sandbox: { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [cwd],
-        serviceTier: null };
+        serviceTier: null, ...(this.effectiveOverride ?? {}) };
     }
     if (method === 'thread/read') return { thread: this.thread(this.resumeCount ? 'idle' : this.beforeStatus) };
     if (method === 'thread/turns/list') return { data: this.turns.map(turn => ({ ...turn, itemsView: 'full' })),
@@ -121,11 +125,89 @@ class BackendFixture {
       cwd: this.readCwd, model: this.exposedModel ?? 'gpt-5.6-sol', reasoningEffort: 'low',
       status: { type: status }, turns: this.turns.map(turn => this.readTurnStatusOverride === null ? turn :
         { ...turn, status: this.readTurnStatusOverride }),
-      environments: [{ environmentId: 'local', cwd, runtimeWorkspaceRoots: [cwd] }] };
+      environments: [{ environmentId: 'local', cwd, runtimeWorkspaceRoots: [cwd] }],
+      ...this.threadOverrides };
   }
 }
 const options = (fixture: BackendFixture) => ({ host: fixture.host, adapterKey: fixture.adapterKey,
   taskId, cwd, initializeRequest, resumeParams });
+
+test('opt-in approved policy qualifies exact native model, profile, sandbox, environment and rejects drift', async () => {
+  for (const sandbox of [
+    { type: 'readOnly', networkAccess: false },
+    { type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false,
+      excludeTmpdirEnvVar: true, excludeSlashTmp: true },
+    { type: 'dangerFullAccess' },
+  ]) {
+    const fixture = new BackendFixture(); await fixture.listen();
+    try {
+      const profile = { id: sandbox.type === 'dangerFullAccess' ? ':danger-full-access' :
+        sandbox.type === 'workspaceWrite' ? ':workspace-write' : ':read-only', extends: null };
+      const environments = [{ environmentId: 'local' as const, cwd, runtimeWorkspaceRoots: [cwd] }];
+      const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+        effort: 'high', cwd, runtimeWorkspaceRoots: [cwd], environments,
+        approvalPolicy: 'never', approvalsReviewer: 'user', activePermissionProfile: profile,
+        sandbox, serviceTier: null });
+      const exposedEnvironments = sandbox.type === 'readOnly'
+        ? [{ environmentId: 'local', cwd: 'c:\\OWN-WORKSPACE',
+          runtimeWorkspaceRoots: ['c:\\own-workspace'] }] : environments;
+      fixture.threadOverrides = { model: policy.model, modelProvider: policy.modelProvider,
+        reasoningEffort: policy.effort, environments: exposedEnvironments };
+      fixture.effectiveOverride = { model: policy.model, modelProvider: policy.modelProvider,
+        reasoningEffort: policy.effort, activePermissionProfile: profile, sandbox };
+      const approvedResume = { ...resumeParams, model: policy.model, permissions: profile.id,
+        config: { model_reasoning_effort: policy.effort } };
+      fixture.expectedResume = structuredClone(approvedResume);
+      const givenResume = structuredClone(approvedResume);
+      const givenPolicy = structuredClone(policy);
+      const pending = bootstrapManagedWorker({ ...options(fixture),
+        resumeParams: givenResume, approvedTaskPolicy: givenPolicy });
+      // Scope is copied before the first awaited native read.
+      (givenResume as Row).model = 'caller-mutated';
+      (givenPolicy as unknown as Row).model = 'caller-mutated';
+      const bootstrap = await pending;
+      assert.equal(bootstrap.initialState.latestModel, policy.model);
+      assert.equal(bootstrap.initialState.currentPermissions.sandboxPolicy &&
+        (bootstrap.initialState.currentPermissions.sandboxPolicy as Row).type, sandbox.type);
+      assert.equal(fixture.resumeCount, 1);
+      await assert.rejects(bootstrap.qualifyContinuation(() => ({} as never)), /opt-in-continuation-not-qualified/);
+      fixture.threadOverrides = { ...fixture.threadOverrides, model: 'unexpected' };
+      await assert.rejects(bootstrap.readInitialState(), /actual-thread-settings-drift/);
+      assert.equal(fixture.stopCalls, 0);
+    } finally { await fixture.close(); }
+  }
+});
+
+test('opt-in effective response rejects missing or mismatched provider, reviewer, profile, tier and roots', async () => {
+  const profile = { id: ':read-only', extends: null };
+  const environments = [{ environmentId: 'local' as const, cwd, runtimeWorkspaceRoots: [cwd] }];
+  const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+    effort: 'high', cwd, runtimeWorkspaceRoots: [cwd], environments,
+    approvalPolicy: 'never', approvalsReviewer: 'user', activePermissionProfile: profile,
+    sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null });
+  const approvedResume = { ...resumeParams, model: policy.model,
+    config: { model_reasoning_effort: policy.effort } };
+  for (const changed of [
+    { modelProvider: 'other' }, { approvalsReviewer: 'auto_review' },
+    { activePermissionProfile: { id: ':read-only', extends: ':inherited' } },
+    { serviceTier: 'priority' }, { runtimeWorkspaceRoots: ['C:/elsewhere'] },
+    { sandbox: { type: 'readOnly', networkAccess: true } },
+  ]) {
+    const fixture = new BackendFixture(); await fixture.listen();
+    try {
+      fixture.expectedResume = approvedResume;
+      fixture.threadOverrides = { model: policy.model, modelProvider: policy.modelProvider,
+        reasoningEffort: policy.effort, environments };
+      fixture.effectiveOverride = { model: policy.model, modelProvider: policy.modelProvider,
+        reasoningEffort: policy.effort, activePermissionProfile: profile,
+        sandbox: policy.sandbox, ...changed };
+      await assert.rejects(bootstrapManagedWorker({ ...options(fixture),
+        resumeParams: approvedResume, approvedTaskPolicy: policy }), /effective resume differs/);
+      assert.equal(fixture.resumeCount, 1);
+      assert.equal(fixture.stopCalls, 0);
+    } finally { await fixture.close(); }
+  }
+});
 
 test('qualified bootstrap returns exact first-turn compiler inputs and fresh attachments', async () => {
   const fixture = new BackendFixture(); await fixture.listen();

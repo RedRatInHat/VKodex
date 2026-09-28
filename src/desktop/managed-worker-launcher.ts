@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ManagedWorkerRegistry } from '../codex/managed-worker-registry.js';
 import { createManagedWorkerPrivateState, type ManagedWorkerPrivateManifest } from './managed-worker-private-state.js';
 import { buildDetachedWorkerSpawnOptions } from './managed-worker-environment.js';
+import { approveTaskPolicy, assertApprovedResumeIntent } from '../codex/managed-task-policy.js';
 
 export interface ManagedWorkerLaunchOptions extends Omit<ManagedWorkerPrivateManifest, 'schemaVersion' | 'epoch'> {
   readonly privateBaseDirectory: string;
@@ -54,12 +55,16 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   dependencies: ManagedWorkerLaunchDependencies = {}): Promise<Readonly<{ epoch: string; state: 'dispatched'; pid: number }>> {
   // Capture caller-owned objects before the first asynchronous step.
   const input = structuredClone(options);
+  const approvedTaskPolicy = Object.hasOwn(input, 'approvedTaskPolicy')
+    ? approveTaskPolicy(input.approvedTaskPolicy) : undefined;
   for (const file of [input.home, input.cwd, input.registryPath, input.privateBaseDirectory]) absolute(file);
   if (input.nativeIpc !== 'local') throw new TypeError('Managed worker launch requires local native IPC');
   for (const value of [input.taskId, input.familyRoot]) {
     if (typeof value !== 'string' || !value || value.length > 256 || value.trim() !== value || /[\u0000-\u001f]/u.test(value))
       throw new TypeError('Invalid managed worker launch scope');
   }
+  if (approvedTaskPolicy)
+    assertApprovedResumeIntent(approvedTaskPolicy, input.resumeParams, input.taskId, input.cwd);
   if (path.extname(input.runtime.entrypoint).toLowerCase() !== '.js')
     throw new TypeError('Managed worker entrypoint must be compiled JavaScript');
   await verifyPinnedFiles(input);
@@ -72,6 +77,7 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     home: input.home, cwd: input.cwd, registryPath: input.registryPath,
     cliPath: input.cliPath, cliSha256: input.cliSha256,
     initializeRequest: input.initializeRequest, resumeParams: input.resumeParams,
+    ...(approvedTaskPolicy ? { approvedTaskPolicy } : {}),
   };
   try {
     if (dependencies.protectState) await dependencies.protectState(manifest, input.privateBaseDirectory);

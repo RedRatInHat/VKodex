@@ -10,7 +10,7 @@ import { NativeStartIntentStore } from '../codex/native-start-intent-store.js';
 import { compileNativeRequestResponse } from '../codex/native-request-response.js';
 import type { AppServerServerRequest } from '../codex/app-server-connection.js';
 import { bootstrapManagedWorker, ManagedWorkerIdleProofRefusedError,
-  type ManagedWorkerBootstrap } from './managed-worker-bootstrap.js';
+  type ManagedWorkerBootstrap, type ContinuationOwnerFence } from './managed-worker-bootstrap.js';
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis } from './managed-worker-control.js';
@@ -251,7 +251,8 @@ export class ManagedWorkerDaemon {
       this.#startupPhase = 'bootstrapping';
       this.#bootstrap = await bootstrapManagedWorker({ host: this.#host, adapterKey,
         taskId: manifest.taskId, cwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
-        resumeParams: manifest.resumeParams });
+        resumeParams: manifest.resumeParams,
+        ...(manifest.approvedTaskPolicy ? { approvedTaskPolicy: manifest.approvedTaskPolicy } : {}) });
       this.#intentStore = new NativeStartIntentStore({ filePath: path.join(state.privateDirectory, 'start-intents.sqlite'),
         ownerEpoch: manifest.epoch, backendGeneration: meta.backendGeneration, threadId: manifest.taskId,
         encryptionKey: Buffer.from(state.keys.intentKey, 'base64') });
@@ -259,7 +260,9 @@ export class ManagedWorkerDaemon {
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, isOwnerCurrent: ownerCurrent,
         allowFollower: this.#options.allowFollower, readInitialState: this.#bootstrap.readInitialState,
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
-        qualifyContinuation: fence => this.#bootstrap!.qualifyContinuation(fence),
+        ...(manifest.approvedTaskPolicy ? {} : {
+          qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),
+        }),
         clientFactory: this.#options.clientFactory });
       this.#startupPhase = 'owner-starting';
       try { await this.#owner.start(); }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { approveTaskPolicy, assertEffectiveResume } from '../src/codex/managed-task-policy.js';
+import { approveTaskPolicy, assertApprovedResumeIntent, assertEffectiveResume } from '../src/codex/managed-task-policy.js';
 
 const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21c';
 function intention() {
@@ -72,6 +72,31 @@ test('native Windows path spelling may differ while workspace identity stays exa
   assert.throws(() => assertEffectiveResume(policy, actual), /effective/i);
 });
 
+test('explicit danger-full-access intention requires exact native sandbox and remains immutable', () => {
+  const input = { ...intention(), activePermissionProfile: { id: ':danger-full-access', extends: null },
+    sandbox: { type: 'dangerFullAccess' } };
+  const policy = approveTaskPolicy(input);
+  const actual = effective();
+  actual.activePermissionProfile = { ...input.activePermissionProfile };
+  actual.sandbox = { ...input.sandbox } as typeof actual.sandbox;
+  assert.doesNotThrow(() => assertEffectiveResume(policy, actual));
+  assert.throws(() => approveTaskPolicy({ ...input, sandbox: { type: 'dangerFullAccess', networkAccess: true } }), /policy/i);
+  assert.throws(() => assertEffectiveResume(policy, { ...actual, sandbox: { type: 'readOnly', networkAccess: false } }), /effective/i);
+});
+
+test('approved initial resume accepts Windows path aliases but rejects every scope or setting change', () => {
+  const policy = approveTaskPolicy(intention());
+  const resume = { threadId: taskId, cwd: 'c:\\OWNED-TASK', model: policy.model,
+    permissions: policy.activePermissionProfile.id, approvalPolicy: policy.approvalPolicy,
+    runtimeWorkspaceRoots: ['c:\\owned-task'], config: { model_reasoning_effort: policy.effort } };
+  assert.doesNotThrow(() => assertApprovedResumeIntent(policy, resume, taskId, 'C:/owned-task'));
+  for (const changed of [
+    { ...resume, model: 'other' }, { ...resume, permissions: ':danger-full-access' },
+    { ...resume, cwd: 'C:/elsewhere' }, { ...resume, runtimeWorkspaceRoots: ['C:/elsewhere'] },
+    { ...resume, config: { model_reasoning_effort: 'low' } }, { ...resume, extra: true },
+  ]) assert.throws(() => assertApprovedResumeIntent(policy, changed, taskId, policy.cwd), /effective/i);
+});
+
 test('effective response never inherits omitted policy fields or mismatched settings', () => {
   const policy = approveTaskPolicy(intention());
   for (const field of ['reasoningEffort', 'approvalPolicy', 'approvalsReviewer', 'serviceTier',
@@ -98,7 +123,6 @@ test('intention requires explicit known fields and rejects unknown or malformed 
   assert.throws(() => approveTaskPolicy({ ...intention(), unreviewed: true }), /policy/i);
   assert.throws(() => approveTaskPolicy({ ...intention(), cwd: 'relative/path' }), /policy/i);
   assert.throws(() => approveTaskPolicy({ ...intention(), model: 'bad model\n' }), /policy/i);
-  assert.throws(() => approveTaskPolicy({ ...intention(), sandbox: { type: 'dangerFullAccess' } }), /policy/i);
   assert.throws(() => approveTaskPolicy({ ...intention(), sandbox: { ...intention().sandbox, unknown: true } }), /policy/i);
   assert.throws(() => approveTaskPolicy({ ...intention(), approvalPolicy: { granular: {} } }), /policy/i);
   assert.throws(() => approveTaskPolicy({ ...intention(), approvalPolicy: { toString: () => 'never' } }), /policy/i);
