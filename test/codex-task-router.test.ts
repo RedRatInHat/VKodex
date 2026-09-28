@@ -24,6 +24,7 @@ function fixture() {
   } satisfies CodexTasks;
   const owner: CodexTaskOwner = {
     owns: task => (task.sourceId ?? "") === "work",
+    ensureOpen: async () => { calls.push("owner:open"); },
     submitWithReceipt: async () => { calls.push("owner:submit"); return { mode: "start", turnId: "owner-turn" }; },
     interrupt: async () => { calls.push("owner:interrupt"); }, queue: async () => "queued",
     selectModel: async () => { calls.push("owner:model"); }, renameTask: async () => { calls.push("owner:rename"); return { liveTitleUpdated: true }; },
@@ -40,8 +41,8 @@ function fixture() {
 
 test("command router uses exactly the configured source owner", async () => {
   const f = fixture();
-  assert.equal((await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" })).turnId, "owner-turn");
-  assert.equal((await f.routed.submitWithReceipt!({ operationId: "two", task: primary, text: "x" })).turnId, "base-turn");
+  assert.deepEqual(await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" }), { mode: "start", turnId: "owner-turn" });
+  assert.deepEqual(await f.routed.submitWithReceipt!({ operationId: "two", task: primary, text: "x" }), { mode: "start", turnId: "base-turn" });
   await f.routed.interrupt(work); await f.routed.interrupt(primary);
   await f.routed.selectModel(work, "model", "high"); await f.routed.selectModel(primary, "model", "high");
   assert.deepEqual(f.calls, ["owner:submit", "base:submitWithReceipt", "owner:interrupt", "base:interrupt", "owner:model", "base:model"]);
@@ -80,25 +81,35 @@ test("an archived goal falls back to its read-only profile store, never for a li
   assert.equal(baseReads, 1);
 });
 
-test("owner route never opens a UI client and rejects unsupported edit instead of falling back", async () => {
-  const f = fixture(); await f.routed.ensureOpen!(work); assert.deepEqual(f.calls, []);
+test("owner route loads through the profile owner without opening a UI client or falling back", async () => {
+  const f = fixture(); await f.routed.ensureOpen!(work); assert.deepEqual(f.calls, ["owner:open"]);
   await assert.rejects(f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);
-  assert.deepEqual(f.calls, []);
-  await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["base:open"]);
+  assert.deepEqual(f.calls, ["owner:open"]);
+  await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["owner:open", "base:open"]);
 });
 
 test("ensure open accepts an active writer as proof that the task is already open", async () => {
   const f = fixture();
-  f.owner.inspectTask = async () => { throw new TaskOwnedByClientError(); };
+  f.owner.ensureOpen = async () => { throw new TaskOwnedByClientError(); };
   await f.routed.ensureOpen!(work);
   assert.deepEqual(f.calls, []);
+});
+
+test("inspection falls back to the connected client when the profile owner is unloaded", async () => {
+  const f = fixture(); let baseReads = 0;
+  f.owner.inspectTask = async () => ({ status: "unavailable", workspace: null, model: null, effort: null,
+    nextModel: null, nextEffort: null, context: null });
+  f.base.inspectTask = async () => { baseReads++; return { status: "idle", workspace: null, model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null }; };
+  assert.equal((await f.routed.inspectTask(work)).status, "idle");
+  assert.equal(baseReads, 1);
 });
 
 test("an active UI writer receives a connected-only fallback before any native mutation", async () => {
   const f = fixture();
   f.owner.submitWithReceipt = async () => { f.calls.push("owner:busy"); throw new TaskOwnedByClientError(); };
   const result = await f.routed.submitWithReceipt!({ operationId: "one", task: work, text: "x" });
-  assert.equal(result.turnId, "client-turn");
+  assert.deepEqual(result, { mode: "steer", turnId: "client-turn" });
   assert.deepEqual(f.calls, ["owner:busy", "base:connectedSubmit"]);
 });
 
@@ -190,6 +201,21 @@ test("exclusive routing readiness affects health only; ambiguity refuses before 
   const ambiguous = new RoutedCodexTasks(f.base, [exclusive, { ...exclusive }]);
   await assert.rejects(ambiguous.submitWithReceipt!({ operationId: "ambiguous", task: work, text: "x" }), ActionRejectedError);
   assert.deepEqual(f.calls, ["owner:submit"]);
+});
+
+test("exclusive queue reconciliation never treats the legacy writer as proof of acceptance", async () => {
+  const f = fixture();
+  let baseReads = 0;
+  const base = { ...f.base,
+    findAcceptedInput: async () => { baseReads++; return "wrong-base-turn"; },
+    findQueuedSubmission: async () => { baseReads++; return "wrong-base-queue"; } };
+  const exclusive = { ...f.owner, routingPolicy: "exclusive" as const,
+    findAcceptedInput: async () => null,
+    findQueuedSubmission: async () => null };
+  const routed = new RoutedCodexTasks(base, [exclusive]);
+  assert.equal(await routed.findAcceptedInput!(work, "unknown-operation"), null);
+  assert.equal(await routed.findQueuedSubmission!(work, "unknown-operation"), null);
+  assert.equal(baseReads, 0);
 });
 
 test("exclusive task refuses unsupported edit, transfer, reveal and export before base", async () => {

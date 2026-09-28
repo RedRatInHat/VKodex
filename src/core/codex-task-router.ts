@@ -1,7 +1,7 @@
 import type { CodexQuestions } from "./codex-questions.js";
 import { ActionRejectedError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
-  type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
+  type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
   type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome } from "./codex-tasks.js";
 
@@ -26,6 +26,8 @@ export interface CodexTaskOwner {
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null>;
+  findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
+  findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   archiveTask(task: TaskRef): Promise<void>;
   archiveRetryReady(task: TaskRef): Promise<boolean>;
@@ -64,7 +66,28 @@ export class RoutedCodexTasks implements CodexTasks {
     }
   }
   async findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
-    return this.owner(task)?.findAcceptedInput(task, operationId) ?? this.base.findAcceptedInput?.(task, operationId) ?? Promise.resolve(null);
+    const owner = this.owner(task);
+    if (owner) {
+      const accepted = await owner.findAcceptedInput(task, operationId);
+      if (owner.routingPolicy === "exclusive" || accepted) return accepted;
+    }
+    return this.base.findAcceptedInput?.(task, operationId) ?? null;
+  }
+  async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
+    const owner = this.owner(task);
+    if (owner) {
+      const queued = await owner.findQueuedSubmission?.(task, operationId) ?? null;
+      if (owner.routingPolicy === "exclusive" || queued) return queued;
+    }
+    return this.base.findQueuedSubmission?.(task, operationId) ?? null;
+  }
+  async findQueuedSubmissionOutcome(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null> {
+    const owner = this.owner(task);
+    if (owner) {
+      const outcome = await owner.findQueuedSubmissionOutcome?.(task, operationId) ?? null;
+      if (owner.routingPolicy === "exclusive" || outcome) return outcome;
+    }
+    return this.base.findQueuedSubmissionOutcome?.(task, operationId) ?? null;
   }
   async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
     const owner = this.owner(request.task);
@@ -124,7 +147,14 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async inspectTask(task: TaskRef): Promise<TaskDetails> {
     const owner = this.owner(task); if (!owner) return this.base.inspectTask(task);
-    try { return await owner.inspectTask(task); }
+    try {
+      const details = await owner.inspectTask(task);
+      // `notLoaded` from the configured profile connection does not make an
+      // externally open task unavailable. The connected desktop adapter can
+      // still read the active client's authoritative state without taking its
+      // writer, which is exactly the fallback used for an ownership rejection.
+      return owner.routingPolicy !== "exclusive" && details.status === "unavailable" ? this.base.inspectTask(task) : details;
+    }
     catch (error) { if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error; return this.base.inspectTask(task); }
   }
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
@@ -247,7 +277,14 @@ export class RoutedCodexTasks implements CodexTasks {
         if (!owner.ensureOpen) this.unsupportedExclusive();
         return owner.ensureOpen(task);
       }
-      try { await owner.inspectTask(task); }
+      try {
+        // A stored task reports `notLoaded` until this profile App Server
+        // resumes it. Transfer targets need that ownership before their idle
+        // state can be verified; a read-only inspection can never make the
+        // target ready on a later retry.
+        if (owner.ensureOpen) await owner.ensureOpen(task);
+        else await owner.inspectTask(task);
+      }
       catch (error) {
         // An active-writer rejection is positive evidence that the selected
         // task is already open in another Codex client. Do not launch/focus a

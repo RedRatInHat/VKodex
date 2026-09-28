@@ -113,6 +113,13 @@ class Desktop implements DesktopTasks {
   submitError: Error | null = null;
   reconciledTurnId: string | null = null;
   async findAcceptedInput(_task: TaskRef, _operationId: string): Promise<string | null> { return this.reconciledTurnId; }
+  reconciledQueueId: string | null = null;
+  async findQueuedSubmission(_task: TaskRef, _operationId: string): Promise<string | null> { return this.reconciledQueueId; }
+  reconciledQueueRejected = false;
+  async findQueuedSubmissionOutcome(_task: TaskRef, _operationId: string) {
+    if (this.reconciledQueueRejected) return { state: "rejected" as const };
+    return this.reconciledQueueId ? { state: "accepted" as const, submissionId: this.reconciledQueueId } : null;
+  }
   submitHook: (() => Promise<void>) | null = null;
   details: TaskDetails = { status: "idle", workspace: "/project", model: "model-a", effort: "medium", nextModel: "model-a", nextEffort: "medium", context: { used: 25_000, window: 100_000, percent: 25 } };
   models: DesktopModel[] = [{ id: "model-a", title: "Model A", efforts: ["low", "medium", "high"], defaultEffort: "medium" }, { id: "model-b", title: "Model B", efforts: ["high"], defaultEffort: "high" }];
@@ -1093,6 +1100,98 @@ test("a new executor recovers a saved launch intent that never reached the targe
   assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
   assert.equal(s.desktop.transfers.length, 1);
   assert.equal(s.desktop.opened.length, 2);
+});
+
+test("a new executor resumes a saved target that is present but unloaded", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let launchCalls = 0;
+  s.desktop.ensureOpen = async ref => {
+    s.desktop.opened.push(ref);
+    launchCalls++;
+    if (launchCalls === 1) throw new TaskNotOpenError();
+    s.desktop.details = { ...s.desktop.details, status: "idle" };
+  };
+  const first = new TaskTransfers(s.store, s.desktop, s.now);
+  first.start(record); await first.idle(); await first.stop();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "targetCreated");
+  s.desktop.details = { ...s.desktop.details, status: "unavailable" };
+  s.advance(30_000);
+  const restarted = new TaskTransfers(s.store, s.desktop, s.now);
+  restarted.tick(); await restarted.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.desktop.opened.length, 2);
+});
+
+test("a target already continuing the copied task can complete the durable handoff", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const sourceGoal: TaskGoal = { threadId: record.source.threadId, objective: "Continue the copied work", status: "paused",
+    tokenBudget: null, tokensUsed: 25, timeUsedSeconds: 10, createdAt: 1, updatedAt: 2 };
+  const targetGoal: TaskGoal = { ...sourceGoal, threadId: `moved-${record.targetSourceId}`, status: "active",
+    tokensUsed: 5, timeUsedSeconds: 2, createdAt: 3, updatedAt: 4 };
+  s.desktop.details = { ...s.desktop.details, status: "running" };
+  s.desktop.getGoal = async ref => {
+    if (!ref) throw new Error("transfer goal checks must name their task");
+    return ref.threadId === record.source.threadId ? sourceGoal : targetGoal;
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.byPeer(peerId)?.threadId, targetGoal.threadId);
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
+test("an explicit recovery preserves a changed active target goal", async t => {
+  const s = setup(t); const base = transferFixture(s); const record = { ...base, targetGoalAdopted: true };
+  const sourceGoal: TaskGoal = { threadId: record.source.threadId, objective: "Archived source objective", status: "paused",
+    tokenBudget: null, tokensUsed: 25, timeUsedSeconds: 10, createdAt: 1, updatedAt: 2 };
+  const targetGoal: TaskGoal = { ...sourceGoal, threadId: `moved-${record.targetSourceId}`, objective: "New target objective",
+    status: "active", tokensUsed: 5, timeUsedSeconds: 2, createdAt: 3, updatedAt: 4 };
+  s.desktop.details = { ...s.desktop.details, status: "running" };
+  s.desktop.getGoal = async ref => {
+    if (!ref) throw new Error("transfer goal checks must name their task");
+    return ref.threadId === record.source.threadId ? sourceGoal : targetGoal;
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.byPeer(peerId)?.threadId, targetGoal.threadId);
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
+test("an exact archived source can finish switching after its live rollout moved", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let sourceVerifications = 0;
+  s.desktop.verifyTransferSource = async () => {
+    sourceVerifications++;
+    if (sourceVerifications > 1) throw Object.assign(new Error("saved live rollout moved to archive"), { code: "ENOENT" });
+  };
+  s.desktop.ensureOpen = async ref => {
+    s.desktop.opened.push(ref);
+    await s.desktop.archiveTask(record.source);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.byPeer(peerId)?.threadId, `moved-${record.targetSourceId}`);
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.desktop.archives.filter(item => item.threadId === record.source.threadId).length, 1);
+});
+
+test("an archived source cannot hide a source context mismatch during handoff", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  let sourceVerifications = 0;
+  s.desktop.verifyTransferSource = async () => {
+    if (++sourceVerifications > 1) throw new TransferConflictError("source model changed after checkpoint");
+  };
+  s.desktop.ensureOpen = async ref => {
+    s.desktop.opened.push(ref);
+    await s.desktop.archiveTask(record.source);
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  transfers.start(record); await transfers.idle();
+  assert.notEqual(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.byPeer(peerId)?.threadId, task.threadId);
 });
 
 test("every durable transfer stage resumes after executor loss without another target copy", async t => {
@@ -3341,6 +3440,55 @@ test("a lost Codex acknowledgment is confirmed from native history without resub
   assert.equal(s.store.operationState(operationId), "accepted");
   assert.deepEqual(s.store.acceptedTurns(binding.id), [{ turnId: "accepted-turn", operationId }]);
   assert.match(s.chat.sent.at(-1)!.view.text, /Codex принял запрос/u);
+});
+
+test("managed queue acceptance is recorded as a queue submission, never as an active turn", async t => {
+  const s = setup(t); const binding = s.attach();
+  const prior = { messageId: 123, senderId: 42, operationId: "prior-operation",
+    turnId: "prior-turn", mode: "start" as const, text: "Prior editable turn" };
+  s.store.saveEditableRequest(binding.id, prior);
+  s.desktop.submitReceipt = { mode: "queue", submissionId: "managed-queue-id" };
+  const input = { ...s.input("Queue through managed owner", peerId), eventId: "message:managed-queue" };
+  await s.manager.handle(input);
+  const operationId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.deepEqual(s.store.queuedInputs(binding.id).map(item => ({ operationId: item.operationId, queuedId: item.queuedId })),
+    [{ operationId, queuedId: "managed-queue-id" }]);
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+  assert.deepEqual(s.store.editableRequest(binding.id), prior);
+  assert.ok(s.store.pendingDeliveries().some(item => /очередь Codex/u.test(item.view.text)));
+  await s.manager.handle(input);
+  assert.equal(s.desktop.submissions.length, 1);
+});
+
+test("lost managed queue acknowledgement reconciles by operation without a second submission", async t => {
+  const s = setup(t); const binding = s.attach();
+  const prior = { messageId: 124, senderId: 42, operationId: "prior-operation",
+    turnId: "prior-turn", mode: "start" as const, text: "Prior editable turn" };
+  s.store.saveEditableRequest(binding.id, prior);
+  s.desktop.submitError = new UncertainActionError();
+  s.desktop.reconciledQueueId = "late-managed-queue-id";
+  const input = { ...s.input("One managed prompt", peerId), eventId: "message:late-managed-queue" };
+  await s.manager.handle(input);
+  const operationId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.deepEqual(s.store.queuedInputs(binding.id).map(item => item.queuedId), ["late-managed-queue-id"]);
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+  assert.deepEqual(s.store.editableRequest(binding.id), prior);
+});
+
+test("late definitive managed refusal settles a lost acknowledgement as rejected", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.submitError = new UncertainActionError();
+  s.desktop.reconciledQueueRejected = true;
+  const input = { ...s.input("Rejected before queue insertion", peerId), eventId: "message:late-managed-refusal" };
+  await s.manager.handle(input);
+  const operationId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.store.operationState(operationId), "rejected");
+  assert.deepEqual(s.store.queuedInputs(binding.id), []);
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+  assert.equal(s.desktop.submissions.length, 1);
 });
 
 test("VK upload errors are checked before docs.save and a later retry can succeed", async t => {

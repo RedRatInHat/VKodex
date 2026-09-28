@@ -41,6 +41,10 @@ export class AppServerProfileOwner {
     if (!this.owns(task)) throw new ActionRejectedError("Задача относится к другому аккаунту Codex.");
   }
 
+  ensureOpen(task: TaskRef): Promise<void> {
+    this.assertOwner(task); return this.executor.ensureOpen(task);
+  }
+
   submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
     this.assertOwner(request.task); return this.executor.submitWithReceipt(request);
   }

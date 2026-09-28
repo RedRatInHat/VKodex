@@ -184,6 +184,30 @@ test("archive confirmation reads the exact row and detects source writes racing 
   await assert.rejects(metadata.isArchived({ ...source, threadId: "missing" }), DesktopUnavailableError);
 });
 
+test("archive confirmation checks saved model, effort and workspace after rollout relocation", async t => {
+  const { mkdtemp, writeFile, stat } = await import("node:fs/promises");
+  const { default: path } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { default: Database } = await import("better-sqlite3");
+  const home = await mkdtemp(path.join(tmpdir(), "vkodex-archive-context-"));
+  const rollout = path.join(home, "archived.jsonl");
+  await writeFile(rollout, JSON.stringify({ type: "turn_context", payload: { turn_id: "boundary", model: "gpt-6-sol",
+    effort: "low", cwd: home } }) + "\n");
+  const db = new Database(path.join(home, "state_5.sqlite")); t.after(() => db.close());
+  db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER, rollout_path TEXT)");
+  db.prepare("INSERT INTO threads VALUES (?, ?, ?)").run("source", 1, rollout);
+  const file = await stat(rollout);
+  const checkpoint = { rolloutPath: path.join(home, "old-live.jsonl"), lastTurnId: "boundary", size: file.size,
+    mtimeMs: file.mtimeMs, model: "gpt-6-sol", effort: "low", workspace: home };
+  const metadata = new ProfileDesktopMetadata(() => home);
+  const source = { hostId: "local", threadId: "source" };
+  assert.equal(await metadata.isArchived(source, checkpoint), true);
+  const changed = { type: "turn_context", payload: { turn_id: "boundary", model: "gpt-6-astra", effort: "high", cwd: home } };
+  await writeFile(rollout, JSON.stringify(changed) + "\n");
+  const changedFile = await stat(rollout);
+  await assert.rejects(metadata.isArchived(source, { ...checkpoint, size: changedFile.size, mtimeMs: changedFile.mtimeMs }), TransferConflictError);
+});
+
 test("archived goals remain readable without resuming a writer or hiding active API failures", async t => {
   const { mkdtemp } = await import("node:fs/promises");
   const { default: path } = await import("node:path");

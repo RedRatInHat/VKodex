@@ -197,7 +197,8 @@ export class BridgeRuntime {
   }
 
   private reconcileUncertainOperation(): void {
-    if (this.stopped || !this.desktop.findAcceptedInput || this.operationReconciliation
+    if (this.stopped || (!this.desktop.findAcceptedInput && !this.desktop.findQueuedSubmission &&
+      !this.desktop.findQueuedSubmissionOutcome) || this.operationReconciliation
       || this.now() - this.lastOperationReconciliationAt < 30_000) return;
     this.lastOperationReconciliationAt = this.now();
     const operation = this.store.uncertainPromptOperations(this.now(), 1)[0];
@@ -205,20 +206,37 @@ export class BridgeRuntime {
     this.store.markOperationChecked(operation.id, this.now());
     const binding = this.store.getBinding(operation.bindingId);
     if (!binding || !binding.attached || binding.peerId === null || taskKey(binding) !== operation.taskKey) return;
-    const work = this.desktop.findAcceptedInput(binding, operation.id).then(turnId => {
-      if (!turnId || this.stopped) return;
+    const work = (async () => {
+      const turnId = this.desktop.findAcceptedInput
+        ? await this.desktop.findAcceptedInput(binding, operation.id).catch(() => null) : null;
+      const outcome = !turnId && this.desktop.findQueuedSubmissionOutcome
+        ? await this.desktop.findQueuedSubmissionOutcome(binding, operation.id).catch(() => null) : null;
+      const submissionId = outcome?.state === "accepted" ? outcome.submissionId
+        : !turnId && !outcome && this.desktop.findQueuedSubmission
+          ? await this.desktop.findQueuedSubmission(binding, operation.id).catch(() => null) : null;
+      if ((!turnId && !submissionId && outcome?.state !== "rejected") || this.stopped) return;
       const current = this.store.getBinding(binding.id);
       if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== operation.taskKey
         || this.store.operationState(operation.id) !== "uncertain") return;
       this.store.atomic(() => {
-        this.store.settlePromptDispatch(operation.id, "accepted");
-        this.store.rememberAcceptedTurn(binding.id, turnId, operation.id);
-        this.files?.finish(binding.id, operation.id, "accepted", turnId);
+        this.store.settlePromptDispatch(operation.id, outcome?.state === "rejected" ? "rejected" : "accepted");
+        if (turnId) {
+          this.store.rememberAcceptedTurn(binding.id, turnId, operation.id);
+          this.files?.finish(binding.id, operation.id, "accepted", turnId);
+        } else if (submissionId) {
+          this.store.rememberQueuedInput(binding.id, operation.id, submissionId);
+          this.files?.markQueued(binding.id, operation.id);
+          this.files?.finish(binding.id, operation.id, "accepted");
+        } else if (outcome?.state === "rejected") {
+          this.files?.finish(binding.id, operation.id, "rejected");
+        }
         this.store.enqueue(`reconciled-operation:${operation.id}`, current.peerId!, {
-          text: "Codex подтвердил ранее неопределённый запрос. Повторно отправлять его не нужно.", silent: true,
+          text: outcome?.state === "rejected"
+            ? "Codex подтвердил отказ ранее неопределённого запроса. Повторной отправки не было."
+            : "Codex подтвердил ранее неопределённый запрос. Повторно отправлять его не нужно.", silent: true,
         }, binding.id);
       });
-    }).catch(() => {}).finally(() => { if (this.operationReconciliation === work) this.operationReconciliation = null; });
+    })().catch(() => {}).finally(() => { if (this.operationReconciliation === work) this.operationReconciliation = null; });
     this.operationReconciliation = work;
   }
 

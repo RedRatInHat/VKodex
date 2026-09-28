@@ -1,5 +1,5 @@
 import { ActionRejectedError, ArchiveOwnerRequiredError, DesktopUnavailableError, UncertainActionError, TransferConflictError, sameTask, taskKey,
-  type CodexTasks, type TransferTaskRequest } from "../core/codex-tasks.js";
+  type CodexTasks, type TaskGoal, type TransferTaskRequest } from "../core/codex-tasks.js";
 import { MENU_BUTTON, type TaskTransferRecord } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 import { randomUUID } from "node:crypto";
@@ -253,7 +253,7 @@ export class TaskTransfers {
           }
           save({ checkpoint: await this.desktop.transferCheckpoint(record.source) });
         }
-        await this.desktop.verifyTransferSource(record.source, record.checkpoint!);
+        await this.verifySavedSource(record);
         if (!record.target || ["forking", "preparingTarget", "failed", "uncertain"].includes(record.phase)) {
           step("fork");
           const target = await this.desktop.transferTask({ ...this.request(record),
@@ -280,16 +280,27 @@ export class TaskTransfers {
             save({ launchOwner: this.owner });
             await this.desktop.ensureOpen(target);
           }
+          // A profile App Server reports a stored but unloaded thread as
+          // unavailable without throwing. That is the same recoverable lost-
+          // launch state as a failed inspection: acquire the saved target on
+          // this executor, then read it again. This never creates a new fork.
+          if (live?.status === "unavailable") {
+            save({ launchOwner: this.owner });
+            await this.desktop.ensureOpen(target);
+            live = undefined;
+          }
         }
         live ??= await this.desktop.inspectTask(target);
-        if (!["idle", "failed", "interrupted"].includes(live.status)) throw new DesktopUnavailableError("Клиент назначения пока не готов к следующему ходу.");
+        if (!["idle", "failed", "interrupted", "running"].includes(live.status)) {
+          throw new DesktopUnavailableError(`Клиент назначения пока не готов к следующему ходу. Статус: ${live.status}.`);
+        }
         step("metadata");
         await this.desktop.renameTask(target, record.source.title);
         await this.desktop.moveTask(target, record.targetProjectId);
         step("goal");
         await this.prepareGoal(record, save);
         step("verify");
-        await this.desktop.verifyTransferSource(record.source, record.checkpoint!);
+        await this.verifySavedSource(record);
         await this.verifySourceGoal(record);
         await this.desktop.verifyTransferTarget(this.request(record), target);
         // The commit and stream generation change share one SQLite transaction.
@@ -329,6 +340,19 @@ export class TaskTransfers {
     }
   }
 
+  /** A user or a recovered earlier archive request may move the source file
+   * after the durable fork was created but before the VK binding commits.
+   * Only a missing saved rollout path permits checking the archived source;
+   * a semantic or context conflict must never be reclassified as relocation. */
+  private async verifySavedSource(record: TaskTransferRecord): Promise<void> {
+    try { await this.desktop.verifyTransferSource!(record.source, record.checkpoint!); }
+    catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")
+        || !record.target || !record.checkpoint || !this.desktop.isTaskArchived) throw error;
+      if (!await this.desktop.isTaskArchived(record.source, record.checkpoint)) throw error;
+    }
+  }
+
   private async verifySourceGoal(record: TaskTransferRecord): Promise<void> {
     if (record.goal === undefined || !this.desktop.getGoal) throw new TransferConflictError("Снимок исходной цели отсутствует.");
     const current = await this.desktop.getGoal(record.source);
@@ -345,6 +369,10 @@ export class TaskTransfers {
     const target = record.target!;
     const source = record.goal;
     let current = await this.desktop.getGoal(target);
+    if (record.targetGoalAdopted) {
+      if (!current) throw new TransferConflictError("Выбранная для сохранения цель назначения исчезла. Нужна повторная проверка.");
+      save({ goalPrepared: true }); return;
+    }
     if (!source) {
       if (current) throw new TransferConflictError("В копии появилась другая цель; она не будет перезаписана.");
       save({ goalPrepared: true }); return;
@@ -354,7 +382,10 @@ export class TaskTransfers {
     const budget = source.tokenBudget === null ? null : Math.max(1, source.tokenBudget - source.tokensUsed);
     const status = source.status === "complete" ? "complete" : source.tokenBudget !== null && source.tokensUsed >= source.tokenBudget ? "budgetLimited"
       : source.status === "active" ? "paused" : source.status;
-    if (current && (current.objective !== source.objective || current.status !== status || current.tokenBudget !== budget || current.tokensUsed !== 0)) {
+    const compatible = (goal: TaskGoal) => goal.objective === source.objective && goal.tokenBudget === budget
+      && (goal.status === status || status === "paused" && goal.status === "active");
+    const existing = !!current;
+    if (current && !compatible(current)) {
       throw new TransferConflictError("Цель назначения изменилась. Автоматическое перезаписывание запрещено.");
     }
     if (!current) {
@@ -362,7 +393,7 @@ export class TaskTransfers {
       await this.desktop.setGoal(target, { objective: source.objective, tokenBudget: budget, status });
       current = await this.desktop.getGoal(target);
     }
-    if (!current || current.objective !== source.objective || current.status !== status || current.tokenBudget !== budget || current.tokensUsed !== 0) {
+    if (!current || !compatible(current) || (!existing && current.tokensUsed !== 0)) {
       throw new DesktopUnavailableError("Цель назначения не подтверждена чтением после записи.");
     }
     const previous = this.store.getValue<TransferredGoalUsage>(`transferred-goal:${taskKey(record.source)}`);

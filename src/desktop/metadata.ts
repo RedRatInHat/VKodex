@@ -14,6 +14,7 @@ import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
 import { findAcceptedInputTurn } from "./input-reconciliation.js";
+import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
 import { nativeCodexPath } from "../codex/native-cli.js";
 
@@ -378,6 +379,12 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
         const archived = db.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(task.threadId) as { rollout_path: string } | undefined;
         const relative = archived && path.relative(home, archived.rollout_path);
         if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid archive path");
+        if (checkpoint.model !== undefined || checkpoint.effort !== undefined || checkpoint.workspace !== undefined) {
+          const context = await readTransferContext(archived!.rollout_path, checkpoint.lastTurnId);
+          if (contextChanged(checkpoint, context)) {
+            throw new TransferConflictError("Настройки источника изменились перед архивацией. Перенос требует проверки.");
+          }
+        }
         if (checkpoint.semanticDigest) {
           // Archived transfer sources can contain hundreds of large turns.
           // A normal metadata read uses 30 seconds, but digest pagination may

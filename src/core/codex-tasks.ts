@@ -92,10 +92,15 @@ export interface SubmitTaskRequest {
   readonly beforeSend?: () => Promise<void>;
 }
 
-export interface SubmitTaskReceipt {
-  readonly mode: "start" | "steer";
-  readonly turnId: string | null;
-}
+export type SubmitTaskReceipt =
+  | { readonly mode: "start" | "steer"; readonly turnId: string | null }
+  | { readonly mode: "queue"; readonly submissionId: string };
+
+/** Read-only durable worker result; a missing row or an unknown write never
+ * authorizes another submission. */
+export type QueuedSubmissionOutcome =
+  | { readonly state: "accepted"; readonly submissionId: string }
+  | { readonly state: "rejected" | "unknown" };
 
 export interface EditLastUserTurnRequest extends SubmitTaskRequest {
   readonly expectedTurnId: string;
@@ -188,6 +193,9 @@ export interface AccountUsageProvider {
 export interface DesktopMetadata {
   queue?(request: SubmitTaskRequest, input: readonly Record<string, unknown>[]): Promise<string>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
+  /** Durable stock queue acceptance, distinct from a started turn ID. */
+  findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
+  findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   rename(task: TaskRef, title: string): Promise<void>;
   archive(task: TaskRef): Promise<void>;
   markdown(task: TaskRef): Promise<string>;
@@ -279,6 +287,8 @@ export interface CodexTasks {
   /** Submit only through an owner that is already connected; never launch UI. */
   submitConnectedWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
+  findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
+  findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
   interrupt(task: TaskRef): Promise<void>;
   moveTask(task: TaskRef, projectId: string | null): Promise<void>;

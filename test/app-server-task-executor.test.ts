@@ -125,6 +125,36 @@ test("native prompt rejections identify the failed stage and safe numeric code",
   } finally { executor.close(); }
 });
 
+test("ensure open resumes a stored task without starting a model turn", async () => {
+  const rpc = new FakeRpc(); rpc.nativeLoaded = false;
+  const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.ensureOpen(task);
+    assert.equal(rpc.nativeLoaded, true);
+    assert.equal((await executor.inspectTask(task)).status, "idle");
+    assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 1);
+    assert.equal(rpc.requests.some(item => item.method === "turn/start" || item.method === "turn/steer"), false);
+  } finally { executor.close(); }
+});
+
+test("an idle resumed runtime ignores a stale in-progress history turn", async () => {
+  const rpc = new FakeRpc(); rpc.nativeLoaded = false;
+  const requestRpc = rpc.request.bind(rpc);
+  rpc.request = async (method, params = {}, options = {}) => method === "thread/resume"
+    ? (rpc.nativeLoaded = true, rpc.requests.push({ method, params, options }), {
+      thread: { id: params.threadId, status: { type: "idle" } },
+      initialTurnsPage: { data: [{ id: "stale-turn", status: "inProgress", items: [] }] },
+      model: "model-a", reasoningEffort: "high",
+    }) : requestRpc(method, params, options);
+  const executor = new AppServerTaskExecutor(rpc);
+  try {
+    await executor.ensureOpen(task);
+    assert.equal((await executor.inspectTask(task)).status, "idle");
+    assert.deepEqual(await executor.submitWithReceipt(request()), { mode: "start", turnId: "started-turn" });
+    assert.equal(rpc.requests.some(item => item.method === "turn/steer"), false);
+  } finally { executor.close(); }
+});
+
 test("inspection of an owned active task never resumes and aborts it", async () => {
   const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
   try {

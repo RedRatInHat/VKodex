@@ -100,9 +100,13 @@ export class AppServerTaskExecutor {
       ? result.initialTurnsPage.data : [];
     const active = page.find(turn => isObject(turn) && turn.status === "inProgress");
     const previous = this.loaded.get(taskKey(task));
+    const runtimeActive = isObject(result.thread.status) && result.thread.status.type === "active";
     const loaded = {
-      activeTurnId: isObject(active) ? idOf(active.id)
-        : isObject(result.thread.status) && result.thread.status.type === "active" ? previous?.activeTurnId ?? null : null,
+      // Old or rebuilt histories may retain an inProgress turn even though
+      // the authoritative thread runtime is idle. Only an active runtime may
+      // adopt that historical ID. A turn/start receipt is preserved through
+      // `previous` while the native runtime catches up.
+      activeTurnId: runtimeActive ? (isObject(active) ? idOf(active.id) : previous?.activeTurnId ?? null) : null,
       model: idOf(result.model), effort: idOf(result.reasoningEffort),
     };
     this.loaded.set(taskKey(task), loaded);
@@ -143,6 +147,11 @@ export class AppServerTaskExecutor {
         ...(status === "failed" ? { failure: "systemError" as const } : {}),
       };
     } catch (error) { throw operationError(error, "проверку состояния задачи"); }
+  }
+
+  /** Load a stored task into this profile owner without starting a model turn. */
+  async ensureOpen(task: TaskRef): Promise<void> {
+    await this.resume(task);
   }
 
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {

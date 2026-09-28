@@ -10,7 +10,7 @@ import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
 import { ActionRejectedError, DesktopUnavailableError, TransferPageTooLargeError, UncertainActionError, ProjectAssignmentUnconfirmedError, TransferConflictError, sameTask,
   type DesktopMetadata, type DesktopTask, type DesktopTaskTransfer, type TransferTaskRequest, type TaskRef, type TransferCheckpoint } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
-import { nativeCodexPath } from "./metadata.js";
+import { nativeCodexPath } from "../codex/native-cli.js";
 import type { MultiDesktopCatalog } from "./multi-catalog.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
@@ -113,7 +113,7 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-async function readTransferContext(rolloutPath: string, lastTurnId: string): Promise<TransferContext> {
+export async function readTransferContext(rolloutPath: string, lastTurnId: string): Promise<TransferContext> {
   let matching: IpcObject | null = null; let latest: IpcObject | null = null;
   try {
     const lines = createInterface({ input: createReadStream(rolloutPath, { encoding: "utf8" }), crlfDelay: Infinity });
@@ -134,7 +134,7 @@ async function readTransferContext(rolloutPath: string, lastTurnId: string): Pro
   return { ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(cwd ? { cwd } : {}) };
 }
 
-function contextChanged(expected: TransferCheckpoint, actual: TransferContext): boolean {
+export function contextChanged(expected: TransferCheckpoint, actual: TransferContext): boolean {
   return (expected.model !== undefined && actual.model !== expected.model)
     || (expected.effort !== undefined && actual.effort !== expected.effort)
     || (expected.workspace !== undefined && (actual.cwd === undefined || comparablePath(actual.cwd) !== comparablePath(expected.workspace)));
@@ -210,7 +210,14 @@ async function portableRolloutDigest(rolloutPath: string, home: string, lastTurn
         const { client_id: _clientId, ...payload } = record.payload;
         hash.update(JSON.stringify(payload)); hash.update("\n");
         if (payload.type === "user_message" || payload.type === "agent_message") messages++;
-        else terminalTurns++;
+        else {
+          terminalTurns++;
+          // The checkpoint is a prefix boundary, not a promise that the target
+          // will remain unused while a durable handoff is recovering. Ignore
+          // later turns only after this exact copied turn reached a terminal
+          // event; all content through the boundary remains strict.
+          if (boundarySeen) return hash.digest("hex");
+        }
       }
     } finally { input.destroy(); }
   }
@@ -500,7 +507,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
     if (current.title !== request.task.title || current.projectId !== (project?.rawId ?? null)) {
       throw new DesktopUnavailableError("Название или нативное назначение проекта не подтверждено. VK-беседа ещё не переключена.");
     }
-    if (await this.lastTerminalTurn(targetHome, target.threadId) !== request.checkpoint.lastTurnId) {
+    if (!request.checkpoint.semanticDigest && await this.lastTerminalTurn(targetHome, target.threadId) !== request.checkpoint.lastTurnId) {
       throw new TransferConflictError("Последний ход копии не совпадает со снимком исходной задачи.");
     }
     if (request.checkpoint.semanticDigest) {
@@ -514,7 +521,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       let nativeMismatch = false;
       if (!crossMode) {
         const targetDigest = await completedHistoryDigest(target.threadId, request.checkpoint.lastTurnId,
-          params => this.createRpc(targetHome).call("thread/turns/list", params), { version: 3 });
+          params => this.createRpc(targetHome).call("thread/turns/list", params), { allowNewerTurns: true, version: 3 });
         const expectedDigest = version === 3 ? request.checkpoint.semanticDigest
           : await completedHistoryDigest(request.task.threadId, request.checkpoint.lastTurnId,
             params => this.createRpc(sourceHome).call("thread/turns/list", params), { version: 3 });

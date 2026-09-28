@@ -799,6 +799,17 @@ export class TaskManager {
       const receipt = this.desktop.submitWithReceipt
         ? await this.desktop.submitWithReceipt(request)
         : (await this.desktop.submit(request), null);
+      if (receipt?.mode === "queue") {
+        this.store.atomic(() => {
+          this.store.rememberQueuedInput(binding.id, operationId, receipt.submissionId);
+          this.store.settlePromptDispatch(operationId, "accepted");
+          this.store.setValue(`route-failure:${binding.id}`, null);
+          this.files?.markQueued(binding.id, operationId);
+          this.files?.finish(binding.id, operationId, "accepted");
+        });
+        this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
+        return;
+      }
       if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
       this.store.settlePromptDispatch(operationId, "accepted");
       this.store.setValue(`route-failure:${binding.id}`, null);
@@ -829,6 +840,30 @@ export class TaskManager {
           this.files?.finish(binding.id, operationId, "accepted", acceptedTurn);
           this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
             { text: "Codex принял запрос; подтверждение ответа задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
+          return;
+        }
+      }
+      if (!(reported instanceof ActionRejectedError) &&
+          (this.desktop.findQueuedSubmissionOutcome || this.desktop.findQueuedSubmission)) {
+        const outcome = await this.desktop.findQueuedSubmissionOutcome?.(binding, operationId).catch(() => null) ?? null;
+        if (outcome?.state === "rejected") {
+          this.store.settlePromptDispatch(operationId, "rejected");
+          this.files?.finish(binding.id, operationId, "rejected");
+          throw new ActionRejectedError("Codex подтвердил отказ ранее неопределённого запроса. Повторной отправки не было.");
+        }
+        const submissionId = outcome?.state === "accepted" ? outcome.submissionId
+          : outcome?.state === "unknown" ? null
+          : await this.desktop.findQueuedSubmission?.(binding, operationId).catch(() => null) ?? null;
+        if (submissionId) {
+          this.store.atomic(() => {
+            this.store.rememberQueuedInput(binding.id, operationId, submissionId);
+            this.store.settlePromptDispatch(operationId, "accepted");
+            this.store.setValue(`route-failure:${binding.id}`, null);
+            this.files?.markQueued(binding.id, operationId);
+            this.files?.finish(binding.id, operationId, "accepted");
+          });
+          this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
+            { text: "Codex принял запрос в очередь; подтверждение задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
           return;
         }
       }

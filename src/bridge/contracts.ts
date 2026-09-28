@@ -114,6 +114,9 @@ export interface TaskTransferRecord {
   readonly forkSubmitted?: boolean;
   readonly goal?: TaskGoal | null;
   readonly goalPrepared?: boolean;
+  /** Explicit recovery choice: the saved target was already used and its
+   * independently changed goal must be preserved instead of overwritten. */
+  readonly targetGoalAdopted?: boolean;
   readonly step?: "snapshot" | "fork" | "metadata" | "open" | "goal" | "verify" | "archive";
   readonly launchAttempted?: boolean;
   /** Executor that last attempted the idempotent target connection. A new

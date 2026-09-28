@@ -486,6 +486,47 @@ test("runtime reconciles an uncertain prompt from Codex history after restart", 
   assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
 });
 
+test("runtime reconciles a managed queue receipt without inventing a turn or replaying the prompt", async t => {
+  const s = runtimeSetup(t);
+  const prior = { messageId: 125, senderId: 42, operationId: "prior-operation",
+    turnId: "prior-turn", mode: "start" as const, text: "Prior editable turn" };
+  s.store.saveEditableRequest(s.binding.id, prior);
+  const operationId = "recovered-managed-operation";
+  const inboxKey = JSON.stringify([s.peerId, "message:managed-recovery"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.finishInput(inboxKey, true);
+  s.desktop.findAcceptedInput = async () => null;
+  (s.desktop as import("../src/core/codex-tasks.js").CodexTasks).findQueuedSubmission = async (_task, id) => id === operationId ? "persisted-managed-queue" : null;
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.equal(s.store.inputState(inboxKey), "done");
+  assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.queuedId), ["persisted-managed-queue"]);
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), []);
+  assert.deepEqual(s.store.editableRequest(s.binding.id), prior);
+});
+
+test("runtime settles a late durable managed queue rejection without replaying", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "recovered-rejected-managed-operation";
+  const inboxKey = JSON.stringify([s.peerId, "message:managed-rejected"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.finishInput(inboxKey, true);
+  s.desktop.findAcceptedInput = async () => null;
+  (s.desktop as import("../src/core/codex-tasks.js").CodexTasks).findQueuedSubmissionOutcome = async (_task, id) =>
+    id === operationId ? { state: "rejected" } : null;
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "rejected"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "rejected");
+  assert.equal(s.store.inputState(inboxKey), "done");
+  assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), []);
+});
+
 test("runtime follows a native queued request into its actual Codex turn", async t => {
   const s = runtimeSetup(t);
   const operationId = "native-queued-operation";
@@ -2414,7 +2455,7 @@ test("an in-flight v1 transfer verifies a portable target without trusting profi
       { id: "user", type: "userMessage", clientId: params.threadId, content: [{ type: "text", text: "Prompt" }] },
       ...(params.threadId === "source" ? [{ id: "tool", type: "webSearch", query: "local projection" }] : []),
       { id: "agent", type: "agentMessage", text: params.threadId === "target" ? targetText : "Done", phase: "final_answer" },
-    ] }], nextCursor: null } }) as never);
+    ] }, ...(params.threadId === "target" ? [{ id: "newer", status: "inProgress", items: [] }] : [])], nextCursor: null } }) as never);
   const request: TransferTaskRequest = { operationId: "legacy-v1", startedAt: 1, task: source,
     targetSourceId: "", projectId: null, checkpoint: { lastTurnId: "boundary", rolloutPath: path.join(sourceHome, "source.jsonl"),
       size: 1, mtimeMs: 1, semanticDigest: "saved-v1-digest", workspace: root, model: "model-a", effort: "high" } };
@@ -2742,6 +2783,12 @@ test("transfer verification falls back to exact persisted messages when native p
     const previousReads = fullReads;
     await transfer.verifyTarget(request, target);
     assert.equal(fullReads, previousReads, "cross-mode verification should not rebuild a large native projection");
+    await writeFile(targetPath, records("target-thread", "Answer", undefined, "legacy") + [
+      { type: "turn_context", payload: { turn_id: "newer-turn" } },
+      { type: "event_msg", payload: { type: "user_message", message: "Continued after the copy" } },
+      { type: "event_msg", payload: { type: "agent_message", message: "Still running", phase: "commentary" } },
+    ].map(record => JSON.stringify(record)).join("\n") + "\n");
+    await transfer.verifyTarget(request, target);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
