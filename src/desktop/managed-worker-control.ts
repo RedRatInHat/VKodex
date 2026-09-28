@@ -51,12 +51,29 @@ export interface ManagedWorkerControlOptions {
   /** Must independently authorize stop and fence current task/family safety.
    * Resolve only after actual shutdown; a failed/unknown attempt is never retried here. */
   readonly requestStop: () => Promise<void>;
+  /** Optional worker-local handoff fence; never asserts a durable bridge claim. */
+  readonly handoff?: Readonly<{
+    revoke: (expected: ManagedWorkerHandoffScope) => ManagedWorkerHandoffScope;
+    qualify: (expected: ManagedWorkerHandoffScope) => Promise<ManagedWorkerControlHandoffProof>;
+  }>;
   /** Absent by default. Callbacks retain the daemon's private in-process capability. */
   readonly vk?: Readonly<{
     submit: (request: SubmitTaskRequest) => Promise<Readonly<{ submissionId: string }>>;
     status: (request: SubmitTaskRequest) => ManagedWorkerVkStatus | null;
     statusByOperationId: (operationId: string) => ManagedWorkerVkStatus | null;
   }>;
+}
+export interface ManagedWorkerHandoffScope {
+  readonly backendGeneration: number;
+  readonly registryRevision: number;
+}
+export interface ManagedWorkerControlHandoffProof extends ManagedWorkerHandoffScope {
+  readonly ownerEpoch: string;
+  readonly taskId: string;
+  readonly host: Readonly<{ pid: number; birthTicks: string }>;
+  readonly backend: Readonly<{ pid: number; birthTicks: string; generation: number }>;
+  readonly endpointRef: string;
+  readonly nonce: string;
 }
 export interface ManagedWorkerVkStatus {
   readonly state: 'dispatching' | 'unknown' | 'accepted' | 'rejected';
@@ -79,6 +96,27 @@ const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean
 const text = (value: unknown, max: number): value is string => typeof value === 'string' &&
   value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const positive = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+const ticks = (v: unknown): v is string => typeof v === 'string' && /^[1-9][0-9]*$/u.test(v);
+const handoffScope = (v: unknown): v is ManagedWorkerHandoffScope => object(v) &&
+  exact(v, ['backendGeneration', 'registryRevision']) &&
+  positive(v.backendGeneration) && positive(v.registryRevision);
+export function validManagedWorkerHandoffProof(value: unknown, ownerEpoch: string,
+  taskId: string, expected: ManagedWorkerHandoffScope): value is ManagedWorkerControlHandoffProof {
+  if (!object(value) || !exact(value, ['ownerEpoch', 'taskId', 'backendGeneration',
+    'registryRevision', 'host', 'backend', 'endpointRef', 'nonce']) ||
+    value.ownerEpoch !== ownerEpoch || value.taskId !== taskId ||
+    value.backendGeneration !== expected.backendGeneration ||
+    value.registryRevision !== expected.registryRevision ||
+    typeof value.endpointRef !== 'string' || !uuid.test(value.endpointRef) ||
+    typeof value.nonce !== 'string' || !uuid.test(value.nonce) ||
+    !object(value.host) || !exact(value.host, ['pid', 'birthTicks']) ||
+    !positive(value.host.pid) || !ticks(value.host.birthTicks) ||
+    !object(value.backend) || !exact(value.backend, ['pid', 'birthTicks', 'generation']) ||
+    !positive(value.backend.pid) || !ticks(value.backend.birthTicks) ||
+    value.backend.generation !== expected.backendGeneration) return false;
+  return true;
+}
 const pathText = (value: unknown): value is string => text(value, 4096) && path.win32.isAbsolute(value);
 /** The socket carries only the serializable, text-only subset of SubmitTaskRequest. */
 export function validManagedVkControlRequest(value: unknown, taskId: string): value is SubmitTaskRequest {
@@ -183,13 +221,17 @@ export class ManagedWorkerControlServer {
         options.diagnose !== undefined && typeof options.diagnose !== 'function' ||
         options.vk !== undefined && (!options.vk || typeof options.vk.submit !== 'function' ||
           typeof options.vk.status !== 'function' || typeof options.vk.statusByOperationId !== 'function') ||
+        options.handoff !== undefined && (!options.handoff ||
+          typeof options.handoff.revoke !== 'function' ||
+          typeof options.handoff.qualify !== 'function') ||
         typeof options.requestStop !== 'function' || !/^[A-Za-z0-9_-]{43,128}$/u.test(token) ||
         !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 60_000 ||
         !Number.isSafeInteger(idleTimeout) || idleTimeout < 10 || idleTimeout > 60_000)
       throw new TypeError('Invalid managed worker control configuration');
     this.#options = Object.freeze({ ...options, authTimeoutMs: timeout,
       authenticatedIdleTimeoutMs: idleTimeout,
-      ...(options.vk ? { vk: Object.freeze({ ...options.vk }) } : {}) });
+      ...(options.vk ? { vk: Object.freeze({ ...options.vk }) } : {}),
+      ...(options.handoff ? { handoff: Object.freeze({ ...options.handoff }) } : {}) });
     this.#token = Buffer.from(token);
     this.#idleTimeout = idleTimeout;
     this.#server = createServer(socket => this.#accept(socket));
@@ -248,16 +290,44 @@ export class ManagedWorkerControlServer {
         const id = frame.id;
         const vkMethod = frame.method === 'submit-vk-v1' || frame.method === 'vk-submission-status-v1' ||
           frame.method === 'vk-submission-status-by-id-v1';
-        if (!(vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+        const handoffMethod = frame.method === 'revoke-ingress-v1' || frame.method === 'qualify-handoff-v1';
+        if (!(handoffMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+          'backendGeneration', 'registryRevision']) : vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           frame.method === 'vk-submission-status-by-id-v1' ? 'operationId' : 'request']) :
           exact(frame, ['id', 'epoch', 'method'])) || frame.epoch !== this.#options.ownerEpoch ||
             vkMethod && (frame.taskId !== this.#options.taskId || !this.#options.vk) ||
+            handoffMethod && (frame.taskId !== this.#options.taskId || !this.#options.handoff ||
+              !positive(frame.backendGeneration) || !positive(frame.registryRevision)) ||
             !['status', 'diagnose-v1', 'stop', 'submit-vk-v1', 'vk-submission-status-v1',
-              'vk-submission-status-by-id-v1'].includes(String(frame.method)) ||
+              'vk-submission-status-by-id-v1', 'revoke-ingress-v1',
+              'qualify-handoff-v1'].includes(String(frame.method)) ||
             ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
+        if (handoffMethod) {
+          const expected = Object.freeze({ backendGeneration: frame.backendGeneration as number,
+            registryRevision: frame.registryRevision as number });
+          if (!handoffScope(expected)) { send({ id, error: 'refused' }); continue; }
+          if (frame.method === 'revoke-ingress-v1') {
+            try {
+              const result = this.#options.handoff!.revoke(expected);
+              if (!handoffScope(result) || result.backendGeneration !== expected.backendGeneration ||
+                result.registryRevision !== expected.registryRevision) throw new Error();
+              send({ id, result });
+            } catch { send({ id, error: 'handoff-unknown' }); }
+          } else {
+            outstanding++;
+            void Promise.resolve().then(() => this.#options.handoff!.qualify(expected)).then(result => {
+              if (!validManagedWorkerHandoffProof(result, this.#options.ownerEpoch,
+                this.#options.taskId, expected)) throw new Error();
+              send({ id, result });
+            }, () => send({ id, error: 'handoff-unknown' }))
+              .catch(() => send({ id, error: 'handoff-unknown' }))
+              .finally(() => { outstanding--; });
+          }
+          continue;
+        }
         if (vkMethod) {
           if (!this.#options.vk || (frame.method === 'vk-submission-status-by-id-v1' ?
             typeof frame.operationId !== 'string' || !uuid.test(frame.operationId) :

@@ -14,7 +14,7 @@ import { bootstrapManagedWorker,
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
-  type ManagedWorkerVkStatus } from './managed-worker-control.js';
+  type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
@@ -362,6 +362,19 @@ export class ManagedWorkerDaemon {
           return row?.epoch === manifest.epoch ? row.state : null;
         } catch { return null; }
       };
+      const handoffScopeCurrent = (expected: ManagedWorkerHandoffScope): boolean => {
+        const row = this.#registry?.get(manifest.home, manifest.familyRoot);
+        return this.#state === 'ready' &&
+          this.#attempt?.state === 'ready' && this.#attempt.revision === expected.registryRevision &&
+          this.#generation === expected.backendGeneration &&
+          this.#backend?.generation === expected.backendGeneration &&
+          !!row && row.state === 'ready' && row.epoch === manifest.epoch &&
+          row.revision === expected.registryRevision && row.endpointRef === this.#endpointRef &&
+          same(row.host, this.#self) && same(row.backend, this.#backend) &&
+          row.backend?.generation === expected.backendGeneration &&
+          same(observe(this.#self!.pid), this.#self) &&
+          same(observe(this.#backend!.pid), this.#backend) && ownerCurrent();
+      };
       this.#control = (this.#options.dependencies?.createControl ??
         (options => new ManagedWorkerControlServer(options)))({
         ownerEpoch: manifest.epoch, taskId: manifest.taskId,
@@ -376,6 +389,22 @@ export class ManagedWorkerDaemon {
           registryState: currentRegistryState(),
           owner: this.metadata.nativeStartup }),
         requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
+        ...(this.#options.nativeStockQueue?.handoffCapability ? { handoff: {
+          revoke: (expected: ManagedWorkerHandoffScope) => {
+            if (!handoffScopeCurrent(expected)) throw new Error('Worker handoff scope unavailable');
+            this.revokeIngress(this.#options.nativeStockQueue!.handoffCapability!);
+            if (!handoffScopeCurrent(expected)) throw new Error('Worker handoff scope changed');
+            return expected;
+          },
+          qualify: async (expected: ManagedWorkerHandoffScope) => {
+            if (!handoffScopeCurrent(expected)) throw new Error('Worker handoff scope unavailable');
+            const proof = await this.qualifyHandoff(this.#options.nativeStockQueue!.handoffCapability!);
+            if (!handoffScopeCurrent(expected) || proof.backendGeneration !== expected.backendGeneration ||
+              proof.registryRevision !== expected.registryRevision)
+              throw new Error('Worker handoff scope changed');
+            return proof;
+          },
+        } } : {}),
         ...(this.#options.nativeStockQueue?.headlessVk ? { vk: {
           submit: (request: SubmitTaskRequest) => this.submitVk(
             this.#options.nativeStockQueue!.headlessVk!.capability, request),

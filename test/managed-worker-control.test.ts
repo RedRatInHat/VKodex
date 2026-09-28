@@ -4,7 +4,8 @@ import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError } from '../src/desktop/managed-worker-control.js';
-import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError } from
+import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError,
+  ManagedWorkerHandoffUnknownError } from
   '../src/desktop/managed-worker-control-client.js';
 
 async function peer(cap: { host: string; port: number; token: string }) {
@@ -54,6 +55,64 @@ test('authenticated metadata control survives client EOF without stopping its wo
     b.socket.destroy();
   } finally { await server.close(); }
   assert.equal(stops, 0, 'listener shutdown is not worker shutdown');
+});
+
+test('opt-in handoff control binds exact worker scope and returns a one-time proof', async () => {
+  const epoch = randomUUID(), taskId = 'owned-thread';
+  let revokes = 0, qualifications = 0;
+  const proof = { ownerEpoch: epoch, taskId, backendGeneration: 2, registryRevision: 5,
+    host: { pid: 41, birthTicks: '123' }, backend: { pid: 42, birthTicks: '124', generation: 2 },
+    endpointRef: randomUUID(), nonce: randomUUID() };
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId,
+    status: () => ({ hostState: 'running', backendGeneration: 2, nativeState: 'connected', nativeRevision: 1 }),
+    requestStop: async () => { throw new Error('stop must not run'); },
+    handoff: { revoke: expected => {
+      assert.deepEqual(expected, { backendGeneration: 2, registryRevision: 5 }); revokes++;
+      return { backendGeneration: 2, registryRevision: 5 };
+    }, qualify: async expected => {
+      assert.deepEqual(expected, { backendGeneration: 2, registryRevision: 5 }); qualifications++;
+      return proof;
+    } } });
+  const cap = await server.listen();
+  try {
+    const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId });
+    const bad = await peer(cap);
+    bad.send({ id: 'wrong-task', epoch, taskId: 'other', method: 'revoke-ingress-v1',
+      backendGeneration: 2, registryRevision: 5 });
+    assert.equal((await bad.read()).error, 'refused');
+    bad.send({ id: 'wrong-revision', epoch, taskId, method: 'revoke-ingress-v1',
+      backendGeneration: 2, registryRevision: 4, extra: true });
+    assert.equal((await bad.read()).error, 'refused');
+    bad.socket.destroy();
+    assert.deepEqual(await client.revokeIngress({ backendGeneration: 2, registryRevision: 5 }),
+      { backendGeneration: 2, registryRevision: 5 });
+    assert.deepEqual(await client.qualifyHandoff({ backendGeneration: 2, registryRevision: 5 }), proof);
+    assert.equal(revokes, 1); assert.equal(qualifications, 1);
+  } finally { await server.close(); }
+});
+
+test('handoff qualification timeout is unknown and does not cancel its worker-local proof', async () => {
+  const epoch = randomUUID(), taskId = 'own', expected = { backendGeneration: 1, registryRevision: 3 };
+  let release!: () => void, qualifications = 0;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId,
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: 'connected', nativeRevision: 0 }),
+    requestStop: async () => { throw new Error('stop must not run'); },
+    handoff: { revoke: () => expected, qualify: async () => {
+      qualifications++; await waiting;
+      return { ownerEpoch: epoch, taskId, ...expected, host: { pid: 1, birthTicks: '11' },
+        backend: { pid: 2, birthTicks: '12', generation: 1 },
+        endpointRef: randomUUID(), nonce: randomUUID() };
+    } } });
+  const cap = await server.listen();
+  try {
+    const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId, timeoutMs: 80 });
+    await assert.rejects(client.qualifyHandoff(expected), ManagedWorkerHandoffUnknownError);
+    release();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(qualifications, 1, 'EOF did not cancel or replay the proof operation');
+    assert.equal((await client.status()).hostState, 'running');
+  } finally { release(); await server.close(); }
 });
 
 test('control client status reads exact scoped health without requesting a worker action', async () => {

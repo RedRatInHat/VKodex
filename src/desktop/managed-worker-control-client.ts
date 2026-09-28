@@ -3,7 +3,8 @@ import { connect } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import { validManagedVkControlRequest, type ManagedWorkerControlStatus,
-  type ManagedWorkerVkStatus } from './managed-worker-control.js';
+  validManagedWorkerHandoffProof, type ManagedWorkerHandoffScope,
+  type ManagedWorkerControlHandoffProof, type ManagedWorkerVkStatus } from './managed-worker-control.js';
 
 export interface ManagedWorkerControlClientOptions {
   readonly host: '127.0.0.1';
@@ -21,13 +22,20 @@ export class ManagedWorkerControlUnknownError extends Error {
 export class ManagedWorkerControlRefusedError extends Error {
   constructor() { super('Managed VK submission refused'); }
 }
+export class ManagedWorkerHandoffUnknownError extends Error {
+  constructor() { super('Managed worker handoff outcome unknown; do not transition the durable claim'); }
+}
+export class ManagedWorkerHandoffRefusedError extends Error {
+  constructor() { super('Managed worker handoff request refused'); }
+}
 
 export interface ManagedWorkerScopedControlStatus extends ManagedWorkerControlStatus {
   readonly ownerEpoch: string;
   readonly taskId: string;
 }
 
-type Method = 'status' | 'submit-vk-v1' | 'vk-submission-status-v1' | 'vk-submission-status-by-id-v1';
+type Method = 'status' | 'submit-vk-v1' | 'vk-submission-status-v1' |
+  'vk-submission-status-by-id-v1' | 'revoke-ingress-v1' | 'qualify-handoff-v1';
 const object = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
@@ -52,11 +60,16 @@ export class ManagedWorkerControlClient {
 
   async #call(method: Method, payload: Readonly<Record<string, unknown>>): Promise<unknown> {
     const scope = this.#options;
+    const handoff = method === 'revoke-ingress-v1' || method === 'qualify-handoff-v1';
+    const unknown = () => handoff ? new ManagedWorkerHandoffUnknownError() :
+      new ManagedWorkerControlUnknownError();
+    const refused = () => handoff ? new ManagedWorkerHandoffRefusedError() :
+      new ManagedWorkerControlRefusedError();
     const id = randomUUID();
     const frame = JSON.stringify({ id, epoch: scope.ownerEpoch,
       ...(method === 'status' ? {} : { taskId: scope.taskId }), method, ...payload }) + '\n';
     if (Buffer.byteLength(frame, 'utf8') > 128 * 1024)
-      throw new ManagedWorkerControlRefusedError();
+      throw refused();
     return new Promise((resolve, reject) => {
       const socket = connect(scope.port, scope.host);
       const decoder = new StringDecoder('utf8');
@@ -66,25 +79,25 @@ export class ManagedWorkerControlClient {
         settled = true; clearTimeout(timer); socket.destroy();
         if (error) reject(error); else resolve(result);
       };
-      const timer = setTimeout(() => end(new ManagedWorkerControlUnknownError()), scope.timeoutMs);
+      const timer = setTimeout(() => end(unknown()), scope.timeoutMs);
       timer.unref();
-      socket.on('error', () => end(new ManagedWorkerControlUnknownError()));
-      socket.on('close', () => end(new ManagedWorkerControlUnknownError()));
+      socket.on('error', () => end(unknown()));
+      socket.on('close', () => end(unknown()));
       socket.on('connect', () => socket.write(JSON.stringify({ token: scope.token }) + '\n'));
       socket.on('data', (chunk: Buffer) => {
         buffer += decoder.write(chunk);
         if (Buffer.byteLength(buffer, 'utf8') > 8192) {
-          end(new ManagedWorkerControlUnknownError()); return;
+          end(unknown()); return;
         }
         while (buffer.includes('\n')) {
           const newline = buffer.indexOf('\n');
           let reply: unknown;
           try { reply = JSON.parse(buffer.slice(0, newline)); }
-          catch { end(new ManagedWorkerControlUnknownError()); return; }
+          catch { end(unknown()); return; }
           buffer = buffer.slice(newline + 1);
           if (!authenticated) {
             if (!object(reply) || Object.keys(reply).length !== 1 || reply.ok !== true) {
-              end(new ManagedWorkerControlUnknownError()); return;
+              end(unknown()); return;
             }
             authenticated = true;
             socket.write(frame);
@@ -93,11 +106,10 @@ export class ManagedWorkerControlClient {
           if (!object(reply) || reply.id !== id || Object.keys(reply).some(key =>
             !['id', 'result', 'error'].includes(key)) ||
             Object.hasOwn(reply, 'result') === Object.hasOwn(reply, 'error')) {
-            end(new ManagedWorkerControlUnknownError()); return;
+            end(unknown()); return;
           }
           if (reply.error !== undefined) {
-            end(reply.error === 'refused' || reply.error === 'rejected' ?
-              new ManagedWorkerControlRefusedError() : new ManagedWorkerControlUnknownError());
+            end(reply.error === 'refused' || reply.error === 'rejected' ? refused() : unknown());
           } else end(undefined, reply.result);
           return;
         }
@@ -143,6 +155,28 @@ export class ManagedWorkerControlClient {
     return this.#status(await this.#call('vk-submission-status-by-id-v1', { operationId }));
   }
 
+  /** Worker-local monotonic revoke. EOF/timeout is unknown, never success. */
+  async revokeIngress(expected: ManagedWorkerHandoffScope): Promise<ManagedWorkerHandoffScope> {
+    if (!validHandoffScope(expected)) throw new ManagedWorkerHandoffRefusedError();
+    const result = await this.#call('revoke-ingress-v1', {
+      backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision });
+    if (!validHandoffScope(result) || result.backendGeneration !== expected.backendGeneration ||
+      result.registryRevision !== expected.registryRevision)
+      throw new ManagedWorkerHandoffUnknownError();
+    return Object.freeze({ backendGeneration: result.backendGeneration,
+      registryRevision: result.registryRevision });
+  }
+
+  /** A proof for handoff_pending only; caller must fence its durable claim. */
+  async qualifyHandoff(expected: ManagedWorkerHandoffScope): Promise<ManagedWorkerControlHandoffProof> {
+    if (!validHandoffScope(expected)) throw new ManagedWorkerHandoffRefusedError();
+    const result = await this.#call('qualify-handoff-v1', {
+      backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision });
+    if (!validManagedWorkerHandoffProof(result, this.#options.ownerEpoch,
+      this.#options.taskId, expected)) throw new ManagedWorkerHandoffUnknownError();
+    return result;
+  }
+
   #status(result: unknown): ManagedWorkerVkStatus | null {
     if (result === null) return null;
     if (!object(result) || Object.keys(result).length !== 2 ||
@@ -155,3 +189,8 @@ export class ManagedWorkerControlClient {
     return result as unknown as ManagedWorkerVkStatus;
   }
 }
+const validHandoffScope = (v: unknown): v is ManagedWorkerHandoffScope => object(v) &&
+  Object.keys(v).length === 2 && Object.hasOwn(v, 'backendGeneration') &&
+  Object.hasOwn(v, 'registryRevision') && Number.isSafeInteger(v.backendGeneration) &&
+  (v.backendGeneration as number) > 0 && Number.isSafeInteger(v.registryRevision) &&
+  (v.registryRevision as number) > 0;

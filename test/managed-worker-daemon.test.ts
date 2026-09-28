@@ -294,14 +294,24 @@ test('handoff proof requires the family and is one-time after a monotonic revoke
   const own = await readyFixture(family, { enabled: true, early: false },
     'normal', true, null, undefined, undefined, false, handoffCapability);
   try {
-    own.daemon.revokeIngress(handoffCapability);
-    await assert.rejects(own.daemon.qualifyHandoff(handoffCapability));
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'endpoint.v1.json'), 'utf8')) as { control: { port: number } };
+    const client = new ManagedWorkerControlClient({ host: '127.0.0.1',
+      port: endpoint.control.port, token: Buffer.alloc(32, 3).toString('base64url'),
+      ownerEpoch: own.reserved.epoch, taskId: own.taskId });
+    const registry = new ManagedWorkerRegistry(own.registryPath);
+    const row = registry.get(own.home, 'own-family'); registry.close();
+    assert.ok(row);
+    const expected = { backendGeneration: own.daemon.metadata.generation!,
+      registryRevision: row.revision };
+    assert.deepEqual(await client.revokeIngress(expected), expected);
+    await assert.rejects(client.qualifyHandoff(expected));
     assert.equal(own.backend.exitCode, null);
     assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch,
       'handoff-family-refused')).error, 'stop-refused');
     assert.equal(own.backend.exitCode, null);
     family.allow = true;
-    const proof = await own.daemon.qualifyHandoff(handoffCapability);
+    const proof = await client.qualifyHandoff(expected);
     assert.equal(proof.ownerEpoch, own.reserved.epoch);
     assert.equal(proof.taskId, own.taskId);
     assert.equal(proof.backendGeneration, own.daemon.metadata.generation);
@@ -309,7 +319,7 @@ test('handoff proof requires the family and is one-time after a monotonic revoke
     assert.ok(proof.host.pid > 0 && proof.host.birthTicks);
     assert.ok(proof.backend.pid > 0 && proof.backend.birthTicks);
     assert.match(proof.nonce, /^[0-9a-f-]{36}$/i);
-    await assert.rejects(own.daemon.qualifyHandoff(handoffCapability));
+    await assert.rejects(client.qualifyHandoff(expected));
     assert.equal(own.daemon.metadata.state, 'ready', 'proof does not retire the writer');
   } finally {
     if (own.backend.exitCode === null) { own.backend.exitCode = 1;
