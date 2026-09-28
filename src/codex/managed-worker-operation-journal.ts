@@ -20,12 +20,27 @@ export interface WorkerOperation extends WorkerOperationIntent {
   readonly receiptId: string | null;
   readonly rejectionCode: number | null;
 }
+/** Separate effect identity: a settings ACK has no native receipt ID. */
+export interface SettingsOperationIntent {
+  readonly operationId: string;
+  readonly fingerprint: string;
+}
+export interface SettingsOperation extends SettingsOperationIntent {
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  readonly threadId: string;
+  readonly revision: number;
+  readonly state: "dispatching" | "unknown";
+  readonly rpcAck: boolean;
+}
 
 interface ScopeRow { owner_epoch: string; backend_generation: number; thread_id: string }
 interface OperationRow {
   operation_id: string; client_user_message_id: string; method: WorkerMutationMethod; fingerprint: string;
   revision: number; state: WorkerOperationState; receipt_id: string | null; rejection_code: number | null;
 }
+interface SettingsRow { operation_id: string; fingerprint: string; revision: number;
+  state: "dispatching" | "unknown"; rpc_ack: number }
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const hmac = /^[0-9a-f]{64}$/u;
@@ -53,6 +68,15 @@ function validateIntent(intent: WorkerOperationIntent): void {
   bounded(intent.clientUserMessageId, "client user message ID", 128);
   if (intent.method !== "turn/start" && intent.method !== "thread/queue/add") throw new Error("Invalid mutation method");
   if (typeof intent.fingerprint !== "string" || !hmac.test(intent.fingerprint)) throw new Error("Invalid fingerprint");
+}
+function validateSettingsIntent(intent: SettingsOperationIntent): void {
+  if (intent === null || typeof intent !== "object" || Array.isArray(intent) ||
+      Object.getPrototypeOf(intent) !== Object.prototype ||
+      Reflect.ownKeys(intent).sort().join("|") !== "fingerprint|operationId")
+    throw new Error("Invalid settings intent fields");
+  validUuid(intent.operationId, "operation ID");
+  if (typeof intent.fingerprint !== "string" || !hmac.test(intent.fingerprint))
+    throw new Error("Invalid settings fingerprint");
 }
 
 /** Metadata-only owner journal. The caller proves live ownership and computes the keyed HMAC. */
@@ -87,7 +111,13 @@ export class ManagedWorkerOperationJournal {
         receipt_id TEXT, rejection_code INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS managed_worker_unsettled ON managed_worker_operations(state)
-        WHERE state IN ('dispatching','unknown');`);
+        WHERE state IN ('dispatching','unknown');
+      CREATE TABLE IF NOT EXISTS managed_worker_settings_operations (
+        operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('dispatching','unknown')),
+        rpc_ack INTEGER NOT NULL CHECK(rpc_ack IN (0,1)),
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );`);
       this.db.transaction(() => {
         const current = this.db.prepare("SELECT owner_epoch,backend_generation,thread_id FROM managed_worker_operation_scope WHERE singleton=1").get() as ScopeRow | undefined;
         if (current) {
@@ -108,7 +138,8 @@ export class ManagedWorkerOperationJournal {
 
   /** Scoped durable evidence only; no reservation or backend request. */
   hasUnconfirmed(): boolean {
-    return this.db.prepare("SELECT 1 FROM managed_worker_operations WHERE state IN ('dispatching','unknown') LIMIT 1")
+    return this.db.prepare(`SELECT 1 FROM managed_worker_operations WHERE state IN ('dispatching','unknown')
+      UNION ALL SELECT 1 FROM managed_worker_settings_operations LIMIT 1`)
       .get() !== undefined;
   }
 
@@ -127,10 +158,45 @@ export class ManagedWorkerOperationJournal {
     const row = this.db.prepare("SELECT * FROM managed_worker_operations WHERE operation_id=?").get(id) as OperationRow | undefined;
     return row ? this.view(row) : null;
   }
+  getSettings(operationId: string): SettingsOperation | null {
+    const id = validUuid(operationId, "operation ID");
+    const row = this.db.prepare("SELECT * FROM managed_worker_settings_operations WHERE operation_id=?")
+      .get(id) as SettingsRow | undefined;
+    return row ? this.settingsView(row) : null;
+  }
+
+  reserveSettings(intent: SettingsOperationIntent): { created: boolean; operation: SettingsOperation } {
+    validateSettingsIntent(intent);
+    return this.db.transaction(() => {
+      if (this.get(intent.operationId)) throw new Error("Settings operation ID conflict");
+      const existing = this.getSettings(intent.operationId);
+      if (existing) {
+        if (existing.fingerprint !== intent.fingerprint) throw new Error("Settings intent conflict");
+        return { created: false, operation: existing };
+      }
+      if (this.hasUnconfirmed()) throw new Error("Unsettled operation blocks admission");
+      const now = Date.now();
+      this.db.prepare(`INSERT INTO managed_worker_settings_operations
+        (operation_id,fingerprint,revision,state,rpc_ack,created_at,updated_at)
+        VALUES (?,?,0,'dispatching',0,?,?)`)
+        .run(intent.operationId, intent.fingerprint, now, now);
+      return { created: true, operation: this.getSettings(intent.operationId)! };
+    }).immediate();
+  }
+
+  markSettingsUnknown(expected: SettingsOperation): SettingsOperation {
+    return this.settingsTransition(expected, false);
+  }
+
+  /** Native `{}` ACK is recorded separately from any effective-settings proof. */
+  noteSettingsAck(expected: SettingsOperation): SettingsOperation {
+    return this.settingsTransition(expected, true);
+  }
 
   reserve(intent: WorkerOperationIntent): { created: boolean; operation: WorkerOperation } {
     validateIntent(intent);
     return this.db.transaction(() => {
+      if (this.getSettings(intent.operationId)) throw new Error("Worker operation ID conflict");
       const existing = this.get(intent.operationId);
       if (existing) {
         if (existing.clientUserMessageId !== intent.clientUserMessageId || existing.method !== intent.method || existing.fingerprint !== intent.fingerprint) {
@@ -141,7 +207,7 @@ export class ManagedWorkerOperationJournal {
       if (this.db.prepare("SELECT 1 FROM managed_worker_operations WHERE client_user_message_id=?").get(intent.clientUserMessageId)) {
         throw new Error("Client user message ID conflict");
       }
-      if (this.db.prepare("SELECT 1 FROM managed_worker_operations WHERE state IN ('dispatching','unknown') LIMIT 1").get()) {
+      if (this.hasUnconfirmed()) {
         throw new Error("Unsettled operation blocks admission");
       }
       const now = Date.now();
@@ -172,6 +238,34 @@ export class ManagedWorkerOperationJournal {
       operationId: row.operation_id, clientUserMessageId: row.client_user_message_id,
       method: row.method, fingerprint: row.fingerprint, revision: row.revision,
       state: row.state, receiptId: row.receipt_id, rejectionCode: row.rejection_code };
+  }
+  private settingsView(row: SettingsRow): SettingsOperation {
+    return { ownerEpoch: this.ownerEpoch, backendGeneration: this.backendGeneration,
+      threadId: this.threadId, operationId: row.operation_id, fingerprint: row.fingerprint,
+      revision: row.revision, state: row.state, rpcAck: row.rpc_ack === 1 };
+  }
+
+  private settingsTransition(expected: SettingsOperation, ack: boolean): SettingsOperation {
+    return this.db.transaction(() => {
+      if (!expected || expected.ownerEpoch !== this.ownerEpoch ||
+          expected.backendGeneration !== this.backendGeneration || expected.threadId !== this.threadId)
+        throw new Error("Settings operation scope mismatch");
+      const current = this.getSettings(expected.operationId);
+      if (!current || current.fingerprint !== expected.fingerprint)
+        throw new Error("Stale settings operation identity");
+      if (current.revision !== expected.revision || current.state !== expected.state ||
+          current.rpcAck !== expected.rpcAck) {
+        if (ack && current.revision === expected.revision + 1 && current.rpcAck &&
+            current.fingerprint === expected.fingerprint) return current;
+        throw new Error("Stale settings operation revision");
+      }
+      if (current.state === 'unknown' && (!ack || current.rpcAck)) return current;
+      const updated = this.db.prepare(`UPDATE managed_worker_settings_operations SET state='unknown',
+        rpc_ack=?,revision=revision+1,updated_at=? WHERE operation_id=? AND revision=?`)
+        .run(ack || current.rpcAck ? 1 : 0, Date.now(), current.operationId, current.revision);
+      if (updated.changes !== 1) throw new Error("Stale settings operation revision");
+      return this.getSettings(current.operationId)!;
+    }).immediate();
   }
 
   private transition(expected: WorkerOperation, next: WorkerOperationState,

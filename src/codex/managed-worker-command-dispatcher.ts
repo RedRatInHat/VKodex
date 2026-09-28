@@ -3,12 +3,17 @@ import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import type { AppServerConnection, AppServerResponseEnvelope } from './app-server-connection.js';
 import { ManagedWorkerOperationJournal } from './managed-worker-operation-journal.js';
-import type { WorkerOperation, WorkerMutationMethod } from './managed-worker-operation-journal.js';
+import type { WorkerOperation, WorkerMutationMethod, SettingsOperation } from './managed-worker-operation-journal.js';
 
 type JsonObject = Record<string, unknown>;
 export interface WorkerCommand {
   readonly operationId: string;
   readonly method: WorkerMutationMethod;
+  readonly params: JsonObject;
+}
+export interface SettingsCommand {
+  readonly operationId: string;
+  readonly method: 'thread/settings/update';
   readonly params: JsonObject;
 }
 export interface WorkerCommandScope {
@@ -33,6 +38,8 @@ export interface WorkerCommandPolicy {
   /** Must establish actual authority and the method's full settings/queue policy.
    * A matching directory, registry reservation or task ID alone is insufficient. */
   readonly authorize: (context: Readonly<WorkerCommandScope & WorkerCommand>) => boolean;
+  /** Separate opt-in. Absence denies every settings write. */
+  readonly authorizeSettings?: (context: Readonly<WorkerCommandScope & SettingsCommand>) => boolean;
   readonly isOwnerCurrent: (scope: Readonly<WorkerCommandScope>) => boolean;
 }
 type Backend = Pick<AppServerConnection, 'request' | 'isSessionCurrent'>;
@@ -65,6 +72,26 @@ function snapshot(command: WorkerCommand): Readonly<WorkerCommand> {
     return freeze(copy);
   } catch { throw new TypeError('Worker command must be bounded strict JSON'); }
 }
+function snapshotSettings(command: SettingsCommand): Readonly<SettingsCommand> {
+  if (!object(command) || !uuid.test(command.operationId) ||
+      command.method !== 'thread/settings/update' || !object(command.params))
+    throw new TypeError('Invalid settings command');
+  try {
+    const copy = structuredClone(command);
+    const encoded = JSON.stringify(copy);
+    const allowed = ['threadId', 'disabledPluginIds', 'cwd', 'approvalPolicy',
+      'approvalsReviewer', 'sandboxPolicy', 'permissions', 'model', 'serviceTier',
+      'effort', 'summary', 'collaborationMode', 'multiAgentMode', 'personality'];
+    if (Buffer.byteLength(encoded) > 1024 * 1024 ||
+        !isDeepStrictEqual(copy, JSON.parse(encoded)) ||
+        Object.keys(copy).some(key => !['operationId', 'method', 'params'].includes(key)) ||
+        Object.keys(copy.params).some(key => !allowed.includes(key)) ||
+        typeof copy.params.threadId !== 'string' ||
+        typeof copy.params.model !== 'string' || !copy.params.model ||
+        copy.params.effort !== null && typeof copy.params.effort !== 'string') throw new Error();
+    return freeze(copy);
+  } catch { throw new TypeError('Settings command must be bounded strict JSON'); }
+}
 
 /** Copies policy before worker launch. Key bytes never enter journal/metadata. */
 export function captureWorkerCommandPolicy(policy: WorkerCommandPolicy): WorkerCommandPolicy {
@@ -73,10 +100,13 @@ export function captureWorkerCommandPolicy(policy: WorkerCommandPolicy): WorkerC
       typeof policy.journalPath !== 'string' || !path.isAbsolute(policy.journalPath) ||
       !(policy.fingerprintKey instanceof Uint8Array) || policy.fingerprintKey.byteLength < 32 ||
       policy.fingerprintKey.byteLength > 128 || typeof policy.authorize !== 'function' ||
+      (policy.authorizeSettings !== undefined && typeof policy.authorizeSettings !== 'function') ||
       typeof policy.isOwnerCurrent !== 'function') throw new TypeError('Explicit worker command policy required');
   return Object.freeze({ controlKey: policy.controlKey, ownerEpoch: policy.ownerEpoch,
     journalPath: policy.journalPath, fingerprintKey: Buffer.from(policy.fingerprintKey),
-    authorize: policy.authorize, isOwnerCurrent: policy.isOwnerCurrent });
+    authorize: policy.authorize,
+    ...(policy.authorizeSettings ? { authorizeSettings: policy.authorizeSettings } : {}),
+    isOwnerCurrent: policy.isOwnerCurrent });
 }
 
 /** Owner control API, NOT a synthetic native RPC response or a scheduler. */
@@ -85,6 +115,7 @@ export class ManagedWorkerCommandDispatcher {
   readonly #scope: Readonly<WorkerCommandScope>;
   readonly #journal: ManagedWorkerOperationJournal;
   readonly #inFlight = new Map<string, Promise<WorkerOperation>>();
+  readonly #settingsInFlight = new Map<string, Promise<SettingsOperation>>();
   readonly #responses = new Map<string, { receiptId: string; value: JsonObject; bytes: number }>();
   #responseBytes = 0;
   #closed = false;
@@ -113,11 +144,15 @@ export class ManagedWorkerCommandDispatcher {
     this.#authenticate(key);
     return this.#journal.get(operationId);
   }
+  getSettings(key: object, operationId: string): SettingsOperation | null {
+    this.#authenticate(key);
+    return this.#journal.getSettings(operationId);
+  }
   /** Read-only snapshot. Caller must close new admission before using it as
    * one part of a stop proof; this says nothing about worker idle/history. */
   quiescence(key: object): WorkerCommandQuiescence {
     this.#authenticate(key);
-    return Object.freeze({ inFlight: this.#inFlight.size,
+    return Object.freeze({ inFlight: this.#inFlight.size + this.#settingsInFlight.size,
       unconfirmed: this.#journal.hasUnconfirmed() });
   }
   acceptedReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {
@@ -141,6 +176,37 @@ export class ManagedWorkerCommandDispatcher {
   }
   execute(key: object, value: WorkerCommand): Promise<WorkerOperation> {
     return this.#execute(key, value, false);
+  }
+
+  /** ACK records only RPC completion; settings remain unknown until a separate effective-state proof API exists. */
+  executeSettings(key: object, value: SettingsCommand, beforeWrite?: () => void): Promise<SettingsOperation> {
+    this.#authenticate(key);
+    if (this.#checkingPolicy) throw new Error('Reentrant worker command admission');
+    if (beforeWrite !== undefined && typeof beforeWrite !== 'function')
+      throw new TypeError('Scoped before-write callback must be a function');
+    const command = snapshotSettings(value);
+    if (command.params.threadId !== this.#scope.threadId) throw new TypeError('Exact settings thread required');
+    const fingerprint = createHmac('sha256', this.#policy.fingerprintKey)
+      .update(canonical({ ...this.#scope, ...command })).digest('hex');
+    const intent = { operationId: command.operationId, fingerprint };
+    if (this.#journal.getSettings(command.operationId)) {
+      const prior = this.#journal.reserveSettings(intent).operation;
+      return this.#settingsInFlight.get(command.operationId) ?? Promise.resolve(prior);
+    }
+    const authorize = () => this.#checkPolicy(() => {
+      if (!this.#current() || this.#policy.authorizeSettings?.(Object.freeze({ ...this.#scope,
+          ...command })) !== true) throw new Error('Settings authority unavailable');
+      beforeWrite?.();
+      if (!this.#current()) throw new Error('Settings authority changed');
+    });
+    authorize();
+    const reserved = this.#journal.reserveSettings(intent);
+    if (!reserved.created) return Promise.resolve(reserved.operation);
+    const work = this.#dispatchSettings(command, authorize);
+    this.#settingsInFlight.set(command.operationId, work);
+    void work.then(() => this.#settingsInFlight.delete(command.operationId),
+      () => this.#settingsInFlight.delete(command.operationId));
+    return work;
   }
 
   executeWithResponse(key: object, value: WorkerCommand,
@@ -261,10 +327,30 @@ export class ManagedWorkerCommandDispatcher {
     return observed.state === 'dispatching' ? this.#journal.markUnknown(observed) : observed;
   }
 
+  #settingsAck(command: SettingsCommand, envelope: AppServerResponseEnvelope): void {
+    if (!this.#checkPolicy(() => this.#current()) || !('result' in envelope) ||
+        !object(envelope.result) || Object.keys(envelope.result).length !== 0) return;
+    const current = this.#journal.getSettings(command.operationId);
+    if (current && !current.rpcAck) this.#journal.noteSettingsAck(current);
+  }
+
+  async #dispatchSettings(command: SettingsCommand, authorize: () => void): Promise<SettingsOperation> {
+    const ack = (envelope: AppServerResponseEnvelope) => this.#settingsAck(command, envelope);
+    try {
+      await this.backend.request(command.method, structuredClone(command.params), {
+        mutating: true, expectedGeneration: this.#scope.backendGeneration,
+        assertBeforeWrite: authorize, onResponseEnvelope: ack, onLateResponseEnvelope: ack,
+      });
+    } catch { /* A settings timeout/error is never a safe replay or effective-state proof. */ }
+    const observed = this.#journal.getSettings(command.operationId);
+    if (!observed) throw new Error('Settings operation result unavailable');
+    return observed.state === 'dispatching' ? this.#journal.markSettingsUnknown(observed) : observed;
+  }
+
   /** Call only after stopping/invalidation of the RPC, so in-flight calls settle. */
   async close(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#inFlight.values()]);
+    await Promise.allSettled([...this.#inFlight.values(), ...this.#settingsInFlight.values()]);
     this.#responses.clear(); this.#responseBytes = 0;
     this.#journal.close();
     this.#policy.fingerprintKey.fill(0);

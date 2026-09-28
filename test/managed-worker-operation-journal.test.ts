@@ -145,3 +145,49 @@ test('accepted receipt IDs are durable metadata for terminal history drain', () 
   try { assert.deepEqual(reopened.acceptedReceipts(), receipts); }
   finally { reopened.close(); }
 });
+
+test('settings intent uses the same scoped journal and atomically blocks turn admission without a receipt', () => {
+  const scope = fixture(), settingsId = randomUUID();
+  const a = new ManagedWorkerOperationJournal(scope);
+  const settings = { operationId: settingsId, fingerprint };
+  const first = a.reserveSettings(settings);
+  assert.equal(first.created, true);
+  assert.equal(first.operation.state, 'dispatching');
+  assert.equal(first.operation.rpcAck, false);
+  assert.equal(a.hasUnconfirmed(), true);
+  assert.throws(() => a.reserve(intent()), /unsettled/i);
+  assert.throws(() => a.reserve(intent(settingsId)), /conflict/i);
+  assert.equal(a.reserveSettings(settings).created, false);
+  assert.throws(() => a.reserveSettings({ ...settings, fingerprint: 'b'.repeat(64) }), /conflict/i);
+  a.close();
+  const b = new ManagedWorkerOperationJournal(scope);
+  try {
+    assert.deepEqual(b.getSettings(settingsId), first.operation);
+    assert.deepEqual(b.acceptedReceipts(), []);
+    const unknown = b.markSettingsUnknown(first.operation);
+    assert.equal(unknown.state, 'unknown');
+    assert.equal(unknown.rpcAck, false);
+    const acknowledged = b.noteSettingsAck(unknown);
+    assert.equal(acknowledged.rpcAck, true);
+    assert.equal(acknowledged.state, 'unknown');
+    assert.equal(Object.hasOwn(acknowledged, 'receiptId'), false);
+    assert.throws(() => b.reserveSettings({ operationId: randomUUID(), fingerprint }), /unsettled/i);
+    assert.throws(() => b.reserve(intent()), /unsettled/i);
+    assert.equal(b.hasUnconfirmed(), true);
+  } finally { b.close(); }
+});
+
+test('a pending turn blocks settings reservation and metadata-only settings reject raw payloads', () => {
+  const scope = fixture(); const journal = new ManagedWorkerOperationJournal(scope);
+  try {
+    const turn = journal.reserve(intent()).operation;
+    const settings = { operationId: randomUUID(), fingerprint };
+    assert.throws(() => journal.reserveSettings(settings), /unsettled/i);
+    journal.accept(turn, 'real-turn');
+    assert.throws(() => journal.reserveSettings({ ...settings, rawParams: 'PRIVATE_SETTINGS_MARKER' } as never), /field|intent/i);
+    assert.equal(readFileSync(scope.filePath).includes('PRIVATE_SETTINGS_MARKER'), false);
+    const reserved = journal.reserveSettings(settings).operation;
+    assert.throws(() => journal.noteSettingsAck({ ...reserved, ownerEpoch: randomUUID() }), /scope/i);
+    assert.throws(() => journal.noteSettingsAck({ ...reserved, revision: 9 }), /stale/i);
+  } finally { journal.close(); }
+});

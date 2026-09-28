@@ -8,8 +8,9 @@ import { PersistentFrontendSessions } from './persistent-frontend-session.js';
 import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
 import { ManagedWorkerCommandDispatcher, captureWorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
-import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse, WorkerCommandQuiescence } from './managed-worker-command-dispatcher.js';
-import type { WorkerOperation } from './managed-worker-operation-journal.js';
+import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse, WorkerCommandQuiescence,
+  SettingsCommand } from './managed-worker-command-dispatcher.js';
+import type { WorkerOperation, SettingsOperation } from './managed-worker-operation-journal.js';
 
 type JsonObject = Record<string, unknown>;
 type StopReason = 'owner-request' | 'test-cleanup';
@@ -167,6 +168,18 @@ export class ManagedWorkerFrontendHost {
   executeCommand(controlKey: object, command: WorkerCommand): Promise<WorkerOperation> {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.execute(controlKey, command);
+  }
+
+  /** Sole-writer settings dispatch. Native `{}` ACK is not effective-state acceptance. */
+  executeSettingsCommand(controlKey: object, command: SettingsCommand,
+    beforeWrite?: () => void): Promise<SettingsOperation> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.executeSettings(controlKey, command, beforeWrite);
+  }
+
+  settingsCommandStatus(controlKey: object, operationId: string): SettingsOperation | null {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.getSettings(controlKey, operationId);
   }
 
   /** Exact native result only after durable acceptance; null means unavailable. */

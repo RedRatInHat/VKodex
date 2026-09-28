@@ -444,7 +444,7 @@ test('explicit stop during startup cannot publish a late listener', async () => 
   assert.equal(fixture.launches, 1);
 });
 
-function commandFixture(timeout = 100) {
+function commandFixture(timeout = 100, enableSettings = false) {
   const child = new Child(); const adapterKey = {}; const controlKey = {};
   const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-command-host-'));
   const journalPath = path.join(directory, 'operations.sqlite');
@@ -454,7 +454,8 @@ function commandFixture(timeout = 100) {
     authorize: ({ params }) => {
       authority.onAuthorize();
       return authority.admit && params.model === 'qualified-fixture-model';
-    } };
+    }, ...(enableSettings ? { authorizeSettings: ({ params }: { params: Record<string, unknown> }) =>
+      authority.admit && params.model === 'qualified-settings-model' } : {}) };
   const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: init, adapterKey, bootstrapReadMethods: [], backendTimeoutMs: timeout,
     allowRequest: () => true, allowAnswer: () => true, commandPolicy: policy,
@@ -464,6 +465,79 @@ function commandFixture(timeout = 100) {
       input: [{ type: 'text', text: `private-marker-${randomUUID()}` }] } };
   return { managed, child, controlKey, adapterKey, command, journalPath, authority, policy };
 }
+
+test('settings mutation is opt-in, ACK is durable but never a receipt or effective-state confirmation', async () => {
+  const denied = commandFixture(200);
+  await denied.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low',
+      collaborationMode: { mode: 'default', settings: { model: 'qualified-settings-model',
+        reasoning_effort: 'low', developer_instructions: 'PRIVATE_SETTINGS_MARKER_9048' } } } };
+  try {
+    assert.throws(() => denied.managed.executeSettingsCommand(denied.controlKey, settings), /authority|policy/i);
+    assert.equal(denied.child.messages.some(frame => frame.method === 'thread/settings/update'), false);
+  } finally { await denied.managed.stop('test-cleanup'); }
+
+  const f = commandFixture(200, true); await f.managed.start();
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 1, unconfirmed: true });
+    f.child.send({ id: wire.id, result: {} });
+    const result = await pending;
+    assert.equal(result.state, 'unknown');
+    assert.equal(result.rpcAck, true);
+    assert.equal(Object.hasOwn(result, 'receiptId'), false);
+    assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+    assert.deepEqual(f.managed.settingsCommandStatus(f.controlKey, settings.operationId), result);
+    assert.throws(() => f.managed.settingsCommandStatus({}, settings.operationId), /control/i);
+    assert.deepEqual(await f.managed.executeSettingsCommand(f.controlKey, settings), result);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'thread/settings/update').length, 1);
+    assert.throws(() => f.managed.executeCommand(f.controlKey, f.command), /unsettled/i);
+    for (const file of [f.journalPath, `${f.journalPath}-wal`]) if (existsSync(file))
+      assert.equal(readFileSync(file).includes('PRIVATE_SETTINGS_MARKER_9048'), false);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('late settings ACK after timeout changes only ack bit and never unblocks another mutation', async () => {
+  const f = commandFixture(20, true); await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    const timedOut = await pending;
+    assert.equal(timedOut.state, 'unknown');
+    assert.equal(timedOut.rpcAck, false);
+    f.child.send({ id: wire.id, result: {} });
+    await new Promise(resolve => setImmediate(resolve));
+    const late = f.managed.settingsCommandStatus(f.controlKey, settings.operationId);
+    assert.equal(late?.rpcAck, true);
+    assert.equal(late?.state, 'unknown');
+    assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
+    assert.throws(() => f.managed.executeCommand(f.controlKey, f.command), /unsettled/i);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('settings before-write lease revocation persists unknown without a backend write', async () => {
+  const f = commandFixture(200, true); await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  let lease = true, checks = 0;
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings, () => {
+      checks++;
+      if (!lease) throw new Error('settings lease revoked');
+    });
+    lease = false;
+    const outcome = await pending;
+    assert.equal(outcome.state, 'unknown'); assert.equal(outcome.rpcAck, false);
+    assert.equal(checks, 2);
+    assert.equal(f.child.messages.some(frame => frame.method === 'thread/settings/update'), false);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+  } finally { await f.managed.stop('test-cleanup'); }
+});
 
 test('command quiescence is authenticated, read-only and distinguishes in-flight from durable unknown', async () => {
   const noPolicy = host(new Child(), {});
