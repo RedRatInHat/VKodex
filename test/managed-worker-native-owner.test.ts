@@ -305,6 +305,53 @@ test('targeted full snapshot and live native turn events continue independently 
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('two permitted native followers retain independent leases while one starts a qualified turn', async () => {
+  const f = await fixture(undefined, undefined, id => id === 'follower' || id === 'follower-two');
+  const snapshots = (source: string) => f.broker.frames.filter(frame => frame.method === 'thread-stream-state-changed' &&
+    Array.isArray(frame.targetClientIds) && frame.targetClientIds.length === 1 && frame.targetClientIds[0] === source);
+  const follow = (source: string, following: boolean) => f.broker.send({ type: 'broadcast',
+    method: 'thread-stream-following-changed', version: 1, sourceClientId: source,
+    params: { conversationId: taskId, hostId: 'local', following } });
+  try {
+    await f.owner.start();
+    const broker = f.broker;
+    const initializations = f.child.frames.filter(frame => frame.method === 'initialize').length;
+    follow('follower', true); follow('follower-two', true);
+    await waitFrame(f.broker.frames, frame => snapshots('follower').includes(frame));
+    await waitFrame(f.broker.frames, frame => snapshots('follower-two').includes(frame));
+    assert.equal(f.owner.metadata.followerCount, 2);
+
+    follow('follower', false);
+    assert.equal(f.owner.metadata.followerCount, 1);
+    const beforeSecond = snapshots('follower-two').length;
+    const beforeFirst = snapshots('follower').length;
+    const clientId = randomUUID();
+    f.broker.send({ type: 'request', requestId: 'second-follower-start', sourceClientId: 'follower-two',
+      hostId: 'local', targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+      params: { conversationId: taskId, turnStart: { request: { threadId: taskId, clientUserMessageId: clientId,
+        input: [{ type: 'text', text: 'two', text_elements: [] }] }, context: { inheritThreadSettings: true } } } });
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    f.child.reply(wire.id, { turn: { id: 'two-follower-turn', status: 'inProgress' } });
+    const response = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'second-follower-start');
+    assert.equal(response.resultType, 'success');
+    f.broker.send({ type: 'request', requestId: 'second-follower-history', sourceClientId: 'follower-two',
+      hostId: 'local', targetClientId: 'owner-peer', method: 'thread-follower-load-complete-history', version: 1,
+      params: { conversationId: taskId } });
+    await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'second-follower-history' && frame.resultType === 'success');
+    await waitFrame(f.broker.frames, frame => snapshots('follower-two').includes(frame) &&
+      snapshots('follower-two').length > beforeSecond);
+    assert.equal(snapshots('follower').length, beforeFirst);
+    assert.equal(f.owner.metadata.followerCount, 1);
+    assert.equal(f.broker, broker);
+    assert.equal(f.brokers.length, 1);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'initialize').length, initializations);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('concurrent reconnect shares one connection and preserves observer projection', async () => {
   const f = await fixture();
   try { await f.owner.start();
