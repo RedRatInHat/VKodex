@@ -140,17 +140,21 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   async continueGoal(task: TaskRef): Promise<void> {
     await this.follow(task, async (subscription, client) => {
-      const state = subscription.current!;
-      if (submissionMode(state) === "steer") return;
-      const reply = await client.request("thread-follower-start-turn", 2, {
-        conversationId: task.threadId,
-        turnStart: {
-          request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
-          context: { inheritThreadSettings: true },
-        },
-      }, { targetClientId: subscription.owner!, timeoutMs: 30_000, mutating: true });
-      const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
-      if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+      // A resumed goal belongs to an existing history. Wait for the live
+      // owner's settled snapshot, then recheck it immediately before writing.
+      // Unknown start outcomes remain uncertain; this path never retries them.
+      await this.withReadySubmission(subscription, false, undefined, async (mode, owner) => {
+        if (mode === "steer") return;
+        const reply = await client.request("thread-follower-start-turn", 2, {
+          conversationId: task.threadId,
+          turnStart: {
+            request: { threadId: task.threadId, clientUserMessageId: randomUUID(), input: [] },
+            context: { inheritThreadSettings: true },
+          },
+        }, { targetClientId: owner, timeoutMs: 30_000, mutating: true });
+        const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
+        if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+      });
     });
   }
 

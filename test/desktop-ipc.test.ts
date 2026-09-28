@@ -3221,6 +3221,54 @@ test("goal continuation does not report success when no live owner accepts a tur
   assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
 });
 
+test("goal continuation waits for the same safe native admission state as a normal turn", async () => {
+  for (const overrides of [
+    { resumeState: "resuming" },
+    { threadRuntimeStatus: { type: "active" } },
+    { requests: [{ id: "pending-approval" }] },
+    { turns: [], turnHistory: null },
+  ]) {
+    const server = new Server(); server.dataState = { ...state([], "completed"), ...overrides };
+    const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+      () => new DesktopIpcClient(() => server, 50), undefined, undefined, undefined, { stateSettleMs: 5 });
+    await assert.rejects(adapter.continueGoal(task), ActionRejectedError);
+    assert.equal(server.received.some(message => message.method === "thread-follower-start-turn"), false);
+    assert.ok(server.destroyed);
+  }
+});
+
+test("goal continuation starts once after a live owner finishes restoring its state", async () => {
+  const server = new Server();
+  server.dataState = { ...state([], "completed"), resumeState: "resuming", threadRuntimeStatus: { type: "idle" } };
+  server.onFollow = () => {
+    server.snapshot();
+    setTimeout(() => {
+      server.dataState = { ...server.dataState, resumeState: "resumed" };
+      server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 11,
+        sourceClientId: server.ownerId, targetClientIds: ["bridge-client"], params: { hostId: "local",
+          conversationId: ref.threadId, change: { type: "snapshot", revision: 2, conversationState: server.dataState } } });
+    }, 10);
+  };
+  const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined, { stateSettleMs: 100 });
+  await adapter.continueGoal(task);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.ok(server.destroyed);
+});
+
+test("lost goal-start acknowledgment remains uncertain and is not retried", async () => {
+  const server = new Server();
+  server.dataState = { ...state([], "completed"), resumeState: "resumed", threadRuntimeStatus: { type: "idle" } };
+  server.disconnectOnStart = true;
+  const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.continueGoal(task), UncertainActionError);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});
+
 test("starting placeholders without a turn ID are steered rather than mistaken for idle tasks", async () => {
   for (const canonical of [true, false]) {
     const server = new Server();
