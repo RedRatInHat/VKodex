@@ -2,12 +2,15 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { BridgeStore } from '../src/bridge/store.js';
+import { BridgeRuntime } from '../src/bridge/runtime.js';
+import { observeAppServerTaskState } from '../src/codex/app-server-task-state.js';
 import { ManagedOwnerExclusiveRouteGuard } from '../src/bridge/managed-owner-exclusive-guard.js';
 import { createDesktopRouting } from '../src/desktop/desktop-routing.js';
 import type { ManagedOwnerRouteObserver } from '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { RoutedCodexTasks } from '../src/core/codex-task-router.js';
 import { ActionRejectedError, type CodexTasks, type TaskRef } from '../src/core/codex-tasks.js';
 import { RoutedTaskStateTransport, type TaskStateTransport } from '../src/core/task-state.js';
+import type { BridgeChat, View } from '../src/bridge/contracts.js';
 
 const task = (sourceId = 'source-a'): TaskRef =>
   ({ hostId: 'local', threadId: 'managed-thread', sourceId });
@@ -209,4 +212,107 @@ test('exclusive managed observation uses the exact claim without opening a fallb
     states.close();
     assert.equal(closedSources, 2, 'failed stream is no longer retained by the guard');
   } finally { states.close(); store.close(); }
+});
+
+test('managed native-origin progress and final reach VK once without a second route or writer', async () => {
+  const store = new BridgeStore();
+  const access = { ownerId: 101, groupId: 202 };
+  const peerId = 2_000_000_017;
+  const desktopTask = { ...task(), title: 'Managed', workspace: 'C:\\ManagedFixture', updatedAt: 1 };
+  const binding = store.ensureBinding(desktopTask);
+  store.setChat(binding.id, peerId, 17);
+  const epoch = randomUUID();
+  const registering = store.claimManagedOwner(binding.id, { ownerEpoch: epoch,
+    canonicalHome: desktopTask.workspace, familyRoot: task().threadId });
+  const claim = store.transitionManagedOwner(registering, 'ready', {
+    backendGeneration: 1, registryRevision: 1, endpointRef: randomUUID(),
+    host: { pid: 101, birthTicks: '10' }, backend: { pid: 102, birthTicks: '11' },
+  });
+  let baseStreams = 0, profileStreams = 0, writes = 0;
+  let emit!: (state: Record<string, unknown>, initial: boolean) => void;
+  let time = 1_000_000;
+  const snapshot = (turns: readonly Record<string, unknown>[], runtimeStatus: string) => ({
+    kind: 'app-server', threadId: task().threadId, title: desktopTask.title,
+    cwd: desktopTask.workspace, model: 'fixture-model', effort: 'low', runtimeStatus,
+    context: null, questions: [], turns,
+  });
+  const privateStates: TaskStateTransport = { subscribe: (requested, onState) => {
+    emit = onState as typeof emit;
+    return { task: requested, start: async () => onState(snapshot([], 'active'), true),
+      verifyOwner: async () => {}, close: () => {} };
+  }, close: () => {} };
+  const observer: ManagedOwnerRouteObserver = {
+    isCurrent: expected => store.managedOwner(task())?.revision === expected.revision,
+    async resolve() { return { kind: 'statically-qualified', claim,
+      controlStatus: async () => ({ ownerEpoch: epoch, taskId: task().threadId,
+        hostState: 'running', backendGeneration: 1, nativeState: 'connected', nativeRevision: 1 }),
+      states: privateStates }; },
+  };
+  const base = {
+    listTasks: async () => [desktopTask],
+    submitWithReceipt: async () => { writes++; return { mode: 'start' as const, turnId: 'base' }; },
+  } as unknown as CodexTasks;
+  const baseStates: TaskStateTransport = { subscribe: requested => {
+    baseStreams++;
+    return { task: requested, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
+  }, close: () => {} };
+  const profile = { owns: () => true, submitWithReceipt: async () => {
+    writes++; return { mode: 'start' as const, turnId: 'profile' };
+  }, states: { subscribe: (requested: TaskRef) => {
+    profileStreams++;
+    return { task: requested, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
+  }, close: () => {} } } as unknown as import('../src/core/codex-task-router.js').CodexTaskOwner &
+    import('../src/core/task-state.js').TaskStateOwnerRoute;
+  const routed = createDesktopRouting(base, baseStates, [profile], store, observer);
+  const sent: View[] = [], edited: View[] = [];
+  const chat = { async send(_peer: number, view: View) {
+    sent.push(view); return { peerId, conversationMessageId: sent.length };
+  }, async edit(_handle: unknown, view: View) { edited.push(view); }, async delete() {} } as unknown as BridgeChat;
+  const history = { enable() {}, disable() {}, async poll() { return null; } };
+  const runtime = new BridgeRuntime(access, routed.tasks, chat, store,
+    { states: routed.states, observe: observeAppServerTaskState, history }, () => time,
+    undefined, undefined, 10_000_000);
+  const drain = async () => {
+    await runtime.tick(true, binding.id);
+    for (let i = 0; i < 8; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  try {
+    await drain();
+    const user = { type: 'userMessage', id: 'user-1', content: [{ type: 'text', text: 'Native request' }] };
+    const progress = { type: 'agentMessage', id: 'progress-1', phase: 'commentary', text: 'Native progress' };
+    const running = { id: 'turn-1', status: 'inProgress', startedAt: 1_001_000, items: [user, progress], error: null };
+    time += 2_000;
+    emit(snapshot([running], 'active'), false);
+    await drain();
+    assert.equal(store.getValue<{ lastObservedAt: number }>(`projection:${binding.id}`)?.lastObservedAt,
+      time, 'native snapshot reached runtime observer');
+    assert.ok(store.pendingDeliveries().length || sent.length, 'native snapshot produced VK delivery');
+    assert.equal(sent.filter(view => view.text.includes('Native request')).length, 1);
+    assert.equal(sent.filter(view => view.text.includes('Native progress')).length, 1);
+
+    const final = { type: 'agentMessage', id: 'final-1', phase: 'final_answer', text: 'Native final' };
+    const next = { id: 'turn-2', status: 'inProgress', startedAt: 1_001_500, items: [], error: null };
+    const completed = { ...running, status: 'completed', items: [user, progress, final] };
+    emit(snapshot([completed, next], 'active'), false);
+    await drain();
+    assert.equal(sent.filter(view => view.text.includes('Native final')).length, 1);
+    emit(snapshot([completed, next], 'active'), false);
+    await drain();
+    assert.equal(sent.filter(view => view.text.includes('Native final')).length, 1);
+    assert.equal(baseStreams, 0);
+    assert.equal(profileStreams, 0);
+    assert.equal(writes, 0);
+
+    store.transitionManagedOwner(claim, 'unavailable');
+    emit(snapshot([completed, { ...next, items: [
+      { type: 'agentMessage', id: 'late-1', phase: 'commentary', text: 'Stale progress' }] }], 'active'), false);
+    await drain();
+    assert.equal(sent.some(view => view.text.includes('Stale progress')), false);
+    assert.equal(edited.some(view => view.text.includes('Stale progress')), false);
+    assert.equal(store.pendingDeliveries().some(delivery =>
+      delivery.view.text.includes('Stale progress')), false);
+    assert.equal(baseStreams, 0);
+    assert.equal(profileStreams, 0);
+    assert.equal(writes, 0);
+  } finally { await runtime.stop(); routed.states.close(); store.close(); }
 });
