@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { BridgeStore, type ManagedOwnerBindingClaim } from "../src/bridge/store.js";
+import { ManagedOwnerHandoffCoordinator } from "../src/bridge/managed-owner-handoff-coordinator.js";
+import type { ManagedOwnerHandoffResolution } from "../src/bridge/managed-owner-route-resolver.js";
 
 const epoch = "123e4567-e89b-42d3-a456-426614174000";
 const endpoint = "123e4567-e89b-42d3-a456-426614174001";
@@ -109,4 +111,74 @@ test("managed owner handoff and retirement are revision-CAS fenced", () => {
     assert.throws(() => store.retireManagedOwner(handoff), /stale/i);
     assert.equal(store.managedOwner(task("thread-a")), null);
   } finally { store.close(); }
+});
+
+function handoffFixture() {
+  const store = new BridgeStore();
+  const target = task("thread-a");
+  const binding = store.ensureBinding(target);
+  const registering = store.claimManagedOwner(binding.id, proof);
+  const ready = store.transitionManagedOwner(registering, "ready");
+  const handoffProof = { ownerEpoch: epoch, taskId: target.threadId,
+    backendGeneration: 1, registryRevision: 3,
+    host: proof.evidence!.host!, backend: { ...proof.evidence!.backend!, generation: 1 },
+    endpointRef: endpoint, nonce: "123e4567-e89b-42d3-a456-426614174004" };
+  return { store, target, ready, handoffProof };
+}
+
+test("handoff coordinator revokes worker ingress before qualifying and CAS transition", async () => {
+  const f = handoffFixture();
+  const calls: string[] = [];
+  const resolver = { resolveHandoff: async () => ({ kind: "statically-qualified", claim: f.ready,
+    revokeIngress: async () => {
+      assert.equal(f.store.managedOwner(f.target)?.state, "ready");
+      calls.push("revoke"); return { backendGeneration: 1, registryRevision: 3 };
+    }, qualify: async () => {
+      assert.deepEqual(calls, ["revoke"]);
+      assert.equal(f.store.managedOwner(f.target)?.state, "ready");
+      calls.push("qualify"); return f.handoffProof;
+    },
+  }) as unknown as ManagedOwnerHandoffResolution };
+  try {
+    const result = await new ManagedOwnerHandoffCoordinator(f.store, resolver).beginHandoff(f.target);
+    assert.deepEqual(calls, ["revoke", "qualify"]);
+    assert.equal(result.state, "handoff_pending");
+    assert.equal(result.revision, f.ready.revision + 1);
+    assert.equal(f.store.managedOwner(f.target)?.id, f.ready.id);
+  } finally { f.store.close(); }
+});
+
+test("handoff coordinator retains the exact exclusive claim after revoke uncertainty", async () => {
+  const f = handoffFixture();
+  let qualified = false;
+  const resolver = { resolveHandoff: async () => ({ kind: "statically-qualified", claim: f.ready,
+    revokeIngress: async () => { throw new Error("control timeout"); },
+    qualify: async () => { qualified = true; return f.handoffProof; },
+  }) as unknown as ManagedOwnerHandoffResolution };
+  try {
+    await assert.rejects(new ManagedOwnerHandoffCoordinator(f.store, resolver).beginHandoff(f.target),
+      /control timeout/);
+    assert.equal(qualified, false);
+    assert.deepEqual(f.store.managedOwner(f.target), f.ready);
+  } finally { f.store.close(); }
+});
+
+test("handoff coordinator refuses mismatched proof and a concurrent claim revision", async () => {
+  const f = handoffFixture();
+  let stale = false;
+  const resolver = { resolveHandoff: async () => ({ kind: "statically-qualified", claim: f.ready,
+    revokeIngress: async () => ({ backendGeneration: 1, registryRevision: 3 }),
+    qualify: async () => {
+        if (stale) f.store.transitionManagedOwner(f.ready, "unavailable");
+        return stale ? f.handoffProof : { ...f.handoffProof, endpointRef: "123e4567-e89b-42d3-a456-426614174005" };
+    },
+  }) as unknown as ManagedOwnerHandoffResolution };
+  try {
+    const coordinator = new ManagedOwnerHandoffCoordinator(f.store, resolver);
+    await assert.rejects(coordinator.beginHandoff(f.target), /proof/i);
+    assert.deepEqual(f.store.managedOwner(f.target), f.ready);
+    stale = true;
+    await assert.rejects(coordinator.beginHandoff(f.target), /stale|changed/i);
+    assert.equal(f.store.managedOwner(f.target)?.state, "unavailable");
+  } finally { f.store.close(); }
 });

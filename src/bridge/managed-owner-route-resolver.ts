@@ -9,6 +9,8 @@ import type { BridgeStore, ManagedOwnerBinding, ManagedOwnerProcessIdentity } fr
 import { ManagedWorkerStateTransport } from '../codex/managed-worker-state-transport.js';
 import { ManagedWorkerControlClient, type ManagedWorkerScopedControlStatus } from
   '../desktop/managed-worker-control-client.js';
+import type { ManagedWorkerControlHandoffProof, ManagedWorkerHandoffScope } from
+  '../desktop/managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type LoadManagedWorkerPrivateStateOptions } from
   '../desktop/managed-worker-private-state.js';
 import { deriveManagedTaskStateToken } from '../desktop/managed-worker-task-state-token.js';
@@ -43,6 +45,12 @@ export type ManagedOwnerRouteResolution =
   | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding;
       controlStatus: () => Promise<ManagedWorkerScopedControlStatus>;
       states: TaskStateTransport }>;
+export type ManagedOwnerHandoffResolution =
+  | Readonly<{ kind: 'unclaimed' }>
+  | Readonly<{ kind: 'unavailable'; claim: ManagedOwnerBinding }>
+  | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding;
+      revokeIngress: (expected: ManagedWorkerHandoffScope) => Promise<ManagedWorkerHandoffScope>;
+      qualify: (expected: ManagedWorkerHandoffScope) => Promise<ManagedWorkerControlHandoffProof> }>;
 
 interface RegistryReadyRow {
   epoch: string; revision: number; canonical_home: string; family_root: string; state: string;
@@ -147,10 +155,20 @@ export class ManagedOwnerRouteResolver {
   }
 
   async resolve(task: TaskRef): Promise<ManagedOwnerRouteResolution> {
+    return this.#resolve(task, false) as Promise<ManagedOwnerRouteResolution>;
+  }
+
+  /** Separately expose only the revoke/quiescence path to the handoff coordinator.
+   * Normal read-only observers never receive a mutating control capability. */
+  async resolveHandoff(task: TaskRef): Promise<ManagedOwnerHandoffResolution> {
+    return this.#resolve(task, true) as Promise<ManagedOwnerHandoffResolution>;
+  }
+
+  async #resolve(task: TaskRef, handoff: boolean): Promise<ManagedOwnerRouteResolution | ManagedOwnerHandoffResolution> {
     const scoped = { hostId: task.hostId, threadId: task.threadId, sourceId: task.sourceId ?? '' };
     const claim = this.options.store.managedOwner(scoped);
     if (!claim) return { kind: 'unclaimed' };
-    const unavailable = (): ManagedOwnerRouteResolution => ({ kind: 'unavailable', claim });
+    const unavailable = () => ({ kind: 'unavailable' as const, claim });
     if (claim.state !== 'ready' || claim.hostId !== scoped.hostId ||
       claim.threadId !== scoped.threadId || claim.sourceId !== scoped.sourceId ||
       claim.hostId !== 'local') return unavailable();
@@ -196,6 +214,9 @@ export class ManagedOwnerRouteResolver {
         port: controlEndpoint.port,
         token: Buffer.from(privateState.keys.controlToken, 'base64').toString('base64url'),
         ownerEpoch: claim.ownerEpoch, taskId: scoped.threadId });
+      if (handoff) return Object.freeze({ kind: 'statically-qualified' as const, claim,
+        revokeIngress: (expected: ManagedWorkerHandoffScope) => control.revokeIngress(expected),
+        qualify: (expected: ManagedWorkerHandoffScope) => control.qualifyHandoff(expected) });
       const states = new ManagedWorkerStateTransport({ hostId: scoped.hostId,
         sourceId: scoped.sourceId, taskId: scoped.threadId,
         ownerEpoch: claim.ownerEpoch, backendGeneration: evidence.backendGeneration,

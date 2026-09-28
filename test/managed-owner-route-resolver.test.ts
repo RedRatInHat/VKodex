@@ -77,6 +77,16 @@ test('exact persisted ready claim resolves private control and state transport w
     assert.equal(resolved.claim.evidence.endpointRef, f.endpoint.endpointRef);
     assert.equal(typeof resolved.controlStatus, 'function');
     assert.equal(Object.hasOwn(resolved, 'control'), false, 'static proof exposes no mutating control client');
+    assert.equal(Object.hasOwn(resolved, 'revokeIngress'), false,
+      'observation must not expose mutating handoff control');
+    const handoff = await f.resolver.resolveHandoff(f.task);
+    assert.equal(handoff.kind, 'statically-qualified');
+    if (handoff.kind === 'statically-qualified') {
+      assert.equal(handoff.claim.id, f.claim.id);
+      assert.equal(typeof handoff.revokeIngress, 'function');
+      assert.equal(typeof handoff.qualify, 'function');
+      assert.equal(Object.hasOwn(handoff, 'states'), false);
+    }
     assert.throws(() => resolved.states.subscribe({ ...f.task, threadId: randomUUID() }, () => {}, () => {}));
     resolved.states.close();
     assert.equal((await f.resolver.resolve({ ...f.task, sourceId: 'foreign' })).kind, 'unclaimed');
