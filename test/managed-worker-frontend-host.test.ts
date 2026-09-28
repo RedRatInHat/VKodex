@@ -450,7 +450,8 @@ test('explicit stop during startup cannot publish a late listener', async () => 
 
 function commandFixture(timeout = 100, enableSettings = false,
   qualifier?: WorkerCommandPolicy['qualifySettingsEffect'],
-  settingsModel = 'qualified-settings-model', scopedTaskId = taskId) {
+  settingsModel = 'qualified-settings-model', scopedTaskId = taskId,
+  settingsAuthorizer?: WorkerCommandPolicy['authorizeSettings']) {
   const child = new Child(); const adapterKey = {}; const controlKey = {};
   const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-command-host-'));
   const journalPath = path.join(directory, 'operations.sqlite');
@@ -460,8 +461,9 @@ function commandFixture(timeout = 100, enableSettings = false,
     authorize: ({ params }) => {
       authority.onAuthorize();
       return authority.admit && params.model === 'qualified-fixture-model';
-    }, ...(enableSettings ? { authorizeSettings: ({ params }: { params: Record<string, unknown> }) =>
-      authority.admit && params.model === settingsModel } : {}),
+    }, ...(enableSettings ? { authorizeSettings: settingsAuthorizer ??
+      (({ params }: { params: Record<string, unknown> }) =>
+        authority.admit && params.model === settingsModel) } : {}),
     ...(qualifier ? { qualifySettingsEffect: qualifier } : {}) };
   const managed = new ManagedWorkerFrontendHost({ taskId: scopedTaskId, ownCwd: 'C:/own',
     initializeRequest: init, adapterKey, bootstrapReadMethods: [], backendTimeoutMs: timeout,
@@ -679,7 +681,7 @@ function stockInitializerFixture(noticeTimeoutMs = 100) {
   let initializer!: ManagedStockSettingsInitializer;
   const f = commandFixture(200, true,
     (context, assertCurrent) => initializer.qualifySettingsEffect(context, assertCurrent),
-    approvedTaskPolicy.model, scopedTaskId);
+    approvedTaskPolicy.model, scopedTaskId, context => initializer.authorizesSettingsCommand(context));
   const bootstrap = { generation: 1, initialState,
     composerDefaults: { taskId: scopedTaskId, cwd, summary: null,
       personality: 'pragmatic' as const },

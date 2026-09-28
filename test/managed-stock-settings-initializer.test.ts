@@ -47,6 +47,11 @@ test(`stock settings initializer confirms actual notification plus readback for 
     observePendingRequests(_key: object, _listener: (event: ManagedWorkerPendingRequest) => void) { return () => {}; },
     async executeSettingsCommand(_key: object, command: { params: Record<string, unknown> }) {
       writes++;
+      const scope = { ...command, threadId: taskId, ownerEpoch: epoch, backendGeneration: 7 };
+      assert.equal(initializer.authorizesSettingsCommand(scope as never), true);
+      assert.equal(initializer.authorizesSettingsCommand({ ...scope, ownerEpoch: randomUUID() } as never), false);
+      assert.equal(initializer.authorizesSettingsCommand({ ...scope,
+        params: { ...command.params, model: 'unapproved-model' } } as never), false);
       assert.equal(command.params.permissions, ':danger-full-access');
       assert.equal(command.params.sandboxPolicy, undefined);
       observer?.({ taskId, generation: 7, notification: { method: 'thread/settings/updated',
@@ -68,7 +73,14 @@ test(`stock settings initializer confirms actual notification plus readback for 
   const bootstrap = {
     generation: 7, initialState: { ...initial, latestModel: model, latestReasoningEffort: effort },
     composerDefaults: { taskId, cwd, summary: null, personality: 'pragmatic' as const },
-    async readStockState() { reads++; return { threadId: taskId, generation: 7,
+    async readStockState() {
+      assert.equal(initializer.authorizesSettingsCommand({ operationId,
+        method: 'thread/settings/update', threadId: taskId, ownerEpoch: epoch, backendGeneration: 7,
+        params: { threadId: taskId, cwd, approvalPolicy: 'never', approvalsReviewer: 'user',
+          permissions: profile.id, model, serviceTier: null, effort, summary: null,
+          personality: 'pragmatic', collaborationMode: { mode: 'default', settings: {
+            model, reasoning_effort: effort, developer_instructions: null } } } }), false);
+      reads++; return { threadId: taskId, generation: 7,
       turnCount: 0, terminalTurnIds: [], historyDigest: 'a'.repeat(64),
       model, modelProvider: readProvider, reasoningEffort: effort, cwd,
       environments: [], updatedAt: 1, fastModeAllowed }; },

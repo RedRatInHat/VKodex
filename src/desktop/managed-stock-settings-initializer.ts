@@ -81,6 +81,7 @@ export class ManagedStockSettingsInitializer {
   #detachNotifications: (() => void) | null = null;
   #detachRequests: (() => void) | null = null;
   #started = false;
+  #dispatching = false;
   #closed = false;
   #faulted = false;
   #revision = 0;
@@ -144,6 +145,17 @@ export class ManagedStockSettingsInitializer {
         after.backendGeneration !== this.#generation) fail();
   }
 
+  /** The daemon's policy admits only this pending immutable initialization,
+   * not an arbitrary scoped settings mutation. No RPC or reservation here. */
+  authorizesSettingsCommand(context: Readonly<WorkerCommandScope & SettingsCommand>): boolean {
+    try {
+      this.#current();
+      return this.#dispatching && this.#qualified === null && this.#pendingRequests === 0 &&
+        this.#revision === 0 && isDeepStrictEqual(context, { ...this.#command,
+          threadId: this.#taskId, ownerEpoch: this.#ownerEpoch, backendGeneration: this.#generation });
+    } catch { return false; }
+  }
+
   #observe(event: ManagedWorkerNotification): void {
     if (this.#closed || this.#faulted) return;
     if (event.taskId !== this.#taskId || event.generation !== this.#generation) {
@@ -186,8 +198,12 @@ export class ManagedStockSettingsInitializer {
         baseline.turnCount !== 0 || baseline.terminalTurnIds.length !== 0 ||
         this.#pendingRequests !== 0 || this.#revision !== 0) fail();
     this.#current();
-    const sent = await this.#executeSettings(this.#controlKey, this.#command,
-      () => { this.#current(); if (this.#pendingRequests !== 0 || this.#revision !== 0) fail(); });
+    this.#dispatching = true;
+    let sent;
+    try {
+      sent = await this.#executeSettings(this.#controlKey, this.#command,
+        () => { this.#current(); if (this.#pendingRequests !== 0 || this.#revision !== 0) fail(); });
+    } finally { this.#dispatching = false; }
     if (sent.operationId !== this.#operationId || sent.ownerEpoch !== this.#ownerEpoch ||
         sent.backendGeneration !== this.#generation || sent.threadId !== this.#taskId ||
         sent.rpcAck !== true) fail();
