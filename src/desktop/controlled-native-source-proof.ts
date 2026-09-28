@@ -245,7 +245,8 @@ export async function proveControlledNativeSource(preflight: ControlledSourcePre
   if (!equalPath(root, preflight.sourceHome) || !equalPath(work, preflight.workspace)) refuse();
   if (preflight.rollouts.length !== 0) refuse();
   const observed = await checkedHeader(root, observedNativePath);
-  if (observed.header.id !== threadId || !equalPath(observed.header.cwd, work)) refuse();
+  const observedWorkspace = await checkedRealDirectory(observed.header.cwd);
+  if (observed.header.id !== threadId || !equalPath(observedWorkspace, work)) refuse();
   const current = await Promise.all((await rolloutFiles(root)).map(file => checkedHeader(root, file)));
   const sameId = current.filter(item => item.header.id === threadId);
   if (sameId.length !== 1 || !equalPath(sameId[0]!.path, observed.path)) refuse();

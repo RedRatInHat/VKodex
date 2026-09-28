@@ -83,6 +83,17 @@ test('rejects mismatched header ID or workspace', async () => {
   await rejected(proveControlledNativeSource(preflight2, wrongCwd, threadA));
 });
 
+test('accepts workspace cwd through a symlinked ancestor alias on Windows', { skip: process.platform !== 'win32' }, async () => {
+  const f = await setup();
+  const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
+  const workspaceAliasParent = path.join(f.root, 'workspace-alias-parent');
+  await symlink(f.root, workspaceAliasParent, 'junction');
+  const workspaceAlias = path.join(workspaceAliasParent, path.basename(f.workspace));
+  const file = await rollout(f.home, threadA, workspaceAlias);
+  const proof = await proveControlledNativeSource(preflight, file, threadA);
+  assert.equal(proof.threadId, threadA);
+});
+
 test('rejects duplicate thread rollouts and unknown metadata', async () => {
   const f = await setup(); const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
   const first = await rollout(f.home, threadA, f.workspace, 'first');
