@@ -59,14 +59,19 @@ test('versioned diagnosis returns only fixed startup metadata and no private cal
   const diagnosis = { schemaVersion: 1 as const, startupPhase: 'bootstrapping' as const,
     daemonState: 'failed' as const, failureCode: 'startup-unavailable' as const,
     registryState: 'backend_registered' as const, owner: null };
+  let injectRaw = false;
   const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
     status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
-    diagnose: () => diagnosis,
+    diagnose: () => injectRaw ? { ...diagnosis,
+      bootstrapFailureCode: 'C:/private/secret-token' } as never : diagnosis,
     requestStop: async () => { throw new ManagedWorkerStopRefusedError(); } });
   const cap = await server.listen(); const client = await peer(cap);
   try {
     client.send({ id: 'd', epoch, method: 'diagnose-v1' });
     assert.deepEqual(await client.read(), { id: 'd', result: { ownerEpoch: epoch, taskId: 'own', ...diagnosis } });
+    injectRaw = true;
+    client.send({ id: 'raw', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'raw', error: 'diagnosis-unavailable' });
     client.send({ id: 's', epoch, method: 'stop' });
     assert.deepEqual(await client.read(), { id: 's', error: 'stop-refused' });
   } finally { client.socket.destroy(); await server.close(); }

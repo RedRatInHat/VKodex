@@ -16,6 +16,13 @@ export interface ManagedWorkerControlDiagnosis {
   readonly daemonState: 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
   readonly failureCode: 'startup-unavailable' | 'backend-lost' | 'backend-loss-unconfirmed' |
     'owner-unconfirmed' | 'native-owner-unavailable' | 'stop-unconfirmed' | null;
+  /** Optional v1 extension: fixed categories only; never a native error body. */
+  readonly bootstrapFailureCode?: 'effective-resume-policy-mismatch' |
+    'thread-read-unqualified' | 'pre-resume-history-not-empty' |
+    'resume-settings-unqualified' | 'goal-or-queue-not-empty' |
+    'initial-projection-unqualified' | 'actual-thread-settings-drift' |
+    'config-defaults-unavailable' | 'config-defaults-unqualified' |
+    'initial-history-not-empty' | 'initial-settings-drift' | 'unclassified' | null;
   readonly registryState: 'reserved' | 'host_registered' | 'backend_registered' |
     'ready' | 'lost' | 'retired' | null;
   readonly owner: Readonly<{
@@ -68,6 +75,12 @@ const startupPhases = new Set(['not-started', 'private-loaded', 'host-registered
 const daemonStates = new Set(['new', 'starting', 'ready', 'failed', 'stopping', 'stopped']);
 const failureCodes = new Set(['startup-unavailable', 'backend-lost', 'backend-loss-unconfirmed',
   'owner-unconfirmed', 'native-owner-unavailable', 'stop-unconfirmed']);
+const bootstrapFailureCodes = new Set(['effective-resume-policy-mismatch',
+  'thread-read-unqualified', 'pre-resume-history-not-empty', 'resume-settings-unqualified',
+  'goal-or-queue-not-empty', 'initial-projection-unqualified',
+  'actual-thread-settings-drift', 'config-defaults-unavailable',
+  'config-defaults-unqualified', 'initial-history-not-empty', 'initial-settings-drift',
+  'unclassified']);
 const registryStates = new Set(['reserved', 'host_registered', 'backend_registered',
   'ready', 'lost', 'retired']);
 const startupStages = new Set(['not-started', 'observing', 'reading-initial',
@@ -77,11 +90,16 @@ const notificationKeys = ['status', 'settings', 'goal', 'usage', 'startup-or-war
 const boundedCount = (value: unknown): value is number =>
   Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 255;
 function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis {
-  if (!object(value) || !exact(value, ['schemaVersion', 'startupPhase', 'daemonState',
-    'failureCode', 'registryState', 'owner']) || value.schemaVersion !== 1 ||
+  if (!object(value) || !(exact(value, ['schemaVersion', 'startupPhase', 'daemonState',
+    'failureCode', 'registryState', 'owner']) || exact(value, ['schemaVersion', 'startupPhase',
+    'daemonState', 'failureCode', 'bootstrapFailureCode', 'registryState', 'owner'])) ||
+    value.schemaVersion !== 1 ||
     typeof value.startupPhase !== 'string' || !startupPhases.has(value.startupPhase) ||
     typeof value.daemonState !== 'string' || !daemonStates.has(value.daemonState) ||
     value.failureCode !== null && (typeof value.failureCode !== 'string' || !failureCodes.has(value.failureCode)) ||
+    Object.hasOwn(value, 'bootstrapFailureCode') && value.bootstrapFailureCode !== null &&
+      (typeof value.bootstrapFailureCode !== 'string' ||
+        !bootstrapFailureCodes.has(value.bootstrapFailureCode)) ||
     value.registryState !== null && (typeof value.registryState !== 'string' || !registryStates.has(value.registryState))) return false;
   const owner = value.owner;
   if (owner === null) return true;

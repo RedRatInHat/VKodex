@@ -29,6 +29,24 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const same = (a: ProcessIdentity | null, b: ProcessIdentity | null): boolean =>
   !!a && !!b && a.pid === b.pid && a.birthTicks === b.birthTicks;
+type BootstrapFailureCode = NonNullable<ManagedWorkerControlDiagnosis['bootstrapFailureCode']>;
+const recognizedBootstrapCodes = new Set<BootstrapFailureCode>([
+  'thread-read-unqualified', 'pre-resume-history-not-empty',
+  'resume-settings-unqualified', 'goal-or-queue-not-empty',
+  'initial-projection-unqualified', 'actual-thread-settings-drift',
+  'config-defaults-unavailable', 'config-defaults-unqualified',
+  'initial-history-not-empty', 'initial-settings-drift',
+]);
+function bootstrapFailureCode(error: unknown): BootstrapFailureCode {
+  if (error instanceof TypeError &&
+      error.message === 'Native effective resume differs from approved task policy')
+    return 'effective-resume-policy-mismatch';
+  if (error instanceof TypeError && error.message.startsWith('managed worker bootstrap: ')) {
+    const code = error.message.slice('managed worker bootstrap: '.length) as BootstrapFailureCode;
+    if (recognizedBootstrapCodes.has(code)) return code;
+  }
+  return 'unclassified';
+}
 
 export interface ManagedWorkerDaemonOptions {
   readonly baseDirectory: string;
@@ -62,6 +80,7 @@ export interface ManagedWorkerDaemonMetadata {
   readonly nativeState: string | null;
   readonly endpointRef: string | null;
   readonly failure: string | null;
+  readonly bootstrapFailureCode: BootstrapFailureCode | null;
   readonly startupPhase: ManagedWorkerControlDiagnosis['startupPhase'];
   readonly nativeStartup: Pick<ManagedWorkerNativeOwnerMetadata,
     'startupStage' | 'bootstrapEventCount' | 'bootstrapNotifications' |
@@ -75,6 +94,7 @@ export class ManagedWorkerDaemon {
   readonly #options: ManagedWorkerDaemonOptions;
   #state: State = 'new';
   #failure: ManagedWorkerControlDiagnosis['failureCode'] = null;
+  #bootstrapFailureCode: BootstrapFailureCode | null = null;
   #startupPhase: ManagedWorkerControlDiagnosis['startupPhase'] = 'not-started';
   #taskId: string | null = null;
   #generation: number | null = null;
@@ -120,6 +140,7 @@ export class ManagedWorkerDaemon {
     return Object.freeze({ state: this.#state, epoch: this.#options.epoch, taskId: this.#taskId,
       generation: this.#generation, nativeState: owner?.state ?? null,
       endpointRef: this.#endpointRef, failure: this.#failure,
+      bootstrapFailureCode: this.#bootstrapFailureCode,
       startupPhase: this.#startupPhase,
       nativeStartup: owner ? Object.freeze({ startupStage: owner.startupStage,
         bootstrapEventCount: owner.bootstrapEventCount,
@@ -190,6 +211,7 @@ export class ManagedWorkerDaemon {
           nativeRevision: this.#owner?.metadata.revision ?? 0 }),
         diagnose: () => ({ schemaVersion: 1, startupPhase: this.#startupPhase,
           daemonState: this.#state, failureCode: this.#failure,
+          bootstrapFailureCode: this.#bootstrapFailureCode,
           registryState: currentRegistryState(),
           owner: this.metadata.nativeStartup }),
         requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
@@ -395,7 +417,9 @@ export class ManagedWorkerDaemon {
       this.#startupPhase = 'ready';
       this.#admissionOpen = true;
       this.#scheduleReconnect();
-    } catch {
+    } catch (error) {
+      if (this.#startupPhase === 'bootstrapping' && this.#bootstrap === null)
+        this.#bootstrapFailureCode = bootstrapFailureCode(error);
       this.#stockInitializer?.close(); this.#stockInitializer = null;
       this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
       // A native owner may already be connected when ready publication fails.

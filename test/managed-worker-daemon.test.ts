@@ -324,7 +324,7 @@ class Backend extends EventEmitter {
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
   stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true; birthDrift = false;
   readonly frames: Record<string, unknown>[] = [];
-  failBootstrap = false;
+  failBootstrap = false; resumeServiceTier: 'default' | null = null;
   terminalQueueClients: string[] | null = null;
   stockCompletedClients: string[] = [];
   queueEntries: Record<string, unknown>[] = [];
@@ -400,7 +400,7 @@ class Backend extends EventEmitter {
           { id: ':danger-full-access', extends: null } : { id: ':read-only' },
         sandbox: this.stock ? { type: 'dangerFullAccess' } :
           { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [this.cwd],
-        serviceTier: null, approvalsReviewer: 'user', disabledPluginIds: [],
+        serviceTier: this.resumeServiceTier, approvalsReviewer: 'user', disabledPluginIds: [],
         multiAgentMode: 'explicitRequestOnly', collaborationMode: null };
     }
     if (method === 'config/read') return { config: { model_reasoning_summary: null, personality: 'pragmatic' } };
@@ -496,7 +496,8 @@ function stockEntry(cwd: string, id = randomUUID()): Record<string, unknown> {
 async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   expectedTurnCount?: number } = { allow: true },
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
-  startup: 'normal' | 'bootstrap-fail' | 'control-bind-fail' | 'endpoint-collision' = 'normal',
+  startup: 'normal' | 'bootstrap-fail' | 'policy-mismatch' |
+    'control-bind-fail' | 'endpoint-collision' = 'normal',
   stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
@@ -514,6 +515,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   backend.stock = stock;
   backend.emitSettingsNotice = stockFailure !== 'notice';
   backend.failBootstrap = startup === 'bootstrap-fail';
+  backend.resumeServiceTier = startup === 'policy-mismatch' ? 'default' : null;
   let control: ManagedWorkerControlServer | null = null;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
@@ -696,7 +698,8 @@ test('bootstrap failure retains authenticated startup diagnosis while EOF cannot
     const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'd', 'diagnose-v1');
     assert.deepEqual(diagnosis.result, { ownerEpoch: reserved.epoch, taskId: 'own-zero-turn',
       schemaVersion: 1, startupPhase: 'bootstrapping', daemonState: 'failed',
-      failureCode: 'startup-unavailable', registryState: 'backend_registered', owner: null });
+      failureCode: 'startup-unavailable', bootstrapFailureCode: 'thread-read-unqualified',
+      registryState: 'backend_registered', owner: null });
     const changed = new ManagedWorkerRegistry(registryPath);
     try {
       const row = changed.get(home, 'own-family')!;
@@ -713,6 +716,21 @@ test('bootstrap failure retains authenticated startup diagnosis while EOF cannot
     await (control as ManagedWorkerControlServer | null)?.close();
     backend.stdin.end();
   }
+});
+
+test('effective resume mismatch reports only its fixed category, never a raw setting', async () => {
+  const { daemon, backend, control, reserved, privateDirectory } =
+    await readyFixture({ allow: true }, { enabled: false, early: false }, 'policy-mismatch', true);
+  try {
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(daemon.metadata.startupPhase, 'bootstrapping');
+    assert.equal(daemon.metadata.bootstrapFailureCode, 'effective-resume-policy-mismatch');
+    const result = await startupControlRequest(privateDirectory, reserved.epoch, 'mismatch', 'diagnose-v1');
+    assert.equal((result.result as Record<string, unknown>).bootstrapFailureCode,
+      'effective-resume-policy-mismatch');
+    assert.equal(JSON.stringify(result).includes('default'), false);
+    assert.equal(backend.exitCode, null);
+  } finally { await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end(); }
 });
 
 test('control request helper reports an authenticated control termination during command reply', async () => {
@@ -750,7 +768,8 @@ test('post-owner ready endpoint collision retires native gateway but preserves b
     const diagnosis = await startupControlRequest(privateDirectory, reserved.epoch, 'failed-owner', 'diagnose-v1');
     assert.deepEqual(diagnosis.result, { ownerEpoch: reserved.epoch, taskId: 'own-zero-turn',
       schemaVersion: 1, startupPhase: 'publishing-ready', daemonState: 'failed',
-      failureCode: 'startup-unavailable', registryState: 'backend_registered',
+      failureCode: 'startup-unavailable', bootstrapFailureCode: null,
+      registryState: 'backend_registered',
       owner: daemon.metadata.nativeStartup });
     assert.deepEqual((await startupControlRequest(privateDirectory, reserved.epoch, 'stop', 'stop')).result,
       { stopped: true });
