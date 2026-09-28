@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -188,7 +189,7 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
     const result = loseRead ? await reconcileControlledNativeCreation({ journal,
       operationId: options.operationId, rpc, resolveSource: options.resolveSource,
       sourceProof: { sourceHome, preflightReceiptPath } }) : await createControlledNativeTask(options);
-    assert.equal(result.rolloutPath, realpathSync(nativePath));
+    assert.equal(await realpath(result.rolloutPath), await realpath(nativePath));
     assert.equal(result.sourceProofRequired, true);
     assert.equal(journal.get(options.operationId)?.qualified?.sourceProofRequired, true);
     assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read'] : ['thread/start']),
