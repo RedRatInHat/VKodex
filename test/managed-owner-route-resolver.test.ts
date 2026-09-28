@@ -7,6 +7,8 @@ import test from 'node:test';
 import { BridgeStore } from '../src/bridge/store.js';
 import { ManagedWorkerRegistry, type ProcessIdentity } from '../src/codex/managed-worker-registry.js';
 import { ManagedOwnerRouteResolver } from '../src/bridge/managed-owner-route-resolver.js';
+import { ManagedOwnerHandoffCoordinator } from '../src/bridge/managed-owner-handoff-coordinator.js';
+import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { createManagedWorkerPrivateState, type ManagedWorkerPrivateStateFilesystem,
   type ManagedWorkerPrivateStateProtector } from '../src/desktop/managed-worker-private-state.js';
 
@@ -62,8 +64,51 @@ async function fixture() {
   const resolver = new ManagedOwnerRouteResolver({ store, privateBaseDirectory,
     privateStateOptions: { protector, filesystem },
     observeProcess: (pid: number): ProcessIdentity | null => observed.get(pid) ?? null });
-  return { root, home, task, store, claim, resolver, registryPath, endpointFile, endpoint, observed };
+  return { root, home, task, store, claim, resolver, registryPath, endpointFile, endpoint,
+    observed, controlToken: Buffer.from(state.keys.controlToken, 'base64').toString('base64url') };
 }
+
+test('real resolver and authenticated control complete a fenced durable handoff', async () => {
+  const f = await fixture();
+  const calls: string[] = [];
+  let revoked = false;
+  const control = new ManagedWorkerControlServer({
+    ownerEpoch: f.claim.ownerEpoch, taskId: f.task.threadId, token: f.controlToken,
+    status: () => ({ hostState: 'running', backendGeneration: 1,
+      nativeState: 'connected', nativeRevision: 1 }),
+    requestStop: async () => { throw new Error('stop must not run'); },
+    handoff: {
+      revoke: expected => {
+        assert.deepEqual(expected, { backendGeneration: f.claim.evidence.backendGeneration,
+          registryRevision: f.claim.evidence.registryRevision });
+        assert.equal(f.store.managedOwner(f.task)?.state, 'ready');
+        revoked = true;
+        calls.push('revoke');
+        return expected;
+      },
+      qualify: async expected => {
+        assert.equal(revoked, true);
+        assert.equal(f.store.managedOwner(f.task)?.state, 'ready');
+        calls.push('qualify');
+        return { ...expected, ownerEpoch: f.claim.ownerEpoch, taskId: f.task.threadId,
+          host: f.endpoint.host, backend: f.endpoint.backend,
+          endpointRef: f.endpoint.endpointRef, nonce: randomUUID() };
+      },
+    },
+  });
+  const capability = await control.listen();
+  try {
+    await writeFile(f.endpointFile, JSON.stringify({ ...f.endpoint,
+      control: { host: capability.host, port: capability.port } }));
+    const handoff = await new ManagedOwnerHandoffCoordinator(f.store, f.resolver)
+      .beginHandoff(f.task);
+    assert.deepEqual(calls, ['revoke', 'qualify']);
+    assert.equal(handoff.state, 'handoff_pending');
+    assert.equal(handoff.revision, f.claim.revision + 1);
+    assert.equal(f.resolver.owns(f.task), true);
+    assert.equal((await f.resolver.resolve(f.task)).kind, 'unavailable');
+  } finally { await control.close(); f.store.close(); }
+});
 
 test('exact persisted ready claim resolves private control and state transport without writing registry', async () => {
   const f = await fixture();

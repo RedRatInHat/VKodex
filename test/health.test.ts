@@ -82,6 +82,19 @@ test("health detects commentary stuck before the VK queue and clears after mirro
   assert.equal((await s.monitor.check()).checks.find(item => item.name === "codex_mirror")?.state, "ok");
 });
 
+test("legacy progress buffers do not claim a current delivery delay", async t => {
+  const s = setup(t);
+  const binding = s.store.ensureBinding((await s.desktop.listTasks())[0]!);
+  s.store.setChat(binding.id, 2_000_000_001, 1);
+  s.store.setValue(`deferred-mirror:${binding.id}:old-turn`, [
+    { type: "progress", id: "historic", turnId: "old-turn", text: "HISTORIC PROGRESS" },
+  ]);
+  assert.equal(s.store.deferredMirrors().length, 1, "legacy data remains available for active-turn adoption");
+  const mirror = (await s.monitor.check()).checks.find(item => item.name === "codex_mirror")!;
+  assert.equal(mirror.state, "ok");
+  assert.doesNotMatch(mirror.detail, /HISTORIC PROGRESS/u);
+});
+
 test("health retains the age and stage of isolated maintenance while scheduler ticks stay healthy", async t => {
   const s = setup(t); let now = 100_000;
   let maintenance = [{ phase: "history" as const, bindingId: "slow-binding", startedAt: 90_000 }];
@@ -369,7 +382,8 @@ test("health detects native queued VK input stranded behind an idle task", async
   status = "idle";
   const stranded = (await monitor.check(true)).checks.find(check => check.name === `codex_native_queue:${binding.id}`)!;
   assert.equal(stranded.state, "failed");
-  assert.match(stranded.detail, /Fixture.*штатной очереди Codex/u);
+  assert.match(stranded.detail, /Fixture.*ранее приняты в очередь/u);
+  assert.doesNotMatch(stranded.detail, /остаются в штатной очереди/u);
   store.settleQueuedInput(binding.id, "queued-op");
   assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);
 });

@@ -164,7 +164,8 @@ export class BridgeHealthMonitor {
         : `Очередь: ${delivery.criticalPending} важных, ${delivery.streamPending} фоновых; отменённых записей: ${delivery.inactivePending}${criticalAge ? `; важные ожидают ${Math.round(criticalAge / 1_000)} с` : ""}.${failureDetail}`,
     });
 
-    const held = this.store.deferredMirrors().filter(item => this.store.getBinding(item.bindingId)?.attached);
+    const held = this.store.deferredMirrors({ includeLegacy: false })
+      .filter(item => this.store.getBinding(item.bindingId)?.attached);
     const overdue = held.filter(item => item.firstSeenAt === null || checkedAt - item.firstSeenAt > 10_000);
     checks.push({ name: "codex_mirror", state: overdue.length ? "degraded" : "ok",
       detail: overdue.length
@@ -246,7 +247,7 @@ export class BridgeHealthMonitor {
       const queuedAge = queued.length ? Math.max(0, checkedAt - Math.min(...queued.map(item => item.acceptedAt))) : 0;
       if (queued.length && queuedAge > 2 * 60_000 && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
         checks.push({ name: `codex_native_queue:${binding.id}`, state: binding.status === "unavailable" ? "degraded" : "failed",
-          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${queued.length} VK-запрос(а) остаются в штатной очереди Codex ${Math.round(queuedAge / 1_000)} с при состоянии «${binding.status}». VKodex не запускает и не повторяет их самостоятельно.` });
+          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): ${queued.length} VK-запрос(а) ранее приняты в очередь Codex; переход в ход не подтверждён ${Math.round(queuedAge / 1_000)} с при состоянии «${binding.status}». VKodex не запускает и не повторяет их самостоятельно.` });
       }
       const actionableFailure = binding.failure !== null
         && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
