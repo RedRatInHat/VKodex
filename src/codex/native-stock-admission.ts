@@ -26,8 +26,11 @@ export interface NativeStockAdmissionDependencies<Entry extends { readonly id: s
   readonly assertOwnerCurrent: (scope: OwnerScope) => boolean;
   readonly assertDispatchCurrent: (scope: DispatchScope) => boolean;
   readonly queueAdd: (request: { readonly threadId: string; readonly clientUserMessageId: string;
-    readonly input: readonly JsonObject[] }) => { readonly queuedSubmission?: StockQueuedSubmission } |
+    readonly input: readonly JsonObject[] }, assertBeforeWrite: () => void) => { readonly queuedSubmission?: StockQueuedSubmission } |
     Promise<{ readonly queuedSubmission?: StockQueuedSubmission }>;
+  /** Synchronous hook after durable reserve, before dispatch, for an item
+   * observed during asynchronous qualification. Throw leaves a reserved intent. */
+  readonly onReserved?: (identity: Readonly<{ opId: string; fingerprint: string }>) => void;
   readonly publish: (messages: readonly JsonObject[], metadata: {
     readonly kind: 'outbox' | 'hydrate'; readonly version?: number;
     readonly taskVersion?: number; readonly taskId: string; readonly ownerEpoch: string;
@@ -66,23 +69,26 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
   private readonly assertOwnerCurrent: NativeStockAdmissionDependencies<Entry, Qualification>['assertOwnerCurrent'];
   private readonly assertDispatchCurrent: NativeStockAdmissionDependencies<Entry, Qualification>['assertDispatchCurrent'];
   private readonly queueAdd: NativeStockAdmissionDependencies<Entry, Qualification>['queueAdd'];
+  private readonly onReserved: NativeStockAdmissionDependencies<Entry, Qualification>['onReserved'];
   private readonly publish: NativeStockAdmissionDependencies<Entry, Qualification>['publish'];
   private taskTail: Promise<unknown> = Promise.resolve();
   private publicationTail: Promise<unknown> = Promise.resolve();
   private inFlight: Flight<Entry> | null = null;
 
   constructor({ taskId, ownerEpoch, journal, identifyEntry, prepareEntry,
-    qualify, confirmOwner, assertOwnerCurrent, assertDispatchCurrent, queueAdd, publish }:
+    qualify, confirmOwner, assertOwnerCurrent, assertDispatchCurrent, queueAdd, onReserved, publish }:
     NativeStockAdmissionDependencies<Entry, Qualification>) {
     if (!nonempty(taskId) || !nonempty(ownerEpoch) || !journal ||
         ![identifyEntry, prepareEntry, qualify, confirmOwner, assertOwnerCurrent,
           assertDispatchCurrent, queueAdd, publish]
-          .every(value => typeof value === 'function')) fail('dependencies required');
+          .every(value => typeof value === 'function') ||
+        onReserved !== undefined && typeof onReserved !== 'function') fail('dependencies required');
     if (journal.taskId !== taskId || journal.ownerEpoch !== ownerEpoch) fail('journal scope differs');
     this.taskId = taskId; this.ownerEpoch = ownerEpoch; this.journal = journal;
     this.identifyEntry = identifyEntry; this.prepareEntry = prepareEntry; this.qualify = qualify;
     this.confirmOwner = confirmOwner; this.assertOwnerCurrent = assertOwnerCurrent;
     this.assertDispatchCurrent = assertDispatchCurrent; this.queueAdd = queueAdd; this.publish = publish;
+    this.onReserved = onReserved;
   }
 
   private task<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -204,6 +210,11 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
         nativeEntry: asJsonObject(entry), effectiveSettings: settings,
         admissionEvidence: evidence,
         stockInput, forwardedUpstream });
+      this.onReserved?.({ opId: classification.newId,
+        fingerprint: incoming.find(row => row.id === classification.newId)?.fingerprint ?? fail('new fingerprint absent') });
+      if (this.journal.readOperation(classification.newId)?.consumed) {
+        fail('entry consumed before stock dispatch');
+      }
       let resolve!: Flight<Entry>['resolve'], reject!: Flight<Entry>['reject'];
       const promise = new Promise<{ ok: true }>((yes, no) => { resolve = yes; reject = no; });
       void promise.catch(() => {});
@@ -242,7 +253,13 @@ export class NativeStockAdmission<Entry extends { readonly id: string },
     }
     try {
       const response = await this.queueAdd({ threadId: this.taskId,
-        clientUserMessageId: flight.opId, input: clone(flight.input) });
+        clientUserMessageId: flight.opId, input: clone(flight.input) }, () => {
+        if (this.journal.readOperation(flight.opId)?.consumed) fail('entry consumed before stock write');
+        this.ownerCurrent();
+        if (this.assertDispatchCurrent({ taskId: this.taskId, ownerEpoch: this.ownerEpoch,
+          effectiveSettings: flight.effectiveSettings }) !== true) fail('dispatch fence changed');
+        flight.ingressCurrent();
+      });
       queued = response?.queuedSubmission;
       if (!queued || !nonempty(queued.id) || queued.clientUserMessageId !== flight.opId ||
           !isDeepStrictEqual(queued.input, flight.input)) return fail('stock queue/add receipt uncertain');
