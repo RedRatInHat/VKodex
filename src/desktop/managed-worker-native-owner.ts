@@ -131,6 +131,22 @@ export interface ManagedWorkerNativeOwnerMetadata {
   }> | null;
 }
 
+export interface ManagedWorkerBridgeStateEvent {
+  readonly seq: number;
+  readonly generation: number;
+  readonly state: NativeProjectionState;
+}
+export interface ManagedWorkerBridgeStateSubscription {
+  readonly initial: ManagedWorkerBridgeStateEvent;
+  /** Synchronous same-worker liveness check; never acquires a route or resumes a thread. */
+  current(): boolean;
+  detach(): void;
+}
+type BridgeStateSubscriber = Readonly<{
+  listener: (event: ManagedWorkerBridgeStateEvent) => void;
+  onFailure: (reason: 'owner-lost' | 'projection-failed') => void;
+}>;
+
 /** One existing worker, one native owner projection. No worker launch/stop or UI reopening. */
 export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   readonly #options: ManagedWorkerNativeOwnerOptions;
@@ -146,6 +162,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #projection: NativeProjectionState | null = null;
   #authoritySnapshot: NativeStartAuthority['snapshot'] | null = null;
   #revision = 0;
+  #bridgeStateSeq = 0;
+  readonly #bridgeStateSubscribers = new Set<BridgeStateSubscriber>();
   #authorityRevision = 0;
   #semanticRevision = 0;
   #queueRevision = 0;
@@ -204,6 +222,60 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),
       bootstrapPendingRequests: this.#bootstrapPendingRequests,
       bootstrapBoundary: this.#bootstrapBoundary });
+  }
+
+  /** Subscribe before capturing the complete same-generation snapshot. Native
+   * projection changes are serialized on this owner; no second reader/resume. */
+  subscribeBridgeState(listener: BridgeStateSubscriber['listener'],
+    onFailure: BridgeStateSubscriber['onFailure']): ManagedWorkerBridgeStateSubscription {
+    if (typeof listener !== 'function' || typeof onFailure !== 'function' ||
+        !this.#projection || this.#generation === null || this.#bridgeStateSeq < 1 ||
+        this.#pendingEvents !== 0 || !this.#ownerCurrent() ||
+        this.#options.host.metadata.state !== 'running' ||
+        !['connected', 'disconnected'].includes(this.#state)) throw refuse();
+    const subscriber = { listener, onFailure };
+    this.#bridgeStateSubscribers.add(subscriber);
+    try {
+      const initial = Object.freeze({ seq: this.#bridgeStateSeq, generation: this.#generation,
+        state: freezeTree(copy(this.#projection)) });
+      const current = () => this.#bridgeStateSubscribers.has(subscriber) &&
+        this.#generation === initial.generation && this.#bridgeStateSeq >= initial.seq &&
+        this.#projection !== null && this.#ownerCurrent() &&
+        this.#options.host.metadata.state === 'running' &&
+        ['connected', 'disconnected'].includes(this.#state);
+      return Object.freeze({ initial, current,
+        detach: () => { this.#bridgeStateSubscribers.delete(subscriber); } });
+    } catch (error) {
+      this.#bridgeStateSubscribers.delete(subscriber);
+      throw error;
+    }
+  }
+
+  #bridgeStateChanged(): void {
+    if (this.#bridgeStateSeq >= Number.MAX_SAFE_INTEGER) {
+      this.#failBridgeStateSubscribers('projection-failed'); return;
+    }
+    this.#bridgeStateSeq++;
+    if (this.#bridgeStateSubscribers.size === 0 || !this.#projection || this.#generation === null) return;
+    let event: ManagedWorkerBridgeStateEvent;
+    try { event = Object.freeze({ seq: this.#bridgeStateSeq, generation: this.#generation,
+      state: freezeTree(copy(this.#projection)) }); }
+    catch { this.#failBridgeStateSubscribers('projection-failed'); return; }
+    for (const subscriber of [...this.#bridgeStateSubscribers]) {
+      if (!this.#bridgeStateSubscribers.has(subscriber)) continue;
+      try { subscriber.listener(event); }
+      catch {
+        this.#bridgeStateSubscribers.delete(subscriber);
+        try { subscriber.onFailure('projection-failed'); } catch { /* observer only */ }
+      }
+    }
+  }
+
+  #failBridgeStateSubscribers(reason: 'owner-lost' | 'projection-failed'): void {
+    for (const subscriber of [...this.#bridgeStateSubscribers]) {
+      this.#bridgeStateSubscribers.delete(subscriber);
+      try { subscriber.onFailure(reason); } catch { /* observer only */ }
+    }
   }
 
   /** Null means native queue drain is unavailable, never an empty queue. */
@@ -315,6 +387,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     if (this.#state === 'failed' || this.#state === 'closed') return;
     this.#captureColdRetirementProof(reason);
     this.#state = 'failed'; this.#failure = reason;
+    this.#failBridgeStateSubscribers(reason.includes('projection') ? 'projection-failed' : 'owner-lost');
     this.#followers.clear(); this.#grants.clear(); this.#queueGrants.clear();
     this.#intentCache.clear(); this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;
@@ -374,6 +447,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         this.#authoritySnapshot = settings; this.#authorityRevision++;
       }
       this.#projection = next; this.#revision++;
+      this.#bridgeStateChanged();
       for (const source of this.#followers.keys()) this.#sendSnapshot(source);
     } catch { this.#fail('projection-failed'); }
   }
@@ -421,6 +495,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#authoritySnapshot = settings; this.#authorityRevision++;
     }
     this.#projection = next; this.#revision++;
+    this.#bridgeStateChanged();
     for (const source of this.#followers.keys()) this.#sendSnapshot(source);
   }
 
@@ -449,6 +524,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       if (next === this.#projection) return;
       this.#semanticRevision++;
       this.#projection = next; this.#revision++;
+      this.#bridgeStateChanged();
       for (const source of this.#followers.keys()) this.#sendSnapshot(source);
     } catch { this.#fail('request-projection-failed'); }
   }
@@ -460,6 +536,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     const next = projectNativeServerRequest(this.#projection, event.request);
     if (next === this.#projection) return;
     this.#semanticRevision++; this.#projection = next; this.#revision++;
+    this.#bridgeStateChanged();
     for (const source of this.#followers.keys()) this.#sendSnapshot(source);
   }
 
@@ -498,6 +575,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       this.#bootstrapBoundary = Object.freeze({ stateIsBootstrapping, hasEvents, ownerCurrent });
       if (!stateIsBootstrapping || hasEvents || !ownerCurrent) throw refuse();
       this.#projection = initial;
+      this.#bridgeStateSeq = 1;
       this.#authoritySnapshot = this.#snapshot(initial);
       this.#revision = 1; this.#authorityRevision = 1;
       this.#semanticRevision = 1;
@@ -821,6 +899,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     if (this.#state === 'closed') return;
     this.#captureColdRetirementProof();
     this.#state = 'closed'; this.#followers.clear(); this.#grants.clear();
+    this.#failBridgeStateSubscribers('owner-lost');
     this.#queueGrants.clear(); this.#intentCache.clear();
     this.#deferredBroadcasts.length = 0;
     this.#detachObserver?.(); this.#detachObserver = null;

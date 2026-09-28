@@ -30,6 +30,72 @@ function state(): NativeProjectionState {
     previousTurnModel: null, title: 'Own', threadRuntimeStatus: { type: 'idle' },
     latestTokenUsageInfo: null, hasUnreadTurn: false, updatedAt: 1 };
 }
+
+test('managed bridge observation snapshots one native generation and fails closed on owner retirement', async () => {
+  const f = await fixture();
+  try {
+    assert.throws(() => f.owner.subscribeBridgeState(() => {}, () => {}));
+    await f.owner.start();
+    const events: Array<{ seq: number; generation: number; state: NativeProjectionState }> = [];
+    const failures: string[] = [];
+    const observed = f.owner.subscribeBridgeState(event => events.push(event), reason => failures.push(reason));
+    assert.equal(observed.initial.seq, 1);
+    assert.equal(observed.initial.generation, f.host.metadata.backendGeneration);
+    assert.equal(observed.initial.state.id, taskId);
+    assert.equal(observed.current(), true);
+    assert.equal(Object.isFrozen(observed.initial.state), true);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'managed-observed-turn', status: 'inProgress', startedAt: 1780000000, items: [] } });
+    await waitUntil(() => events.length === 1);
+    assert.equal(events[0]?.seq, 2);
+    assert.equal(events[0]?.generation, observed.initial.generation);
+    assert.equal(events[0]?.state.turns[0]?.turnId, 'managed-observed-turn');
+    assert.equal(observed.initial.state.turns.length, 0);
+    observed.detach();
+    f.child.send('turn/completed', { threadId: taskId,
+      turn: { id: 'managed-observed-turn', status: 'completed', startedAt: 1780000000,
+        completedAt: 1780000001, items: [] } });
+    await waitUntil(() => f.owner.metadata.revision > 2);
+    assert.equal(events.length, 1);
+    f.owner.close();
+    assert.equal(observed.current(), false);
+    assert.deepEqual(failures, []);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('managed bridge observation continues through frontend EOF without reopening the backend', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    const events: Array<{ seq: number; state: NativeProjectionState }> = [];
+    const observed = f.owner.subscribeBridgeState(event => events.push(event), () => {});
+    const initializations = f.child.frames.filter(frame => frame.method === 'initialize').length;
+    f.broker.destroy();
+    await waitUntil(() => f.owner.metadata.state === 'disconnected');
+    assert.equal(observed.current(), true);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'offline-bridge-turn', status: 'inProgress', startedAt: 1780000000, items: [] } });
+    await waitUntil(() => events.length === 1);
+    assert.equal(events[0]?.seq, observed.initial.seq + 1);
+    assert.equal(events[0]?.state.turns[0]?.turnId, 'offline-bridge-turn');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'initialize').length, initializations);
+    observed.detach();
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('managed bridge observation reports projection failure without stopping backend', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    const failures: string[] = [];
+    const observed = f.owner.subscribeBridgeState(() => {}, reason => failures.push(reason));
+    f.child.send('turn/started', { threadId: taskId, turn: { status: 'inProgress', items: [] } });
+    await waitUntil(() => failures.length === 1);
+    assert.deepEqual(failures, ['projection-failed']);
+    assert.equal(observed.current(), false);
+    assert.equal(f.host.metadata.state, 'running');
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
 function stockQualification(ownerEpoch: string) {
   const cwd = 'C:/own';
   const requested = { mode: 'default', settings: { model: 'fixture-model',
