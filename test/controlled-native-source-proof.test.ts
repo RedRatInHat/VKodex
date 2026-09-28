@@ -34,6 +34,22 @@ test('header-only rollout qualifies after a recorded empty preflight without sta
   assert.equal(proof.rolloutPath, await import('node:fs/promises').then(({ realpath }) => realpath(file)));
 });
 
+test('accepts an extended-length rollout path inside its ordinary source root on Windows', { skip: process.platform !== 'win32' }, async () => {
+  const f = await setup();
+  const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
+  const file = await rollout(f.home, threadA, f.workspace);
+  const proof = await proveControlledNativeSource(preflight, path.toNamespacedPath(file), threadA);
+  assert.equal(proof.threadId, threadA);
+});
+
+test('persists a receipt through an extended-length path inside its ordinary parent on Windows', { skip: process.platform !== 'win32' }, async () => {
+  const f = await setup();
+  const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
+  const receipt = path.toNamespacedPath(path.join(f.root, 'source-preflight.json'));
+  await persistControlledNativeSourcePreflightReceipt(receipt, preflight);
+  assert.equal((await import('node:fs/promises').then(({ stat }) => stat(receipt))).isFile(), true);
+});
+
 test('existing matching history is not a before-start absence proof', async () => {
   const f = await setup();
   await rollout(f.home, threadA, f.workspace);

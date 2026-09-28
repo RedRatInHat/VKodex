@@ -53,8 +53,13 @@ function equalPath(left: string, right: string): boolean {
 }
 
 function inside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return !!relative && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+  const windowsPath = path.win32.isAbsolute(root) || path.win32.isAbsolute(candidate);
+  const api = windowsPath ? path.win32 : path;
+  const comparableRoot = windowsPath ? comparablePath(root) : path.resolve(root);
+  const comparableCandidate = windowsPath ? comparablePath(candidate) : path.resolve(candidate);
+  const relative = api.relative(comparableRoot, comparableCandidate);
+  const separator = windowsPath ? path.win32.sep : path.sep;
+  return !!relative && !relative.startsWith(`..${separator}`) && relative !== '..' && !api.isAbsolute(relative);
 }
 
 function inRolloutTree(root: string, candidate: string): boolean {
