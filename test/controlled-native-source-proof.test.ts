@@ -50,6 +50,14 @@ test('persists a receipt through an extended-length path inside its ordinary par
   assert.equal((await import('node:fs/promises').then(({ stat }) => stat(receipt))).isFile(), true);
 });
 
+test('rejects a receipt whose parent directory is a symlink or junction', async () => {
+  const f = await setup();
+  const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
+  const parentLink = path.join(f.root, 'linked-parent');
+  await symlink(f.root, parentLink, process.platform === 'win32' ? 'junction' : 'dir');
+  await rejected(persistControlledNativeSourcePreflightReceipt(path.join(parentLink, 'source-preflight.json'), preflight));
+});
+
 test('existing matching history is not a before-start absence proof', async () => {
   const f = await setup();
   await rollout(f.home, threadA, f.workspace);

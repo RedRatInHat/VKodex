@@ -78,7 +78,6 @@ async function checkedRealDirectory(value: string): Promise<string> {
 async function checkedFile(root: string, value: string): Promise<string> {
   if (typeof value !== 'string' || !absolute(value)) refuse();
   const lexical = path.resolve(value);
-  if (!inRolloutTree(root, lexical)) refuse();
   const metadata = await lstat(lexical).catch(() => refuse());
   if (!metadata.isFile() || metadata.isSymbolicLink()) refuse();
   const resolved = await realpath(lexical).catch(() => refuse());
@@ -183,9 +182,11 @@ export async function persistControlledNativeSourcePreflightReceipt(filePath: st
   const workspace = await checkedRealDirectory(preflight.workspace);
   if (!equalPath(root, preflight.sourceHome) || !equalPath(workspace, preflight.workspace) ||
     (await rolloutFiles(root)).length !== 0) refuse();
-  const parent = await checkedRealDirectory(path.dirname(filePath));
-  const candidate = path.resolve(filePath);
-  if (!inside(parent, candidate)) refuse();
+  const lexical = path.resolve(filePath);
+  const parent = await checkedRealDirectory(path.dirname(lexical));
+  const name = path.basename(lexical);
+  if (!name || name === '.' || name === '..') refuse();
+  const candidate = path.join(parent, name);
   const data = JSON.stringify({ schemaVersion: 1, operationId: preflight.identity.operationId,
     sourceId: preflight.identity.sourceId, sourceGeneration: preflight.identity.sourceGeneration,
     sourceHome: root, workspace, capturedAtMs: preflight.capturedAtMs });
