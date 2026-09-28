@@ -1,4 +1,4 @@
-import { TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js";
+import { ActionRejectedError, TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js";
 
 export type TaskState = Record<string, unknown>;
 
@@ -26,6 +26,7 @@ export interface TaskStateTransport {
 }
 
 export interface TaskStateOwnerRoute {
+  readonly routingPolicy?: "exclusive";
   owns(task: TaskRef): boolean;
   readonly states: TaskStateTransport;
 }
@@ -66,7 +67,10 @@ export class RoutedTaskStateTransport implements TaskStateTransport {
   constructor(private readonly fallback: TaskStateTransport, private readonly owners: readonly TaskStateOwnerRoute[],
     private readonly preferFallback?: (task: TaskRef) => Promise<boolean>) {}
   subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void, onError: (error: Error) => void): TaskStateStream {
-    const owner = this.owners.find(owner => owner.owns(task));
+    const exclusive = this.owners.filter(owner => owner.routingPolicy === "exclusive" && owner.owns(task));
+    if (exclusive.length > 1) throw new ActionRejectedError("Для задачи найдено несколько исключительных потоков состояния.");
+    if (exclusive.length === 1) return exclusive[0]!.states.subscribe(task, onState, onError);
+    const owner = this.owners.find(owner => owner.routingPolicy !== "exclusive" && owner.owns(task));
     if (!owner) return this.fallback.subscribe(task, onState, onError);
     return new RoutedTaskStateStream(task, owner.states.subscribe(task, onState, onError),
       () => this.fallback.subscribe(task, onState, onError), this.preferFallback);
