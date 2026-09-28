@@ -51,6 +51,191 @@ test('stock daemon confirms one settings write on its own backend before readine
   }
 });
 
+test('headless VK uses the same managed stock worker queue and durable accepted receipt', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true, expectedTurnCount: 1 },
+    { enabled: true, early: false }, 'normal', true, null,
+    { capability, sourceId: '' });
+  const request = { operationId, task: { hostId: 'local', threadId: own.taskId, sourceId: '' },
+    text: 'PUBLIC_VK', author: { id: 7, name: 'VK fixture' }, outboxDir: own.home };
+  try {
+    await assert.rejects(own.daemon.submitVk({}, request), /Managed VK stock input unavailable/);
+    await assert.rejects(own.daemon.submitVk(capability, { ...request,
+      task: { ...request.task, sourceId: 'foreign-source' } }), /Managed VK stock input unavailable/);
+    await assert.rejects(own.daemon.submitVk(capability, { ...request,
+      inputFiles: [{ kind: 'image', path: path.join(own.home, 'image.png'), originalName: 'image.png',
+        sizeBytes: 1 }] }),
+      /Managed VK stock input unavailable/);
+    const generation = own.daemon.metadata.generation;
+    assert.ok(generation);
+    const collisionId = randomUUID();
+    const journal = new ManagedWorkerOperationJournal({
+      filePath: path.join(own.privateDirectory, 'operations.sqlite'),
+      ownerEpoch: own.reserved.epoch, backendGeneration: generation, threadId: own.taskId });
+    try {
+      const row = journal.reserve({ operationId: randomUUID(), clientUserMessageId: collisionId,
+        method: 'thread/queue/add', fingerprint: 'a'.repeat(64) }).operation;
+      journal.reject(row, -32602);
+    } finally { journal.close(); }
+    await assert.rejects(own.daemon.submitVk(capability, { ...request,
+      operationId: collisionId }), /Managed VK stock input unavailable/);
+    assert.equal(own.backend.queueWrites, 0);
+    const accepted = await own.daemon.submitVk(capability, request);
+    assert.equal(accepted.submissionId, 'submission-1');
+    assert.equal(own.backend.queueWrites, 1);
+    assert.equal(own.backend.writes, 0);
+    const queueFrame = own.backend.frames.find(frame => frame.method === 'thread/queue/add');
+    assert.ok(queueFrame);
+    const params = queueFrame.params as Record<string, unknown>;
+    assert.equal(params.clientUserMessageId, operationId);
+    assert.match(JSON.stringify(params.input), /VK author.*VK fixture/);
+    assert.match(JSON.stringify(params.input), /VKodex file delivery/);
+    assert.deepEqual(await own.daemon.submitVk(capability, request), accepted);
+    assert.equal(own.backend.queueWrites, 1, 'exact duplicate did not write again');
+    await assert.rejects(own.daemon.submitVk(capability, { ...request, text: 'changed' }),
+      /intent conflict/i);
+    own.backend.terminalQueueClients = [operationId];
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-stock-stop')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK lease fences native ingress and stop while its one queue RPC awaits ACK', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true, expectedTurnCount: 1 },
+    { enabled: true, early: false }, 'normal', true, null,
+    { capability, sourceId: '' });
+  const broker = own.brokers[0]!;
+  const request = { operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK' };
+  own.backend.holdQueueReply = true;
+  try {
+    const pending = own.daemon.submitVk(capability, request);
+    const deadline = Date.now() + 3000;
+    while (own.backend.queueWrites === 0 && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(own.backend.queueWrites, 1);
+    assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-busy-stop')).error,
+      'stop-refused');
+    assert.equal(own.backend.exitCode, null);
+    broker.send({ type: 'request', requestId: 'native-during-vk', sourceClientId: 'follower',
+      targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+      params: { hostId: 'local', conversationId: own.taskId,
+        state: { [own.taskId]: [stockEntry(own.home)] } } });
+    const until = Date.now() + 3000;
+    while (!broker.frames.some(frame => frame.requestId === 'native-during-vk' &&
+      frame.type === 'response') && Date.now() < until)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'native-during-vk')?.resultType,
+      'error');
+    assert.equal(own.backend.queueWrites, 1);
+    const earlyUser = { id: 'queue-user-0', type: 'userMessage', clientId: operationId,
+      content: [{ type: 'text', text: 'PUBLIC_VK' }] };
+    const earlyTurn = { id: 'queue-terminal-turn', status: 'inProgress', startedAt: 1,
+      items: [] };
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started',
+      params: { threadId: own.taskId, turn: earlyTurn } }) + '\n');
+    own.backend.stdout.write(JSON.stringify({ method: 'item/started',
+      params: { threadId: own.taskId, turnId: earlyTurn.id, item: earlyUser } }) + '\n');
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/completed',
+      params: { threadId: own.taskId, turn: { ...earlyTurn, status: 'completed',
+        completedAt: 2, itemsView: 'full', items: [earlyUser] } } }) + '\n');
+    own.backend.terminalQueueClients = [operationId];
+    own.backend.answerHeldQueue();
+    assert.deepEqual(await pending, { submissionId: 'submission-1' });
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-drained-stop')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK refuses authority drift during beforeSend without reserving a queue write', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  try {
+    await assert.rejects(own.daemon.submitVk(capability, {
+      operationId: randomUUID(), task: { hostId: 'local', threadId: own.taskId },
+      text: 'PUBLIC_VK', beforeSend: async () => {
+        own.backend.stdout.write(JSON.stringify({ method: 'thread/queue/changed',
+          params: { threadId: own.taskId } }) + '\n');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      },
+    }));
+    assert.equal(own.backend.queueWrites, 0);
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-drift-stop')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK malformed queue ACK stays durable unknown and blocks replay and stop', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  const request = { operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK' };
+  own.backend.holdQueueReply = true;
+  try {
+    const pending = own.daemon.submitVk(capability, request);
+    const deadline = Date.now() + 3000;
+    while (!own.backend.heldQueueReply && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(own.backend.heldQueueReply);
+    own.backend.answerHeldQueueMalformed();
+    await assert.rejects(pending, /Результат операции неизвестен/);
+    assert.equal(own.daemon.vkSubmissionStatus(capability, request)?.state, 'unknown');
+    await assert.rejects(own.daemon.submitVk(capability, request), /Результат операции неизвестен/);
+    assert.equal(own.backend.queueWrites, 1);
+    assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-unknown-stop')).error,
+      'stop-refused');
+    assert.equal(own.backend.exitCode, null);
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK late exact queue ACK reconciles unknown without replay', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true, expectedTurnCount: 1 },
+    { enabled: true, early: false }, 'normal', true, null,
+    { capability, sourceId: '' }, 300);
+  const request = { operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK' };
+  own.backend.holdQueueReply = true;
+  try {
+    await assert.rejects(own.daemon.submitVk(capability, request), /Результат операции неизвестен/);
+    assert.equal(own.backend.queueWrites, 1);
+    assert.equal(own.daemon.vkSubmissionStatus(capability, request)?.state, 'unknown');
+    assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-late-pending')).error,
+      'stop-refused');
+    own.backend.answerHeldQueue();
+    const deadline = Date.now() + 3000;
+    while (own.daemon.vkSubmissionStatus(capability, request)?.state !== 'accepted' && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(own.daemon.vkSubmissionStatus(capability, request)?.receiptId, 'submission-1');
+    assert.deepEqual(await own.daemon.submitVk(capability, request), { submissionId: 'submission-1' });
+    assert.equal(own.backend.queueWrites, 1);
+    own.backend.terminalQueueClients = [operationId];
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-late-drained')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
 test('stock daemon routes two native queue sends through one journaled backend and stops after terminal proof', async () => {
   const own = await readyFixture({ allow: true, expectedTurnCount: 2 },
     { enabled: true, early: false }, 'normal', true);
@@ -323,6 +508,7 @@ class Backend extends EventEmitter {
   readonly pid = 42424; exitCode: number | null = null; signalCode: NodeJS.Signals | null = null;
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
   stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true; birthDrift = false;
+  holdQueueReply = false; heldQueueReply: Record<string, unknown> | null = null;
   readonly frames: Record<string, unknown>[] = [];
   failBootstrap = false; resumeServiceTier: 'default' | null = null;
   terminalQueueClients: string[] | null = null;
@@ -361,6 +547,7 @@ class Backend extends EventEmitter {
         }
         if (method === 'thread/queue/add') { this.queueWrites++;
           const params = frame.params as Record<string, unknown>;
+          if (this.holdQueueReply) { this.heldQueueReply = frame; continue; }
           queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
             result: { queuedSubmission: { id: `submission-${this.queueWrites}`,
               clientUserMessageId: params.clientUserMessageId, input: params.input } } }) + '\n'));
@@ -409,6 +596,24 @@ class Backend extends EventEmitter {
     throw new Error(`unexpected method ${method}`);
   }
   kill(): boolean { this.exitCode = 0; this.emit('close', 0, null); return true; }
+  answerHeldQueue(): void {
+    const frame = this.heldQueueReply;
+    assert.ok(frame);
+    this.heldQueueReply = null; this.holdQueueReply = false;
+    const params = frame.params as Record<string, unknown>;
+    this.stdout.write(JSON.stringify({ id: frame.id, result: { queuedSubmission: {
+      id: `submission-${this.queueWrites}`, clientUserMessageId: params.clientUserMessageId,
+      input: params.input } } }) + '\n');
+  }
+  answerHeldQueueMalformed(): void {
+    const frame = this.heldQueueReply;
+    assert.ok(frame);
+    this.heldQueueReply = null; this.holdQueueReply = false;
+    const params = frame.params as Record<string, unknown>;
+    this.stdout.write(JSON.stringify({ id: frame.id, result: { queuedSubmission: {
+      id: `submission-${this.queueWrites}`, clientUserMessageId: 'wrong-client',
+      input: params.input } } }) + '\n');
+  }
   rejectHeldIdOnlyResume(): void {
     assert.notEqual(this.heldIdOnlyResume, null);
     this.stdout.write(JSON.stringify({ id: this.heldIdOnlyResume,
@@ -498,7 +703,8 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'policy-mismatch' |
     'control-bind-fail' | 'endpoint-collision' = 'normal',
-  stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null) {
+  stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null,
+  headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -522,6 +728,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
     ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
       assertControlledNativeBaseline: () => stockFailure !== 'baseline',
+      ...(headlessVk ? { headlessVk } : {}),
       createProbeClient: () => new DesktopIpcClient(() => {
         const probe = new Broker(null, taskId, false, true,
           stockFailure === 'discovery' ? 'foreign-owner' : ownerId);
@@ -546,6 +753,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         idle.turnCount === 0 && idle.latestTurnId === null);
     },
     dependencies: {
+      ...(backendTimeoutMs ? { backendTimeoutMs } : {}),
       createControl: options => {
         control = startup === 'control-bind-fail' ?
           new class extends ManagedWorkerControlServer {

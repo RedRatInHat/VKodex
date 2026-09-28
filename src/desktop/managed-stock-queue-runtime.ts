@@ -6,6 +6,7 @@ import type { ManagedStockInitialized } from './managed-stock-settings-initializ
 import { ManagedNativeStockQueueAdapter } from './managed-native-stock-queue-adapter.js';
 import type { ManagedNativeStockQueueAdapterOptions } from './managed-native-stock-queue-adapter.js';
 import type { ManagedNativeStockQueueAuthority, ManagedNativeStockQueueContext } from './managed-worker-native-owner.js';
+import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 
 type Scope = Readonly<{ taskId: string; ownerEpoch: string; backendGeneration: number;
   sourceGeneration: string }>;
@@ -23,6 +24,34 @@ function copy<T>(value: T): T {
 function samePath(a: unknown, b: string): boolean {
   return typeof a === 'string' &&
     path.win32.normalize(a).toLowerCase() === path.win32.normalize(b).toLowerCase();
+}
+
+/** Pure parity assertion shared by native FWE and headless VK queue ingress.
+ * The caller separately proves that the owner ticket is still current. */
+type QualifiedInitial = Pick<NativeProjectionState, 'latestThreadSettings' |
+  'currentPermissions'> & { readonly environments?: unknown };
+export function assertManagedStockReadParity(ticket: ManagedNativeStockQueueAuthority,
+  read: StockReadState, initial: QualifiedInitial, policy: ApprovedTaskPolicy,
+  ownerEpoch: string, generation: number): void {
+  const p = ticket.projection;
+  if (ticket.taskId !== policy.threadId || ticket.ownerEpoch !== ownerEpoch ||
+      ticket.backendGeneration !== generation || ticket.pendingEvents !== 0 ||
+      !row(p) || p.id !== policy.threadId || !row(p.threadRuntimeStatus) ||
+      p.threadRuntimeStatus.type !== 'idle' ||
+      !Array.isArray(p.activeTurnIds) || p.activeTurnIds.length !== 0 ||
+      !Array.isArray(p.terminalTurnIds) ||
+      !isDeepStrictEqual(p.terminalTurnIds, read.terminalTurnIds) ||
+      read.turnCount !== p.terminalTurnIds.length ||
+      read.threadId !== policy.threadId || read.generation !== generation ||
+      read.model !== policy.model || read.modelProvider !== policy.modelProvider ||
+      read.reasoningEffort !== policy.effort || !samePath(read.cwd, policy.cwd) ||
+      !isDeepStrictEqual(read.environments, policy.environments) ||
+      policy.serviceTier === null && read.fastModeAllowed !== false ||
+      !samePath(p.cwd, policy.cwd) || p.latestModel !== policy.model ||
+      p.latestReasoningEffort !== policy.effort ||
+      !isDeepStrictEqual(p.latestThreadSettings, initial.latestThreadSettings) ||
+      !isDeepStrictEqual(p.currentPermissions, initial.currentPermissions) ||
+      !isDeepStrictEqual(p.environments, initial.environments ?? null)) fail();
 }
 
 export interface ManagedStockQueueRuntimeOptions {
@@ -122,27 +151,6 @@ export function createManagedStockQueueRuntimeFactory(options: ManagedStockQueue
     const assertTicket = (ticket: ManagedNativeStockQueueAuthority): void => {
       if (!ticketCurrent(ticket)) fail();
     };
-    const validateRead = (ticket: ManagedNativeStockQueueAuthority, read: StockReadState): void => {
-      const p = ticket.projection;
-      if (ticket.taskId !== taskId || ticket.ownerEpoch !== ownerEpoch ||
-          ticket.backendGeneration !== generation || ticket.pendingEvents !== 0 ||
-          !row(p) || p.id !== taskId || !row(p.threadRuntimeStatus) ||
-          p.threadRuntimeStatus.type !== 'idle' ||
-          !Array.isArray(p.activeTurnIds) || p.activeTurnIds.length !== 0 ||
-          !Array.isArray(p.terminalTurnIds) ||
-          !isDeepStrictEqual(p.terminalTurnIds, read.terminalTurnIds) ||
-          read.turnCount !== p.terminalTurnIds.length ||
-          read.threadId !== taskId || read.generation !== generation ||
-          read.model !== policy.model || read.modelProvider !== policy.modelProvider ||
-          read.reasoningEffort !== policy.effort || !samePath(read.cwd, policy.cwd) ||
-          !isDeepStrictEqual(read.environments, policy.environments) ||
-          policy.serviceTier === null && read.fastModeAllowed !== false ||
-          !samePath(p.cwd, policy.cwd) || p.latestModel !== policy.model ||
-          p.latestReasoningEffort !== policy.effort ||
-          !isDeepStrictEqual(p.latestThreadSettings, qualifiedInitial.latestThreadSettings) ||
-          !isDeepStrictEqual(p.currentPermissions, qualifiedInitial.currentPermissions) ||
-          !isDeepStrictEqual(p.environments, qualifiedInitial.environments)) fail();
-    };
     const adapterOptions: ManagedNativeStockQueueAdapterOptions = {
       taskId, ownerEpoch, backendGeneration: generation, sourceGeneration,
       journalPath, controlKey, host,
@@ -162,7 +170,7 @@ export function createManagedStockQueueRuntimeFactory(options: ManagedStockQueue
         assertTicket(ticket);
         const read = await readStockState(() => assertTicket(ticket));
         assertTicket(ticket);
-        validateRead(ticket, read);
+        assertManagedStockReadParity(ticket, read, qualifiedInitial, policy, ownerEpoch, generation);
         // A same-entry requalification cannot replace its original wire fence.
         // Empty-state/hydration qualification cannot authorize a queued write.
         if (entryId !== null && previous === null) wireTicket = { entryId, ticket };

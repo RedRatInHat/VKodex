@@ -21,6 +21,8 @@ import { createManagedStockSettingsInitializer, type ManagedStockSettingsInitial
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
+import { ManagedStockVkSubmitter, type ManagedStockVkLease } from './managed-stock-vk-submit.js';
+import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 
 type State = 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
@@ -63,6 +65,8 @@ export interface ManagedWorkerDaemonOptions {
     assertControlledNativeBaseline: (scope: Readonly<{ taskId: string; ownerEpoch: string;
       backendGeneration: number; sourceGeneration: string }>) => boolean | Promise<boolean>;
     createProbeClient: () => DesktopIpcClient;
+    /** Internal capability only. No daemon control or native IPC route is added. */
+    headlessVk?: Readonly<{ capability: object; sourceId: string }>;
   }>;
   /** Injectable seams for isolated tests, not remote control methods. */
   readonly dependencies?: Readonly<{
@@ -70,6 +74,7 @@ export interface ManagedWorkerDaemonOptions {
     observeProcess?: typeof readWindowsProcessIdentity;
     launch?: (cliPath: string, cwd: string, home: string) => ChildProcessWithoutNullStreams;
     createControl?: (options: ManagedWorkerControlOptions) => ManagedWorkerControlServer;
+    backendTimeoutMs?: number;
   }>;
 }
 export interface ManagedWorkerDaemonMetadata {
@@ -110,6 +115,8 @@ export class ManagedWorkerDaemon {
   #backend: BackendIdentity | null = null;
   #intentStore: NativeStartIntentStore | null = null;
   #stockInitializer: ManagedStockSettingsInitializer | null = null;
+  #vkSubmitter: ManagedStockVkSubmitter | null = null;
+  #headlessPending = 0;
   #admissionOpen = false;
   #everReady = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
@@ -125,14 +132,21 @@ export class ManagedWorkerDaemon {
     const stock = options.nativeStockQueue;
     if (stock !== undefined && (!object(stock) ||
       !isDeepStrictEqual(Object.keys(stock).sort(),
-        ['assertControlledNativeBaseline', 'createProbeClient', 'sourceGeneration'].sort()) ||
+        ['assertControlledNativeBaseline', 'createProbeClient', 'sourceGeneration',
+          ...(stock.headlessVk === undefined ? [] : ['headlessVk'])].sort()) ||
       typeof stock.sourceGeneration !== 'string' || !stock.sourceGeneration ||
       stock.sourceGeneration.length > 128 || /[\x00-\x1f\x7f]/u.test(stock.sourceGeneration) ||
       typeof stock.assertControlledNativeBaseline !== 'function' ||
-      typeof stock.createProbeClient !== 'function'))
+      typeof stock.createProbeClient !== 'function' ||
+      stock.headlessVk !== undefined && (!object(stock.headlessVk) ||
+        !isDeepStrictEqual(Object.keys(stock.headlessVk).sort(), ['capability', 'sourceId']) ||
+        !stock.headlessVk.capability || typeof stock.headlessVk.capability !== 'object' ||
+        typeof stock.headlessVk.sourceId !== 'string' ||
+        stock.headlessVk.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(stock.headlessVk.sourceId))))
       throw new TypeError('Explicit managed native stock queue policy invalid');
     this.#options = Object.freeze({ ...options,
-      ...(stock ? { nativeStockQueue: Object.freeze({ ...stock }) } : {}) });
+      ...(stock ? { nativeStockQueue: Object.freeze({ ...stock,
+        ...(stock.headlessVk ? { headlessVk: Object.freeze({ ...stock.headlessVk }) } : {}) }) } : {}) });
   }
 
   get metadata(): ManagedWorkerDaemonMetadata {
@@ -147,6 +161,20 @@ export class ManagedWorkerDaemon {
         bootstrapNotifications: owner.bootstrapNotifications,
         bootstrapPendingRequests: owner.bootstrapPendingRequests,
         bootstrapBoundary: owner.bootstrapBoundary }) : null });
+  }
+
+  /** Capability-bound in-process seam. There is deliberately no TCP/control method. */
+  submitVk(capability: object, request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+    if (!this.#vkSubmitter || this.#state !== 'ready')
+      return Promise.reject(new Error('Managed VK stock ingress unavailable'));
+    return this.#vkSubmitter.submit(capability, request);
+  }
+
+  /** Read-only exact-intent lookup remains available for late response
+   * reconciliation even when fresh command admission has closed. */
+  vkSubmissionStatus(capability: object, request: SubmitTaskRequest) {
+    if (!this.#vkSubmitter) throw new Error('Managed VK stock ingress unavailable');
+    return this.#vkSubmitter.status(capability, request);
   }
 
   start(): Promise<void> {
@@ -226,6 +254,7 @@ export class ManagedWorkerDaemon {
         if (!ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
         if (this.#options.nativeStockQueue) {
+          if (this.#vkSubmitter?.authorizes(scope) === true) return true;
           const p = scope.params;
           if (!stockInitialized || scope.method !== 'thread/queue/add' ||
               p.threadId !== manifest.taskId || typeof p.clientUserMessageId !== 'string' ||
@@ -236,6 +265,11 @@ export class ManagedWorkerDaemon {
                 ['threadId', 'clientUserMessageId', 'input'].sort()) ||
               scope.operationId !== managedStockCommandId(manifest.epoch, manifest.taskId,
                 p.clientUserMessageId)) return false;
+          if (this.#headlessPending !== 0) {
+            const admitted = this.#host?.commandStatusForIntent(controlKey, {
+              operationId: scope.operationId, method: scope.method, params: scope.params });
+            return admitted?.state === 'dispatching';
+          }
           if (!this.#admissionOpen) {
             const admitted = this.#host?.commandStatusForIntent(controlKey, {
               operationId: scope.operationId, method: scope.method, params: scope.params });
@@ -288,6 +322,8 @@ export class ManagedWorkerDaemon {
       };
       this.#host = new ManagedWorkerFrontendHost({
         taskId: manifest.taskId, ownCwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
+        ...(this.#options.dependencies?.backendTimeoutMs ?
+          { backendTimeoutMs: this.#options.dependencies.backendTimeoutMs } : {}),
         bootstrapReadMethods: this.#options.nativeStockQueue ?
           ['thread/turns/list', 'config/read', 'configRequirements/read'] :
           ['thread/turns/list', 'config/read'],
@@ -356,14 +392,22 @@ export class ManagedWorkerDaemon {
         } catch { return false; }
       };
       const stock = this.#options.nativeStockQueue;
-      const queueAdapterFactory = stock && initialized ? createManagedStockQueueRuntimeFactory({
+      const stockFactory = stock && initialized ? createManagedStockQueueRuntimeFactory({
         journalPath: path.join(state.privateDirectory, 'native-stock.sqlite'),
         sourceGeneration: stock.sourceGeneration, bootstrap: this.#bootstrap,
         initialized, approvedTaskPolicy: manifest.approvedTaskPolicy!,
         assertControlledNativeBaseline: stock.assertControlledNativeBaseline,
         confirmNativeOwner: confirmStockOwner, isOwnerCurrent: ownerCurrent,
-        admissionOpen: () => this.#admissionOpen,
+        admissionOpen: () => this.#admissionOpen && this.#headlessPending === 0,
       }) : undefined;
+      let stockAuthority: Pick<Parameters<NonNullable<typeof stockFactory>>[0],
+        'captureAuthority' | 'assertCurrent'> | null = null;
+      const queueAdapterFactory = stockFactory ?
+        (context: Parameters<typeof stockFactory>[0]) => {
+          stockAuthority = Object.freeze({ captureAuthority: context.captureAuthority,
+            assertCurrent: context.assertCurrent });
+          return stockFactory(context);
+        } : undefined;
       this.#owner = new ManagedWorkerNativeOwner({ host: this.#host, adapterKey, controlKey,
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, isOwnerCurrent: ownerCurrent,
         allowFollower: this.#options.allowFollower,
@@ -410,6 +454,60 @@ export class ManagedWorkerDaemon {
         host: self, backend: this.#backend,
         control: { host: controlEndpoint.host, port: controlEndpoint.port } });
       if (!readyCurrent()) throw new Error('Native owner changed before registry publication');
+      if (stock?.headlessVk && initialized && stockAuthority) {
+        const authority = stockAuthority as Pick<Parameters<NonNullable<typeof stockFactory>>[0],
+          'captureAuthority' | 'assertCurrent'>;
+        const acquireLease = (): ManagedStockVkLease => {
+          if (this.#state !== 'ready' || !this.#admissionOpen ||
+            this.#headlessPending !== 0 || !ownerCurrent())
+            throw new Error('Managed VK ingress unavailable');
+          this.#headlessPending++;
+          let settled = false;
+          try {
+            const nativeOwner = this.#owner!, host = this.#host!;
+            const revision = nativeOwner.metadata.semanticRevision;
+            const nativeQueue = nativeOwner.queueQuiescence();
+            const initialCommands = host.commandQuiescence(controlKey);
+            const initialRequests = host.requestQuiescence(controlKey);
+            if (!nativeQueue || nativeQueue.unresolved || nativeQueue.unconsumed ||
+              nativeOwner.metadata.pendingNativeOperations !== 0 ||
+              nativeOwner.metadata.pendingEvents !== 0 ||
+              initialCommands.inFlight !== 0 || initialCommands.unconfirmed ||
+              initialRequests.unresolved !== 0 || initialRequests.generation !== this.#generation)
+              throw new Error('Managed VK stock queue is busy');
+            const assertCurrent = (): void => {
+              const meta = nativeOwner.metadata;
+              const queue = nativeOwner.queueQuiescence();
+              const requests = host.requestQuiescence(controlKey);
+              if (this.#state !== 'ready' || !ownerCurrent() ||
+                host.metadata.state !== 'running' || host.metadata.taskId !== manifest.taskId ||
+                host.metadata.backendGeneration !== this.#generation ||
+                !['connected', 'disconnected'].includes(meta.state) ||
+                meta.semanticRevision !== revision || meta.pendingNativeOperations !== 0 ||
+                meta.pendingEvents !== 0 || !queue || queue.unresolved !== 0 ||
+                queue.unconsumed !== 0 || queue.taskVersion !== nativeQueue.taskVersion ||
+                requests.unresolved !== 0 || requests.generation !== this.#generation)
+                throw new Error('Managed VK stock authority changed');
+            };
+            assertCurrent();
+            return Object.freeze({ assertCurrent,
+              finish: (outcome: 'accepted' | 'rejected' | 'unknown') => {
+                if (settled || outcome === 'unknown') return;
+                settled = true; this.#headlessPending--;
+              } });
+          } catch (error) { this.#headlessPending--; throw error; }
+        };
+        this.#vkSubmitter = new ManagedStockVkSubmitter({
+          capability: stock.headlessVk.capability, sourceId: stock.headlessVk.sourceId,
+          controlKey, taskId: manifest.taskId, ownerEpoch: manifest.epoch,
+          backendGeneration: this.#generation!, approvedTaskPolicy: manifest.approvedTaskPolicy!,
+          host: this.#host, readStockState: this.#bootstrap!.readStockState,
+          initialState: initialized.initialState,
+          captureAuthority: authority.captureAuthority,
+          assertAuthorityCurrent: authority.assertCurrent,
+          acquireLease,
+        });
+      }
       this.#attempt = this.#registry.markReady(this.#attempt, self, this.#backend, endpointRef);
       this.#endpointRef = endpointRef;
       this.#everReady = true;
@@ -517,7 +615,8 @@ export class ManagedWorkerDaemon {
           host.metadata.state === 'running' && host.metadata.backendGeneration === generation &&
           (owner.metadata.state === 'connected' || owner.metadata.state === 'disconnected');
       };
-      const stable = () => identityCurrent() && owner.metadata.pendingNativeOperations === 0 &&
+      const stable = () => identityCurrent() && this.#headlessPending === 0 &&
+        owner.metadata.pendingNativeOperations === 0 &&
         owner.metadata.pendingEvents === 0;
       if (!stable() || generation === null) throw new ManagedWorkerStopRefusedError();
       // Native reservation can precede every worker command. Empty backend

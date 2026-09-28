@@ -150,6 +150,14 @@ test('runtime queue factory qualifies current same-worker state and refuses drif
   await assert.rejects(adapter.accept(request([entry]), () => true));
   assert.equal(writes, 0);
   projection.latestThreadSettings.model = model;
+  projection.latestThreadSettings.serviceTier = 'different' as never;
+  await assert.rejects(adapter.accept(request([entry]), () => true));
+  assert.equal(writes, 0);
+  projection.latestThreadSettings.serviceTier = settings.serviceTier;
+  projection.latestThreadSettings.collaborationMode = { mode: 'plan' } as never;
+  await assert.rejects(adapter.accept(request([entry]), () => true));
+  assert.equal(writes, 0);
+  projection.latestThreadSettings.collaborationMode = confirmedMode;
   projection.currentPermissions.approvalPolicy = 'on-request';
   await assert.rejects(adapter.accept(request([entry]), () => true));
   assert.equal(writes, 0);
