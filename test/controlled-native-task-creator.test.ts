@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import type { AppServerRpc } from '../src/codex/app-server-connection.js';
 import { createControlledNativeTask, ControlledNativeCreationUncertainError,
   type ControlledCreationIntent, type ControlledCreationStarted,
   type ControlledCreationReceipt } from '../src/desktop/controlled-native-task-creator.js';
+import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
+import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 
 const cwd = 'C:\\fixture\\workspace';
 const rolloutPath = 'C:\\fixture\\home\\sessions\\new.jsonl';
@@ -136,4 +141,125 @@ test('native policy mismatch still persists known created ID before refusing qua
   await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
   assert.deepEqual(f.calls, ['thread/start']);
   assert.deepEqual(f.persisted, ['intent', 'started']);
+});
+
+function journalFixture() {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-create-')), 'creation.sqlite');
+  const intent: ControlledCreationIntent = { operationId: randomUUID(), creatorNonce: randomUUID(),
+    sourceGeneration: randomUUID(), sourceId: 'source-a', requestedPolicy: template };
+  const started: ControlledCreationStarted = { ...intent, threadId: taskId,
+    selectedEffective: { model: template.model, modelProvider: template.modelProvider,
+      reasoningEffort: template.effort, serviceTier: 'default', cwd,
+      approvalPolicy: template.approvalPolicy, environments: [] } };
+  const { allowedEnvironments: _environments, allowedServiceTiers: _tiers, ...requested } = template;
+  const effectivePolicy = approveTaskPolicy({ ...requested, threadId: taskId,
+    serviceTier: 'default', environments: [] });
+  const qualified: ControlledCreationReceipt = { ...started, effectivePolicy,
+    rolloutPath, status: 'qualified-zero-turn' };
+  return { filePath, intent, started, qualified };
+}
+
+test('creation journal persists intent, native ID, and qualification across reopen', async () => {
+  const f = journalFixture();
+  let journal = new ControlledNativeCreationJournal(f.filePath);
+  const reservation = await journal.persistIntent(f.intent);
+  assert.equal(reservation.isCurrent(), true);
+  assert.equal(journal.get(f.intent.operationId)?.state, 'intent');
+  assert.equal(journal.synchronousMode(), 2);
+  journal.close();
+  journal = new ControlledNativeCreationJournal(f.filePath);
+  assert.equal(journal.get(f.intent.operationId)?.state, 'intent');
+  await journal.persistStarted(f.started);
+  journal.close();
+  journal = new ControlledNativeCreationJournal(f.filePath);
+  assert.equal(journal.get(f.intent.operationId)?.started?.threadId, taskId);
+  await journal.persistQualified(f.qualified);
+  journal.close();
+  journal = new ControlledNativeCreationJournal(f.filePath);
+  assert.equal(journal.get(f.intent.operationId)?.qualified?.rolloutPath, rolloutPath);
+  assert.deepEqual(journal.listUncertain(), []);
+  journal.close();
+});
+
+test('creation journal rejects duplicate operation and immutable-scope drift without overwrite', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  await journal.persistIntent(f.intent);
+  await assert.rejects(journal.persistIntent(f.intent));
+  await assert.rejects(journal.persistStarted({ ...f.started, sourceId: 'different' }));
+  assert.equal(journal.get(f.intent.operationId)?.state, 'intent');
+  await journal.persistStarted(f.started);
+  await assert.rejects(journal.persistStarted({ ...f.started, threadId: randomUUID() }));
+  await assert.rejects(journal.persistQualified({ ...f.qualified, creatorNonce: randomUUID() }));
+  assert.equal(journal.get(f.intent.operationId)?.state, 'started');
+  assert.equal(journal.get(f.intent.operationId)?.started?.threadId, taskId);
+  assert.deepEqual(journal.listUncertain().map(row => row.state), ['started']);
+  journal.close();
+});
+
+test('reopened uncertain intent prevents any second native thread/start', async () => {
+  const f = journalFixture();
+  let journal = new ControlledNativeCreationJournal(f.filePath);
+  await journal.persistIntent(f.intent);
+  journal.close();
+  journal = new ControlledNativeCreationJournal(f.filePath);
+  const rpc = fixture();
+  await assert.rejects(createControlledNativeTask({ ...rpc.options,
+    operationId: f.intent.operationId,
+    persistIntent: intent => journal.persistIntent(intent),
+    persistStarted: started => journal.persistStarted(started),
+    persistQualified: receipt => journal.persistQualified(receipt) }));
+  assert.deepEqual(rpc.calls, []);
+  assert.equal(journal.get(f.intent.operationId)?.state, 'intent');
+  journal.close();
+});
+
+test('journal independently rejects forged or malformed requested policy', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  await assert.rejects(journal.persistIntent({ ...f.intent,
+    requestedPolicy: { ...f.intent.requestedPolicy, model: 'bad model' } }));
+  await assert.rejects(journal.persistIntent({ ...f.intent,
+    requestedPolicy: { ...f.intent.requestedPolicy, allowedServiceTiers: ['bad tier'] } }));
+  await assert.rejects(journal.persistIntent({ ...f.intent,
+    requestedPolicy: { ...f.intent.requestedPolicy, extra: 'unapproved' } } as ControlledCreationIntent));
+  assert.equal(journal.get(f.intent.operationId), null);
+  journal.close();
+});
+
+test('journal rejects qualified policy that differs from fixed request or native selection', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  await journal.persistIntent(f.intent);
+  await journal.persistStarted(f.started);
+  await assert.rejects(journal.persistQualified({ ...f.qualified,
+    effectivePolicy: approveTaskPolicy({ ...f.qualified.effectivePolicy, model: 'gpt-6-sol' }) }));
+  await assert.rejects(journal.persistQualified({ ...f.qualified,
+    effectivePolicy: approveTaskPolicy({ ...f.qualified.effectivePolicy, serviceTier: null }) }));
+  assert.equal(journal.get(f.intent.operationId)?.state, 'started');
+  journal.close();
+});
+
+test('same native thread ID cannot be persisted for two creation operations', async () => {
+  const first = journalFixture(), second = journalFixture();
+  const journal = new ControlledNativeCreationJournal(first.filePath);
+  await journal.persistIntent(first.intent);
+  await journal.persistStarted(first.started);
+  await journal.persistIntent(second.intent);
+  await assert.rejects(journal.persistStarted(second.started));
+  assert.equal(journal.get(second.intent.operationId)?.state, 'intent');
+  assert.equal(journal.get(first.intent.operationId)?.started?.threadId, taskId);
+  journal.close();
+});
+
+test('qualified native cwd accepts equivalent Windows path spelling', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  const started = { ...f.started, selectedEffective: { ...f.started.selectedEffective,
+    cwd: 'c:\\FIXTURE\\workspace\\.' } };
+  await journal.persistIntent(f.intent);
+  await journal.persistStarted(started);
+  await journal.persistQualified({ ...f.qualified, selectedEffective: started.selectedEffective });
+  assert.equal(journal.get(f.intent.operationId)?.state, 'qualified');
+  journal.close();
 });
