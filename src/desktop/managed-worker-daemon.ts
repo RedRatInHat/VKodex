@@ -13,7 +13,8 @@ import { bootstrapManagedWorker,
   type ManagedWorkerBootstrap, type ContinuationOwnerFence } from './managed-worker-bootstrap.js';
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
-  type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis } from './managed-worker-control.js';
+  type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
+  type ManagedWorkerVkStatus } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
@@ -21,7 +22,10 @@ import { createManagedStockSettingsInitializer, type ManagedStockSettingsInitial
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
-import { ManagedStockVkSubmitter, type ManagedStockVkLease } from './managed-stock-vk-submit.js';
+import { ManagedStockVkSubmitter, managedVkStockCommandId,
+  type ManagedStockVkLease } from './managed-stock-vk-submit.js';
+import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server.js';
+import { deriveManagedTaskStateToken } from './managed-worker-task-state-token.js';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 
@@ -67,7 +71,11 @@ export interface ManagedWorkerDaemonOptions {
     createProbeClient: () => DesktopIpcClient;
     /** Internal capability only. No daemon control or native IPC route is added. */
     headlessVk?: Readonly<{ capability: object; sourceId: string }>;
+    /** In-process, opt-in handoff admission fence; never exposed on control. */
+    handoffCapability?: object;
   }>;
+  /** Explicit private native projection listener. It adds no writer capability. */
+  readonly nativeTaskState?: true;
   /** Injectable seams for isolated tests, not remote control methods. */
   readonly dependencies?: Readonly<{
     loadPrivateState?: typeof loadManagedWorkerPrivateState;
@@ -92,6 +100,20 @@ export interface ManagedWorkerDaemonMetadata {
     'bootstrapPendingRequests' | 'bootstrapBoundary'> | null;
 }
 
+/** Quiescence evidence for entering handoff_pending only. Retiring the claim
+ * or assigning a new writer additionally requires proven process release and
+ * reconciliation of late receipts. */
+export interface ManagedWorkerHandoffProof {
+  readonly ownerEpoch: string;
+  readonly taskId: string;
+  readonly backendGeneration: number;
+  readonly registryRevision: number;
+  readonly host: ProcessIdentity;
+  readonly backend: BackendIdentity;
+  readonly endpointRef: string;
+  readonly nonce: string;
+}
+
 /** Explicit single-use managed worker. The optional native stock queue route
  * requires its own approved task policy, owner discovery and controlled baseline.
  * Neither parent EOF nor frontend EOF stops the worker. */
@@ -109,6 +131,7 @@ export class ManagedWorkerDaemon {
   #owner: ManagedWorkerNativeOwner | null = null;
   #bootstrap: ManagedWorkerBootstrap | null = null;
   #control: ManagedWorkerControlServer | null = null;
+  #taskStateServer: ManagedWorkerTaskStateServer | null = null;
   #registry: ManagedWorkerRegistry | null = null;
   #attempt: WorkerAttempt | null = null;
   #self: ProcessIdentity | null = null;
@@ -116,8 +139,12 @@ export class ManagedWorkerDaemon {
   #intentStore: NativeStartIntentStore | null = null;
   #stockInitializer: ManagedStockSettingsInitializer | null = null;
   #vkSubmitter: ManagedStockVkSubmitter | null = null;
+  #vkControlKey: object | null = null;
   #headlessPending = 0;
   #admissionOpen = false;
+  #ingressRevoked = false;
+  #handoffQualifying = false;
+  #handoffProofIssued = false;
   #everReady = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
   #reconnectPending = false;
@@ -130,14 +157,19 @@ export class ManagedWorkerDaemon {
       typeof options.verifyFamilyQuiescent !== 'function')
       throw new TypeError('Daemon requires explicit local follower, IPC, and family policies');
     const stock = options.nativeStockQueue;
+    if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
+      throw new TypeError('Managed native task-state listener requires explicit opt-in');
     if (stock !== undefined && (!object(stock) ||
       !isDeepStrictEqual(Object.keys(stock).sort(),
         ['assertControlledNativeBaseline', 'createProbeClient', 'sourceGeneration',
-          ...(stock.headlessVk === undefined ? [] : ['headlessVk'])].sort()) ||
+          ...(stock.headlessVk === undefined ? [] : ['headlessVk']),
+          ...(stock.handoffCapability === undefined ? [] : ['handoffCapability'])].sort()) ||
       typeof stock.sourceGeneration !== 'string' || !stock.sourceGeneration ||
       stock.sourceGeneration.length > 128 || /[\x00-\x1f\x7f]/u.test(stock.sourceGeneration) ||
       typeof stock.assertControlledNativeBaseline !== 'function' ||
       typeof stock.createProbeClient !== 'function' ||
+      stock.handoffCapability !== undefined && (!stock.handoffCapability ||
+        typeof stock.handoffCapability !== 'object') ||
       stock.headlessVk !== undefined && (!object(stock.headlessVk) ||
         !isDeepStrictEqual(Object.keys(stock.headlessVk).sort(), ['capability', 'sourceId']) ||
         !stock.headlessVk.capability || typeof stock.headlessVk.capability !== 'object' ||
@@ -163,9 +195,9 @@ export class ManagedWorkerDaemon {
         bootstrapBoundary: owner.bootstrapBoundary }) : null });
   }
 
-  /** Capability-bound in-process seam. There is deliberately no TCP/control method. */
+  /** Capability-bound queue ingress, also exposed only by opt-in private control. */
   submitVk(capability: object, request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
-    if (!this.#vkSubmitter || this.#state !== 'ready')
+    if (!this.#vkSubmitter || this.#state !== 'ready' || this.#ingressRevoked)
       return Promise.reject(new Error('Managed VK stock ingress unavailable'));
     return this.#vkSubmitter.submit(capability, request);
   }
@@ -175,6 +207,106 @@ export class ManagedWorkerDaemon {
   vkSubmissionStatus(capability: object, request: SubmitTaskRequest) {
     if (!this.#vkSubmitter) throw new Error('Managed VK stock ingress unavailable');
     return this.#vkSubmitter.status(capability, request);
+  }
+
+  /** Read-only crash reconciliation. This does not attest an input fingerprint
+   * and never authorizes another submission or a replay. */
+  vkSubmissionStatusByOperationId(capability: object, operationId: string) {
+    const stock = this.#options.nativeStockQueue?.headlessVk;
+    if (!stock || capability !== stock.capability || !this.#vkSubmitter ||
+      !this.#host || !this.#vkControlKey || !this.#taskId || !this.#generation ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(operationId))
+      throw new Error('Managed VK stock status unavailable');
+    const commandId = managedVkStockCommandId(this.#options.epoch, this.#taskId, operationId);
+    const row = this.#host.commandStatus(this.#vkControlKey, commandId);
+    if (row && (row.ownerEpoch !== this.#options.epoch ||
+      row.backendGeneration !== this.#generation || row.threadId !== this.#taskId ||
+      row.method !== 'thread/queue/add' || row.clientUserMessageId !== operationId))
+      throw new Error('Managed VK stock status scope conflict');
+    return row;
+  }
+
+  /** Closes all new native/VK worker writes synchronously, before any await.
+   * This is not a durable claim transition and does not stop the backend. */
+  revokeIngress(capability: object): void {
+    if (!this.#options.nativeStockQueue?.handoffCapability ||
+      capability !== this.#options.nativeStockQueue.handoffCapability || this.#state !== 'ready')
+      throw new Error('Managed handoff unavailable');
+    this.#ingressRevoked = true;
+  }
+
+  /** One-shot, in-process evidence for entering handoff_pending only. */
+  async qualifyHandoff(capability: object): Promise<ManagedWorkerHandoffProof> {
+    if (!this.#options.nativeStockQueue?.handoffCapability ||
+      capability !== this.#options.nativeStockQueue.handoffCapability ||
+      !this.#ingressRevoked || this.#handoffProofIssued || this.#handoffQualifying ||
+      this.#state !== 'ready' || !this.#host || !this.#owner || !this.#bootstrap ||
+      !this.#registry || !this.#attempt || !this.#self || !this.#backend ||
+      !this.#taskId || !this.#generation || !this.#endpointRef || !this.#vkControlKey)
+      throw new Error('Managed handoff unavailable');
+    this.#handoffQualifying = true;
+    try {
+      const host = this.#host, owner = this.#owner, generation = this.#generation;
+      const attempt = this.#attempt, self = this.#self, backend = this.#backend;
+      const taskId = this.#taskId, key = this.#vkControlKey;
+      const observe = this.#options.dependencies?.observeProcess ?? readWindowsProcessIdentity;
+      const identityCurrent = (): boolean => {
+        const row = this.#registry!.get(attempt.canonicalHome, attempt.familyRoot);
+        return !!row && row.state === 'ready' && row.epoch === this.#options.epoch &&
+          row.revision === attempt.revision && row.endpointRef === this.#endpointRef &&
+          same(row.host, self) && same(row.backend, backend) &&
+          same(observe(self.pid), self) && same(observe(backend.pid), backend) &&
+          this.#state === 'ready' && this.#ingressRevoked && this.#generation === generation &&
+          host.metadata.state === 'running' && host.metadata.taskId === taskId &&
+          host.metadata.backendGeneration === generation &&
+          (owner.metadata.state === 'connected' || owner.metadata.state === 'disconnected');
+      };
+      const stable = (): boolean => identityCurrent() && this.#headlessPending === 0 &&
+        owner.metadata.pendingNativeOperations === 0 && owner.metadata.pendingEvents === 0;
+      if (!stable()) throw new Error('Managed handoff unqualified');
+      const nativeQueue = owner.queueQuiescence();
+      if (!nativeQueue || nativeQueue.unresolved !== 0 || nativeQueue.unconsumed !== 0)
+        throw new Error('Managed handoff unqualified');
+      const semanticRevision = owner.metadata.semanticRevision;
+      const receipts = host.acceptedCommandReceipts(key), queueInputs = host.acceptedQueueInputs(key);
+      if (receipts.some(receipt => receipt.method !== 'turn/start' && receipt.method !== 'thread/queue/add'))
+        throw new Error('Managed handoff unqualified');
+      const turnIds = receipts.filter(receipt => receipt.method === 'turn/start').map(receipt => receipt.receiptId);
+      const submissions = receipts.filter(receipt => receipt.method === 'thread/queue/add')
+        .map(receipt => receipt.receiptId);
+      const queueClientIds = queueInputs.map(input => input.clientUserMessageId);
+      if (new Set(turnIds).size !== turnIds.length ||
+        new Set(submissions).size !== submissions.length ||
+        new Set(queueClientIds).size !== queueClientIds.length ||
+        !isDeepStrictEqual(submissions, queueInputs.map(input => input.submissionId)))
+        throw new Error('Managed handoff unqualified');
+      const before = host.commandQuiescence(key), requests = host.requestQuiescence(key);
+      if (before.inFlight || before.unconfirmed || requests.unresolved || requests.generation !== generation)
+        throw new Error('Managed handoff unqualified');
+      const idle = await this.#bootstrap.verifyIdle(turnIds, queueClientIds);
+      if (!stable() || await this.#options.verifyFamilyQuiescent({ taskId, generation, idle }) !== true)
+        throw new Error('Managed handoff unqualified');
+      const after = host.commandQuiescence(key), pending = host.requestQuiescence(key);
+      if (after.inFlight || after.unconfirmed || pending.unresolved || pending.generation !== generation ||
+        !isDeepStrictEqual(receipts, host.acceptedCommandReceipts(key)) ||
+        !isDeepStrictEqual(queueInputs, host.acceptedQueueInputs(key)) ||
+        !isDeepStrictEqual(nativeQueue, owner.queueQuiescence()) ||
+        semanticRevision !== owner.metadata.semanticRevision || !stable())
+        throw new Error('Managed handoff unqualified');
+      this.#handoffProofIssued = true;
+      return Object.freeze({ ownerEpoch: this.#options.epoch, taskId,
+        backendGeneration: generation, registryRevision: attempt.revision,
+        host: Object.freeze({ ...self }), backend: Object.freeze({ ...backend }),
+        endpointRef: this.#endpointRef, nonce: randomUUID() });
+    } finally { this.#handoffQualifying = false; }
+  }
+
+  #vkControlStatus(row: ReturnType<ManagedWorkerDaemon['vkSubmissionStatus']>): ManagedWorkerVkStatus | null {
+    if (!row) return null;
+    if (row.state === 'accepted' && !row.receiptId)
+      throw new Error('Managed VK receipt unavailable');
+    return Object.freeze({ state: row.state,
+      submissionId: row.state === 'accepted' ? row.receiptId : null });
   }
 
   start(): Promise<void> {
@@ -212,6 +344,7 @@ export class ManagedWorkerDaemon {
       this.#startupPhase = 'host-registered';
       await pinnedCli(manifest.cliPath, manifest.cliSha256);
       const adapterKey = {}, controlKey = {};
+      this.#vkControlKey = controlKey;
       const launched: { child: ChildProcessWithoutNullStreams | null } = { child: null };
       const ownerCurrent = (): boolean => {
         const row = this.#registry?.get(manifest.home, manifest.familyRoot);
@@ -243,6 +376,15 @@ export class ManagedWorkerDaemon {
           registryState: currentRegistryState(),
           owner: this.metadata.nativeStartup }),
         requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
+        ...(this.#options.nativeStockQueue?.headlessVk ? { vk: {
+          submit: (request: SubmitTaskRequest) => this.submitVk(
+            this.#options.nativeStockQueue!.headlessVk!.capability, request),
+          status: (request: SubmitTaskRequest) => this.#vkControlStatus(this.vkSubmissionStatus(
+            this.#options.nativeStockQueue!.headlessVk!.capability, request)),
+          statusByOperationId: (operationId: string) => this.#vkControlStatus(
+            this.vkSubmissionStatusByOperationId(
+              this.#options.nativeStockQueue!.headlessVk!.capability, operationId)),
+        } } : {}),
       });
       const controlEndpoint = await this.#control.listen();
       await writePrivateLocator(state, 'startup-control.v1.json', {
@@ -251,7 +393,7 @@ export class ManagedWorkerDaemon {
       });
       this.#startupPhase = 'control-listening';
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
-        if (!ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
+        if (this.#ingressRevoked || !ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
         if (this.#options.nativeStockQueue) {
           if (this.#vkSubmitter?.authorizes(scope) === true) return true;
@@ -398,7 +540,7 @@ export class ManagedWorkerDaemon {
         initialized, approvedTaskPolicy: manifest.approvedTaskPolicy!,
         assertControlledNativeBaseline: stock.assertControlledNativeBaseline,
         confirmNativeOwner: confirmStockOwner, isOwnerCurrent: ownerCurrent,
-        admissionOpen: () => this.#admissionOpen && this.#headlessPending === 0,
+        admissionOpen: () => !this.#ingressRevoked && this.#admissionOpen && this.#headlessPending === 0,
       }) : undefined;
       let stockAuthority: Pick<Parameters<NonNullable<typeof stockFactory>>[0],
         'captureAuthority' | 'assertCurrent'> | null = null;
@@ -449,16 +591,28 @@ export class ManagedWorkerDaemon {
         throw new Error('Native owner unavailable');
       this.#startupPhase = 'publishing-ready';
       if (!ownerCurrent()) throw new Error('Worker owner changed before publication');
+      let taskStateEndpoint: { readonly host: '127.0.0.1'; readonly port: number } | null = null;
+      if (this.#options.nativeTaskState) {
+        const server = new ManagedWorkerTaskStateServer({ epoch: manifest.epoch, taskId: manifest.taskId,
+          backendGeneration: this.#generation!, token: deriveManagedTaskStateToken(state.keys.controlToken,
+            manifest.epoch, manifest.taskId, this.#generation!), source: {
+              subscribe: (listener, onFailure) => this.#owner!.subscribeBridgeState(listener, onFailure),
+            } });
+        this.#taskStateServer = server;
+        taskStateEndpoint = await server.listen();
+        if (!readyCurrent()) throw new Error('Native owner changed before task-state publication');
+      }
       const endpointRef = randomUUID();
       await writeEndpoint(state, { schemaVersion: 1, epoch: manifest.epoch, endpointRef,
         host: self, backend: this.#backend,
-        control: { host: controlEndpoint.host, port: controlEndpoint.port } });
+        control: { host: controlEndpoint.host, port: controlEndpoint.port },
+        ...(taskStateEndpoint ? { taskState: taskStateEndpoint } : {}) });
       if (!readyCurrent()) throw new Error('Native owner changed before registry publication');
       if (stock?.headlessVk && initialized && stockAuthority) {
         const authority = stockAuthority as Pick<Parameters<NonNullable<typeof stockFactory>>[0],
           'captureAuthority' | 'assertCurrent'>;
         const acquireLease = (): ManagedStockVkLease => {
-          if (this.#state !== 'ready' || !this.#admissionOpen ||
+          if (this.#ingressRevoked || this.#state !== 'ready' || !this.#admissionOpen ||
             this.#headlessPending !== 0 || !ownerCurrent())
             throw new Error('Managed VK ingress unavailable');
           this.#headlessPending++;
@@ -479,7 +633,7 @@ export class ManagedWorkerDaemon {
               const meta = nativeOwner.metadata;
               const queue = nativeOwner.queueQuiescence();
               const requests = host.requestQuiescence(controlKey);
-              if (this.#state !== 'ready' || !ownerCurrent() ||
+              if (this.#ingressRevoked || this.#state !== 'ready' || !ownerCurrent() ||
                 host.metadata.state !== 'running' || host.metadata.taskId !== manifest.taskId ||
                 host.metadata.backendGeneration !== this.#generation ||
                 !['connected', 'disconnected'].includes(meta.state) ||
@@ -519,6 +673,7 @@ export class ManagedWorkerDaemon {
       if (this.#startupPhase === 'bootstrapping' && this.#bootstrap === null)
         this.#bootstrapFailureCode = bootstrapFailureCode(error);
       this.#stockInitializer?.close(); this.#stockInitializer = null;
+      await this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
       this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
       // A native owner may already be connected when ready publication fails.
       // Retire only that gateway; the owned backend and diagnostic control stay available.
@@ -538,6 +693,7 @@ export class ManagedWorkerDaemon {
       !this.#attempt || !this.#self || !this.#backend) return;
     this.#admissionOpen = false;
     this.#clearReconnect();
+    void this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
     this.#state = 'failed'; this.#failure = 'backend-lost';
     this.#owner?.close();
     try {
@@ -669,6 +825,7 @@ export class ManagedWorkerDaemon {
       this.#state = 'stopping';
       this.#stockInitializer?.close(); this.#stockInitializer = null;
       this.#clearReconnect();
+      await this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
       owner.close(); stopIssued = true;
       await host.stop('owner-request');
       if (same(observe(this.#backend.pid), this.#backend))
@@ -680,7 +837,8 @@ export class ManagedWorkerDaemon {
       const retireControl = setTimeout(() => { void this.#control?.close().catch(() => {}); }, 250);
       retireControl.unref();
     } catch (error) {
-      if (!stopIssued && error instanceof ManagedWorkerStopRefusedError) this.#admissionOpen = true;
+      if (!stopIssued && error instanceof ManagedWorkerStopRefusedError)
+        this.#admissionOpen = !this.#ingressRevoked;
       else { this.#state = 'failed'; this.#failure = 'stop-unconfirmed'; }
       throw error;
     }
@@ -737,6 +895,7 @@ export class ManagedWorkerDaemon {
       if (familyQuiescent !== true || !quiescent()) throw new ManagedWorkerStopRefusedError();
       this.#state = 'stopping';
       this.#clearReconnect();
+      await this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
       stopIssued = true;
       owner?.close();
       await host.stop('owner-request');

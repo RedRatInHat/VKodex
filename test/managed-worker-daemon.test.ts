@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { connect } from 'node:net';
@@ -14,6 +14,8 @@ import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
+import { ManagedWorkerControlClient } from '../src/desktop/managed-worker-control-client.js';
+import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
@@ -22,6 +24,48 @@ test('daemon requires explicit follower and IPC policy before private state is r
   assert.throws(() => new ManagedWorkerDaemon({
     baseDirectory: 'C:\\private', epoch: '11111111-1111-4111-8111-111111111111',
   } as never), /explicit.*polic/i);
+});
+
+test('opt-in native task-state listener publishes initial and changed state without another backend request', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: false, early: false }, 'normal', false, null, undefined, undefined, true);
+  try {
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory, 'endpoint.v1.json'), 'utf8')) as {
+      epoch: string; taskState?: { host: string; port: number }; control: { port: number };
+    };
+    assert.equal(endpoint.epoch, own.reserved.epoch);
+    assert.ok(endpoint.taskState);
+    assert.deepEqual(Object.keys(endpoint.taskState!).sort(), ['host', 'port']);
+    assert.doesNotMatch(JSON.stringify(endpoint), /(?:token|fingerprint|intent)/iu);
+    const before = own.backend.methods.filter(method => method === 'thread/resume').length;
+    const observed = await observeNativeTaskState(endpoint.taskState!, own.reserved.epoch, own.taskId,
+      own.daemon.metadata.generation!);
+    assert.equal(observed.frames.find(frame => frame.kind === 'snapshot')?.historyComplete, true);
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started', params: { threadId: own.taskId,
+      turn: { id: 'observation-only-turn', status: 'inProgress', startedAt: 1780000000, items: [] } } }) + '\n');
+    await waitFor(() => observed.frames.some(frame => frame.kind === 'changed'));
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, before);
+    assert.equal(own.launches, 1);
+    observed.socket.destroy();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(own.daemon.metadata.state, 'ready');
+    assert.equal(own.backend.exitCode, null);
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'state-stop')).result, { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('native task-state endpoint remains absent without the explicit daemon opt-in', async () => {
+  const own = await readyFixture();
+  try {
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory, 'endpoint.v1.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal(Object.hasOwn(endpoint, 'taskState'), false);
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'no-state-stop')).result, { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
 });
 
 test('stock daemon confirms one settings write on its own backend before readiness', async () => {
@@ -80,8 +124,33 @@ test('headless VK uses the same managed stock worker queue and durable accepted 
     await assert.rejects(own.daemon.submitVk(capability, { ...request,
       operationId: collisionId }), /Managed VK stock input unavailable/);
     assert.equal(own.backend.queueWrites, 0);
-    const accepted = await own.daemon.submitVk(capability, request);
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'endpoint.v1.json'), 'utf8')) as { control: { port: number } };
+    const client = new ManagedWorkerControlClient({ host: '127.0.0.1',
+      port: endpoint.control.port, token: Buffer.alloc(32, 3).toString('base64url'),
+      ownerEpoch: own.reserved.epoch, taskId: own.taskId });
+    assert.equal(await client.vkSubmissionStatusByOperationId(operationId), null);
+    const forgedOperationId = randomUUID();
+    const otherJournal = new ManagedWorkerOperationJournal({
+      filePath: path.join(own.privateDirectory, 'operations.sqlite'),
+      ownerEpoch: own.reserved.epoch, backendGeneration: generation, threadId: own.taskId });
+    try {
+      const row = otherJournal.reserve({ operationId: managedVkStockCommandId(
+        own.reserved.epoch, own.taskId, forgedOperationId),
+      clientUserMessageId: randomUUID(), method: 'thread/queue/add',
+      fingerprint: 'b'.repeat(64) }).operation;
+      otherJournal.reject(row, -32602);
+    } finally { otherJournal.close(); }
+    await assert.rejects(client.vkSubmissionStatusByOperationId(forgedOperationId),
+      /unknown|status/i, 'derived operation ID alone cannot attest a foreign client identity');
+    const accepted = await client.submitVk(request);
     assert.equal(accepted.submissionId, 'submission-1');
+    assert.deepEqual(await client.vkSubmissionStatusByOperationId(operationId),
+      { state: 'accepted', submissionId: 'submission-1' });
+    assert.deepEqual(await client.vkSubmissionStatus(request),
+      { state: 'accepted', submissionId: 'submission-1' });
+    await assert.rejects(client.vkSubmissionStatus({ ...request, text: 'changed' }),
+      /unknown|status/i);
     assert.equal(own.backend.queueWrites, 1);
     assert.equal(own.backend.writes, 0);
     const queueFrame = own.backend.frames.find(frame => frame.method === 'thread/queue/add');
@@ -172,6 +241,101 @@ test('headless VK refuses authority drift during beforeSend without reserving a 
     assert.equal(own.backend.queueWrites, 0);
     assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-drift-stop')).result,
       { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('handoff revoke fences an awaiting VK submission before the worker write', async () => {
+  const capability = {}, handoffCapability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' }, undefined, false, handoffCapability);
+  let entered!: () => void, release!: () => void;
+  const beforeSendEntered = new Promise<void>(resolve => { entered = resolve; });
+  const beforeSendReleased = new Promise<void>(resolve => { release = resolve; });
+  try {
+    const operationId = randomUUID();
+    const request = { operationId, task: { hostId: 'local', threadId: own.taskId },
+      text: 'PUBLIC_VK', beforeSend: async () => { entered(); await beforeSendReleased; } };
+    const pending = own.daemon.submitVk(capability, request);
+    await beforeSendEntered;
+    own.daemon.revokeIngress(handoffCapability);
+    release();
+    await assert.rejects(pending);
+    assert.equal(own.backend.queueWrites, 0);
+    assert.equal(own.daemon.vkSubmissionStatusByOperationId(capability, operationId), null,
+      'revocation before reservation leaves no synthetic worker receipt');
+    await assert.rejects(own.daemon.submitVk(capability, { ...request, operationId: randomUUID() }));
+    const broker = own.brokers[0]!;
+    broker.send({ type: 'request', requestId: 'native-after-revoke', sourceClientId: 'follower',
+      targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+      params: { hostId: 'local', conversationId: own.taskId,
+        state: { [own.taskId]: [stockEntry(own.home)] } } });
+    const deadline = Date.now() + 3000;
+    while (!broker.frames.some(frame => frame.requestId === 'native-after-revoke') && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'native-after-revoke')?.resultType,
+      'error');
+    assert.equal(own.backend.queueWrites, 0);
+    assert.equal(own.backend.exitCode, null);
+  } finally {
+    release();
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('handoff proof requires the family and is one-time after a monotonic revoke', async () => {
+  const handoffCapability = {}, family = { allow: false };
+  const own = await readyFixture(family, { enabled: true, early: false },
+    'normal', true, null, undefined, undefined, false, handoffCapability);
+  try {
+    own.daemon.revokeIngress(handoffCapability);
+    await assert.rejects(own.daemon.qualifyHandoff(handoffCapability));
+    assert.equal(own.backend.exitCode, null);
+    assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch,
+      'handoff-family-refused')).error, 'stop-refused');
+    assert.equal(own.backend.exitCode, null);
+    family.allow = true;
+    const proof = await own.daemon.qualifyHandoff(handoffCapability);
+    assert.equal(proof.ownerEpoch, own.reserved.epoch);
+    assert.equal(proof.taskId, own.taskId);
+    assert.equal(proof.backendGeneration, own.daemon.metadata.generation);
+    assert.ok(proof.registryRevision > own.reserved.revision);
+    assert.ok(proof.host.pid > 0 && proof.host.birthTicks);
+    assert.ok(proof.backend.pid > 0 && proof.backend.birthTicks);
+    assert.match(proof.nonce, /^[0-9a-f-]{36}$/i);
+    await assert.rejects(own.daemon.qualifyHandoff(handoffCapability));
+    assert.equal(own.daemon.metadata.state, 'ready', 'proof does not retire the writer');
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('handoff cannot qualify a VK unknown outcome after one idle snapshot', async () => {
+  const capability = {}, handoffCapability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' }, 300, false, handoffCapability);
+  const request = { operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK' };
+  own.backend.holdQueueReply = true;
+  try {
+    const pending = own.daemon.submitVk(capability, request);
+    const deadline = Date.now() + 3000;
+    while (!own.backend.heldQueueReply && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(own.backend.heldQueueReply);
+    own.daemon.revokeIngress(handoffCapability);
+    await assert.rejects(pending);
+    assert.equal(own.daemon.vkSubmissionStatusByOperationId(capability, operationId)?.state, 'unknown');
+    await assert.rejects(own.daemon.qualifyHandoff(handoffCapability));
+    assert.equal(own.backend.exitCode, null);
+    assert.equal(own.backend.queueWrites, 1);
   } finally {
     if (own.backend.exitCode === null) { own.backend.exitCode = 1;
       own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
@@ -704,7 +868,8 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   startup: 'normal' | 'bootstrap-fail' | 'policy-mismatch' |
     'control-bind-fail' | 'endpoint-collision' = 'normal',
   stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null,
-  headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number) {
+  headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number,
+  nativeTaskState = false, handoffCapability?: object) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -726,9 +891,11 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
+    ...(nativeTaskState ? { nativeTaskState: true as const } : {}),
     ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
       assertControlledNativeBaseline: () => stockFailure !== 'baseline',
       ...(headlessVk ? { headlessVk } : {}),
+      ...(handoffCapability ? { handoffCapability } : {}),
       createProbeClient: () => new DesktopIpcClient(() => {
         const probe = new Broker(null, taskId, false, true,
           stockFailure === 'discovery' ? 'foreign-owner' : ownerId);
@@ -870,6 +1037,43 @@ async function startupControlRequest(privateDirectory: string, epoch: string,
   const locator = JSON.parse(await readFile(path.join(privateDirectory, 'startup-control.v1.json'), 'utf8')) as
     { control: { port: number } };
   return controlRequest(locator.control.port, epoch, id, method, afterAuth);
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error('fixture observation timeout');
+}
+
+async function observeNativeTaskState(endpoint: { host: string; port: number }, epoch: string,
+  taskId: string, backendGeneration: number): Promise<{ socket: ReturnType<typeof connect>; frames: Record<string, unknown>[] }> {
+  const socket = connect(endpoint.port, endpoint.host);
+  const frames: Record<string, unknown>[] = [];
+  let buffer = '';
+  socket.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    while (buffer.includes('\n')) {
+      const at = buffer.indexOf('\n');
+      frames.push(JSON.parse(buffer.slice(0, at)) as Record<string, unknown>);
+      buffer = buffer.slice(at + 1);
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    const connected = () => { socket.off('error', failed); resolve(); };
+    const failed = () => { socket.off('connect', connected); reject(new Error('task-state socket connection failed')); };
+    socket.once('connect', connected); socket.once('error', failed);
+  });
+  const token = createHmac('sha256', Buffer.alloc(32, 3))
+    .update('vkodex-managed-task-state-v1\0').update(epoch).update('\0').update(taskId)
+    .update('\0').update(String(backendGeneration)).digest('base64url');
+  socket.write(JSON.stringify({ token }) + '\n');
+  await waitFor(() => frames.some(frame => frame.ok === true));
+  socket.write(JSON.stringify({ method: 'observe-task-v1', epoch, taskId, backendGeneration }) + '\n');
+  await waitFor(() => frames.some(frame => frame.kind === 'snapshot'));
+  return { socket, frames };
 }
 
 test('control bind failure leaves reserved worker unlaunched', async () => {
