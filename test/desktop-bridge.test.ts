@@ -3538,7 +3538,10 @@ test("a full VK document store is cleaned once and the same file is retried", as
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
   const prepared = await files.prepare(binding, "cleanup-op", []); files.finish(binding.id, "cleanup-op", "accepted");
   await writeFile(path.join(prepared.outboxDir, "installer.exe"), "fixture");
-  s.store.setValue("vk-document-registry", [{ attachment: "doc-202_7", ownerId: -202, documentId: 7, name: "old.zip", uploadedAt: 1, fileKey: "old" }]);
+  s.store.setValue("vk-document-registry", [{ attachment: "doc-202_7", ownerId: -202, documentId: 7, name: "old.zip", uploadedAt: 1, fileKey: "file:old" }]);
+  s.store.enqueue("files:old", peerId, { text: "old.zip", attachments: ["doc-202_7"] }, binding.id);
+  const receipt = s.store.pendingDeliveries().find(item => item.key === "files:old")!;
+  s.store.delivered(receipt, { peerId, conversationMessageId: 77 });
   s.chat.cleanupResult = ["doc-202_7"];
   let attempts = 0;
   t.mock.method(s.chat, "uploadFile", async () => {
@@ -3552,6 +3555,65 @@ test("a full VK document store is cleaned once and the same file is retried", as
   assert.equal(s.chat.cleanupCalls.length, 1);
   assert.deepEqual(s.chat.cleanupCalls[0]!.map(record => record.attachment), ["doc-202_7"]);
   assert.deepEqual(s.store.getValue<VkDocumentRecord[]>("vk-document-registry")?.map(record => record.attachment), ["doc-202_8"]);
+});
+
+test("document quota cleanup excludes history-only, legacy, undelivered, young and pending attachments", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-document-cleanup-safety-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "cleanup-safety", []); files.finish(binding.id, "cleanup-safety", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "next.zip"), "fixture");
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000;
+  const records: VkDocumentRecord[] = [
+    { attachment: "doc-202_11", ownerId: -202, documentId: 11, name: "legacy.zip", uploadedAt: old, fileKey: "legacy:11" },
+    { attachment: "doc-202_12", ownerId: -202, documentId: 12, name: "undelivered.zip", uploadedAt: old, fileKey: "file:undelivered" },
+    { attachment: "doc-202_13", ownerId: -202, documentId: 13, name: "young.zip", uploadedAt: Date.now(), fileKey: "file:young" },
+    { attachment: "doc-202_14", ownerId: -202, documentId: 14, name: "pending.zip", uploadedAt: old, fileKey: "file:pending" },
+  ];
+  s.store.setValue("vk-document-registry", records);
+  for (const record of records) {
+    s.store.enqueue(`files:${record.documentId}`, peerId, { text: record.name, attachments: [record.attachment] }, binding.id);
+    const delivery = s.store.pendingDeliveries().find(item => item.key === `files:${record.documentId}`)!;
+    if (record.documentId === 12) s.store.completed(delivery); // Settled without a VK send receipt is still not delivered.
+    else s.store.delivered(delivery, { peerId, conversationMessageId: record.documentId });
+  }
+  s.store.enqueue("files:history-only", peerId, { text: "history.zip", attachments: ["doc-202_15"] }, binding.id);
+  const history = s.store.pendingDeliveries().find(item => item.key === "files:history-only")!;
+  s.store.delivered(history, { peerId, conversationMessageId: 15 });
+  // A newer pending revision still protects an attachment with an earlier receipt.
+  s.store.enqueue("files:pending-again", peerId, { text: "pending.zip", attachments: ["doc-202_14"] }, binding.id);
+  t.mock.method(s.chat, "uploadFile", async () => { throw new FileUploadStorageFullError("storage full"); });
+  files.observe(binding.id, "idle");
+  await assert.rejects(files.collect(binding), /нет безопасных документов/u);
+  assert.deepEqual(s.chat.cleanupCalls, []);
+  assert.deepEqual(s.store.getValue<VkDocumentRecord[]>("vk-document-registry"), records);
+});
+
+test("document quota cleanup keeps sibling uploads while removing only old delivered owned documents", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-document-cleanup-sibling-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "cleanup-sibling", []); files.finish(binding.id, "cleanup-sibling", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "first.zip"), "first");
+  await writeFile(path.join(prepared.outboxDir, "second.zip"), "second");
+  const oldRecord: VkDocumentRecord = { attachment: "doc-202_30", ownerId: -202, documentId: 30, name: "old.zip", uploadedAt: Date.now() - 31 * 24 * 60 * 60 * 1000, fileKey: "file:old" };
+  s.store.setValue("vk-document-registry", [oldRecord]);
+  s.store.enqueue("files:old-sibling", peerId, { text: "old.zip", attachments: [oldRecord.attachment] }, binding.id);
+  const delivery = s.store.pendingDeliveries().find(item => item.key === "files:old-sibling")!;
+  s.store.delivered(delivery, { peerId, conversationMessageId: 30 });
+  s.chat.cleanupResult = [oldRecord.attachment];
+  let attempts = 0;
+  t.mock.method(s.chat, "uploadFile", async (_peer: number, name: string) => {
+    attempts++;
+    if (name === "second.zip" && attempts === 2) throw new FileUploadStorageFullError("storage full");
+    return name === "first.zip" ? "doc-202_31" : "doc-202_32";
+  });
+  files.observe(binding.id, "idle");
+  assert.equal(await files.collect(binding), 2);
+  assert.equal(attempts, 3);
+  assert.deepEqual(s.chat.cleanupCalls[0]!.map(record => record.attachment), [oldRecord.attachment]);
+  const queued = s.store.pendingDeliveries().find(item => item.key.startsWith("files:") && item.view.attachments?.includes("doc-202_31"));
+  assert.deepEqual(queued?.view.attachments, ["doc-202_31", "doc-202_32"]);
 });
 
 

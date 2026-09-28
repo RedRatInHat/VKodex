@@ -1068,19 +1068,17 @@ export class BridgeStore {
     return rows.map(row => ({ id: row.id, key: row.key, bindingId: row.binding_id, peerId: row.peer_id, kind: row.kind, view: JSON.parse(row.view) as View, firstView: row.first_view ? JSON.parse(row.first_view) as View : null, handle: row.handle ? JSON.parse(row.handle) as MessageHandle : null, revision: row.revision, deliveredRevision: row.delivered_revision }));
   }
 
-  /** Outgoing attachments previously registered by this bridge, including
-   * messages delivered before the cleanup registry was introduced. */
-  deliveryAttachmentHistory(): readonly { attachment: string; order: number }[] {
-    const rows = this.db.prepare("SELECT id, view FROM bridge_delivery WHERE kind <> 'delete' ORDER BY id").all() as { id: number; view: string }[];
-    const result: { attachment: string; order: number }[] = [];
-    const seen = new Set<string>();
+  /** A send receipt, not an enqueued or merely attempted delivery. Ownership
+   * still requires an independent file: record in the document registry. */
+  deliveredFileAttachments(): ReadonlySet<string> {
+    const rows = this.db.prepare(`SELECT view FROM bridge_delivery
+      WHERE kind = 'send' AND substr(key, 1, 6) = 'files:'
+        AND delivered_revision >= revision AND handle IS NOT NULL`).all() as { view: string }[];
+    const result = new Set<string>();
     for (const row of rows) {
       let view: View;
       try { view = JSON.parse(row.view) as View; } catch { continue; }
-      for (const attachment of view.attachments ?? []) {
-        if (!/^doc-?\d+_\d+(?:_|$)/u.test(attachment) || seen.has(attachment)) continue;
-        seen.add(attachment); result.push({ attachment, order: row.id });
-      }
+      for (const attachment of view.attachments ?? []) if (typeof attachment === "string") result.add(attachment);
     }
     return result;
   }

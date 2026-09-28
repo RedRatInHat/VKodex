@@ -37,6 +37,12 @@ const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(
 const mebibytes = (bytes: number): number => Math.ceil(bytes / (1024 * 1024));
 const VK_DOCUMENT_PAGE_LIMIT = 1024 * 1024;
 const MAX_OUTPUT_ENTRIES = 4_096;
+const VK_DOCUMENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+function isOwnedDocumentRecord(record: VkDocumentRecord): boolean {
+  if (!record.fileKey.startsWith("file:")) return false;
+  const match = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(record.attachment);
+  return !!match && Number(match[1]) === record.ownerId && Number(match[2]) === record.documentId;
+}
 
 export function validateVkFileUrl(raw: string): URL {
   let url: URL;
@@ -268,37 +274,30 @@ export class TaskFiles {
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private documentRegistry(): VkDocumentRecord[] {
-    const saved = this.store.getValue<VkDocumentRecord[]>("vk-document-registry") ?? [];
-    const known = new Set(saved.map(record => record.attachment));
-    const migrated = [...saved];
-    for (const item of this.store.deliveryAttachmentHistory()) {
-      if (known.has(item.attachment)) continue;
-      const match = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(item.attachment);
-      if (!match) continue;
-      migrated.push({ attachment: item.attachment, ownerId: Number(match[1]), documentId: Number(match[2]), name: "historical VKodex upload", uploadedAt: item.order, fileKey: `legacy:${item.order}:${item.attachment}` });
-      known.add(item.attachment);
-    }
-    if (migrated.length !== saved.length) this.store.setValue("vk-document-registry", migrated.slice(-4096));
-    return migrated;
+    return this.store.getValue<VkDocumentRecord[]>("vk-document-registry") ?? [];
   }
   private rememberDocument(record: VkDocumentRecord): void {
     const records = this.documentRegistry().filter(item => item.attachment !== record.attachment);
     this.store.setValue("vk-document-registry", [...records, record].slice(-4096));
   }
-  private async cleanupDocuments(except: readonly string[]): Promise<boolean> {
-    if (!this.chat.cleanupDocuments) return false;
+  private async cleanupDocuments(except: readonly string[]): Promise<"removed" | "no-candidate" | "not-removed"> {
+    if (!this.chat.cleanupDocuments) return "not-removed";
     const protectedAttachments = new Set(except);
     for (const delivery of this.store.pendingDeliveries()) for (const attachment of delivery.view.attachments ?? []) protectedAttachments.add(attachment);
+    const delivered = this.store.deliveredFileAttachments();
+    const cutoff = Date.now() - VK_DOCUMENT_RETENTION_MS;
     const candidates = this.documentRegistry()
-      .filter(record => !protectedAttachments.has(record.attachment))
+      .filter(record => isOwnedDocumentRecord(record) && Number.isSafeInteger(record.uploadedAt) && record.uploadedAt > 0 && record.uploadedAt <= cutoff
+        && delivered.has(record.attachment) && !protectedAttachments.has(record.attachment))
       .sort((a, b) => a.uploadedAt - b.uploadedAt)
       .slice(0, 100);
-    if (!candidates.length) return false;
+    if (!candidates.length) return "no-candidate";
     const removed = await this.chat.cleanupDocuments(candidates);
-    if (!removed.length) return false;
-    const deleted = new Set(removed);
+    const candidateAttachments = new Set(candidates.map(record => record.attachment));
+    const deleted = new Set(removed.filter(attachment => candidateAttachments.has(attachment)));
+    if (!deleted.size) return "not-removed";
     this.store.setValue("vk-document-registry", this.documentRegistry().filter(record => !deleted.has(record.attachment)));
-    return true;
+    return "removed";
   }
   private async check(binding: Binding, generation: number): Promise<void> {
     if (this.stopped || binding.peerId === null || this.store.streamGeneration(binding.id) !== generation || !await this.gate.check(binding.peerId) || this.store.streamGeneration(binding.id) !== generation) throw new ActionRejectedError("Передача файлов остановлена: беседа больше не подключена.");
@@ -398,7 +397,9 @@ export class TaskFiles {
                 if (error instanceof FileUploadStorageFullError) {
                   if (cleanupAttempted) throw error;
                   cleanupAttempted = true;
-                  if (!await this.cleanupDocuments([])) throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено. Для автоматической очистки один раз запусти npm run vk:token:setup на компьютере VKodex.");
+                  const cleanup = await this.cleanupDocuments([]);
+                  if (cleanup === "no-candidate") throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено, но нет безопасных документов для автоматической очистки. Файл не отправлен; освободи место в VK и повтори /files.");
+                  if (cleanup !== "removed") throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено, а очистка не подтвердила удаление. Файл не отправлен; проверь доступ к документам VK или освободи место вручную, затем повтори /files.");
                   continue;
                 }
                 if (!(error instanceof FileUploadRejectedError)) throw error;
