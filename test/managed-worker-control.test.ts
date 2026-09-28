@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { connect, type Socket } from 'node:net';
+import { connect, createServer, type Socket } from 'node:net';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError } from '../src/desktop/managed-worker-control.js';
+import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError } from
+  '../src/desktop/managed-worker-control-client.js';
 
 async function peer(cap: { host: string; port: number; token: string }) {
   const socket = connect(cap.port, cap.host);
@@ -52,6 +54,59 @@ test('authenticated metadata control survives client EOF without stopping its wo
     b.socket.destroy();
   } finally { await server.close(); }
   assert.equal(stops, 0, 'listener shutdown is not worker shutdown');
+});
+
+test('control client status reads exact scoped health without requesting a worker action', async () => {
+  const epoch = randomUUID(); let stops = 0, reads = 0;
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    status: () => { reads++; return { hostState: 'frontend-unavailable', backendGeneration: 2,
+      nativeState: 'disconnected', nativeRevision: 7 }; },
+    requestStop: async () => { stops++; } });
+  const cap = await server.listen();
+  try {
+    const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId: 'own' });
+    assert.deepEqual(await client.status(), { ownerEpoch: epoch, taskId: 'own',
+      hostState: 'frontend-unavailable', backendGeneration: 2,
+      nativeState: 'disconnected', nativeRevision: 7 });
+    assert.equal(reads, 1);
+    assert.equal(stops, 0);
+  } finally { await server.close(); }
+});
+
+test('control client status fails closed on malformed or wrong-scope metadata', async () => {
+  const epoch = randomUUID();
+  const replies = [
+    { ownerEpoch: randomUUID(), taskId: 'own', hostState: 'running', backendGeneration: 1,
+      nativeState: 'connected', nativeRevision: 0 },
+    { ownerEpoch: epoch, taskId: 'other', hostState: 'running', backendGeneration: 1,
+      nativeState: 'connected', nativeRevision: 0 },
+    { ownerEpoch: epoch, taskId: 'own', hostState: 'running', backendGeneration: 0,
+      nativeState: 'connected', nativeRevision: 0 },
+    { ownerEpoch: epoch, taskId: 'own', hostState: 'running', backendGeneration: 1,
+      nativeState: 'connected', nativeRevision: 0, token: 'must-not-pass' },
+  ];
+  const server = createServer(socket => {
+    let buffer = '', authenticated = false;
+    socket.on('error', () => {});
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      while (buffer.includes('\n')) {
+        const end = buffer.indexOf('\n');
+        const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
+        buffer = buffer.slice(end + 1);
+        if (!authenticated) { authenticated = true; socket.write('{"ok":true}\n'); continue; }
+        socket.write(JSON.stringify({ id: frame.id, result: replies.shift() }) + '\n');
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    const client = new ManagedWorkerControlClient({ host: '127.0.0.1', port: address.port,
+      token: 'a'.repeat(43), ownerEpoch: epoch, taskId: 'own' });
+    for (let i = 0; i < 4; i++) await assert.rejects(client.status(), ManagedWorkerControlUnknownError);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
 test('versioned diagnosis returns only fixed startup metadata and no private callback details', async () => {
@@ -233,4 +288,105 @@ test('definitive pre-stop refusal permits only a new explicit stop request', asy
       assert.equal(stops, 2);
     } finally { second.socket.destroy(); }
   } finally { first.socket.destroy(); await server.close(); }
+});
+
+test('VK control is opt-in, exact task and epoch scoped, and never echoes prompt', async () => {
+  const epoch = randomUUID(), operationId = randomUUID();
+  const request = { operationId, task: { hostId: 'local', threadId: 'own', sourceId: '' },
+    text: 'private prompt', inputFiles: [] };
+  const calls: string[] = [];
+  const options = { ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
+    requestStop: async () => {} };
+  const absent = new ManagedWorkerControlServer(options);
+  const absentCap = await absent.listen();
+  try {
+    const client = await peer(absentCap);
+    client.send({ id: 'absent', epoch, taskId: 'own', method: 'submit-vk-v1', request });
+    assert.deepEqual(await client.read(), { id: 'absent', error: 'refused' });
+    client.socket.destroy();
+  } finally { await absent.close(); }
+  const server = new ManagedWorkerControlServer({ ...options, vk: {
+    submit: async () => { calls.push('submit'); return { submissionId: 'queued-1' }; },
+    status: () => { calls.push('exact-status'); return { state: 'accepted', submissionId: 'queued-1' }; },
+    statusByOperationId: () => { calls.push('id-status'); return { state: 'accepted', submissionId: 'queued-1' }; },
+  } });
+  const cap = await server.listen(); const peerOne = await peer(cap);
+  try {
+    for (const [id, bad] of [
+      ['wrong-task', { id: 'wrong-task', epoch, taskId: 'other', method: 'submit-vk-v1', request }],
+      ['wrong-epoch', { id: 'wrong-epoch', epoch: randomUUID(), taskId: 'own', method: 'submit-vk-v1', request }],
+      ['extra', { id: 'extra', epoch, taskId: 'own', method: 'submit-vk-v1', request, extra: true }],
+      ['callback', { id: 'callback', epoch, taskId: 'own', method: 'submit-vk-v1', request: { ...request, beforeSend: true } }],
+    ] as const) {
+      peerOne.send(bad);
+      assert.deepEqual(await peerOne.read(), { id, error: 'refused' });
+    }
+    assert.deepEqual(calls, []);
+    const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId: 'own' });
+    assert.deepEqual(await client.submitVk(request), { submissionId: 'queued-1' });
+    assert.deepEqual(await client.submitVk({ ...request, operationId: randomUUID(),
+      text: '😀'.repeat(16_384) }), { submissionId: 'queued-1' },
+    'the 64 KiB UTF-8 boundary is admitted after authentication');
+    assert.deepEqual(await client.vkSubmissionStatus(request), { state: 'accepted', submissionId: 'queued-1' });
+    assert.deepEqual(await client.vkSubmissionStatusByOperationId(operationId),
+      { state: 'accepted', submissionId: 'queued-1' });
+    assert.deepEqual(calls, ['submit', 'submit', 'exact-status', 'id-status']);
+  } finally { peerOne.socket.destroy(); await server.close(); }
+});
+
+test('VK submit continues after authenticated client EOF; oversized UTF-8 prompt never reaches callback', async () => {
+  const epoch = randomUUID(), operationId = randomUUID(); let entered = 0, finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const request = { operationId, task: { hostId: 'local', threadId: 'own' }, text: 'known' };
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
+    requestStop: async () => {}, vk: {
+      submit: async () => { entered++; await pending; return { submissionId: 'queued-1' }; },
+      status: () => ({ state: 'accepted', submissionId: 'queued-1' }),
+      statusByOperationId: () => ({ state: 'accepted', submissionId: 'queued-1' }),
+    } });
+  const cap = await server.listen(); const client = await peer(cap);
+  try {
+    client.send({ id: 'submit', epoch, taskId: 'own', method: 'submit-vk-v1', request });
+    for (let n = 0; entered === 0 && n < 100; n++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(entered, 1); client.socket.destroy(); finish();
+    const second = await peer(cap);
+    second.send({ id: 'too-long', epoch, taskId: 'own', method: 'submit-vk-v1',
+      request: { ...request, text: '😀'.repeat(20_000) } });
+    assert.deepEqual(await second.read(), { id: 'too-long', error: 'refused' });
+    assert.equal(entered, 1);
+    second.socket.destroy();
+  } finally { finish(); client.socket.destroy(); await server.close(); }
+});
+
+test('client timeout is unknown, does not replay, and requires explicit by-ID status', async () => {
+  const epoch = randomUUID(), operationId = randomUUID(); let writes = 0, finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  let accepted = false;
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    authenticatedIdleTimeoutMs: 40,
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
+    requestStop: async () => {}, vk: {
+      submit: async () => { writes++; await pending; accepted = true;
+        return { submissionId: 'queued-1' }; },
+      status: () => accepted ? { state: 'accepted', submissionId: 'queued-1' } :
+        { state: 'unknown', submissionId: null },
+      statusByOperationId: () => accepted ? { state: 'accepted', submissionId: 'queued-1' } :
+        { state: 'unknown', submissionId: null },
+    } });
+  const cap = await server.listen();
+  const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId: 'own', timeoutMs: 80 });
+  const request = { operationId, task: { hostId: 'local', threadId: 'own' }, text: 'known' };
+  try {
+    await assert.rejects(client.submitVk(request), ManagedWorkerControlUnknownError);
+    assert.equal(writes, 1);
+    assert.deepEqual(await client.vkSubmissionStatusByOperationId(operationId),
+      { state: 'unknown', submissionId: null });
+    finish();
+    for (let n = 0; !accepted && n < 100; n++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(await client.vkSubmissionStatusByOperationId(operationId),
+      { state: 'accepted', submissionId: 'queued-1' });
+    assert.equal(writes, 1);
+  } finally { finish(); await server.close(); }
 });

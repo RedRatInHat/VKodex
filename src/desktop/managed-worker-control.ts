@@ -1,6 +1,8 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
+import path from 'node:path';
+import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from '../core/codex-tasks.js';
 
 export interface ManagedWorkerControlStatus {
   readonly hostState: string;
@@ -49,6 +51,16 @@ export interface ManagedWorkerControlOptions {
   /** Must independently authorize stop and fence current task/family safety.
    * Resolve only after actual shutdown; a failed/unknown attempt is never retried here. */
   readonly requestStop: () => Promise<void>;
+  /** Absent by default. Callbacks retain the daemon's private in-process capability. */
+  readonly vk?: Readonly<{
+    submit: (request: SubmitTaskRequest) => Promise<Readonly<{ submissionId: string }>>;
+    status: (request: SubmitTaskRequest) => ManagedWorkerVkStatus | null;
+    statusByOperationId: (operationId: string) => ManagedWorkerVkStatus | null;
+  }>;
+}
+export interface ManagedWorkerVkStatus {
+  readonly state: 'dispatching' | 'unknown' | 'accepted' | 'rejected';
+  readonly submissionId: string | null;
 }
 export interface ManagedWorkerControlCapability {
   readonly host: '127.0.0.1'; readonly port: number; readonly token: string;
@@ -66,6 +78,37 @@ const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean
   Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 const text = (value: unknown, max: number): value is string => typeof value === 'string' &&
   value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const pathText = (value: unknown): value is string => text(value, 4096) && path.win32.isAbsolute(value);
+/** The socket carries only the serializable, text-only subset of SubmitTaskRequest. */
+export function validManagedVkControlRequest(value: unknown, taskId: string): value is SubmitTaskRequest {
+  if (!object(value) || Object.keys(value).some(key =>
+      !['operationId', 'task', 'text', 'author', 'inputFiles', 'outboxDir'].includes(key)) ||
+    typeof value.operationId !== 'string' || !uuid.test(value.operationId) ||
+    typeof value.text !== 'string' || !value.text.trim() ||
+    value.text.length > 64_000 || Buffer.byteLength(value.text, 'utf8') > 64 * 1024 ||
+    !object(value.task)) return false;
+  const task = value.task;
+  if (Object.keys(task).some(key => !['hostId', 'threadId', 'sourceId', 'rolloutPath'].includes(key)) ||
+    task.hostId !== 'local' || task.threadId !== taskId ||
+    Object.hasOwn(task, 'sourceId') && (typeof task.sourceId !== 'string' ||
+      task.sourceId.length > 256 || /[\u0000-\u001f\u007f]/u.test(task.sourceId)) ||
+    Object.hasOwn(task, 'rolloutPath') && !pathText(task.rolloutPath) ||
+    Object.hasOwn(value, 'outboxDir') && !pathText(value.outboxDir) ||
+    Object.hasOwn(value, 'inputFiles') && (!Array.isArray(value.inputFiles) || value.inputFiles.length !== 0))
+    return false;
+  if (Object.hasOwn(value, 'author')) {
+    if (!object(value.author) || !exact(value.author, ['id', 'name']) ||
+      !Number.isSafeInteger(value.author.id) || value.author.id === 0 ||
+      !text(value.author.name, 120)) return false;
+  }
+  return true;
+}
+const validVkStatus = (value: unknown): value is ManagedWorkerVkStatus | null =>
+  value === null || object(value) && exact(value, ['state', 'submissionId']) &&
+  ['dispatching', 'unknown', 'accepted', 'rejected'].includes(String(value.state)) &&
+  (value.submissionId === null || text(value.submissionId, 256)) &&
+  (value.state === 'accepted' ? value.submissionId !== null : value.submissionId === null);
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
   'failed', 'lost', 'stopping', 'stopped']);
 const nativeStates = new Set(['new', 'bootstrapping', 'connected', 'disconnected', 'failed', 'closed']);
@@ -138,12 +181,15 @@ export class ManagedWorkerControlServer {
     if (!options || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(options.ownerEpoch) ||
         !text(options.taskId, 256) || typeof options.status !== 'function' ||
         options.diagnose !== undefined && typeof options.diagnose !== 'function' ||
+        options.vk !== undefined && (!options.vk || typeof options.vk.submit !== 'function' ||
+          typeof options.vk.status !== 'function' || typeof options.vk.statusByOperationId !== 'function') ||
         typeof options.requestStop !== 'function' || !/^[A-Za-z0-9_-]{43,128}$/u.test(token) ||
         !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 60_000 ||
         !Number.isSafeInteger(idleTimeout) || idleTimeout < 10 || idleTimeout > 60_000)
       throw new TypeError('Invalid managed worker control configuration');
     this.#options = Object.freeze({ ...options, authTimeoutMs: timeout,
-      authenticatedIdleTimeoutMs: idleTimeout });
+      authenticatedIdleTimeoutMs: idleTimeout,
+      ...(options.vk ? { vk: Object.freeze({ ...options.vk }) } : {}) });
     this.#token = Buffer.from(token);
     this.#idleTimeout = idleTimeout;
     this.#server = createServer(socket => this.#accept(socket));
@@ -184,7 +230,7 @@ export class ManagedWorkerControlServer {
     socket.on('data', (chunk: Buffer) => {
       if (this.#closed) { socket.destroy(); return; }
       buffer += decoder.write(chunk);
-      if (Buffer.byteLength(buffer) > 8192) { socket.destroy(); return; }
+      if (Buffer.byteLength(buffer) > (authenticated ? 128 * 1024 : 8192)) { socket.destroy(); return; }
       while (!socket.destroyed && buffer.includes('\n')) {
         const end = buffer.indexOf('\n'); let frame: unknown;
         try { frame = JSON.parse(buffer.slice(0, end)); } catch { socket.destroy(); return; }
@@ -200,11 +246,45 @@ export class ManagedWorkerControlServer {
         }
         if (!text(frame.id, 128)) { socket.destroy(); return; }
         const id = frame.id;
-        if (!exact(frame, ['id', 'epoch', 'method']) || frame.epoch !== this.#options.ownerEpoch ||
-            !['status', 'diagnose-v1', 'stop'].includes(String(frame.method)) || ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
+        const vkMethod = frame.method === 'submit-vk-v1' || frame.method === 'vk-submission-status-v1' ||
+          frame.method === 'vk-submission-status-by-id-v1';
+        if (!(vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+          frame.method === 'vk-submission-status-by-id-v1' ? 'operationId' : 'request']) :
+          exact(frame, ['id', 'epoch', 'method'])) || frame.epoch !== this.#options.ownerEpoch ||
+            vkMethod && (frame.taskId !== this.#options.taskId || !this.#options.vk) ||
+            !['status', 'diagnose-v1', 'stop', 'submit-vk-v1', 'vk-submission-status-v1',
+              'vk-submission-status-by-id-v1'].includes(String(frame.method)) ||
+            ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
+        if (vkMethod) {
+          if (!this.#options.vk || (frame.method === 'vk-submission-status-by-id-v1' ?
+            typeof frame.operationId !== 'string' || !uuid.test(frame.operationId) :
+            !validManagedVkControlRequest(frame.request, this.#options.taskId))) {
+            send({ id, error: 'refused' }); continue;
+          }
+          if (frame.method === 'submit-vk-v1') {
+            outstanding++;
+            const request = frame.request as SubmitTaskRequest;
+            void Promise.resolve().then(() => this.#options.vk!.submit(request)).then(result => {
+              if (!object(result) || !exact(result, ['submissionId']) || !text(result.submissionId, 256))
+                throw new Error('Malformed VK submission receipt');
+              send({ id, result: { submissionId: result.submissionId } });
+            }, error => { send({ id, error: error instanceof ActionRejectedError ? 'rejected' :
+              error instanceof UncertainActionError ? 'unknown' : 'unknown' }); })
+              .catch(() => send({ id, error: 'unknown' })).finally(() => { outstanding--; });
+          } else {
+            try {
+              const status = frame.method === 'vk-submission-status-v1' ?
+                this.#options.vk.status(frame.request as SubmitTaskRequest) :
+                this.#options.vk.statusByOperationId(frame.operationId as string);
+              if (!validVkStatus(status)) throw new Error();
+              send({ id, result: status });
+            } catch { send({ id, error: 'status-unavailable' }); }
+          }
+          continue;
+        }
         if (frame.method === 'status') {
           try {
             const status = this.#options.status();
