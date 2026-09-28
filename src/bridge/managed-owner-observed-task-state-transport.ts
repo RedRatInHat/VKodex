@@ -1,0 +1,110 @@
+import { taskKey, type TaskRef } from '../core/codex-tasks.js';
+import type { TaskState, TaskStateStream, TaskStateTransport } from '../core/task-state.js';
+import { ManagedClaimStateTransport } from '../codex/managed-claim-state-transport.js';
+import type { ManagedOwnerBinding } from './store.js';
+import type { ManagedOwnerRouteResolution } from './managed-owner-route-resolver.js';
+
+/** Read-only subset used by the optional exclusive state-route composition. */
+export interface ManagedOwnerRouteObserver {
+  resolve(task: TaskRef): Promise<ManagedOwnerRouteResolution>;
+  isCurrent(claim: ManagedOwnerBinding): boolean;
+}
+
+const unavailable = (): Error => new Error('Managed owner observed state is unavailable');
+
+/**
+ * Lazily proves an already-registered managed route before exposing its private
+ * observation stream.  It neither launches a worker nor falls back to another
+ * state transport.  The returned claim wrapper rechecks the durable revision
+ * on every frame and owner verification.
+ */
+export class ManagedOwnerObservedTaskStateTransport implements TaskStateTransport {
+  readonly #resolver: ManagedOwnerRouteObserver;
+  readonly #task: Readonly<TaskRef>;
+  readonly #key: string;
+  readonly #streams = new Set<() => void>();
+  #closed = false;
+
+  constructor(resolver: ManagedOwnerRouteObserver, task: TaskRef) {
+    if (!resolver || typeof resolver.resolve !== 'function' || typeof resolver.isCurrent !== 'function' ||
+      !task || typeof task.hostId !== 'string' || !task.hostId || typeof task.threadId !== 'string' || !task.threadId)
+      throw new TypeError('Managed owner observed transport requires an exact task and resolver');
+    this.#resolver = resolver;
+    this.#task = Object.freeze({ ...task });
+    this.#key = taskKey(task);
+  }
+
+  subscribe(task: TaskRef, onState: (state: TaskState, initial: boolean) => void,
+    onError: (error: Error) => void): TaskStateStream {
+    if (this.#closed || taskKey(task) !== this.#key) throw unavailable();
+    let active: TaskStateStream | null = null;
+    let fenced: ManagedClaimStateTransport | null = null;
+    let pendingStates: TaskStateTransport | null = null;
+    let closed = false;
+    let started: Promise<void> | null = null;
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      active?.close();
+      this.#streams.delete(close);
+      fenced?.close();
+      pendingStates?.close();
+    };
+    const begin = async (timeoutMs?: number): Promise<void> => {
+      if (closed || this.#closed) throw unavailable();
+      let resolution: ManagedOwnerRouteResolution;
+      try { resolution = await this.#resolver.resolve(this.#task); }
+      catch { close(); throw unavailable(); }
+      if (resolution.kind === 'statically-qualified') pendingStates = resolution.states;
+      if (closed || this.#closed || resolution.kind !== 'statically-qualified' ||
+        resolution.claim.hostId !== this.#task.hostId || resolution.claim.threadId !== this.#task.threadId ||
+        resolution.claim.sourceId !== (this.#task.sourceId ?? '') || !this.#resolver.isCurrent(resolution.claim)) {
+        if (closed) pendingStates?.close();
+        else close();
+        throw unavailable();
+      }
+      let status;
+      try { status = await resolution.controlStatus(); }
+      catch { close(); throw unavailable(); }
+      if (closed || this.#closed || !this.#resolver.isCurrent(resolution.claim) ||
+        status.ownerEpoch !== resolution.claim.ownerEpoch || status.taskId !== this.#task.threadId ||
+        status.backendGeneration !== resolution.claim.evidence.backendGeneration || status.hostState !== 'running') {
+        close(); throw unavailable();
+      }
+      fenced = new ManagedClaimStateTransport(resolution.states, this.#task,
+        () => !closed && !this.#closed && this.#resolver.isCurrent(resolution.claim));
+      pendingStates = null;
+      try {
+        active = fenced.subscribe(this.#task, onState, onError);
+        await active.start(timeoutMs);
+        if (closed || this.#closed || !this.#resolver.isCurrent(resolution.claim)) {
+          close(); throw unavailable();
+        }
+      } catch {
+        close();
+        throw unavailable();
+      }
+    };
+    const start = (timeoutMs?: number): Promise<void> => {
+      if (!started) started = begin(timeoutMs);
+      return started;
+    };
+    this.#streams.add(close);
+    return Object.freeze({ task: { ...this.#task }, start,
+      verifyOwner: async (timeoutMs?: number): Promise<void> => {
+        if (!active || closed || this.#closed) throw unavailable();
+        try { await active.verifyOwner(timeoutMs); }
+        catch { close(); throw unavailable(); }
+        if (closed || this.#closed) throw unavailable();
+      },
+      diagnostic: () => active?.diagnostic?.() ?? { kind: 'unknown' as const },
+      close });
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const close of this.#streams) close();
+    this.#streams.clear();
+  }
+}
