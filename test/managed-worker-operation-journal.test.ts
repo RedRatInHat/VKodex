@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { ManagedWorkerOperationJournal } from "../src/codex/managed-worker-operation-journal.js";
+import Database from 'better-sqlite3';
 
 const fingerprint = "a".repeat(64);
 function fixture() {
@@ -190,4 +191,56 @@ test('a pending turn blocks settings reservation and metadata-only settings reje
     assert.throws(() => journal.noteSettingsAck({ ...reserved, ownerEpoch: randomUUID() }), /scope/i);
     assert.throws(() => journal.noteSettingsAck({ ...reserved, revision: 9 }), /stale/i);
   } finally { journal.close(); }
+});
+
+test('settings effect confirmation is a separate durable CAS and releases admission', () => {
+  const scope = fixture(), journal = new ManagedWorkerOperationJournal(scope);
+  const operationId = randomUUID();
+  try {
+    const initial = journal.reserveSettings({ operationId, fingerprint }).operation;
+    assert.throws(() => journal.confirmSettings(initial, 'c'.repeat(64)), /ack|unknown/i);
+    const unknown = journal.markSettingsUnknown(initial);
+    assert.throws(() => journal.confirmSettings(unknown, 'c'.repeat(64)), /ack/i);
+    const acked = journal.noteSettingsAck(unknown);
+    assert.throws(() => journal.confirmSettings({ ...acked, revision: acked.revision - 1 }, 'c'.repeat(64)), /stale/i);
+    const confirmed = journal.confirmSettings(acked, 'c'.repeat(64));
+    assert.equal(confirmed.state, 'confirmed');
+    assert.equal(confirmed.rpcAck, true);
+    assert.equal(confirmed.effectiveFingerprint, 'c'.repeat(64));
+    assert.equal(journal.hasUnconfirmed(), false);
+    assert.deepEqual(journal.acceptedReceipts(), []);
+    assert.throws(() => journal.confirmSettings(acked, 'd'.repeat(64)), /conflict|stale/i);
+    journal.reserve(intent());
+  } finally { journal.close(); }
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try { assert.equal(reopened.getSettings(operationId)?.state, 'confirmed'); }
+  finally { reopened.close(); }
+});
+
+test('legacy two-state settings table migrates without erasing an unresolved operation', () => {
+  const scope = fixture(), operationId = randomUUID();
+  const old = new Database(scope.filePath);
+  old.exec(`CREATE TABLE managed_worker_settings_operations (
+    operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('dispatching','unknown')),
+    rpc_ack INTEGER NOT NULL CHECK(rpc_ack IN (0,1)),
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  )`);
+  old.prepare(`INSERT INTO managed_worker_settings_operations
+    (operation_id,fingerprint,revision,state,rpc_ack,created_at,updated_at)
+    VALUES (?, ?, 3, 'unknown', 1, 1, 1)`).run(operationId, fingerprint);
+  old.close();
+  const journal = new ManagedWorkerOperationJournal(scope);
+  try {
+    assert.equal(journal.hasUnconfirmed(), true);
+    assert.throws(() => journal.reserve(intent()), /unsettled/i);
+    const persisted = journal.getSettings(operationId);
+    assert.ok(persisted);
+    assert.equal(persisted.effectiveFingerprint, null);
+    assert.equal(journal.confirmSettings(persisted, 'd'.repeat(64)).state, 'confirmed');
+    assert.equal(journal.hasUnconfirmed(), false);
+  } finally { journal.close(); }
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try { assert.equal(reopened.getSettings(operationId)?.state, 'confirmed'); }
+  finally { reopened.close(); }
 });

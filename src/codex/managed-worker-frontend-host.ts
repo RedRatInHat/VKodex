@@ -182,6 +182,12 @@ export class ManagedWorkerFrontendHost {
     return this.#commands.getSettings(controlKey, operationId);
   }
 
+  /** Separately qualified effective-state proof; no native receipt is minted. */
+  confirmSettingsCommand(controlKey: object, command: SettingsCommand): Promise<SettingsOperation> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.confirmSettings(controlKey, command);
+  }
+
   /** Exact native result only after durable acceptance; null means unavailable. */
   executeCommandWithResponse(controlKey: object, command: WorkerCommand,
     beforeWrite?: () => void): Promise<WorkerCommandResponse> {

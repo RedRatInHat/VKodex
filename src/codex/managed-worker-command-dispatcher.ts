@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { AppServerConnection, AppServerResponseEnvelope } from './app-server-connection.js';
 import { ManagedWorkerOperationJournal } from './managed-worker-operation-journal.js';
 import type { WorkerOperation, WorkerMutationMethod, SettingsOperation } from './managed-worker-operation-journal.js';
+import type { HomogeneousQueueSettings } from './homogeneous-queue-policy.js';
 
 type JsonObject = Record<string, unknown>;
 export interface WorkerCommand {
@@ -40,6 +41,11 @@ export interface WorkerCommandPolicy {
   readonly authorize: (context: Readonly<WorkerCommandScope & WorkerCommand>) => boolean;
   /** Separate opt-in. Absence denies every settings write. */
   readonly authorizeSettings?: (context: Readonly<WorkerCommandScope & SettingsCommand>) => boolean;
+  /** Trusted same-host observer. Its synchronous verifier fences a notification
+   * revision immediately before durable confirmation. No observer is installed by default. */
+  readonly qualifySettingsEffect?: (context: Readonly<WorkerCommandScope & SettingsCommand>,
+    assertCurrent: () => void) => Promise<Readonly<{ effectiveSettings: HomogeneousQueueSettings;
+      assertCurrent: () => void }>>;
   readonly isOwnerCurrent: (scope: Readonly<WorkerCommandScope>) => boolean;
 }
 type Backend = Pick<AppServerConnection, 'request' | 'isSessionCurrent'>;
@@ -92,6 +98,51 @@ function snapshotSettings(command: SettingsCommand): Readonly<SettingsCommand> {
     return freeze(copy);
   } catch { throw new TypeError('Settings command must be bounded strict JSON'); }
 }
+const effectiveKeys = ['cwd', 'runtimeWorkspaceRoots', 'approvalPolicy', 'approvalsReviewer',
+  'permissions', 'sandboxPolicy', 'model', 'serviceTier', 'effort', 'summary',
+  'collaborationMode', 'personality'];
+function strictJson(value: unknown, seen = new Set<object>(), depth = 0): void {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+  if (typeof value === 'number' && Number.isFinite(value)) return;
+  if (typeof value !== 'object' || depth > 32 || seen.has(value))
+    throw new TypeError('Effective settings must be strict JSON');
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Reflect.ownKeys(value).length !== value.length + 1 ||
+          Object.keys(value).length !== value.length ||
+          Array.from({ length: value.length }, (_, index) => !Object.hasOwn(value, index)).some(Boolean))
+        throw new TypeError('Effective settings must be strict JSON');
+      for (const item of value) strictJson(item, seen, depth + 1);
+    } else {
+      if (Object.getPrototypeOf(value) !== Object.prototype ||
+          Reflect.ownKeys(value).length !== Object.keys(value).length ||
+          Reflect.ownKeys(value).some(key => typeof key !== 'string' ||
+            ['__proto__', 'prototype', 'constructor'].includes(key)))
+        throw new TypeError('Effective settings must be strict JSON');
+      for (const item of Object.values(value)) strictJson(item, seen, depth + 1);
+    }
+  } finally { seen.delete(value); }
+}
+function snapshotEffectiveSettings(value: unknown): Readonly<HomogeneousQueueSettings> {
+  if (!object(value) || Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.keys(value).sort().join('|') !== [...effectiveKeys].sort().join('|') ||
+      typeof value.cwd !== 'string' || !value.cwd ||
+      !Array.isArray(value.runtimeWorkspaceRoots) ||
+      value.runtimeWorkspaceRoots.some(root => typeof root !== 'string' || !root) ||
+      typeof value.model !== 'string' || !value.model ||
+      !(value.permissions === null || typeof value.permissions === 'string' && !!value.permissions) ||
+      !object(value.sandboxPolicy) || Object.getPrototypeOf(value.sandboxPolicy) !== Object.prototype)
+    throw new TypeError('Incomplete effective settings');
+  try {
+    strictJson(value);
+    const copy = structuredClone(value);
+    const encoded = JSON.stringify(copy);
+    if (Buffer.byteLength(encoded) > 1024 * 1024 ||
+        !isDeepStrictEqual(copy, JSON.parse(encoded))) throw new Error();
+    return freeze(copy as unknown as HomogeneousQueueSettings);
+  } catch { throw new TypeError('Effective settings must be bounded strict JSON'); }
+}
 
 /** Copies policy before worker launch. Key bytes never enter journal/metadata. */
 export function captureWorkerCommandPolicy(policy: WorkerCommandPolicy): WorkerCommandPolicy {
@@ -101,11 +152,13 @@ export function captureWorkerCommandPolicy(policy: WorkerCommandPolicy): WorkerC
       !(policy.fingerprintKey instanceof Uint8Array) || policy.fingerprintKey.byteLength < 32 ||
       policy.fingerprintKey.byteLength > 128 || typeof policy.authorize !== 'function' ||
       (policy.authorizeSettings !== undefined && typeof policy.authorizeSettings !== 'function') ||
+      (policy.qualifySettingsEffect !== undefined && typeof policy.qualifySettingsEffect !== 'function') ||
       typeof policy.isOwnerCurrent !== 'function') throw new TypeError('Explicit worker command policy required');
   return Object.freeze({ controlKey: policy.controlKey, ownerEpoch: policy.ownerEpoch,
     journalPath: policy.journalPath, fingerprintKey: Buffer.from(policy.fingerprintKey),
     authorize: policy.authorize,
     ...(policy.authorizeSettings ? { authorizeSettings: policy.authorizeSettings } : {}),
+    ...(policy.qualifySettingsEffect ? { qualifySettingsEffect: policy.qualifySettingsEffect } : {}),
     isOwnerCurrent: policy.isOwnerCurrent });
 }
 
@@ -120,6 +173,8 @@ export class ManagedWorkerCommandDispatcher {
   #responseBytes = 0;
   #closed = false;
   #checkingPolicy = false;
+  #confirmingSettings = false;
+  #confirmationInFlight: Promise<SettingsOperation> | null = null;
 
   constructor(readonly backend: Backend, threadId: string, backendGeneration: number,
     policy: WorkerCommandPolicy, readonly canExecute: () => boolean) {
@@ -152,7 +207,8 @@ export class ManagedWorkerCommandDispatcher {
    * one part of a stop proof; this says nothing about worker idle/history. */
   quiescence(key: object): WorkerCommandQuiescence {
     this.#authenticate(key);
-    return Object.freeze({ inFlight: this.#inFlight.size + this.#settingsInFlight.size,
+    return Object.freeze({ inFlight: this.#inFlight.size + this.#settingsInFlight.size +
+      (this.#confirmingSettings ? 1 : 0),
       unconfirmed: this.#journal.hasUnconfirmed() });
   }
   acceptedReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {
@@ -181,13 +237,12 @@ export class ManagedWorkerCommandDispatcher {
   /** ACK records only RPC completion; settings remain unknown until a separate effective-state proof API exists. */
   executeSettings(key: object, value: SettingsCommand, beforeWrite?: () => void): Promise<SettingsOperation> {
     this.#authenticate(key);
-    if (this.#checkingPolicy) throw new Error('Reentrant worker command admission');
+    if (this.#checkingPolicy || this.#confirmingSettings) throw new Error('Reentrant worker command admission');
     if (beforeWrite !== undefined && typeof beforeWrite !== 'function')
       throw new TypeError('Scoped before-write callback must be a function');
     const command = snapshotSettings(value);
     if (command.params.threadId !== this.#scope.threadId) throw new TypeError('Exact settings thread required');
-    const fingerprint = createHmac('sha256', this.#policy.fingerprintKey)
-      .update(canonical({ ...this.#scope, ...command })).digest('hex');
+    const fingerprint = this.#settingsFingerprint(command);
     const intent = { operationId: command.operationId, fingerprint };
     if (this.#journal.getSettings(command.operationId)) {
       const prior = this.#journal.reserveSettings(intent).operation;
@@ -209,6 +264,53 @@ export class ManagedWorkerCommandDispatcher {
     return work;
   }
 
+  /** Durable confirmation of a separately observed actual effective tuple.
+   * A native `{}` ACK alone cannot call this; absence of an observer leaves unknown. */
+  confirmSettings(key: object, value: SettingsCommand): Promise<SettingsOperation> {
+    this.#authenticate(key);
+    if (this.#checkingPolicy || this.#confirmingSettings) throw new Error('Reentrant settings confirmation');
+    const command = snapshotSettings(value);
+    if (command.params.threadId !== this.#scope.threadId) throw new TypeError('Exact settings thread required');
+    const prior = this.#journal.getSettings(command.operationId);
+    if (!prior || prior.fingerprint !== this.#settingsFingerprint(command))
+      throw new Error('Settings intent conflict');
+    if (prior.state === 'confirmed') return Promise.resolve(prior);
+    if (!prior.rpcAck || prior.state !== 'unknown' || this.#settingsInFlight.size !== 0 ||
+        !this.#policy.qualifySettingsEffect || !this.#current())
+      throw new Error('Settings effect qualification unavailable');
+    this.#confirmingSettings = true;
+    const work = this.#confirmSettingsEffect(command, prior);
+    this.#confirmationInFlight = work;
+    void work.finally(() => { this.#confirmingSettings = false; this.#confirmationInFlight = null; }).catch(() => {});
+    return work;
+  }
+
+  async #confirmSettingsEffect(command: Readonly<SettingsCommand>, prior: SettingsOperation): Promise<SettingsOperation> {
+    const assertCurrent = () => {
+      if (!this.#current() || this.#settingsInFlight.size !== 0 || this.#closed)
+        throw new Error('Settings owner or generation changed');
+    };
+    assertCurrent();
+    const qualified = await this.#policy.qualifySettingsEffect!(
+      Object.freeze({ ...this.#scope, ...command }), assertCurrent);
+    assertCurrent();
+    if (!object(qualified) || Object.keys(qualified).sort().join('|') !== 'assertCurrent|effectiveSettings' ||
+        typeof qualified.assertCurrent !== 'function') throw new TypeError('Qualified settings effect required');
+    const effective = snapshotEffectiveSettings(qualified.effectiveSettings);
+    // No await after the observer's synchronous revision check: the callback
+    // must reject if a relevant notification arrived during observation.
+    const verified: unknown = qualified.assertCurrent();
+    if (verified !== undefined) {
+      if (object(verified) && typeof verified.then === 'function')
+        void Promise.resolve(verified).catch(() => {});
+      throw new TypeError('Settings effect verifier must be synchronous');
+    }
+    assertCurrent();
+    const digest = createHmac('sha256', this.#policy.fingerprintKey)
+      .update(canonical(effective)).digest('hex');
+    return this.#journal.confirmSettings(prior, digest);
+  }
+
   executeWithResponse(key: object, value: WorkerCommand,
     beforeWrite?: () => void): Promise<WorkerCommandResponse> {
     const work = this.#execute(key, value, true, beforeWrite);
@@ -227,7 +329,7 @@ export class ManagedWorkerCommandDispatcher {
       throw new TypeError('Scoped before-write callback must be a function');
     // Owner callbacks must not recursively admit either this or a different
     // operation before the outer reservation/write has been fenced.
-    if (this.#checkingPolicy) throw new Error('Reentrant worker command admission');
+    if (this.#checkingPolicy || this.#confirmingSettings) throw new Error('Reentrant worker command admission');
     const command = snapshot(value);
     if (command.params.threadId !== this.#scope.threadId ||
         typeof command.params.clientUserMessageId !== 'string' ||
@@ -261,6 +363,10 @@ export class ManagedWorkerCommandDispatcher {
   }
 
   #fingerprint(command: Readonly<WorkerCommand>): string {
+    return createHmac('sha256', this.#policy.fingerprintKey)
+      .update(canonical({ ...this.#scope, ...command })).digest('hex');
+  }
+  #settingsFingerprint(command: Readonly<SettingsCommand>): string {
     return createHmac('sha256', this.#policy.fingerprintKey)
       .update(canonical({ ...this.#scope, ...command })).digest('hex');
   }
@@ -350,7 +456,8 @@ export class ManagedWorkerCommandDispatcher {
   /** Call only after stopping/invalidation of the RPC, so in-flight calls settle. */
   async close(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#inFlight.values(), ...this.#settingsInFlight.values()]);
+    await Promise.allSettled([...this.#inFlight.values(), ...this.#settingsInFlight.values(),
+      ...(this.#confirmationInFlight ? [this.#confirmationInFlight] : [])]);
     this.#responses.clear(); this.#responseBytes = 0;
     this.#journal.close();
     this.#policy.fingerprintKey.fill(0);

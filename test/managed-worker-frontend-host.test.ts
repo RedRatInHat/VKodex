@@ -444,7 +444,8 @@ test('explicit stop during startup cannot publish a late listener', async () => 
   assert.equal(fixture.launches, 1);
 });
 
-function commandFixture(timeout = 100, enableSettings = false) {
+function commandFixture(timeout = 100, enableSettings = false,
+  qualifier?: WorkerCommandPolicy['qualifySettingsEffect']) {
   const child = new Child(); const adapterKey = {}; const controlKey = {};
   const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-command-host-'));
   const journalPath = path.join(directory, 'operations.sqlite');
@@ -455,7 +456,8 @@ function commandFixture(timeout = 100, enableSettings = false) {
       authority.onAuthorize();
       return authority.admit && params.model === 'qualified-fixture-model';
     }, ...(enableSettings ? { authorizeSettings: ({ params }: { params: Record<string, unknown> }) =>
-      authority.admit && params.model === 'qualified-settings-model' } : {}) };
+      authority.admit && params.model === 'qualified-settings-model' } : {}),
+    ...(qualifier ? { qualifySettingsEffect: qualifier } : {}) };
   const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: init, adapterKey, bootstrapReadMethods: [], backendTimeoutMs: timeout,
     allowRequest: () => true, allowAnswer: () => true, commandPolicy: policy,
@@ -518,6 +520,132 @@ test('late settings ACK after timeout changes only ack bit and never unblocks an
     assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
     assert.throws(() => f.managed.executeCommand(f.controlKey, f.command), /unsettled/i);
   } finally { await f.managed.stop('test-cleanup'); }
+});
+
+function effectiveSettings() {
+  return { cwd: 'C:/own', runtimeWorkspaceRoots: ['C:/own'], approvalPolicy: 'never',
+    approvalsReviewer: null, permissions: 'read-only', sandboxPolicy: { type: 'readOnly' },
+    model: 'qualified-settings-model', serviceTier: null, effort: 'low', summary: null,
+    collaborationMode: null, personality: null };
+}
+
+test('settings confirmation requires a trusted fresh full tuple and never creates a native receipt', async () => {
+  let calls = 0, revision = 1;
+  const f = commandFixture(200, true, async (context, assertCurrent) => {
+    calls++; assertCurrent();
+    assert.equal(context.params.model, 'qualified-settings-model');
+    assert.equal(Object.isFrozen(context), true);
+    const observed = revision;
+    return { effectiveSettings: effectiveSettings(), assertCurrent: () => {
+      if (revision !== observed) throw new Error('notification revision changed');
+    } };
+  });
+  await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  try {
+    assert.throws(() => f.managed.confirmSettingsCommand(f.controlKey, settings), /conflict/i);
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    assert.throws(() => f.managed.confirmSettingsCommand(f.controlKey, settings), /unavailable/i);
+    f.child.send({ id: wire.id, result: {} });
+    await pending;
+    const confirmed = await f.managed.confirmSettingsCommand(f.controlKey, settings);
+    assert.equal(confirmed.state, 'confirmed');
+    assert.match(confirmed.effectiveFingerprint ?? '', /^[a-f0-9]{64}$/);
+    assert.equal(calls, 1);
+    assert.deepEqual(await f.managed.confirmSettingsCommand(f.controlKey, settings), confirmed);
+    assert.equal(calls, 1);
+    assert.deepEqual(f.managed.acceptedCommandReceipts(f.controlKey), []);
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+    assert.equal(f.child.messages.filter(frame => frame.method === 'thread/settings/update').length, 1);
+    assert.throws(() => f.managed.confirmSettingsCommand(f.controlKey,
+      { ...settings, params: { ...settings.params, effort: 'high' } }), /conflict/i);
+    revision++;
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('effect observation drift and missing verifier leave ACKed settings unknown', async () => {
+  let release!: () => void; let revision = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = commandFixture(200, true, async (_context, assertCurrent) => {
+    assertCurrent(); const observed = revision; await gate;
+    return { effectiveSettings: effectiveSettings(), assertCurrent: () => {
+      if (revision !== observed) throw new Error('effect revision drift');
+    } };
+  });
+  await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    f.child.send({ id: wire.id, result: {} }); await pending;
+    const confirmation = f.managed.confirmSettingsCommand(f.controlKey, settings);
+    assert.throws(() => f.managed.executeCommand(f.controlKey, f.command), /reentrant/i);
+    revision++; release();
+    await assert.rejects(confirmation, /drift/i);
+    assert.equal(f.managed.settingsCommandStatus(f.controlKey, settings.operationId)?.state, 'unknown');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+  } finally { release(); await f.managed.stop('test-cleanup'); }
+});
+
+test('missing qualifier and incomplete effective tuple cannot clear durable uncertainty', async () => {
+  let tuple: unknown = { ...effectiveSettings(), personality: undefined };
+  let verified = 0;
+  const f = commandFixture(200, true, async () => ({
+    effectiveSettings: tuple as ReturnType<typeof effectiveSettings>,
+    assertCurrent: () => { verified++; },
+  }));
+  await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    f.child.send({ id: wire.id, result: {} }); await pending;
+    await assert.rejects(f.managed.confirmSettingsCommand(f.controlKey, settings), /strict JSON/i);
+    assert.equal(verified, 0);
+    assert.equal(f.managed.settingsCommandStatus(f.controlKey, settings.operationId)?.state, 'unknown');
+    tuple = Object.defineProperty(effectiveSettings(), 'hidden', { value: 1 });
+    await assert.rejects(f.managed.confirmSettingsCommand(f.controlKey, settings), /strict JSON/i);
+    assert.equal(verified, 0);
+    tuple = effectiveSettings();
+    assert.equal((await f.managed.confirmSettingsCommand(f.controlKey, settings)).state, 'confirmed');
+    assert.equal(verified, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+
+  const noQualifier = commandFixture(200, true); await noQualifier.managed.start();
+  try {
+    const next = { ...settings, operationId: randomUUID() };
+    const pending = noQualifier.managed.executeSettingsCommand(noQualifier.controlKey, next);
+    const wire = await sentMutation(noQualifier.child, 'thread/settings/update');
+    noQualifier.child.send({ id: wire.id, result: {} }); await pending;
+    assert.throws(() => noQualifier.managed.confirmSettingsCommand(noQualifier.controlKey, next), /unavailable/i);
+    assert.equal(noQualifier.managed.commandQuiescence(noQualifier.controlKey).unconfirmed, true);
+  } finally { await noQualifier.managed.stop('test-cleanup'); }
+});
+
+test('owner loss during effect read cannot confirm an ACKed settings operation', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = commandFixture(200, true, async (_context, assertCurrent) => {
+    assertCurrent(); await gate;
+    return { effectiveSettings: effectiveSettings(), assertCurrent: () => {} };
+  });
+  await f.managed.start();
+  const settings = { operationId: randomUUID(), method: 'thread/settings/update' as const,
+    params: { threadId: taskId, model: 'qualified-settings-model', effort: 'low' } };
+  try {
+    const pending = f.managed.executeSettingsCommand(f.controlKey, settings);
+    const wire = await sentMutation(f.child, 'thread/settings/update');
+    f.child.send({ id: wire.id, result: {} }); await pending;
+    const confirmation = f.managed.confirmSettingsCommand(f.controlKey, settings);
+    f.authority.current = false; release();
+    await assert.rejects(confirmation, /changed/i);
+    assert.equal(f.managed.settingsCommandStatus(f.controlKey, settings.operationId)?.state, 'unknown');
+    assert.equal(f.managed.commandQuiescence(f.controlKey).unconfirmed, true);
+  } finally { release(); await f.managed.stop('test-cleanup'); }
 });
 
 test('settings before-write lease revocation persists unknown without a backend write', async () => {
