@@ -162,6 +162,172 @@ test('second read RPC error is not retried', async () => {
   assert.deepEqual(f.persisted, ['intent', 'started']);
 });
 
+test('exhausted first read uses one distinct fresh read-only session and closes it', async () => {
+  const f = fixture('read-fail');
+  const freshCalls: string[] = [];
+  let factoryCalls = 0, closes = 0;
+  const freshRpc = {
+    async initializedSession() { return { generation: 2 }; },
+    isSessionCurrent(generation: number) { return generation === 2; },
+    async request(method: string, _params?: Record<string, unknown>, options?: { expectedGeneration?: number }) {
+      freshCalls.push(method);
+      assert.equal(options?.expectedGeneration, 2);
+      if (method === 'thread/read') return { thread: { ...startResult.thread, path: rolloutPath } };
+      if (method === 'thread/turns/list' || method === 'thread/queue/list')
+        return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      throw new Error(`fresh session invoked ${method}`);
+    },
+  };
+  const receipt = await createControlledNativeTask({ ...f.options,
+    freshReadRpc: async () => { factoryCalls++; return { rpc: freshRpc, close: async () => { closes++; } }; } });
+  assert.equal(receipt.threadId, taskId);
+  assert.deepEqual(f.persisted, ['intent', 'started', 'qualified']);
+  assert.deepEqual(f.calls, ['thread/start', 'thread/read', 'thread/read', 'thread/read']);
+  assert.deepEqual(freshCalls, ['thread/read', 'thread/turns/list', 'thread/goal/get',
+    'thread/queue/list', 'thread/read']);
+  assert.equal(factoryCalls, 1);
+  assert.equal(closes, 1);
+});
+
+for (const failure of ['unknown', 'policy-mismatch', 'source-mismatch',
+  'provider-mismatch', 'cwd-mismatch', 'second-read-fail',
+  'read-once-lost-reservation'] as const)
+  test(`fresh read factory is not invoked for ${failure}`, async () => {
+    const f = fixture(failure);
+    let factoryCalls = 0;
+    await assert.rejects(createControlledNativeTask({ ...f.options,
+      freshReadRpc: async () => { factoryCalls++; throw new Error('factory should not run'); } }),
+    ControlledNativeCreationUncertainError);
+    assert.equal(factoryCalls, 0);
+    assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
+    assert.deepEqual(f.persisted, failure === 'unknown' ? ['intent'] : ['intent', 'started']);
+  });
+
+test('fresh reader failure leaves started uncertain and closes the reader', async () => {
+  const f = fixture('read-fail');
+  const freshCalls: string[] = [];
+  let closes = 0;
+  const freshRpc = {
+    async initializedSession() { return { generation: 2 }; },
+    isSessionCurrent(generation: number) { return generation === 2; },
+    async request(method: string) { freshCalls.push(method); throw new Error('fresh read unavailable'); },
+  };
+  await assert.rejects(createControlledNativeTask({ ...f.options,
+    freshReadRpc: async () => ({ rpc: freshRpc, close: async () => { closes++; } }) }),
+  ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
+  assert.deepEqual(freshCalls, ['thread/read']);
+  assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
+  assert.equal(closes, 1);
+});
+
+test('fresh reader must be a distinct RPC and never closes the original writer', async () => {
+  const f = fixture('read-fail');
+  let closes = 0;
+  await assert.rejects(createControlledNativeTask({ ...f.options,
+    freshReadRpc: async () => ({ rpc: f.options.rpc, close: async () => { closes++; } }) }),
+  ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
+  assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
+  assert.equal(closes, 0);
+});
+
+test('malformed fresh RPC does not trigger an untrusted close callback', async () => {
+  const f = fixture('read-fail');
+  let closes = 0;
+  await assert.rejects(createControlledNativeTask({ ...f.options,
+    freshReadRpc: async () => ({ rpc: {} as ControlledNativeTaskCreatorOptions['rpc'],
+      close: async () => { closes++; } }) }), ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
+  assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
+  assert.equal(closes, 0);
+});
+
+test('fresh reader still requires the opt-in source proof', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-fresh-proof-'));
+  const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  const preflightReceiptPath = path.join(root, 'preflight.json');
+  mkdirSync(sourceHome); mkdirSync(workspace);
+  const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
+  const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
+    thread: { ...startResult.thread, cwd: workspace } };
+  const originalCalls: string[] = [], freshCalls: string[] = [];
+  let closes = 0;
+  const originalRpc = {
+    async initializedSession() { return { generation: 1 }; },
+    isSessionCurrent(generation: number) { return generation === 1; },
+    async request(method: string) {
+      originalCalls.push(method);
+      if (method === 'thread/start') {
+        mkdirSync(path.dirname(nativePath), { recursive: true });
+        writeFileSync(nativePath, `${JSON.stringify({ type: 'session_meta',
+          payload: { id: taskId, session_id: taskId, cwd: workspace } })}\n`);
+        return native;
+      }
+      if (method === 'thread/read') throw new Error('original session read rejected');
+      throw new Error(`unexpected original ${method}`);
+    },
+  } as unknown as ControlledNativeTaskCreatorOptions['rpc'];
+  const freshRpc = {
+    async initializedSession() { return { generation: 2 }; },
+    isSessionCurrent(generation: number) { return generation === 2; },
+    async request(method: string) {
+      freshCalls.push(method);
+      if (method === 'thread/read') return { thread: { ...native.thread, path: nativePath } };
+      if (method === 'thread/turns/list' || method === 'thread/queue/list')
+        return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      throw new Error(`unexpected fresh ${method}`);
+    },
+  } as unknown as ControlledNativeTaskCreatorOptions['rpc'];
+  const journal = new ControlledNativeCreationJournal(path.join(root, 'creation.sqlite'));
+  const operationId = randomUUID();
+  try {
+    const receipt = await createControlledNativeTask({ rpc: originalRpc, operationId,
+      sourceId: 'isolated', requestedPolicy: { ...template, cwd: workspace,
+        runtimeWorkspaceRoots: [workspace] },
+      persistIntent: intent => journal.persistIntent(intent),
+      persistStarted: started => journal.persistStarted(started),
+      persistQualified: qualified => journal.persistQualified(qualified),
+      sourceProof: { sourceHome, preflightReceiptPath },
+      resolveSource: async () => { throw new Error('uncontrolled resolver'); },
+      freshReadRpc: async () => ({ rpc: freshRpc, close: async () => { closes++; } }) });
+    assert.equal(await realpath(receipt.rolloutPath), await realpath(nativePath));
+    assert.equal(journal.get(operationId)?.state, 'qualified');
+    assert.deepEqual(originalCalls, ['thread/start', 'thread/read', 'thread/read', 'thread/read']);
+    assert.deepEqual(freshCalls, ['thread/read', 'thread/turns/list', 'thread/goal/get',
+      'thread/queue/list', 'thread/read']);
+    assert.equal(closes, 1);
+  } finally { journal.close(); }
+});
+
+test('reservation loss during fresh reader close leaves started uncertain', async () => {
+  const f = fixture('read-fail');
+  let current = true, closes = 0;
+  const freshRpc = {
+    async initializedSession() { return { generation: 2 }; },
+    isSessionCurrent(generation: number) { return generation === 2; },
+    async request(method: string) {
+      if (method === 'thread/read') return { thread: { ...startResult.thread, path: rolloutPath } };
+      if (method === 'thread/turns/list' || method === 'thread/queue/list')
+        return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+  await assert.rejects(createControlledNativeTask({ ...f.options,
+    persistIntent: async intent => {
+      const reservation = await f.options.persistIntent(intent);
+      return { isCurrent: () => current && reservation.isCurrent() };
+    },
+    freshReadRpc: async () => ({ rpc: freshRpc,
+      close: async () => { closes++; current = false; } }) }), ControlledNativeCreationUncertainError);
+  assert.deepEqual(f.persisted, ['intent', 'started']);
+  assert.equal(closes, 1);
+  assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
+});
+
 for (const loseRead of [false, true]) test(`opt-in source proof qualifies the only rollout${loseRead ? ' after restart' : ''}`, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-source-'));
   const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');

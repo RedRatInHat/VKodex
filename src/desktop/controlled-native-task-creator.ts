@@ -35,6 +35,7 @@ async function sameExistingFilePath(a: unknown, b: unknown): Promise<boolean> {
   } catch { return false; }
 }
 const refuse = (): never => { throw new Error('Controlled native creation unqualified'); };
+class FirstReadRpcExhausted extends Error {}
 function freezeTree<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
     for (const nested of Object.values(value)) freezeTree(nested);
@@ -102,6 +103,9 @@ export interface ControlledNativeTaskCreatorOptions {
   readonly persistStarted: (started: ControlledCreationStarted) => Promise<void>;
   /** Saves a qualified, immutable receipt before it is returned to the caller. */
   readonly persistQualified: (receipt: ControlledCreationReceipt) => Promise<void>;
+  /** Optional new, owned, independent read-only session after the original first read RPC is exhausted.
+   * The factory must not return a shared connection. The creator closes a validated returned session. */
+  readonly freshReadRpc?: () => Promise<Readonly<{ rpc: CreatorRpc; close(): Promise<void> }>>;
   /** Opt-in exclusive source proof. The durable receipt must be saved before thread/start. */
   readonly sourceProof?: ControlledNativeSourceProofOptions;
   /** Independent trusted source mapping; cannot be synthesized from empty history. */
@@ -274,6 +278,7 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
   effectivePolicy: ApprovedTaskPolicy;
   resolveSource: ControlledNativeTaskCreatorOptions['resolveSource'];
   assertCurrent?: () => void;
+  retryFirstRead?: boolean;
 }>): Promise<string> {
   const { rpc, generation, threadId, effectivePolicy } = options;
   const current = (): void => {
@@ -284,7 +289,7 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
   const readParams = { threadId, includeTurns: true };
   // A newly accepted thread can briefly reject its first read. Retry only
   // this read-only RPC while the original session and reservation still hold.
-  const firstReadDelaysMs = [150, 500] as const;
+  const firstReadDelaysMs = options.retryFirstRead === false ? [] : [150, 500];
   let read: Row | undefined;
   for (let attempt = 0; attempt <= firstReadDelaysMs.length; attempt++) {
     current();
@@ -292,7 +297,7 @@ export async function qualifyControlledZeroTurn(options: Readonly<{
       read = await rpc.request('thread/read', readParams, { expectedGeneration: generation });
       break;
     } catch {
-      if (attempt === firstReadDelaysMs.length) refuse();
+      if (attempt === firstReadDelaysMs.length) throw new FirstReadRpcExhausted();
       current();
       await delay(firstReadDelaysMs[attempt]);
     }
@@ -333,6 +338,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
     typeof options.rpc.isSessionCurrent !== 'function' ||
     !UUID.test(options.operationId) || typeof options.sourceId !== 'string' ||
     !options.sourceId || options.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(options.sourceId) ||
+    options.freshReadRpc !== undefined && typeof options.freshReadRpc !== 'function' ||
     ![options.persistIntent, options.persistStarted, options.persistQualified,
       options.resolveSource].every(callback => typeof callback === 'function')) refuse();
   const requestedPolicy = policyTemplate(options.requestedPolicy);
@@ -391,10 +397,42 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
       !requestedPolicy.allowedEnvironments.some(allowed => isDeepStrictEqual(allowed, selectedEnvironments))) refuse();
     assertEffectiveResume(effectivePolicy, start);
     phase = 'readback';
-    const rolloutPath = await qualifyControlledZeroTurn({ rpc: options.rpc,
-      generation: session.generation, threadId, sourceId: intent.sourceId,
-      effectivePolicy, resolveSource,
-      assertCurrent: () => { if (reservation.isCurrent() !== true) refuse(); } });
+    let rolloutPath: string;
+    try {
+      rolloutPath = await qualifyControlledZeroTurn({ rpc: options.rpc,
+        generation: session.generation, threadId, sourceId: intent.sourceId,
+        effectivePolicy, resolveSource,
+        assertCurrent: () => { if (reservation.isCurrent() !== true) refuse(); } });
+    } catch (error) {
+      if (!(error instanceof FirstReadRpcExhausted) || !options.freshReadRpc) throw error;
+      if (reservation.isCurrent() !== true) refuse();
+      let fresh: Awaited<ReturnType<NonNullable<typeof options.freshReadRpc>>> | undefined;
+      try {
+        const candidate = await options.freshReadRpc();
+        // Do not invoke an untrusted close callback until ownership is plausible.
+        if (!candidate || typeof candidate.close !== 'function' || !candidate.rpc ||
+          candidate.rpc === options.rpc || typeof candidate.rpc.initializedSession !== 'function' ||
+          typeof candidate.rpc.isSessionCurrent !== 'function' ||
+          typeof candidate.rpc.request !== 'function') refuse();
+        fresh = candidate;
+        if (reservation.isCurrent() !== true) refuse();
+        const allowed = new Set(['thread/read', 'thread/turns/list', 'thread/goal/get', 'thread/queue/list']);
+        const readOnlyRpc: CreatorRpc = { initializedSession: () => fresh!.rpc.initializedSession(),
+          isSessionCurrent: generation => fresh!.rpc.isSessionCurrent(generation),
+          request: (method, params, requestOptions) => {
+            if (!allowed.has(method) || requestOptions?.mutating === true) refuse();
+            return fresh!.rpc.request(method, params, requestOptions);
+          } };
+        const freshSession = await readOnlyRpc.initializedSession();
+        if (!Number.isSafeInteger(freshSession.generation) || freshSession.generation < 1 ||
+          !readOnlyRpc.isSessionCurrent(freshSession.generation) || reservation.isCurrent() !== true) refuse();
+        rolloutPath = await qualifyControlledZeroTurn({ rpc: readOnlyRpc,
+          generation: freshSession.generation, threadId, sourceId: intent.sourceId,
+          effectivePolicy, resolveSource, retryFirstRead: false,
+          assertCurrent: () => { if (reservation.isCurrent() !== true) refuse(); } });
+      } finally { if (fresh && typeof fresh.close === 'function') await fresh.close(); }
+      if (reservation.isCurrent() !== true) refuse();
+    }
     const receipt = Object.freeze({ ...started, effectivePolicy, rolloutPath,
       status: 'qualified-zero-turn' as const }) satisfies ControlledCreationReceipt;
     phase = 'persist-qualified';
