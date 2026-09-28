@@ -4,14 +4,17 @@ import { fileURLToPath } from 'node:url';
 import { DesktopIpcClient } from './ipc-client.js';
 
 export function parseManagedWorkerArguments(args: readonly string[]): Readonly<{
-  baseDirectory: string; epoch: string; nativeIpc: 'local';
+  baseDirectory: string; epoch: string; nativeIpc: 'local'; nativeTaskState?: true;
 }> {
-  if (args.length !== 6 || args[0] !== '--private-base' || args[2] !== '--epoch' ||
+  const nativeTaskState = args.length === 7 && args[6] === '--native-task-state';
+  if ((args.length !== 6 && !nativeTaskState) ||
+      args[0] !== '--private-base' || args[2] !== '--epoch' ||
       args[4] !== '--native-ipc' || args[5] !== 'local' ||
       !path.isAbsolute(args[1] ?? '') || /[\u0000-\u001f]/u.test(args[1] ?? '') ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(args[3] ?? ''))
     throw new TypeError('Invalid managed worker arguments');
-  return Object.freeze({ baseDirectory: args[1]!, epoch: args[3]!, nativeIpc: 'local' });
+  return Object.freeze({ baseDirectory: args[1]!, epoch: args[3]!, nativeIpc: 'local',
+    ...(nativeTaskState ? { nativeTaskState: true as const } : {}) });
 }
 
 async function main(): Promise<void> {
@@ -19,6 +22,7 @@ async function main(): Promise<void> {
   const { ManagedWorkerDaemon } = await import('./managed-worker-daemon.js');
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: options.baseDirectory, epoch: options.epoch,
+    ...(options.nativeTaskState ? { nativeTaskState: true } : {}),
     // The explicit local-native launch opts into this user's native broker.
     // sourceClientId is routing metadata, not independently authenticated identity.
     allowFollower: source => typeof source === 'string' && source.length > 0 &&

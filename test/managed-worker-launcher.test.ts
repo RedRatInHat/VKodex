@@ -76,6 +76,27 @@ test('launch reserves before protecting state and detaches without secret argume
   await assert.rejects(launchManagedWorker(options, { protectState: async () => { throw new Error('should not run'); } }), /already reserved/);
 });
 
+test('read-only task-state launch opt-in reaches only the exact worker argument', async () => {
+  const { options } = fixture();
+  let dispatched = false;
+  await launchManagedWorker({ ...options, nativeTaskState: true }, {
+    protectState: async manifest => {
+      assert.equal(Object.hasOwn(manifest, 'nativeTaskState'), false,
+        'transport opt-in is not task policy or a protected state mutation');
+    },
+    spawn: (_file, args) => {
+      assert.deepEqual(args.slice(-3), ['--native-ipc', 'local', '--native-task-state']);
+      dispatched = true;
+      const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
+      queueMicrotask(() => child.emit('spawn')); return child;
+    },
+  });
+  assert.equal(dispatched, true);
+  const invalid = fixture();
+  await assert.rejects(launchManagedWorker({ ...invalid.options, nativeTaskState: false } as never),
+    /native task-state/);
+});
+
 test('opt-in launch snapshots explicit policy and rejects changed resume before reservation', async () => {
   const { options } = fixture();
   const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21c';

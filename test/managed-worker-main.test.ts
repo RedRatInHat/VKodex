@@ -10,8 +10,13 @@ test('daemon main accepts only explicit scoped local-native opt-in', () => {
   assert.deepEqual(parseManagedWorkerArguments(args), { baseDirectory, epoch, nativeIpc: 'local' });
   assert.equal(Object.isFrozen(parseManagedWorkerArguments(args)), true);
 });
+test('daemon main accepts an exact read-only task-state opt-in', () => {
+  assert.deepEqual(parseManagedWorkerArguments([...args, '--native-task-state']),
+    { baseDirectory, epoch, nativeIpc: 'local', nativeTaskState: true });
+});
 test('daemon main refuses missing, duplicated, unknown or unscoped arguments', () => {
   for (const input of [[], args.slice(0, 4), [...args, '--force'],
+    [...args, '--native-task-state', '--native-task-state'],
     ['--private-base', 'relative', ...args.slice(2)],
     [...args.slice(0, 3), '../other', ...args.slice(4)],
     [...args.slice(0, 5), 'external'], ['--epoch', epoch, ...args.slice(2)]]) {

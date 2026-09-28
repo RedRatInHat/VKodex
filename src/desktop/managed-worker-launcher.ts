@@ -12,6 +12,8 @@ export interface ManagedWorkerLaunchOptions extends Omit<ManagedWorkerPrivateMan
   readonly privateBaseDirectory: string;
   /** Explicitly opt into the local native broker; no shared IPC route is implied. */
   readonly nativeIpc: 'local';
+  /** Explicit read-only private task-state listener; absent preserves legacy workers. */
+  readonly nativeTaskState?: true;
   /** Caller deploys a trusted compiled runtime bundle; entrypoint pin is not a signature for its imports. */
   readonly runtime: Readonly<{ executable: string; sha256: string; entrypoint: string; entrypointSha256: string }>;
 }
@@ -55,6 +57,8 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   dependencies: ManagedWorkerLaunchDependencies = {}): Promise<Readonly<{ epoch: string; state: 'dispatched'; pid: number }>> {
   // Capture caller-owned objects before the first asynchronous step.
   const input = structuredClone(options);
+  if (input.nativeTaskState !== undefined && input.nativeTaskState !== true)
+    throw new TypeError('Invalid managed native task-state opt-in');
   const approvedTaskPolicy = Object.hasOwn(input, 'approvedTaskPolicy')
     ? approveTaskPolicy(input.approvedTaskPolicy) : undefined;
   for (const file of [input.home, input.cwd, input.registryPath, input.privateBaseDirectory]) absolute(file);
@@ -94,7 +98,9 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     const timer = setTimeout(() => fail('unknown'), 10_000);
     try {
       const child = (dependencies.spawn ?? spawn)(input.runtime.executable,
-        [input.runtime.entrypoint, '--private-base', input.privateBaseDirectory, '--epoch', epoch, '--native-ipc', input.nativeIpc],
+        [input.runtime.entrypoint, '--private-base', input.privateBaseDirectory, '--epoch', epoch,
+          '--native-ipc', input.nativeIpc,
+          ...(input.nativeTaskState ? ['--native-task-state'] : [])],
         buildDetachedWorkerSpawnOptions(input.cwd, input.home, process.env));
       // No exit/EOF listener kills a worker; the durable registry/control plane reports its state.
       child.once('error', () => fail('not-dispatched'));
