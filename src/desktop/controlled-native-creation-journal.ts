@@ -3,8 +3,8 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import DatabaseConstructor, { type Database } from 'better-sqlite3';
 import { approveTaskPolicy } from '../codex/managed-task-policy.js';
-import type { ControlledCreationIntent, ControlledCreationStarted,
-  ControlledCreationReceipt } from './controlled-native-task-creator.js';
+import { policyFromControlledStarted, type ControlledCreationIntent,
+  type ControlledCreationStarted, type ControlledCreationReceipt } from './controlled-native-task-creator.js';
 
 type State = 'intent' | 'started' | 'qualified';
 interface StoredRow {
@@ -20,6 +20,11 @@ export interface ControlledCreationJournalRecord {
   readonly qualified: ControlledCreationReceipt | null;
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const legacySelectedKeys = ['model', 'modelProvider', 'reasoningEffort',
+  'serviceTier', 'cwd', 'approvalPolicy', 'environments'] as const;
+const fullSelectedKeys = [...legacySelectedKeys, 'runtimeWorkspaceRoots',
+  'approvalsReviewer', 'activePermissionProfile', 'sandbox'] as const;
+const reconcilableSelectedKeys = [...fullSelectedKeys, 'startThread', 'nativeShapeExact'] as const;
 const keys = (value: unknown, expected: readonly string[]): boolean =>
   value !== null && typeof value === 'object' && !Array.isArray(value) &&
   Reflect.ownKeys(value).length === expected.length &&
@@ -80,8 +85,13 @@ function startedOf(value: ControlledCreationReceipt): ControlledCreationStarted 
 function validStarted(value: ControlledCreationStarted): void {
   if (!keys(value, ['operationId', 'creatorNonce', 'sourceGeneration', 'sourceId',
     'requestedPolicy', 'threadId', 'selectedEffective']) || !uuid.test(value.threadId) ||
-    !keys(value.selectedEffective, ['model', 'modelProvider', 'reasoningEffort',
-      'serviceTier', 'cwd', 'approvalPolicy', 'environments'])) fail();
+    !keys(value.selectedEffective, legacySelectedKeys) &&
+    !keys(value.selectedEffective, fullSelectedKeys) &&
+    !keys(value.selectedEffective, reconcilableSelectedKeys)) fail();
+  if (keys(value.selectedEffective, reconcilableSelectedKeys) &&
+    (!keys(value.selectedEffective.startThread, ['status', 'turnCount', 'model',
+      'modelProvider', 'reasoningEffort', 'cwd']) ||
+      typeof value.selectedEffective.nativeShapeExact !== 'boolean')) fail();
   validIntent(intentOf(value));
 }
 function validQualified(value: ControlledCreationReceipt): void {
@@ -105,6 +115,14 @@ function validQualified(value: ControlledCreationReceipt): void {
     !sameWindowsPath(value.selectedEffective.cwd, policy.cwd) ||
     value.selectedEffective.approvalPolicy !== policy.approvalPolicy ||
     !isDeepStrictEqual(value.selectedEffective.environments, policy.environments)) fail();
+  if ((keys(value.selectedEffective, fullSelectedKeys) ||
+    keys(value.selectedEffective, reconcilableSelectedKeys)) &&
+    (!isDeepStrictEqual(value.selectedEffective.runtimeWorkspaceRoots, policy.runtimeWorkspaceRoots) ||
+      value.selectedEffective.approvalsReviewer !== policy.approvalsReviewer ||
+      !isDeepStrictEqual(value.selectedEffective.activePermissionProfile, policy.activePermissionProfile) ||
+      !isDeepStrictEqual(value.selectedEffective.sandbox, policy.sandbox))) fail();
+  if (keys(value.selectedEffective, reconcilableSelectedKeys) &&
+    !isDeepStrictEqual(policyFromControlledStarted(startedOf(value)), policy)) fail();
 }
 
 /** Durable, single-operation evidence. An intent or started row after restart is

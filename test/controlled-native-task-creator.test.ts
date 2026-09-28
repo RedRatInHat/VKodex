@@ -10,6 +10,7 @@ import { createControlledNativeTask, ControlledNativeCreationUncertainError,
   type ControlledCreationIntent, type ControlledCreationStarted,
   type ControlledCreationReceipt } from '../src/desktop/controlled-native-task-creator.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
+import { reconcileControlledNativeCreation } from '../src/desktop/controlled-native-creation-reconciler.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 
 const cwd = 'C:\\fixture\\workspace';
@@ -29,7 +30,8 @@ const startResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
 
 function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-mismatch' |
   'read-fail' | 'unloaded' | 'idle-to-unloaded' | 'provider-mismatch' |
-  'cwd-mismatch' | 'policy-mismatch' = 'none') {
+  'cwd-mismatch' | 'policy-mismatch' | 'start-active' | 'start-turn' |
+  'profile-extra' | 'sandbox-extra' | 'environment-extra' = 'none') {
   const calls: string[] = [], persisted: string[] = [];
   let reserved = false, readCount = 0;
   const rpc = {
@@ -49,7 +51,19 @@ function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-misma
           permissions: template.activePermissionProfile.id,
           approvalPolicy: template.approvalPolicy, runtimeWorkspaceRoots: [cwd], ephemeral: false });
         if (failure === 'unknown') throw new Error('connection lost after write');
-        return failure === 'policy-mismatch' ? { ...startResult, serviceTier: 'unapproved' } : startResult;
+        if (failure === 'policy-mismatch') return { ...startResult, serviceTier: 'unapproved' };
+        if (failure === 'start-active') return { ...startResult,
+          thread: { ...startResult.thread, status: { type: 'active' } } };
+        if (failure === 'start-turn') return { ...startResult,
+          thread: { ...startResult.thread, turns: [{ id: 'turn-1' }] } };
+        if (failure === 'profile-extra') return { ...startResult,
+          activePermissionProfile: { ...startResult.activePermissionProfile, extra: 'hidden' } };
+        if (failure === 'sandbox-extra') return { ...startResult,
+          sandbox: { ...startResult.sandbox, extra: 'hidden' } };
+        if (failure === 'environment-extra') return { ...startResult,
+          thread: { ...startResult.thread, environments: [{ environmentId: 'local', cwd,
+            runtimeWorkspaceRoots: [cwd], extra: 'hidden' }] } };
+        return startResult;
       }
       if (method === 'thread/read') {
         readCount++;
@@ -77,6 +91,17 @@ function fixture(failure: 'none' | 'unknown' | 'started-persist' | 'source-misma
     },
     persistStarted: async (started: ControlledCreationStarted) => {
       assert.equal(started.threadId, taskId); persisted.push('started');
+      assert.deepEqual(started.selectedEffective.runtimeWorkspaceRoots, [cwd]);
+      assert.equal(started.selectedEffective.approvalsReviewer, 'user');
+      assert.deepEqual(started.selectedEffective.activePermissionProfile,
+        { id: ':danger-full-access', extends: null });
+      assert.deepEqual(started.selectedEffective.sandbox, { type: 'dangerFullAccess' });
+      assert.deepEqual(started.selectedEffective.startThread, {
+        status: failure === 'start-active' ? 'active' : 'idle',
+        turnCount: failure === 'start-turn' ? 1 : 0, model: template.model,
+        modelProvider: template.modelProvider, reasoningEffort: template.effort, cwd });
+      assert.equal(started.selectedEffective.nativeShapeExact,
+        !['profile-extra', 'sandbox-extra', 'environment-extra'].includes(failure));
       if (failure === 'policy-mismatch') assert.equal(started.selectedEffective.serviceTier, 'unapproved');
       if (failure === 'started-persist') throw new Error('storage unavailable');
     },
@@ -143,6 +168,15 @@ test('native policy mismatch still persists known created ID before refusing qua
   assert.deepEqual(f.calls, ['thread/start']);
   assert.deepEqual(f.persisted, ['intent', 'started']);
 });
+
+for (const failure of ['start-active', 'start-turn', 'profile-extra',
+  'sandbox-extra', 'environment-extra'] as const)
+  test(`${failure} persists positive ID but refuses qualification`, async () => {
+    const f = fixture(failure);
+    await assert.rejects(createControlledNativeTask(f.options), ControlledNativeCreationUncertainError);
+    assert.deepEqual(f.calls, ['thread/start']);
+    assert.deepEqual(f.persisted, ['intent', 'started']);
+  });
 
 function journalFixture() {
   const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-create-')), 'creation.sqlite');
@@ -312,3 +346,84 @@ test('published pre-pagination journal schema reopens and paginates without migr
   assert.equal(page.nextCursor, null);
   journal.close();
 });
+
+function fullStarted(started: ControlledCreationStarted): ControlledCreationStarted {
+  return { ...started, selectedEffective: { ...started.selectedEffective,
+    runtimeWorkspaceRoots: [cwd], approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':danger-full-access', extends: null },
+    sandbox: { type: 'dangerFullAccess' }, nativeShapeExact: true,
+    startThread: { status: 'idle', turnCount: 0, model: template.model,
+      modelProvider: template.modelProvider, reasoningEffort: template.effort, cwd } } };
+}
+
+test('read-only reconciliation qualifies a full persisted native selection without any write', async () => {
+  const f = journalFixture(), runtime = fixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  const observed: string[] = [];
+  await journal.persistIntent(f.intent);
+  await journal.persistStarted(fullStarted(f.started));
+  const receipt = await reconcileControlledNativeCreation({ journal,
+    operationId: f.intent.operationId, rpc: runtime.options.rpc,
+    resolveSource: async (id, observedPath) => {
+      assert.equal(id, taskId);
+      observed.push(observedPath!);
+      return { sourceId: 'source-a', rolloutPath };
+    } });
+  assert.equal(receipt.threadId, taskId);
+  assert.equal(journal.get(f.intent.operationId)?.state, 'qualified');
+  assert.deepEqual(runtime.calls, ['thread/read', 'thread/turns/list', 'thread/goal/get',
+    'thread/queue/list', 'thread/read']);
+  assert.deepEqual(observed, [rolloutPath, rolloutPath]);
+  journal.close();
+});
+
+test('legacy incomplete started record remains readable but cannot reconcile', async () => {
+  const f = journalFixture(), runtime = fixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  await journal.persistIntent(f.intent);
+  await journal.persistStarted(f.started);
+  assert.equal(journal.get(f.intent.operationId)?.state, 'started');
+  await assert.rejects(reconcileControlledNativeCreation({ journal,
+    operationId: f.intent.operationId, rpc: runtime.options.rpc,
+    resolveSource: runtime.options.resolveSource }));
+  assert.equal(journal.get(f.intent.operationId)?.state, 'started');
+  assert.deepEqual(runtime.calls, []);
+  journal.close();
+});
+
+for (const failure of ['wrong-policy', 'wrong-source', 'active', 'resumed', 'new-turn',
+  'start-active', 'start-turn', 'shape-loss', 'thread-policy'] as const)
+  test(`reconciliation refuses ${failure} without any native mutation`, async () => {
+    const f = journalFixture(), runtime = fixture();
+    const journal = new ControlledNativeCreationJournal(f.filePath);
+    const started = fullStarted(f.started);
+    await journal.persistIntent(f.intent);
+    const selection = failure === 'wrong-policy' ? { ...started.selectedEffective,
+      approvalsReviewer: 'auto_review' }
+      : failure === 'start-active' ? { ...started.selectedEffective,
+        startThread: { ...started.selectedEffective.startThread!, status: 'active' } }
+      : failure === 'start-turn' ? { ...started.selectedEffective,
+        startThread: { ...started.selectedEffective.startThread!, turnCount: 1 } }
+      : failure === 'shape-loss' ? { ...started.selectedEffective, nativeShapeExact: false }
+      : failure === 'thread-policy' ? { ...started.selectedEffective,
+        startThread: { ...started.selectedEffective.startThread!, model: 'other' } }
+      : started.selectedEffective;
+    await journal.persistStarted({ ...started, selectedEffective: selection });
+    const original = runtime.options.rpc.request.bind(runtime.options.rpc);
+    const rpc = { ...runtime.options.rpc, request: async (...args: Parameters<typeof original>) => {
+      if (failure === 'active' && args[0] === 'thread/read') return { thread: {
+        ...startResult.thread, path: rolloutPath, status: { type: 'active' } } };
+      if (failure === 'resumed' && args[0] === 'thread/read') return { thread: {
+        ...startResult.thread, path: rolloutPath, turns: [{ id: 'unexpected' }] } };
+      if (failure === 'new-turn' && args[0] === 'thread/turns/list')
+        return { data: [{ id: 'unexpected' }], nextCursor: null };
+      return original(...args);
+    } };
+    await assert.rejects(reconcileControlledNativeCreation({ journal,
+      operationId: f.intent.operationId, rpc,
+      resolveSource: failure === 'wrong-source' ? async () => ({ sourceId: 'other', rolloutPath })
+        : runtime.options.resolveSource }));
+    assert.equal(journal.get(f.intent.operationId)?.state, 'started');
+    assert.equal(runtime.calls.includes('thread/start'), false);
+    journal.close();
+  });
