@@ -4,6 +4,9 @@ import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js
 import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
 import { qualifyNativeCliResumePolicy } from '../src/codex/native-cli-resume-policy.js';
+import { ManagedNativeCliSourceQualifier } from '../src/codex/managed-native-cli-source-qualifier.js';
+import type { ManagedWorkerNotification, ManagedWorkerPendingRequest } from
+  '../src/codex/managed-worker-frontend-host.js';
 
 const taskId = '01a0eb7e-bec3-7a93-9641-8c4fb5f15d6a';
 const ownerEpoch = 'f2945262-91bd-42ed-ac48-77dbca48a138';
@@ -94,12 +97,15 @@ test('CLI admission rechecks same-worker queue proof before durable host write',
       response: { turn: { id: 'native-turn' } } };
     } };
   const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch,
-    controlKey, qualify: async () => ({ taskId, ownerEpoch,
-      backendGeneration: 7, semanticRevision: 4, effectiveSettings: settings,
-      idle: true as const, nativeQueueEmpty: true as const,
-      noPendingAutoStart: true as const,
-      assertCurrent: () => { if (!current) throw new Error('stale'); },
-    }) });
+    controlKey, qualify: async resume => {
+      assert.deepEqual(resume, qualifyNativeCliResumePolicy(resumeResult(), taskId));
+      return { taskId, ownerEpoch,
+        backendGeneration: 7, semanticRevision: 4, effectiveSettings: settings,
+        idle: true as const, nativeQueueEmpty: true as const,
+        noPendingAutoStart: true as const,
+        assertCurrent: () => { if (!current) throw new Error('stale'); },
+      };
+    } });
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
   assert.throws(() => admission.bindHost(host, taskId, { ownerEpoch, controlKey }), /mismatch/);
   await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /resume/i);
@@ -230,4 +236,79 @@ test('native resume supplies the exact read-only policy tuple, not optional comp
     { ...resume, thread: { ...resume.thread, model: 'different' } },
     { ...resume, runtimeWorkspaceRoots: ['foreign'] },
   ]) assert.throws(() => qualifyNativeCliResumePolicy(value, taskId));
+});
+
+test('CLI source qualifier fences live worker changes around complete idle reads', async () => {
+  const controlKey = {}, adapterKey = {};
+  let notify: ((event: ManagedWorkerNotification) => void) | null = null;
+  let ownerCurrent = true, noPendingAutoStart = true, unresolved = 0;
+  let inFlight = 0, unconfirmed = false;
+  let acceptedQueue = false, acceptedReceipt = false, notifyDuringRead = false;
+  const thread = { ...resumeResult().thread, updatedAt: 5 };
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    observeNotifications(key: object, listener: (event: ManagedWorkerNotification) => void) {
+      assert.equal(key, adapterKey); notify = listener; return () => { notify = null; };
+    },
+    observePendingRequests(key: object, _listener: (event: ManagedWorkerPendingRequest) => void) {
+      assert.equal(key, adapterKey); return () => {};
+    },
+    async ownerRead(key: object, generation: number, method: string) {
+      assert.equal(key, controlKey); assert.equal(generation, 7);
+      if (method === 'thread/read') {
+        if (notifyDuringRead) {
+          notify?.({ taskId, generation: 7,
+            notification: { method: 'thread/settings/updated', params: { threadId: taskId } } });
+        }
+        return { thread };
+      }
+      if (method === 'thread/turns/list') return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'thread/queue/list') return { data: [], nextCursor: null };
+      throw new Error('unexpected read');
+    },
+    commandQuiescence: () => ({ inFlight, unconfirmed }),
+    requestQuiescence: () => ({ generation: 7, unresolved }),
+    acceptedCommandReceipts: () => acceptedReceipt ?
+      [{ method: 'turn/start' as const, receiptId: 'not-terminal' }] : [],
+    acceptedQueueInputs: () => acceptedQueue ?
+      [{ clientUserMessageId: clientId, submissionId: 'queued' }] : [],
+  };
+  const qualifier = new ManagedNativeCliSourceQualifier({ host, taskId, ownerEpoch,
+    adapterKey, controlKey, assertOwnerCurrent: () => ownerCurrent,
+    noPendingAutoStart: () => noPendingAutoStart });
+  qualifier.start();
+  const proof = await qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId));
+  assert.equal(proof.idle, true);
+  assert.equal(proof.nativeQueueEmpty, true);
+  assert.equal(proof.effectiveSettings.permissions, ':read-only');
+  proof.assertCurrent();
+  inFlight = 1;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /ledger/i);
+  inFlight = 0; unconfirmed = true;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /ledger/i);
+  unconfirmed = false; acceptedQueue = true;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /queue/i);
+  acceptedQueue = false; acceptedReceipt = true;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /history|incomplete/i);
+  acceptedReceipt = false;
+  unresolved = 1;
+  assert.throws(proof.assertCurrent, /pending|request/i);
+  unresolved = 0; noPendingAutoStart = false;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /auto|pending/i);
+  noPendingAutoStart = true;
+  notifyDuringRead = true;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /revision|changed/i);
+  notifyDuringRead = false;
+  (notify as ((event: ManagedWorkerNotification) => void) | null)?.({ taskId, generation: 7,
+    notification: { method: 'thread/settings/updated', params: { threadId: taskId } } });
+  assert.throws(proof.assertCurrent, /revision|changed/i);
+  ownerCurrent = false;
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)));
+  qualifier.close();
 });

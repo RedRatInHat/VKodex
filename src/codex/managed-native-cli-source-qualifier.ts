@@ -1,0 +1,135 @@
+import { isDeepStrictEqual } from 'node:util';
+import type { ManagedWorkerFrontendHost } from './managed-worker-frontend-host.js';
+import { readNativeCliIdleEvidence } from './managed-native-cli-source-reader.js';
+import type { NativeCliStartProof } from './managed-native-cli-start-admission.js';
+import type { NativeCliResumePolicy } from './native-cli-resume-policy.js';
+
+type Host = Pick<ManagedWorkerFrontendHost, 'ownerRead' | 'observeNotifications' |
+  'observePendingRequests' | 'commandQuiescence' | 'requestQuiescence' |
+  'acceptedCommandReceipts' | 'acceptedQueueInputs'> & {
+  readonly metadata: Readonly<{ taskId: string; state: string; backendGeneration: number | null }>;
+};
+export interface ManagedNativeCliSourceQualifierOptions {
+  readonly host: Host;
+  readonly adapterKey: object;
+  readonly controlKey: object;
+  readonly taskId: string;
+  readonly ownerEpoch: string;
+  /** Physical writer/family proof, supplied by the owner, never a task-path guess. */
+  readonly assertOwnerCurrent: () => boolean;
+  /** Synchronous stock scheduler/goal proof; not inferred from an empty queue. */
+  readonly noPendingAutoStart: () => boolean;
+}
+const fail = (reason: string): never => { throw new Error(`Native CLI source ${reason}`); };
+
+/** Opt-in same-worker source proof. Call start before exposing the frontend
+ * bearer. It never starts, resumes, stops or writes to a worker. */
+export class ManagedNativeCliSourceQualifier {
+  readonly #options: ManagedNativeCliSourceQualifierOptions;
+  #generation: number | null = null;
+  #revision = 0;
+  #started = false;
+  #faulted = false;
+  #closed = false;
+  #detachNotifications: (() => void) | null = null;
+  #detachRequests: (() => void) | null = null;
+
+  constructor(options: ManagedNativeCliSourceQualifierOptions) {
+    if (!options || !options.host || !options.adapterKey || !options.controlKey ||
+        typeof options.taskId !== 'string' || !options.taskId ||
+        typeof options.ownerEpoch !== 'string' || !options.ownerEpoch ||
+        typeof options.assertOwnerCurrent !== 'function' ||
+        typeof options.noPendingAutoStart !== 'function') fail('qualifier unavailable');
+    this.#options = Object.freeze({ ...options });
+  }
+
+  start(): void {
+    if (this.#started || this.#closed) fail('observer already used');
+    const meta = this.#options.host.metadata;
+    if (meta.taskId !== this.#options.taskId || meta.state !== 'running' ||
+        !Number.isSafeInteger(meta.backendGeneration) ||
+        (meta.backendGeneration ?? 0) < 1 ||
+        this.#options.assertOwnerCurrent() !== true) fail('owner unavailable');
+    this.#generation = meta.backendGeneration;
+    this.#started = true;
+    const changed = () => {
+      if (!Number.isSafeInteger(this.#revision + 1)) this.#faulted = true;
+      else this.#revision++;
+    };
+    try {
+      this.#detachNotifications = this.#options.host.observeNotifications(
+        this.#options.adapterKey, event => {
+          if (event.taskId !== this.#options.taskId ||
+              event.generation !== this.#generation) this.#faulted = true;
+          changed();
+        }, () => { this.#faulted = true; changed(); });
+      this.#detachRequests = this.#options.host.observePendingRequests(
+        this.#options.adapterKey, event => {
+          if (event.taskId !== this.#options.taskId ||
+              event.generation !== this.#generation) this.#faulted = true;
+          changed();
+        }, () => { this.#faulted = true; changed(); });
+      this.#check();
+    } catch (error) { this.close(); throw error; }
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true; this.#faulted = true;
+    this.#detachNotifications?.(); this.#detachRequests?.();
+    this.#detachNotifications = null; this.#detachRequests = null;
+  }
+
+  #check(revision?: number): void {
+    if (!this.#started || this.#closed || this.#faulted || this.#generation === null)
+      fail('observer unavailable');
+    const host = this.#options.host, meta = host.metadata;
+    if (meta.taskId !== this.#options.taskId || meta.state !== 'running' ||
+        meta.backendGeneration !== this.#generation ||
+        this.#options.assertOwnerCurrent() !== true)
+      fail('owner or worker changed');
+    if (revision !== undefined && this.#revision !== revision) fail('revision changed');
+    const requests = host.requestQuiescence(this.#options.controlKey);
+    if (requests.generation !== this.#generation || requests.unresolved !== 0)
+      fail('pending request');
+    // This first CLI write subset does not claim that an accepted stock queue
+    // item has been consumed. A future shared-queue qualifier must prove it.
+    if (host.acceptedQueueInputs(this.#options.controlKey).length !== 0)
+      fail('accepted queue input unqualified');
+    if (this.#options.noPendingAutoStart() !== true) fail('pending auto start');
+    if (revision !== undefined && this.#revision !== revision) fail('revision changed');
+  }
+
+  async qualify(resume: NativeCliResumePolicy): Promise<NativeCliStartProof> {
+    this.#check();
+    const generation = this.#generation!, revision = this.#revision;
+    const current = () => this.#check(revision);
+    const before = this.#options.host.commandQuiescence(this.#options.controlKey);
+    if (before.inFlight !== 0 || before.unconfirmed !== false)
+      fail('command ledger unsettled');
+    const receipts = this.#options.host.acceptedCommandReceipts(this.#options.controlKey);
+    if (receipts.some(receipt => receipt.method !== 'turn/start'))
+      fail('non-CLI command receipt unqualified');
+    const evidence = await readNativeCliIdleEvidence({ host: this.#options.host,
+      controlKey: this.#options.controlKey, taskId: this.#options.taskId,
+      generation, expectedCwd: resume.cwd, expectedModel: resume.model,
+      expectedEffort: resume.effort as string, assertCurrent: current });
+    current();
+    const after = this.#options.host.commandQuiescence(this.#options.controlKey);
+    if (after.inFlight !== 0 || after.unconfirmed !== false ||
+        !isDeepStrictEqual(receipts,
+          this.#options.host.acceptedCommandReceipts(this.#options.controlKey)) ||
+        receipts.some(receipt => !evidence.terminalTurnIds.includes(receipt.receiptId)))
+      fail('command history changed or incomplete');
+    current();
+    return Object.freeze({ taskId: this.#options.taskId,
+      ownerEpoch: this.#options.ownerEpoch, backendGeneration: generation,
+      semanticRevision: revision,
+      // These three fields are no-override CLI request semantics, not claims
+      // about unexposed per-thread settings in the native resume response.
+      effectiveSettings: Object.freeze({ ...resume, summary: null,
+        personality: null, collaborationMode: Object.freeze({ mode: 'default', settings: null }) }),
+      idle: true, nativeQueueEmpty: true, noPendingAutoStart: true,
+      assertCurrent: current });
+  }
+}

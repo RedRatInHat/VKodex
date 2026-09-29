@@ -30,7 +30,7 @@ export interface ManagedNativeCliStartAdmissionOptions {
   readonly ownerEpoch: string;
   readonly controlKey: object;
   /** Must independently prove source, native queue, active turn and goal state. */
-  readonly qualify: () => Promise<NativeCliStartProof>;
+  readonly qualify: (resume: NativeCliResumePolicy) => Promise<NativeCliStartProof>;
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 function assertSync(proof: NativeCliStartProof): void {
@@ -118,7 +118,7 @@ export class ManagedNativeCliStartAdmission {
     };
     this.#qualifying = true;
     let proof: NativeCliStartProof;
-    try { proof = await this.#options.qualify(); }
+    try { proof = await this.#options.qualify(resume.policy); }
     finally { this.#qualifying = false; }
     exactHost(); exactResume();
     if (!proof || proof.taskId !== taskId || proof.ownerEpoch !== this.ownerEpoch ||
