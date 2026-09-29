@@ -2773,10 +2773,10 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   };
   let cursor: import("../src/core/codex-tasks.js").QueuedInputHistoryCursor | null = null;
   let turnId: string | null = null;
-  for (let scanNumber = 0; scanNumber < 10; scanNumber++) {
+  for (let scanNumber = 0; scanNumber < 130; scanNumber++) {
     const before = calls.length;
     const result = await scanTerminalQueuedInputTurn("thread", "old-queue-id", list, cursor);
-    assert.ok(calls.length - before <= 20, "one scan must have a bounded native RPC budget");
+    assert.ok(calls.length - before <= 2, "one scan may parse at most two full native turns");
     if (result.done) { turnId = result.turnId; break; }
     cursor = result.cursor;
   }
@@ -2830,12 +2830,11 @@ test("terminal queue reconciliation survives appended turns but rejects a change
   if (first.done) return;
   turns.push({ id: "active-new", status: "inProgress", itemsView: "full",
     items: [{ type: "userMessage", clientId: "unrelated-active" }] });
-  const second = await scanTerminalQueuedInputTurn("thread", "queued-id", list, first.cursor);
-  assert.equal(second.done, false);
-  if (second.done) return;
-  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "queued-id", list, second.cursor),
-    { done: true, turnId: "turn-40" });
-  assert.ok(calls.length <= 43, "each continuation rechecks only the oldest page");
+  let result = await scanTerminalQueuedInputTurn("thread", "queued-id", list, first.cursor);
+  for (let scanNumber = 0; !result.done && scanNumber < 45; scanNumber++)
+    result = await scanTerminalQueuedInputTurn("thread", "queued-id", list, result.cursor);
+  assert.deepEqual(result, { done: true, turnId: "turn-40" });
+  assert.ok(calls.length <= 83, "each continuation rechecks only the oldest page");
 
   const prefix = await scanTerminalQueuedInputTurn("thread", "missing", list);
   assert.equal(prefix.done, false);

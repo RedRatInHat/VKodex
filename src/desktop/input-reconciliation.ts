@@ -110,7 +110,10 @@ export async function scanTerminalQueuedInputTurn(
     const matched = consume(oldest);
     if (matched) return { done: true, turnId: matched };
   }
-  while (cursor !== null && calls < 20) {
+  // A single full historical turn can be very large. Keep this maintenance
+  // pass below the bridge health deadline and persist the cursor for the next
+  // pass instead of parsing twenty heavy turns in one event-loop burst.
+  while (cursor !== null && calls < 2) {
     if (pages >= 5_000) throw new DesktopUnavailableError("История очереди превысила предел чтения.");
     const page = await read(cursor);
     calls++;
