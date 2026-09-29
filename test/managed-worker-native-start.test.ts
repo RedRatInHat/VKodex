@@ -305,6 +305,25 @@ test('opt-in first Composer fence refusal at actual write never reaches backend'
   } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('opt-in first Composer fence never falls back to ordinary or continuation starts', async () => {
+  const f = await fixture();
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-first-fence-no-fallback-'));
+  const store = new NativeStartIntentStore({ filePath: path.join(directory, 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
+    encryptionKey: randomBytes(32) });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store, qualifyFirstTurn: () => {} });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    const continued = continuationFixture(f).request;
+    await assert.rejects(handler.handle(continued, new AbortController().signal));
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    assert.equal(store.list().length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('unqualified native scope, lease, context and version cannot dispatch', async () => {
   const f = await fixture();
   try {

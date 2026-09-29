@@ -179,6 +179,9 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     const firstComposer = intent.uiParams !== null &&
       Array.isArray(storedAdmission.composer?.snapshot.turns) &&
       storedAdmission.composer.snapshot.turns.length === 0;
+    // A bounded first-turn route must not silently use the ordinary compiler
+    // or admit a continuation under a callback intended for an empty task.
+    if (this.#options.qualifyFirstTurn && !firstComposer) throw refused();
     let firstTurnFenceCalls = 0;
     const commandBytes = Buffer.byteLength(JSON.stringify(command));
     if (commandBytes > 32 * 1024 * 1024) throw refused();

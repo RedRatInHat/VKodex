@@ -13,6 +13,7 @@ import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-opera
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
+import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { ManagedWorkerControlClient } from '../src/desktop/managed-worker-control-client.js';
 import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
@@ -24,6 +25,16 @@ test('daemon requires explicit follower and IPC policy before private state is r
   assert.throws(() => new ManagedWorkerDaemon({
     baseDirectory: 'C:\\private', epoch: '11111111-1111-4111-8111-111111111111',
   } as never), /explicit.*polic/i);
+});
+
+test('one-shot first Composer cannot be enabled without a callback or alongside stock queue', () => {
+  const common = { baseDirectory: 'C:\\private', epoch: '11111111-1111-4111-8111-111111111111',
+    allowFollower: () => true, clientFactory: () => { throw new Error('unused'); },
+    verifyFamilyQuiescent: async () => true };
+  assert.throws(() => new ManagedWorkerDaemon({ ...common, oneShotFirstComposer: true as never }),
+    /One-shot first Composer/);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common, oneShotFirstComposer: () => true,
+    nativeStockQueue: {} as never }), /One-shot first Composer/);
 });
 
 test('opt-in native task-state listener publishes initial and changed state without another backend request', async () => {
@@ -879,7 +890,8 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
     'control-bind-fail' | 'endpoint-collision' = 'normal',
   stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | 'policy' | null = null,
   headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number,
-  nativeTaskState = false, handoffCapability?: object) {
+  nativeTaskState = false, handoffCapability?: object,
+  oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -901,6 +913,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
+    ...(oneShotFirstComposer ? { oneShotFirstComposer } : {}),
     ...(nativeTaskState ? { nativeTaskState: true as const } : {}),
     ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
       assertControlledNativeBaseline: () => stockFailure !== 'baseline',
@@ -1465,6 +1478,94 @@ test('pre-ready start cannot write; qualified first Composer start preserves inh
       backend.exitCode = 1; backend.emit('exit', 1, null); backend.emit('close', 1, null);
     }
   }
+});
+
+test('opt-in one-shot first Composer admission permits only one read-only start', async () => {
+  const phases: string[] = [];
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal',
+    false, null, undefined, undefined, false, undefined,
+    scope => { phases.push(scope.phase); return true; });
+  const { daemon, backend, brokers, home, privateDirectory, reserved } = own;
+  try {
+    const broker = brokers[0]!;
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: own.taskId, hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    const first = composerRequest(own.taskId, home, 'one-shot-first');
+    broker.send(first);
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'one-shot-first'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'one-shot-first')?.resultType, 'success');
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+    broker.send(composerRequest(own.taskId, home, 'one-shot-second'));
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'one-shot-second'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'one-shot-second')?.resultType, 'error');
+    assert.equal(backend.writes, 1);
+    const duplicate = structuredClone(first);
+    duplicate.requestId = 'one-shot-duplicate';
+    broker.send(duplicate);
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'one-shot-duplicate'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'one-shot-duplicate')?.resultType, 'success');
+    assert.equal(backend.writes, 1);
+    const intents = new Database(path.join(privateDirectory, 'start-intents.sqlite'), { readonly: true });
+    assert.equal((intents.prepare('SELECT count(*) AS n FROM native_start_intents').get() as { n: number }).n, 1);
+    intents.close();
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'stop-one-shot')).result,
+      { stopped: true });
+    assert.equal(daemon.metadata.state, 'stopped');
+  } finally { if (backend.exitCode === null) { backend.exitCode = 1;
+    backend.emit('exit', 1, null); backend.emit('close', 1, null); } }
+});
+
+test('one-shot first Composer budget remains consumed after pre-write refusal', async () => {
+  const phases: string[] = [];
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal',
+    false, null, undefined, undefined, false, undefined, scope => {
+      phases.push(scope.phase); return scope.phase === 'before-reservation';
+    });
+  const { backend, brokers, home, privateDirectory, reserved } = own;
+  try {
+    const broker = brokers[0]!;
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: own.taskId, hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    broker.send(composerRequest(own.taskId, home, 'refused-first'));
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'refused-first'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'refused-first')?.resultType, 'error');
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+    broker.send(composerRequest(own.taskId, home, 'refused-second'));
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === 'refused-second'));
+    assert.equal(broker.frames.find(frame => frame.requestId === 'refused-second')?.resultType, 'error');
+    assert.equal(backend.writes, 0);
+    const intents = new Database(path.join(privateDirectory, 'start-intents.sqlite'), { readonly: true });
+    assert.equal((intents.prepare('SELECT count(*) AS n FROM native_start_intents').get() as { n: number }).n, 1);
+    intents.close();
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'stop-refused-one-shot')).result,
+      { stopped: true });
+  } finally { if (backend.exitCode === null) { backend.exitCode = 1;
+    backend.emit('exit', 1, null); backend.emit('close', 1, null); } }
+});
+
+test('concurrent distinct one-shot Composer requests never create two intents or writes', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal',
+    false, null, undefined, undefined, false, undefined, () => true);
+  const { backend, brokers, home, privateDirectory, reserved } = own;
+  try {
+    const broker = brokers[0]!;
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: own.taskId, hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    broker.send(composerRequest(own.taskId, home, 'concurrent-first'));
+    broker.send(composerRequest(own.taskId, home, 'concurrent-second'));
+    await waitFor(() => ['concurrent-first', 'concurrent-second'].every(id =>
+      broker.frames.some(frame => frame.type === 'response' && frame.requestId === id)));
+    assert.ok(backend.writes <= 1);
+    const intents = new Database(path.join(privateDirectory, 'start-intents.sqlite'), { readonly: true });
+    assert.ok((intents.prepare('SELECT count(*) AS n FROM native_start_intents').get() as { n: number }).n <= 1);
+    intents.close();
+    assert.deepEqual((await controlStop(privateDirectory, reserved.epoch, 'stop-concurrent-one-shot')).result,
+      { stopped: true });
+  } finally { if (backend.exitCode === null) { backend.exitCode = 1;
+    backend.emit('exit', 1, null); backend.emit('close', 1, null); } }
 });
 
 test('definitive family refusal preserves worker and permits a new explicit stop', async () => {

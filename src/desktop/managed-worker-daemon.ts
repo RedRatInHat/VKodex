@@ -11,7 +11,8 @@ import { compileNativeRequestResponse } from '../codex/native-request-response.j
 import type { AppServerServerRequest } from '../codex/app-server-connection.js';
 import { bootstrapManagedWorker,
   type ManagedWorkerBootstrap, type ContinuationOwnerFence } from './managed-worker-bootstrap.js';
-import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata } from './managed-worker-native-owner.js';
+import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata,
+  type ManagedWorkerNativeOwnerOptions } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
   type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope } from './managed-worker-control.js';
@@ -77,6 +78,9 @@ export interface ManagedWorkerDaemonOptions {
   }>;
   /** Explicit private native projection listener. It adds no writer capability. */
   readonly nativeTaskState?: true;
+  /** Explicit isolated first-turn route. The callback must validate its own
+   * one-shot challenge; the private intent store caps distinct starts at one. */
+  readonly oneShotFirstComposer?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>;
   /** Injectable seams for isolated tests, not remote control methods. */
   readonly dependencies?: Readonly<{
     loadPrivateState?: typeof loadManagedWorkerPrivateState;
@@ -160,6 +164,9 @@ export class ManagedWorkerDaemon {
     const stock = options.nativeStockQueue;
     if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
       throw new TypeError('Managed native task-state listener requires explicit opt-in');
+    if (options.oneShotFirstComposer !== undefined &&
+        (typeof options.oneShotFirstComposer !== 'function' || stock !== undefined))
+      throw new TypeError('One-shot first Composer requires a non-stock synchronous admission');
     if (stock !== undefined && (!object(stock) ||
       !isDeepStrictEqual(Object.keys(stock).sort(),
         ['assertControlledNativeBaseline', 'createProbeClient', 'sourceGeneration',
@@ -559,7 +566,8 @@ export class ManagedWorkerDaemon {
       }
       this.#intentStore = new NativeStartIntentStore({ filePath: path.join(state.privateDirectory, 'start-intents.sqlite'),
         ownerEpoch: manifest.epoch, backendGeneration: meta.backendGeneration, threadId: manifest.taskId,
-        encryptionKey: Buffer.from(state.keys.intentKey, 'base64') });
+        encryptionKey: Buffer.from(state.keys.intentKey, 'base64'),
+        ...(this.#options.oneShotFirstComposer ? { maxRows: 1 } : {}) });
       let ownedClient: DesktopIpcClient | null = null;
       const confirmStockOwner = async (scope: Readonly<{taskId: string; ownerEpoch: string}>): Promise<boolean> => {
         if (!this.#options.nativeStockQueue || scope.taskId !== manifest.taskId ||
@@ -594,6 +602,7 @@ export class ManagedWorkerDaemon {
         allowFollower: this.#options.allowFollower,
         readInitialState: initialized ? initialized.readInitialState : this.#bootstrap.readInitialState,
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
+        ...(this.#options.oneShotFirstComposer ? { qualifyFirstTurn: this.#options.oneShotFirstComposer } : {}),
         ...(queueAdapterFactory ? { queueAdapterFactory } : {}),
         ...(manifest.approvedTaskPolicy ? {} : {
           qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),
