@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rm, statfs } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import path from "node:path";
+import { promisify } from "node:util";
 import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
@@ -76,6 +78,26 @@ const VK_DOCUMENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const INITIAL_LATE_SCAN_MS = 60_000;
 const MAX_LATE_SCAN_MS = 60 * 60_000;
 const LATE_SCAN_WINDOW_MS = 48 * 60 * 60_000;
+const STAGE_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const MIN_STAGE_FREE_BYTES = 512 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
+/** Windows-only single-file Recycle Bin move. Isolated same-session canary
+ * passed; automatic retention still requires a stronger object-identity fence. */
+export async function recycleStageOnWindows(target: string): Promise<void> {
+  if (process.platform !== "win32") throw new ActionRejectedError("Корзина Windows недоступна на этой платформе.");
+  if (!path.isAbsolute(target)) throw new ActionRejectedError("Для Корзины требуется абсолютный путь к файлу.");
+  const before = await lstat(target).catch(() => { throw new ActionRejectedError("Файл для Корзины недоступен; резерв сохранён."); });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1)
+    throw new ActionRejectedError("Файл для Корзины должен быть обычным файлом без ссылок.");
+  // The path travels through the child environment, never through PowerShell
+  // source or a shell-interpreted argument.
+  const command = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:VKODEX_STAGE_RECYCLE_TARGET, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)";
+  try {
+    await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")], {
+      env: { ...process.env, VKODEX_STAGE_RECYCLE_TARGET: target }, windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024,
+    });
+  } catch { throw new ActionRejectedError("Не удалось переместить staged-файл в Корзину Windows; резерв сохранён."); }
+}
 function isOwnedDocumentRecord(record: VkDocumentRecord): boolean {
   if (!record.fileKey.startsWith("file:")) return false;
   const match = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(record.attachment);
@@ -308,11 +330,17 @@ export class TaskFiles {
   private readonly retries = new Map<string, number>();
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
+  private reconciliation: Promise<number> | null = null;
   private stopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
-    /** Kept off in production until staged-file retention and disk admission are implemented. */
-    private readonly stageNewUploads = false) {}
+    /** Kept off in production until recycle identity and end-to-end acceptance are proven. */
+    private readonly stageNewUploads = false,
+    private readonly recycleStage: (target: string) => Promise<void> = recycleStageOnWindows,
+    private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
+      const free = await statfs(folder);
+      return BigInt(free.bavail) * BigInt(free.bsize);
+    }) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private terminalTurns(bindingId: string): ReadonlySet<string> {
@@ -370,8 +398,11 @@ export class TaskFiles {
     const existing = this.stageIndex(binding.id, job.operationId)[key];
     if (existing) return existing;
     const folder = await this.stageDirectory(job, binding.id);
+    const observedFree = await this.stageFreeBytes(folder);
+    if (observedFree < BigInt(MIN_STAGE_FREE_BYTES + file.contents.length))
+      throw new ActionRejectedError("Недостаточно свободного места для staged-файла и резерва диска. Загрузка в VK остановлена.");
     const target = path.join(folder, `${randomUUID()}.bin`);
-    const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target);
+    const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target, observedFree);
     if (reservation === "limit") throw new ActionRejectedError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
     if (reservation === "existing") throw new ActionRejectedError("Обнаружена незавершённая staged-версия файла. Загрузка остановлена до сверки сохранённых данных; повтор не создаст другую версию автоматически.");
     const handle = await open(target, "wx", 0o600);
@@ -386,6 +417,40 @@ export class TaskFiles {
       this.store.markStageReady(key, target);
     });
     return receipt;
+  }
+  /** Explicit maintenance entry point. Never runs from tick and never touches
+   * incomplete reservations, unknown uploads, or undelivered VK batches. */
+  reconcileStagedArtifacts(now = Date.now()): Promise<number> {
+    if (this.reconciliation) return this.reconciliation;
+    const work = this.reconcileStagedArtifactsNow(now).finally(() => { this.reconciliation = null; });
+    this.reconciliation = work;
+    return work;
+  }
+  private async reconcileStagedArtifactsNow(now: number): Promise<number> {
+    if (!Number.isSafeInteger(now) || now < STAGE_RETENTION_MS) throw new RangeError("Invalid stage reconciliation time");
+    let recycled = 0;
+    for (const row of this.store.stageRecycleCandidates()) {
+      const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key];
+      if (!receipt || receipt.path !== row.path || receipt.bytes !== row.bytes || receipt.key !== row.key
+        || !receipt.deliveryKey?.startsWith(`files:${row.bindingId}:${row.operationId}:`)
+        || !receipt.attachment || !Number.isSafeInteger(receipt.peerId) || receipt.peerId! <= 0
+        || !Number.isSafeInteger(receipt.stagedAt) || receipt.stagedAt <= 0 || receipt.stagedAt > now - STAGE_RETENTION_MS
+        || this.store.getValue<boolean>(`${row.key}:queued`) !== true
+        || this.store.getValue<string>(`${row.key}:upload-state`) !== "uploaded"
+        || this.store.getValue<string>(`${row.key}:uploaded`) !== receipt.attachment
+        || !this.store.hasConfirmedFileDelivery(receipt.deliveryKey, row.bindingId, receipt.peerId!, receipt.attachment)) continue;
+      const job = this.jobs(row.bindingId).find(item => item.operationId === row.operationId);
+      if (!job) continue;
+      try { await this.stagedContents(receipt, job, row.bindingId); }
+      catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
+      if (!this.store.markStageRecyclePending(row.key, row.path)) continue;
+      // A failed or interrupted move leaves the reservation charged. Missing
+      // files on a later run are not interpreted as successful recycling.
+      await this.recycleStage(row.path);
+      this.store.markStageRecycled(row.key, row.path);
+      recycled++;
+    }
+    return recycled;
   }
   private async cleanupDocuments(except: readonly string[]): Promise<"removed" | "no-candidate" | "not-removed"> {
     if (!this.chat.cleanupDocuments) return "not-removed";

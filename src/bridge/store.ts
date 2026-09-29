@@ -239,6 +239,11 @@ export class BridgeStore {
         bytes INTEGER NOT NULL CHECK(bytes >= 0), path TEXT NOT NULL UNIQUE,
         state TEXT NOT NULL CHECK(state IN ('reserved', 'ready')), created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS bridge_stage_recycling (
+        file_key TEXT PRIMARY KEY REFERENCES bridge_stage_reservations(file_key),
+        state TEXT NOT NULL CHECK(state IN ('pending', 'recycled')),
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
         operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id),
@@ -851,8 +856,10 @@ export class BridgeStore {
 
   /** Reservations stay charged after a crash until a separate reconciler safely
    * resolves them. Existing keys never get a new path or byte count. */
-  reserveStage(fileKey: string, bindingId: string, operationId: string, bytes: number, stagedPath: string): "reserved" | "existing" | "limit" {
+  reserveStage(fileKey: string, bindingId: string, operationId: string, bytes: number, stagedPath: string,
+    observedFreeBytes?: bigint): "reserved" | "existing" | "limit" {
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 200 * 1024 * 1024 || !stagedPath) throw new RangeError("Invalid staged file reservation");
+    if (observedFreeBytes !== undefined && (typeof observedFreeBytes !== "bigint" || observedFreeBytes < 0n)) throw new RangeError("Invalid stage free-space observation");
     if (this.stageLegacyUnaccounted) return "limit";
     return this.atomic(() => {
       const existing = this.db.prepare("SELECT binding_id, operation_id, bytes, path FROM bridge_stage_reservations WHERE file_key = ?")
@@ -863,7 +870,11 @@ export class BridgeStore {
       }
       const operationBytes = this.stageReservedBytes(bindingId, operationId);
       const globalBytes = this.stageReservedBytes();
-      if (operationBytes + bytes > 512 * 1024 * 1024 || globalBytes + bytes > 2 * 1024 * 1024 * 1024
+      // Count every active reservation against one possibly stale statfs
+      // observation. Ready files are counted twice by design: the conservative
+      // floor remains safe when concurrent bridge writers share this database.
+      if (observedFreeBytes !== undefined && observedFreeBytes < 512n * 1024n * 1024n + BigInt(globalBytes + bytes)
+        || operationBytes + bytes > 512 * 1024 * 1024 || globalBytes + bytes > 2 * 1024 * 1024 * 1024
         || this.stageReservedCount(bindingId, operationId) >= BridgeStore.MAX_STAGE_FILES_PER_OPERATION
         || this.stageReservedCount() >= BridgeStore.MAX_STAGE_FILES_GLOBAL) return "limit";
       this.db.prepare("INSERT INTO bridge_stage_reservations(file_key, binding_id, operation_id, bytes, path, state, created_at) VALUES (?, ?, ?, ?, ?, 'reserved', ?)")
@@ -875,8 +886,8 @@ export class BridgeStore {
   stageReservedBytes(bindingId?: string, operationId?: string): number {
     if ((bindingId === undefined) !== (operationId === undefined)) throw new RangeError("Both stage owner fields are required");
     const row = bindingId === undefined
-      ? this.db.prepare("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM bridge_stage_reservations").get() as { bytes: number }
-      : this.db.prepare("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM bridge_stage_reservations WHERE binding_id = ? AND operation_id = ?")
+      ? this.db.prepare("SELECT COALESCE(SUM(r.bytes), 0) AS bytes FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key WHERE c.state IS NULL OR c.state <> 'recycled'").get() as { bytes: number }
+      : this.db.prepare("SELECT COALESCE(SUM(r.bytes), 0) AS bytes FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key WHERE r.binding_id = ? AND r.operation_id = ? AND (c.state IS NULL OR c.state <> 'recycled')")
         .get(bindingId, operationId) as { bytes: number };
     return row.bytes;
   }
@@ -884,8 +895,8 @@ export class BridgeStore {
   stageReservedCount(bindingId?: string, operationId?: string): number {
     if ((bindingId === undefined) !== (operationId === undefined)) throw new RangeError("Both stage owner fields are required");
     const row = bindingId === undefined
-      ? this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations").get() as { count: number }
-      : this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations WHERE binding_id = ? AND operation_id = ?")
+      ? this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key WHERE c.state IS NULL OR c.state <> 'recycled'").get() as { count: number }
+      : this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key WHERE r.binding_id = ? AND r.operation_id = ? AND (c.state IS NULL OR c.state <> 'recycled')")
         .get(bindingId, operationId) as { count: number };
     return row.count;
   }
@@ -893,6 +904,37 @@ export class BridgeStore {
   markStageReady(fileKey: string, stagedPath: string): void {
     const result = this.db.prepare("UPDATE bridge_stage_reservations SET state = 'ready' WHERE file_key = ? AND path = ? AND state = 'reserved'").run(fileKey, stagedPath);
     if (result.changes !== 1) throw new Error("Missing staged file reservation");
+  }
+
+  stageRecycleCandidates(limit = BridgeStore.MAX_STAGE_FILES_GLOBAL): readonly { key: string; bindingId: string; operationId: string; path: string; bytes: number; recycling: "pending" | null }[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > BridgeStore.MAX_STAGE_FILES_GLOBAL) throw new RangeError("Invalid stage reconciliation limit");
+    const rows = this.db.prepare(`SELECT r.file_key, r.binding_id, r.operation_id, r.path, r.bytes, c.state AS recycling
+      FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key
+      WHERE r.state = 'ready' AND (c.state IS NULL OR c.state = 'pending')
+      ORDER BY r.created_at, r.file_key LIMIT ?`).all(limit) as {
+      file_key: string; binding_id: string; operation_id: string; path: string; bytes: number; recycling: "pending" | null;
+    }[];
+    return rows.map(row => ({ key: row.file_key, bindingId: row.binding_id, operationId: row.operation_id,
+      path: row.path, bytes: row.bytes, recycling: row.recycling }));
+  }
+
+  markStageRecyclePending(fileKey: string, stagedPath: string): boolean {
+    return this.atomic(() => {
+      const ready = this.db.prepare("SELECT 1 FROM bridge_stage_reservations WHERE file_key = ? AND path = ? AND state = 'ready'").get(fileKey, stagedPath);
+      if (!ready) return false;
+      const state = this.db.prepare("SELECT state FROM bridge_stage_recycling WHERE file_key = ?").get(fileKey) as { state: string } | undefined;
+      if (state?.state === "recycled") return false;
+      if (!state) this.db.prepare("INSERT INTO bridge_stage_recycling(file_key, state, updated_at) VALUES (?, 'pending', ?)").run(fileKey, Date.now());
+      return true;
+    });
+  }
+
+  markStageRecycled(fileKey: string, stagedPath: string): void {
+    const result = this.db.prepare(`UPDATE bridge_stage_recycling SET state = 'recycled', updated_at = ?
+      WHERE file_key = ? AND state = 'pending' AND EXISTS
+        (SELECT 1 FROM bridge_stage_reservations WHERE file_key = ? AND path = ? AND state = 'ready')`)
+      .run(Date.now(), fileKey, fileKey, stagedPath);
+    if (result.changes !== 1) throw new Error("Staged file was not pending recycling");
   }
 
   claimInitialHandoff(bindingId: string, task: TaskRef, now = Date.now()): boolean {

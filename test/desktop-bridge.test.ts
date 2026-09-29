@@ -3238,6 +3238,143 @@ test("confirmed file delivery requires the exact batch, binding, and attachment 
   restored.close();
 });
 
+test("stage retention waits seven days and an exact confirmed send before recycling", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-retention-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "retention", []);
+  files.finish(binding.id, "retention", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "retained bytes");
+  assert.equal(await files.collect(binding, true), 1);
+  const receipt = Object.values(s.store.getValue<Record<string, { path: string; bytes: number }>>(`file-stage-index:${binding.id}:retention`) ?? {})[0]!;
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.deepEqual(recycled, []);
+  await s.worker.flush();
+  assert.equal(await files.reconcileStagedArtifacts(), 1);
+  assert.deepEqual(recycled, [receipt.path]);
+  assert.equal(s.store.stageReservedBytes(binding.id, "retention"), 0);
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.equal(await readFile(receipt.path, "utf8"), "retained bytes"); // injected recycler never deletes fixture bytes
+});
+
+test("staging refuses low physical free space even when logical quota is available", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-free-space-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {}, async () => 0n);
+  const prepared = await files.prepare(binding, "low-space", []);
+  files.finish(binding.id, "low-space", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await assert.rejects(files.collect(binding, true), /Недостаточно свободного места/u);
+  assert.equal(s.store.stageReservedBytes(), 0);
+  assert.equal(s.chat.binaryUploads.length, 0);
+});
+
+test("transactional admission accounts for concurrent reservations against one free-space snapshot", t => {
+  const s = setup(t);
+  const frozenFree = 1024n * 1024n * 1024n;
+  const bytes = 200 * 1024 * 1024;
+  assert.equal(s.store.reserveStage("concurrent-a", "one", "operation", bytes, "private-a", frozenFree), "reserved");
+  assert.equal(s.store.reserveStage("concurrent-b", "two", "operation", bytes, "private-b", frozenFree), "reserved");
+  assert.equal(s.store.reserveStage("concurrent-c", "three", "operation", bytes, "private-c", frozenFree), "limit");
+  assert.equal(s.store.stageReservedBytes(), 2 * bytes);
+});
+
+test("stageFile submits its free-space snapshot to transactional admission", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-concurrent-free-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {}, async () => 700n * 1024n * 1024n);
+  const prepared = await files.prepare(binding, "snapshot-admission", []);
+  files.finish(binding.id, "snapshot-admission", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  assert.equal(s.store.reserveStage("already-admitted", "other", "operation", 200 * 1024 * 1024, "private-existing"), "reserved");
+  await assert.rejects(files.collect(binding, true), /лимит.*staged/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
+  assert.equal(s.store.stageReservedBytes(), 200 * 1024 * 1024);
+});
+
+test("stage retention fails closed for unknown upload, incomplete reserve, and corrupt bytes", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-retention-guard-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "guards", []);
+  files.finish(binding.id, "guards", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "good bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; path: string }>>(`file-stage-index:${binding.id}:guards`) ?? {})[0]!;
+  s.store.setValue(`${receipt.key}:upload-state`, "unknown");
+  s.store.reserveStage("orphan-reservation", binding.id, "guards", 9, path.join(root, "orphan.bin"));
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  s.store.setValue(`${receipt.key}:upload-state`, "uploaded");
+  await writeFile(receipt.path, "bad bytes!");
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.deepEqual(recycled, []);
+  assert.equal(s.store.stageReservedBytes(binding.id, "guards"), "good bytes".length + 9);
+});
+
+test("failed recycling keeps the reservation charged and a retry can complete", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-retry-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let attempts = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {
+    if (++attempts === 1) throw new Error("Recycle Bin unavailable");
+  });
+  const prepared = await files.prepare(binding, "retry-recycle", []);
+  files.finish(binding.id, "retry-recycle", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  now += 8 * 24 * 60 * 60_000;
+  await assert.rejects(files.reconcileStagedArtifacts(), /Recycle Bin unavailable/u);
+  assert.equal(s.store.stageReservedBytes(binding.id, "retry-recycle"), 5);
+  assert.equal(await files.reconcileStagedArtifacts(), 1);
+  assert.equal(s.store.stageReservedBytes(binding.id, "retry-recycle"), 0);
+});
+
+test("a lost recycle acknowledgement remains charged when the staged path cannot be verified", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-uncertain-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let moves = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const prepared = await files.prepare(binding, "uncertain-recycle", []);
+  files.finish(binding.id, "uncertain-recycle", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  now += 8 * 24 * 60 * 60_000;
+  const lost = t.mock.method(s.store, "markStageRecycled", () => { throw new Error("receipt lost after recycle"); });
+  await assert.rejects(files.reconcileStagedArtifacts(), /receipt lost after recycle/u);
+  lost.mock.restore();
+  assert.equal(moves, 1);
+  assert.equal(s.store.stageReservedBytes(binding.id, "uncertain-recycle"), 5);
+  const unavailable = t.mock.method(files as unknown as { stagedContents: () => Promise<Buffer> }, "stagedContents", async () => {
+    throw new ActionRejectedError("staged path missing after recycle");
+  });
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  unavailable.mock.restore();
+  assert.equal(moves, 1);
+  assert.equal(s.store.stageReservedBytes(binding.id, "uncertain-recycle"), 5);
+});
+
+test("a pending recycle remains charged across database restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-journal-test-"));
+  const filename = path.join(root, "bridge.sqlite"); const stagedPath = path.join(root, "stage.bin");
+  const initial = new BridgeStore(filename);
+  assert.equal(initial.reserveStage("stage-key", "binding", "operation", 10, stagedPath), "reserved");
+  initial.markStageReady("stage-key", stagedPath);
+  assert.equal(initial.markStageRecyclePending("stage-key", stagedPath), true);
+  initial.close();
+  const recovered = new BridgeStore(filename);
+  assert.equal(recovered.stageReservedBytes(), 10);
+  assert.equal(recovered.stageRecycleCandidates()[0]?.recycling, "pending");
+  recovered.markStageRecycled("stage-key", stagedPath);
+  assert.equal(recovered.stageReservedBytes(), 0);
+  recovered.close();
+  const again = new BridgeStore(filename);
+  assert.equal(again.stageRecycleCandidates().length, 0);
+  assert.equal(again.stageReservedBytes(), 0);
+  again.close();
+});
+
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
