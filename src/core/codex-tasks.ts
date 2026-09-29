@@ -273,6 +273,12 @@ export interface DesktopCompatibility {
   readonly message: string;
 }
 
+/** Native evidence for a goal continuation; it is not a claim that the goal completed. */
+export interface GoalContinuationReceipt {
+  readonly mode: "started" | "alreadyRunning";
+  readonly turnId: string;
+}
+
 /** Transport-neutral Codex task port consumed by the VK bridge core. */
 export interface CodexTasks {
   pendingQuestions?(task: TaskRef): Promise<readonly import("./codex-questions.js").CodexQuestions[]>;
@@ -318,7 +324,7 @@ export interface CodexTasks {
   healthGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
-  continueGoal?(task: TaskRef, operationId: string): Promise<void>;
+  continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;
   /** Bring the configured Codex client to the foreground after an explicit user action. */
   revealTask?(task: TaskRef): Promise<void>;
   /** One-time handoff used after a task or transfer is first linked to VK. */

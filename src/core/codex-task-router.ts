@@ -3,7 +3,7 @@ import { ActionRejectedError, TaskOwnedByClientError, type AccountUsage, type Co
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
-  type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome } from "./codex-tasks.js";
+  type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome, type GoalContinuationReceipt } from "./codex-tasks.js";
 
 export interface CodexTaskOwner {
   /** An exclusive claim is independent of transient adapter readiness. */
@@ -23,7 +23,7 @@ export interface CodexTaskOwner {
   setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal(task: TaskRef): Promise<boolean>;
   /** Must confirm a continuation turn or an already running turn. */
-  continueGoal?(task: TaskRef, operationId: string): Promise<void>;
+  continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]>;
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
@@ -269,7 +269,7 @@ export class RoutedCodexTasks implements CodexTasks {
   async clearGoal(task: TaskRef): Promise<boolean> {
     const owner = this.owner(task); return owner?.clearGoal(task) ?? this.base.clearGoal?.(task) ?? Promise.resolve(false);
   }
-  async continueGoal(task: TaskRef, operationId: string): Promise<void> {
+  async continueGoal(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt> {
     const owner = this.owner(task);
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
     if (owner) {

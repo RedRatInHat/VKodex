@@ -1,4 +1,4 @@
-import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskConnectionLostError, TaskNotOpenError, UncertainActionError, ProjectAssignmentUnconfirmedError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTaskCreator, type DesktopTaskLauncher, type DesktopTasks, type DesktopTaskTransfer, type EditLastUserTurnRequest, type EditLastUserTurnResult, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef, type TransferTaskRequest } from "./contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TaskConnectionLostError, TaskNotOpenError, UncertainActionError, ProjectAssignmentUnconfirmedError, sameTask, type AccountUsageProvider, type CreateTaskRequest, type DesktopCompatibility, type DesktopGoals, type DesktopMetadata, type DesktopTaskCreator, type DesktopTaskLauncher, type DesktopTasks, type DesktopTaskTransfer, type EditLastUserTurnRequest, type EditLastUserTurnResult, type GoalContinuationReceipt, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskGoalUpdate, type TaskRef, type TransferTaskRequest } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
@@ -137,13 +137,18 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.goals.clear(task);
   }
 
-  async continueGoal(task: TaskRef, operationId: string): Promise<void> {
-    await this.follow(task, async (subscription, client) => {
+  async continueGoal(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt> {
+    return this.follow(task, async (subscription, client) => {
       // A resumed goal belongs to an existing history. Wait for the live
       // owner's settled snapshot, then recheck it immediately before writing.
       // Unknown start outcomes remain uncertain; this path never retries them.
-      await this.withReadySubmission(subscription, false, undefined, async (mode, owner) => {
-        if (mode === "steer") return;
+      return this.withReadySubmission(subscription, false, undefined, async (mode, owner) => {
+        if (mode === "steer") {
+          const active = activeTurnsFromState(subscription.current!);
+          if (active.length !== 1 || typeof active[0]!.turnId !== "string" || !active[0]!.turnId)
+            throw new ActionRejectedError("Нельзя подтвердить выполняющийся ход цели. Обнови задачу в Codex; новый ход не отправлен.");
+          return { mode: "alreadyRunning", turnId: active[0]!.turnId };
+        }
         const reply = await client.request("thread-follower-start-turn", 2, {
           conversationId: task.threadId,
           turnStart: {
@@ -153,6 +158,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
         }, { targetClientId: owner, timeoutMs: 30_000, mutating: true });
         const result = isObject(reply.result) && isObject(reply.result.result) ? reply.result.result : null;
         if (!isObject(result?.turn) || typeof result.turn.id !== "string" || !result.turn.id) throw new UncertainActionError();
+        return { mode: "started", turnId: result.turn.id };
       });
     });
   }

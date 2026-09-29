@@ -61,8 +61,8 @@ test("metadata and goals use the selected profile owner", async () => {
 
 test("goal continuation uses only an owner that can confirm it", async () => {
   const f = fixture();
-  f.owner.continueGoal = async () => { f.calls.push("owner:continue-goal"); };
-  await f.routed.continueGoal!(work, "resume-routed");
+  f.owner.continueGoal = async () => { f.calls.push("owner:continue-goal"); return { mode: "started", turnId: "goal-turn" }; };
+  assert.deepEqual(await f.routed.continueGoal!(work, "resume-routed"), { mode: "started", turnId: "goal-turn" });
   assert.deepEqual(f.calls, ["owner:continue-goal"]);
 });
 

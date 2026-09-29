@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -45,6 +45,15 @@ interface GoalContinuationState {
   taskKey: string;
   goalCreatedAt: number | null;
   phase: "activating" | "sending" | "accepted" | "rejected" | "uncertain";
+  /** Optional so pre-receipt durable markers from earlier releases remain readable. */
+  receipt?: GoalContinuationReceipt;
+}
+
+function validGoalContinuationReceipt(value: unknown): value is GoalContinuationReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return ["started", "alreadyRunning"].includes(String(receipt.mode))
+    && typeof receipt.turnId === "string" && receipt.turnId.length > 0;
 }
 
 function validGoalContinuation(value: unknown): value is GoalContinuationState {
@@ -53,7 +62,8 @@ function validGoalContinuation(value: unknown): value is GoalContinuationState {
   return typeof record.operationId === "string" && record.operationId.length > 0
     && typeof record.taskKey === "string" && record.taskKey.length > 0
     && (record.goalCreatedAt === null || typeof record.goalCreatedAt === "number" && Number.isFinite(record.goalCreatedAt))
-    && ["activating", "sending", "accepted", "rejected", "uncertain"].includes(String(record.phase));
+    && ["activating", "sending", "accepted", "rejected", "uncertain"].includes(String(record.phase))
+    && (record.receipt === undefined || validGoalContinuationReceipt(record.receipt));
 }
 
 const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
@@ -539,7 +549,7 @@ export class TaskPanels {
           this.markGoalContinuation(binding, attempt, "uncertain");
           throw error;
         }
-        const note = await this.goalContinuationNote(binding, updated, attempt, "Цель возобновлена. Новый ход запущен или уже выполняется.");
+        const note = await this.goalContinuationNote(binding, updated, attempt);
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, note);
         break;
@@ -724,7 +734,7 @@ export class TaskPanels {
       throw error;
     }
     const activationNote = !current || current.status === "complete"
-      ? await this.goalContinuationNote(binding, updated, attempt!, "Цель сохранена и активирована. Новый ход запущен или уже выполняется.")
+      ? await this.goalContinuationNote(binding, updated, attempt!)
       : null;
     const next = this.newState(binding.peerId!, binding.id, "goal");
     const note = activationNote ?? (current?.status === "active" ? "Активная цель обновлена." : "Цель обновлена; её прежний статус сохранён.");
@@ -758,16 +768,18 @@ export class TaskPanels {
     return raw === null ? null : validGoalContinuation(raw) ? raw : "malformed";
   }
 
-  private async goalContinuationNote(binding: Binding, goal: TaskGoal, attempt: GoalContinuationState, success: string): Promise<string> {
+  private async goalContinuationNote(binding: Binding, goal: TaskGoal, attempt: GoalContinuationState): Promise<string> {
     if (!this.desktop.continueGoal) {
       this.markGoalContinuation(binding, attempt, "rejected", goal);
       return "Цель активна, но следующий ход не запущен: продолжение недоступно в этом подключении.";
     }
     this.markGoalContinuation(binding, attempt, "sending", goal);
     try {
-      await this.desktop.continueGoal(binding, attempt.operationId);
-      this.markGoalContinuation(binding, attempt, "accepted", goal);
-      return success;
+      const receipt = await this.desktop.continueGoal(binding, attempt.operationId);
+      this.markGoalContinuation(binding, { ...attempt, receipt }, "accepted", goal);
+      return receipt.mode === "started"
+        ? "Цель возобновлена. Новый ход запущен."
+        : "Цель возобновлена. Уже выполняется подтверждённый ход.";
     } catch (error) {
       if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
         this.markGoalContinuation(binding, attempt, "rejected", goal);

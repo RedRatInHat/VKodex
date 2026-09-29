@@ -3534,12 +3534,12 @@ test("an idle runtime with a possibly current in-progress turn fails closed", as
   assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" || message.method === "thread-follower-steer-turn"), false);
 });
 
-test("resuming a goal wakes an idle live owner with an empty inherited turn and never steers an active turn", async () => {
+test("resuming a goal returns either its new turn or the proven already-active turn", async () => {
   for (const status of ["completed", "inProgress"] as const) {
     const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: status === "inProgress" ? "active" : "idle" } };
     const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 50));
-    await adapter.continueGoal(ref, `goal-resume-${status}`);
+    const receipt = await adapter.continueGoal(ref, `goal-resume-${status}`);
     const starts = server.received.filter(message => message.method === "thread-follower-start-turn");
     assert.equal(starts.length, status === "completed" ? 1 : 0);
     if (status === "completed") {
@@ -3550,10 +3550,25 @@ test("resuming a goal wakes an idle live owner with an empty inherited turn and 
       assert.deepEqual(((params.turnStart as IpcObject).request as IpcObject).input, []);
       assert.equal(typeof ((params.turnStart as IpcObject).request as IpcObject).clientUserMessageId, "string");
       assert.deepEqual((params.turnStart as IpcObject).context, { inheritThreadSettings: true });
+      assert.deepEqual(receipt, { mode: "started", turnId: "next-turn" });
+    } else {
+      assert.deepEqual(receipt, { mode: "alreadyRunning", turnId: "fixture-turn" });
     }
     assert.equal(server.received.some(message => message.method === "thread-follower-steer-turn"), false);
     assert.ok(server.destroyed);
   }
+});
+
+test("goal continuation refuses an active placeholder without a confirmed turn ID", async () => {
+  const server = new Server();
+  server.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed",
+    threadRuntimeStatus: { type: "active" }, turns: [{ turnId: null, status: "inProgress", items: [] }] };
+  const task = { ...ref, title: "Goal fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 50));
+  await assert.rejects(adapter.continueGoal(task, "goal-resume-placeholder"), ActionRejectedError);
+  assert.equal(server.received.some(message => message.method === "thread-follower-start-turn" ||
+    message.method === "thread-follower-steer-turn"), false);
 });
 
 test("goal continuation does not report success when no live owner accepts a turn", async () => {

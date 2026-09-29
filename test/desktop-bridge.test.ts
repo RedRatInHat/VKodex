@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
-import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
+import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type GoalContinuationReceipt, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
@@ -198,7 +198,7 @@ class Desktop implements DesktopTasks {
     return this.goal;
   }
   async clearGoal(): Promise<boolean> { this.goalClears++; const existed = this.goal !== null; this.goal = null; return existed; }
-  async continueGoal(_task: TaskRef, _operationId: string): Promise<void> { this.goalContinuations++; }
+  async continueGoal(_task: TaskRef, _operationId: string): Promise<GoalContinuationReceipt> { this.goalContinuations++; return { mode: "started", turnId: `goal-turn-${this.goalContinuations}` }; }
   async listTasks() { return this.tasks; }
   listSources() { return this.sources; }
   async listProjects(sourceId?: string) { if (this.projectsError) throw this.projectsError; return sourceId !== undefined && this.sourceProjects ? (this.sourceProjects[sourceId] ?? []) : this.projects; }
@@ -563,6 +563,21 @@ test("goal resume records a scoped start attempt before submission and keeps an 
   assert.match(panelView(s).text, /не подтверждён/u);
   await clickPanel(s, "Обновить");
   assert.match(panelView(s).text, /не подтверждён/u);
+});
+
+test("goal resume durably records the confirmed continuation turn", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.continueGoal = async () => ({ mode: "started" as const, turnId: "goal-turn-1" });
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.deepEqual(s.store.getValue(`goal-continuation:${binding.id}`), {
+    operationId: s.store.getValue<{ operationId: string }>(`goal-continuation:${binding.id}`)!.operationId,
+    taskKey: taskKey(binding), goalCreatedAt: 1, phase: "accepted",
+    receipt: { mode: "started", turnId: "goal-turn-1" },
+  });
+  assert.match(panelView(s).text, /Новый ход запущен/u);
 });
 
 test("lost goal activation acknowledgment preserves intent and blocks another start", async t => {
