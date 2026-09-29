@@ -13,7 +13,7 @@ import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, captureStageIdentity, sameStageIdentity, downloadVkFileToPath } from "../src/bridge/files.js";
 import type { ProcessIdentity } from "../src/codex/managed-worker-registry.js";
-import { lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -3580,6 +3580,73 @@ test("a lost recycle acknowledgement remains charged when the staged path cannot
   unavailable.mock.restore();
   assert.equal(moves, 1);
   assert.equal(s.store.stageReservedBytes(binding.id, "uncertain-recycle"), 5);
+});
+
+test("a pending recycle with a missing staged path recovers the lost acknowledgement", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-lost-ack-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let moves = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => {
+    moves++;
+    await rename(target, `${target}.recycled-fixture`);
+    throw new Error("acknowledgement lost after move");
+  });
+  const prepared = await files.prepare(binding, "lost-ack", []);
+  files.finish(binding.id, "lost-ack", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; path: string }>>(`file-stage-index:${binding.id}:lost-ack`) ?? {})[0]!;
+  now += 8 * 24 * 60 * 60_000;
+  await assert.rejects(files.reconcileStagedArtifacts(), /acknowledgement lost after move/u);
+  assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, "pending");
+  assert.equal(s.store.stageReservedBytes(binding.id, "lost-ack"), 5);
+  assert.equal(await files.reconcileStagedArtifacts(), 1);
+  assert.equal(moves, 1);
+  assert.equal(s.store.stageReservedBytes(binding.id, "lost-ack"), 0);
+  assert.equal(await readFile(`${receipt.path}.recycled-fixture`, "utf8"), "bytes");
+});
+
+test("a ready reservation with a missing staged path remains charged", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-ready-missing-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let moves = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const prepared = await files.prepare(binding, "ready-missing", []);
+  files.finish(binding.id, "ready-missing", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:ready-missing`) ?? {})[0]!;
+  await rename(receipt.path, `${receipt.path}.moved-fixture`);
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.equal(moves, 0);
+  assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, null);
+  assert.equal(s.store.stageReservedBytes(binding.id, "ready-missing"), 5);
+});
+
+test("a pending recycle remains charged when lstat fails with a non-ENOENT error", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-lstat-error-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let moves = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const prepared = await files.prepare(binding, "lstat-error", []);
+  files.finish(binding.id, "lstat-error", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const indexKey = `file-stage-index:${binding.id}:lstat-error`;
+  const index = s.store.getValue<Record<string, { key: string; path: string }>>(indexKey)!;
+  const receipt = Object.values(index)[0]!;
+  assert.equal(s.store.markStageRecyclePending(receipt.key, receipt.path), true);
+  const invalidPath = `${receipt.path}\0`;
+  await assert.rejects(lstat(invalidPath), error => (error as NodeJS.ErrnoException).code !== "ENOENT");
+  (s.store as unknown as { db: Database }).db.prepare("UPDATE bridge_stage_reservations SET path = ? WHERE file_key = ?").run(invalidPath, receipt.key);
+  s.store.setValue(indexKey, { ...index, [receipt.key]: { ...receipt, path: invalidPath } });
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.equal(moves, 0);
+  assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, "pending");
+  assert.equal(s.store.stageReservedBytes(binding.id, "lstat-error"), 5);
+  assert.equal(await readFile(receipt.path, "utf8"), "bytes");
 });
 
 test("a pending recycle remains charged across database restart", async () => {

@@ -538,8 +538,18 @@ export class TaskFiles {
         || !this.store.hasConfirmedFileDelivery(receipt.deliveryKey, row.bindingId, receipt.peerId!, receipt.attachment)) continue;
       const job = this.jobs(row.bindingId).find(item => item.operationId === row.operationId);
       if (!job) continue;
-      const verified = await lstat(row.path, { bigint: true }).catch(() => null);
-      if (!verified) continue;
+      let verified;
+      try { verified = await lstat(row.path, { bigint: true }); }
+      catch (error) {
+        // The pending journal was written before the Recycle Bin move. If
+        // that move succeeded but its acknowledgement was lost, only ENOENT
+        // can release the reservation; other filesystem errors cannot.
+        if (row.recycling === "pending" && (error as NodeJS.ErrnoException).code === "ENOENT") {
+          this.store.markStageRecycled(row.key, row.path);
+          recycled++;
+        }
+        continue;
+      }
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       if (!this.store.markStageRecyclePending(row.key, row.path)) continue;
@@ -552,8 +562,8 @@ export class TaskFiles {
       const legacyCurrent = current && !("version" in receipt.identity) ? await lstat(row.path).catch(() => null) : undefined;
       if (!current || current.dev !== verified.dev || current.ino !== verified.ino
         || current.birthtimeNs !== verified.birthtimeNs || !sameStageIdentity(current, receipt.identity, legacyCurrent ?? undefined)) continue;
-      // A failed or interrupted move leaves the reservation charged. Missing
-      // files on a later run are not interpreted as successful recycling.
+      // A failed or interrupted move leaves the reservation charged while
+      // its pathname exists. A later ENOENT is reconciled above.
       await this.recycleStage(row.path);
       this.store.markStageRecycled(row.key, row.path);
       recycled++;
