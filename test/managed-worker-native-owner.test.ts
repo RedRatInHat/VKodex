@@ -63,6 +63,28 @@ test('managed bridge observation snapshots one native generation and fails close
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('native goal changes fence stale Composer state without retiring the turn observer', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    const events: Array<{ state: NativeProjectionState }> = [];
+    const failures: string[] = [];
+    const observed = f.owner.subscribeBridgeState(event => events.push(event), reason => failures.push(reason));
+    const before = f.owner.metadata.semanticRevision;
+    f.child.send('thread/goal/updated', { threadId: taskId, goal: { objective: 'inspect', status: 'active' } });
+    await waitUntil(() => events.length === 1);
+    assert.ok(f.owner.metadata.semanticRevision > before);
+    assert.equal(events[0]!.state.goalSignalRevision, 1);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'goal-followup', status: 'inProgress', items: [] } });
+    await waitUntil(() => events.length === 2);
+    assert.equal(events[1]!.state.turns[0]!.turnId, 'goal-followup');
+    assert.equal(observed.current(), true);
+    assert.deepEqual(failures, []);
+    observed.detach();
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('managed owner retains only a bounded category for native IPC refusal diagnosis', async () => {
   const f = await fixture();
   try {

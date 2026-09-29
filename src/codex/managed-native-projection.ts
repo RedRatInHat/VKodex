@@ -23,6 +23,7 @@ export interface NativeProjectionState extends RecordValue {
   latestCollaborationMode: RecordValue; previousTurnModel: string | null;
   title: string | null; threadRuntimeStatus: RecordValue; latestTokenUsageInfo: unknown;
   hasUnreadTurn: boolean;
+  goalSignalRevision?: number;
   updatedAt: number | null;
 }
 export interface NativeProjectionOptions extends RecordValue {
@@ -369,6 +370,7 @@ export function createProjection(startResponse: unknown, threadReadResponse: unk
     previousTurnModel: null,
     latestCollaborationMode: clone(collaborationMode),
     hasUnreadTurn: false,
+    goalSignalRevision: 0,
     rolloutPath: read.path ?? '',
     cwd,
     gitInfo: read.gitInfo ?? null,
@@ -414,6 +416,16 @@ export function applyNotification(state: NativeProjectionState, notification: un
   }
   const next = clone(state);
   switch (notification.method) {
+    case 'thread/goal/updated':
+    case 'thread/goal/cleared':
+      // Goal metadata has its own native API, not a conversation transcript
+      // item. Preserve a monotonic signal so a concurrent goal change fences
+      // pending Composer qualification without exposing the goal payload.
+      if (next.goalSignalRevision !== undefined && !nonnegativeInteger(next.goalSignalRevision))
+        fail('goal signal revision invalid');
+      if (next.goalSignalRevision === Number.MAX_SAFE_INTEGER) fail('goal signal revision exhausted');
+      next.goalSignalRevision = (next.goalSignalRevision ?? 0) + 1;
+      break;
     case 'thread/settings/updated': {
       const settings = params.threadSettings;
       if (!object(settings) || !nonempty(settings.cwd) || !nonempty(settings.model)

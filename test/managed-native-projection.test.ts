@@ -98,6 +98,15 @@ assert.deepEqual(collabStarted.details,{task:'inspect'});
 assert.throws(()=>createProjection(start,{thread:{...read.thread,turns:[{...read.thread.turns[0]!,items:[{id:'bad',type:'imageGeneration',result:'x'}]}]}},{hostId:'local',workspaceKind:'projectless'}),/special item mapping/);
 assert.equal(applyNotification(state,{method:'item/agentMessage/delta',params:{threadId:'wrong',turnId:'turn-1',itemId:'agent-1',delta:'x'}}),state);
 assert.equal(applyNotification(state,{method:'mcpServer/startupStatus/updated',params:{threadId:id,name:'test',status:'ready'}}),state);
+// Goal metadata is delivered outside the conversation transcript. A goal
+// started by another native client must not kill this task's turn observer.
+const goalUpdated=applyNotification(started,{method:'thread/goal/updated',params:{threadId:id,
+  goal:{objective:'inspect',status:'active'}}});
+assert.equal(goalUpdated.goalSignalRevision,1);
+assert.deepEqual(goalUpdated.turns,started.turns);
+assert.equal(applyNotification(goalUpdated,{method:'thread/goal/cleared',params:{threadId:id}}).goalSignalRevision,2);
+assert.equal(applyNotification(started,{method:'thread/goal/updated',params:{threadId:'other',
+  goal:{objective:'foreign',status:'active'}}}),started);
 assert.equal(applyNotification(state,{method:'warning',params:{threadId:id,message:'isolated warning'}}),state);
 assert.throws(()=>applyNotification(state,{method:'warning',params:{threadId:id,message:42}}),/warning message/);
 const usageBreakdown={totalTokens:12,inputTokens:9,cachedInputTokens:0,cacheWriteInputTokens:0,outputTokens:3,reasoningOutputTokens:1};
