@@ -100,7 +100,7 @@ function ownerReadShape(method: string, params: JsonObject, taskId: string, ownC
     (!Object.hasOwn(params, 'includeLayers') || params.includeLayers === false);
   if (params.threadId !== taskId) return false;
   if (method === 'thread/read') return keysOnly(['threadId', 'includeTurns']) &&
-    (!Object.hasOwn(params, 'includeTurns') || params.includeTurns === false);
+    (!Object.hasOwn(params, 'includeTurns') || typeof params.includeTurns === 'boolean');
   if (method === 'thread/goal/get') return keysOnly(['threadId']);
   if (method === 'thread/queue/list') return keysOnly(['threadId', 'cursor', 'limit']) &&
     (!Object.hasOwn(params, 'cursor') || cursor(params.cursor)) &&

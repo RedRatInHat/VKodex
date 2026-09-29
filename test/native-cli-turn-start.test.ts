@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
 import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
+import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
 
 const taskId = '01a0eb7e-bec3-7a93-9641-8c4fb5f15d6a';
 const ownerEpoch = 'f2945262-91bd-42ed-ac48-77dbca48a138';
@@ -116,4 +117,43 @@ test('CLI admission refuses an occupied queue and unsettled command ledger', asy
   queued = false; unsettled = true;
   await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /unsettled/);
   assert.equal(writes, 0);
+});
+
+test('CLI source reader requires stable terminal history, empty native queue and null goal', async () => {
+  const turn = { id: 'prior', status: 'completed', itemsView: 'full', items: [] };
+  const thread = { id: taskId, status: { type: 'idle' }, turns: [
+    { id: 'prior', status: 'completed' }], model: settings.model,
+  reasoningEffort: settings.effort, cwd: settings.cwd, updatedAt: 5 };
+  const calls: string[] = [];
+  let queued = false, changed = false;
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    async ownerRead(key: object, generation: number, method: string, params: Record<string, unknown>) {
+      assert.equal(key, keyObject); assert.equal(generation, 7);
+      assert.equal(params.threadId, taskId);
+      calls.push(method);
+      if (method === 'thread/read') return { thread: changed ? { ...thread, updatedAt: 6 } : thread };
+      if (method === 'thread/turns/list') return { data: [turn], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'thread/queue/list') return { data: queued ? [{ id: 'pending' }] : [], nextCursor: null };
+      throw new Error('unexpected method');
+    } };
+  const keyObject = {};
+  const options = { host, controlKey: keyObject, taskId, generation: 7,
+    expectedCwd: settings.cwd, expectedModel: settings.model,
+    expectedEffort: settings.effort, assertCurrent: () => {} };
+  const evidence = await readNativeCliIdleEvidence(options);
+  assert.equal(evidence.turnCount, 1);
+  assert.deepEqual(evidence.terminalTurnIds, ['prior']);
+  assert.match(evidence.historyDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(calls.filter(method => method === 'thread/read').length, 2);
+  queued = true;
+  await assert.rejects(readNativeCliIdleEvidence(options), /queue/i);
+  queued = false;
+  let reads = 0;
+  const drift = { ...host, ownerRead: async (key: object, generation: number, method: string,
+    params: Record<string, unknown>) => {
+    if (method === 'thread/read' && ++reads === 2) changed = true;
+    return host.ownerRead(key, generation, method, params);
+  } };
+  await assert.rejects(readNativeCliIdleEvidence({ ...options, host: drift }), /unstable/i);
 });

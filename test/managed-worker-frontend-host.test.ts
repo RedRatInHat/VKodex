@@ -227,6 +227,8 @@ test('owner-scoped state reads use the exact worker without opening or mutating 
       { cwd: 'C:/foreign' }));
     assert.deepEqual(await managed.ownerRead(controlKey, generation, 'thread/read',
       { threadId: taskId, includeTurns: false }), { thread: { id: taskId } });
+    assert.deepEqual(await managed.ownerRead(controlKey, generation, 'thread/read',
+      { threadId: taskId, includeTurns: true }), { thread: { id: taskId } });
     const queue = managed.ownerRead(controlKey, generation, 'thread/queue/list',
       { threadId: taskId, cursor: null, limit: 100 });
     const wire = await sentMutation(child, 'thread/queue/list');
@@ -239,7 +241,7 @@ test('owner-scoped state reads use the exact worker without opening or mutating 
     child.send({ id: goalWire.id, result: { goal: null } });
     await assert.rejects(goal, /source changed/i);
     await assert.rejects(managed.ownerRead(controlKey, generation, 'thread/read', { threadId: taskId }));
-    assert.equal(child.messages.filter(frame => frame.method === 'thread/read').length, 1);
+    assert.equal(child.messages.filter(frame => frame.method === 'thread/read').length, 2);
   } finally { await managed.stop('test-cleanup'); }
 });
 
