@@ -2506,35 +2506,53 @@ test("legacy archived transfer verifies the source and target history prefix", a
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
 });
 
-test("archived v3 transfer reconciles a stale pre-archive digest only against an exact copied pair", async () => {
-  const sourceHome = "C:\\source"; const targetHome = "C:\\target";
-  const sourcePath = path.join(sourceHome, "archived.jsonl"); const targetPath = path.join(targetHome, "target.jsonl");
-  const source = { hostId: "local", threadId: "source", sourceId: "work", rolloutPath: sourcePath };
-  const target = { hostId: "local", threadId: "target", sourceId: "", title: "Copied", workspace: "D:\\GitStorageG\\RaceLineCalc", rolloutPath: targetPath, updatedAt: 1 };
-  const checkpoint = { lastTurnId: "boundary", rolloutPath: path.join(sourceHome, "before-archive.jsonl"), size: 1, mtimeMs: 1,
+test("return transfer verifies fork-of-fork lineage, attributes and archived history", async () => {
+  // Return leg of A→B→A: the source B itself descends from A, and the new
+  // target in A descends from B. App Server reports the older ancestor A,
+  // while the copied rollout proves that B is the final inherited session.
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-return-transfer-"));
+  const sourceHome = path.join(root, "source-B"); const targetHome = path.join(root, "target-A");
+  await mkdir(sourceHome); await mkdir(targetHome);
+  const sourcePath = path.join(sourceHome, "archived-B.jsonl"); const targetPath = path.join(targetHome, "return-copy.jsonl");
+  const source = { hostId: "local", threadId: "thread-B", sourceId: "B", rolloutPath: sourcePath };
+  const target = { hostId: "local", threadId: "thread-A-return", sourceId: "A", title: "Returned", workspace: "D:\\GitStorageG\\RaceLineCalc", rolloutPath: targetPath, updatedAt: 1 };
+  const checkpoint = { lastTurnId: "boundary-B", rolloutPath: path.join(sourceHome, "before-archive.jsonl"), size: 1, mtimeMs: 1,
     semanticDigest: "stale-before-archive-projection", semanticDigestVersion: 3 as const,
     workspace: "D:\\GitStorageG\\RaceLineCalc", model: "gpt-6-astra", effort: "high" };
-  let archived = true; let ancestor: string | undefined = "source"; let targetText = "Original";
+  let archived = true; let ancestor: string | undefined = "thread-A"; let targetText = "Original B history";
   let sourceContext = { model: "gpt-6-astra", effort: "high", cwd: "D:\\GitStorageG\\RaceLineCalc" };
   const targetContext = { model: "gpt-6-astra", effort: "high", cwd: "D:\\GitStorageG\\RaceLineCalc" };
-  const transfer = new AppServerTaskTransfer({ sourceHome: (task: typeof source) => task.sourceId === "work" ? sourceHome : targetHome } as never, {
+  await writeFile(sourcePath, JSON.stringify({ type: "session_meta", payload: { id: "thread-B", forked_from_id: "thread-A" } }) + "\n");
+  await writeFile(targetPath, ["thread-A-return", "thread-A", "thread-B"].map(id =>
+    JSON.stringify({ type: "session_meta", payload: { id } })).join("\n") + "\n");
+  const transfer = new AppServerTaskTransfer({ sourceHome: (task: typeof source | typeof target) => task.threadId === source.threadId ? sourceHome : targetHome } as never, {
     isArchived: async () => archived,
     archivedRolloutPath: async () => sourcePath,
   } as never, (_home: string) => ({ call: async (method: string, params: IpcObject) => method === "thread/read"
-    ? { thread: { id: "target", forkedFromId: ancestor } }
+    ? { thread: { id: target.threadId, forkedFromId: ancestor } }
     : { data: params.itemsView === "summary"
-      ? [{ id: "boundary", status: "completed", items: [] }]
-      : [{ id: "boundary", status: "completed", items: [{ id: params.threadId === "source" ? "s" : "t", type: "userMessage",
-        text: params.threadId === "source" ? "Original" : targetText }] }], nextCursor: null } }) as never,
+      ? [{ id: "boundary-B", status: "completed", items: [] }]
+      : [{ id: "boundary-B", status: "completed", items: [{ id: params.threadId === source.threadId ? "s" : "t", type: "userMessage",
+        text: params.threadId === source.threadId ? "Original B history" : targetText }] }], nextCursor: null } }) as never,
     undefined, undefined, async rollout => rollout === sourcePath ? sourceContext : targetContext);
   await transfer.verifyArchivedPair(source, target, checkpoint);
   sourceContext = { ...sourceContext, model: "gpt-6-sol" };
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
-  sourceContext = { ...sourceContext, model: "gpt-6-astra" }; ancestor = "unrelated";
+  sourceContext = { ...sourceContext, model: "gpt-6-astra", effort: "low" };
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
-  ancestor = "source"; targetText = "Changed";
+  sourceContext = { ...sourceContext, effort: "high", cwd: "D:\\GitStorageG\\Other" };
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
-  targetText = "Original"; ancestor = undefined;
+  sourceContext = { ...sourceContext, cwd: checkpoint.workspace }; ancestor = "unrelated";
+  await writeFile(targetPath, ["thread-A-return", "thread-A", "older-thread"].map(id =>
+    JSON.stringify({ type: "session_meta", payload: { id } })).join("\n") + "\n");
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  await writeFile(targetPath, ["thread-A-return", "thread-A", "thread-B"].map(id =>
+    JSON.stringify({ type: "session_meta", payload: { id } })).join("\n") + "\n");
+  ancestor = "thread-A"; targetText = "Changed return transcript";
+  await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
+  targetText = "Original B history"; ancestor = undefined;
+  await writeFile(targetPath, ["thread-A-return", "thread-A", "older-thread"].map(id =>
+    JSON.stringify({ type: "session_meta", payload: { id } })).join("\n") + "\n");
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
   archived = false;
   await assert.rejects(transfer.verifyArchivedPair(source, target, checkpoint), TransferConflictError);
