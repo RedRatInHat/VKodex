@@ -43,6 +43,10 @@ interface FileJob {
 }
 interface StagedFile {
   readonly key: string;
+  /** Exact VK message batch containing this version, persisted with :queued. */
+  readonly deliveryKey?: string;
+  readonly attachment?: string;
+  readonly peerId?: number;
   readonly path: string;
   readonly relativePath: string;
   readonly name: string;
@@ -503,6 +507,17 @@ export class TaskFiles {
         const names = pending.map(item => item.name).join("\n");
         this.store.atomic(() => {
           this.store.enqueue(batchKey, binding.peerId!, { text: pending.length === 1 ? pending[0]!.name : `Файлы (${pending.length}):\n${names}`, attachments: pending.map(item => item.attachment) }, binding.id);
+          const staged = this.stageIndex(binding.id, job.operationId);
+          let stageChanged = false;
+          for (const item of pending) {
+            const receipt = staged[item.key];
+            if (!receipt) continue;
+            if (receipt.deliveryKey && (receipt.deliveryKey !== batchKey || receipt.attachment !== item.attachment || receipt.peerId !== binding.peerId))
+              throw new ActionRejectedError("Квитанция staged-файла связана с другой доставкой; отправка остановлена.");
+            staged[item.key] = { ...receipt, deliveryKey: batchKey, attachment: item.attachment, peerId: binding.peerId! };
+            stageChanged = true;
+          }
+          if (stageChanged) this.store.setValue(this.stageIndexKey(binding.id, job.operationId), staged);
           for (const item of pending) this.store.setValue(`${item.key}:queued`, true);
         });
         count += pending.length; pending.length = 0; pendingBytes = 0;

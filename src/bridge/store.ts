@@ -1185,6 +1185,22 @@ export class BridgeStore {
     return result;
   }
 
+  /** Confirm one staged version through its exact file batch, not merely a
+   * matching VK attachment that may appear in another delivery. */
+  hasConfirmedFileDelivery(batchKey: string, bindingId: string, peerId: number, attachment: string): boolean {
+    if (!batchKey.startsWith("files:") || !bindingId || !Number.isSafeInteger(peerId) || peerId <= 0 || !attachment) return false;
+    try {
+      const row = this.db.prepare(`SELECT view, handle FROM bridge_delivery
+        WHERE key = ? AND binding_id = ? AND peer_id = ? AND kind = 'send'
+          AND delivered_revision >= revision AND handle IS NOT NULL`).get(batchKey, bindingId, peerId) as { view: string; handle: string } | undefined;
+      if (!row) return false;
+      const handle = JSON.parse(row.handle) as MessageHandle;
+      if (handle.peerId !== peerId || !Number.isSafeInteger(handle.conversationMessageId) || handle.conversationMessageId <= 0) return false;
+      const view = JSON.parse(row.view) as View;
+      return Array.isArray(view.attachments) && view.attachments.includes(attachment);
+    } catch { return false; }
+  }
+
   sending(delivery: Delivery): void {
     this.db.prepare("UPDATE bridge_delivery SET first_view = COALESCE(first_view, ?) WHERE id = ?").run(JSON.stringify(delivery.view), delivery.id);
   }

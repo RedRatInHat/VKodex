@@ -3165,6 +3165,79 @@ test("new staging stays disabled until disk retention is qualified", async t => 
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-disabled`), null);
 });
 
+test("a queued staged file records its exact delivery key and attachment atomically", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-delivery-link-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "delivery-link", []);
+  files.finish(binding.id, "delivery-link", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  assert.equal(await files.collect(binding, true), 1);
+  const queued = s.store.pendingDeliveries().find(item => item.key.startsWith(`files:${binding.id}:delivery-link:`))!;
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; deliveryKey?: string; attachment?: string; peerId?: number }>>(`file-stage-index:${binding.id}:delivery-link`) ?? {})[0]!;
+  assert.equal(s.store.getValue(`${receipt.key}:queued`), true);
+  assert.equal(receipt.deliveryKey, queued.key);
+  assert.equal(receipt.attachment, queued.view.attachments![0]);
+  assert.equal(receipt.peerId, binding.peerId);
+  assert.equal(s.store.hasConfirmedFileDelivery(receipt.deliveryKey!, binding.id, binding.peerId!, receipt.attachment!), false);
+  await s.worker.flush();
+  assert.equal(s.store.hasConfirmedFileDelivery(receipt.deliveryKey!, binding.id, binding.peerId!, receipt.attachment!), true);
+});
+
+test("a queue transaction failure leaves neither a delivery nor a staged delivery link", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-queue-atomic-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "queue-atomic", []);
+  files.finish(binding.id, "queue-atomic", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":queued") && value === true) throw new Error("queue transaction lost");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /queue transaction lost/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; deliveryKey?: string; attachment?: string }>>(`file-stage-index:${binding.id}:queue-atomic`) ?? {})[0]!;
+  assert.equal(receipt.deliveryKey, undefined);
+  assert.equal(receipt.attachment, undefined);
+  assert.equal(s.store.getValue(`${receipt.key}:queued`), null);
+  assert.equal(s.store.pendingDeliveries().filter(item => item.key.startsWith(`files:${binding.id}:queue-atomic:`)).length, 0);
+});
+
+test("confirmed file delivery requires the exact batch, binding, and attachment after restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-exact-delivery-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const store = new BridgeStore(filename);
+  const binding = store.ensureBinding(task);
+  store.enqueue("files:binding:op:first", peerId, { text: "one", attachments: ["doc-202_1"] }, null);
+  store.enqueue("files:binding:op:second", peerId, { text: "two", attachments: ["doc-202_1", "doc-202_2"] }, binding.id);
+  store.enqueue("files:binding:op:wrong-handle", peerId, { text: "three", attachments: ["doc-202_3"] }, binding.id);
+  store.enqueue("files:binding:op:malformed-handle", peerId, { text: "four", attachments: ["doc-202_4"] }, binding.id);
+  store.enqueue("files:binding:op:commentary", peerId, { text: "not a file send", attachments: ["doc-202_2"] }, binding.id, true);
+  const first = store.pendingDeliveries().find(item => item.key.endsWith(":first"))!;
+  const second = store.pendingDeliveries().find(item => item.key.endsWith(":second"))!;
+  const wrongHandle = store.pendingDeliveries().find(item => item.key.endsWith(":wrong-handle"))!;
+  const malformedHandle = store.pendingDeliveries().find(item => item.key.endsWith(":malformed-handle"))!;
+  const commentary = store.pendingDeliveries().find(item => item.key.endsWith(":commentary"))!;
+  store.completed(first); // A retired queue row without a VK message is not delivery.
+  store.delivered(second, { peerId, conversationMessageId: 2 });
+  store.delivered(wrongHandle, { peerId: peerId + 1, conversationMessageId: 4 });
+  store.delivered(malformedHandle, { peerId, conversationMessageId: "bogus" as unknown as number });
+  store.delivered(commentary, { peerId, conversationMessageId: 3 });
+  assert.equal(store.hasConfirmedFileDelivery(first.key, binding.id, peerId, "doc-202_1"), false);
+  assert.equal(store.hasConfirmedFileDelivery(second.key, "other-binding", peerId, "doc-202_1"), false);
+  assert.equal(store.hasConfirmedFileDelivery(second.key, binding.id, peerId + 1, "doc-202_1"), false);
+  assert.equal(store.hasConfirmedFileDelivery(second.key, binding.id, peerId, "doc-202_3"), false);
+  assert.equal(store.hasConfirmedFileDelivery(second.key, binding.id, peerId, "doc-202_2"), true);
+  assert.equal(store.hasConfirmedFileDelivery(wrongHandle.key, binding.id, peerId, "doc-202_3"), false);
+  assert.equal(store.hasConfirmedFileDelivery(malformedHandle.key, binding.id, peerId, "doc-202_4"), false);
+  assert.equal(store.hasConfirmedFileDelivery(commentary.key, binding.id, peerId, "doc-202_2"), false);
+  store.close();
+  const restored = new BridgeStore(filename);
+  assert.equal(restored.hasConfirmedFileDelivery(second.key, binding.id, peerId, "doc-202_1"), true);
+  assert.equal(restored.hasConfirmedFileDelivery(first.key, binding.id, peerId, "doc-202_1"), false);
+  restored.close();
+});
+
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
