@@ -56,6 +56,8 @@ const bootstrapMethods = Object.freeze([
   'config/read', 'configRequirements/read', 'model/list', 'permissionProfile/list',
   'account/read', 'account/rateLimits/read', 'getAuthStatus',
   'thread/turns/list', 'thread/list', 'thread/loaded/list',
+  'collaborationMode/list', 'hooks/list', 'skills/list', 'plugin/list',
+  'app/installed', 'app/list', 'app/read',
 ]);
 const maxReadyRequests = 128;
 const nullable = (value: unknown, check: (value: unknown) => boolean): boolean => value === null || check(value);
@@ -74,11 +76,35 @@ const cwdValue = (value: unknown, ownCwd: string | null): boolean => nullable(va
   path.win32.isAbsolute(ownCwd) && path.win32.isAbsolute(cwd) &&
   path.win32.parse(ownCwd).root.length > 1 && path.win32.parse(cwd).root.length > 1 &&
   path.win32.resolve(cwd).toLowerCase() === path.win32.resolve(ownCwd).toLowerCase());
+const ownCwds = (value: unknown, ownCwd: string | null): boolean =>
+  Array.isArray(value) && value.length === 1 && typeof value[0] === 'string' &&
+  cwdValue(value[0], ownCwd);
+const appIds = (value: unknown): boolean => Array.isArray(value) &&
+  value.length > 0 && value.length <= 100 &&
+  value.every(id => typeof id === 'string' && id.length <= 128 &&
+    /^(?:asdk_app_[A-Za-z0-9]+|connector_[A-Za-z0-9_]+)$/u.test(id)) &&
+  new Set(value).size === value.length;
 function bootstrapKind(method: string, params: unknown, taskId: string,
   ownCwd: string | null, trustedLocalFrontend: boolean): Kind | null {
   if (method === 'configRequirements/read' &&
     (params === undefined || params === null || keysOnly(params, []))) return 'bootstrap';
   if (!object(params)) return null;
+  if (method === 'collaborationMode/list' && keysOnly(params, [])) return 'bootstrap';
+  if (method === 'hooks/list' && keysOnly(params, ['cwds']) &&
+    ownCwds(params.cwds, ownCwd)) return 'bootstrap';
+  if (method === 'skills/list' && keysOnly(params, ['cwds', 'forceReload']) &&
+    ownCwds(params.cwds, ownCwd) &&
+    optional(params, 'forceReload', value => typeof value === 'boolean')) return 'bootstrap';
+  if (method === 'plugin/list' && keysOnly(params, ['cwds', 'marketplaceKinds']) &&
+    ownCwds(params.cwds, ownCwd) &&
+    optional(params, 'marketplaceKinds', value => value === null)) return 'bootstrap';
+  if (method === 'app/installed' && keysOnly(params, ['threadId']) &&
+    params.threadId === taskId) return 'bootstrap';
+  if (method === 'app/list' && keysOnly(params, ['threadId', 'cursor', 'limit']) &&
+    params.threadId === taskId && optional(params, 'cursor', cursorValue) &&
+    optional(params, 'limit', limitValue)) return 'bootstrap';
+  if (method === 'app/read' && keysOnly(params, ['threadId', 'appIds']) &&
+    params.threadId === taskId && appIds(params.appIds)) return 'bootstrap';
   if (method === 'config/read' && keysOnly(params, ['includeLayers', 'cwd']) &&
     optional(params, 'includeLayers', value => typeof value === 'boolean') &&
     optional(params, 'cwd', value => cwdValue(value, ownCwd))) return 'bootstrap';
@@ -92,7 +118,7 @@ function bootstrapKind(method: string, params: unknown, taskId: string,
     optional(params, 'refreshToken', value => value === false || value === null)) return 'bootstrap';
   if (method === 'account/rateLimits/read' &&
     keysOnly(params, ['supportsLunaReserve', 'excludeResetCreditDetails']) &&
-    optional(params, 'supportsLunaReserve', value => value === false) &&
+    optional(params, 'supportsLunaReserve', value => typeof value === 'boolean') &&
     optional(params, 'excludeResetCreditDetails', value => typeof value === 'boolean')) return 'bootstrap';
   if (method === 'getAuthStatus' && trustedLocalFrontend &&
     keysOnly(params, ['includeToken', 'refreshToken']) &&

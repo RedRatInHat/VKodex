@@ -449,11 +449,25 @@ test('bootstrap reads are opt-in, validated, and leave mutations unavailable', a
     ['model/list', { limit: -1 }],
     ['permissionProfile/list', { cwd: 'C:/foreign' }],
     ['account/read', { refreshToken: true }],
-    ['account/rateLimits/read', { supportsLunaReserve: true }],
+    ['account/rateLimits/read', { supportsLunaReserve: 'true' }],
     ['thread/turns/list', { threadId: 'foreign' }],
     ['config/value/write', {}], ['thread/start', {}],
   ]) await enabled.frontend.receive({ id: `bad-${method}`, method, params });
   assert.equal(backend.requests.length, 7);
+});
+
+test('native CLI rate-limit capabilities are read-only and schema validated', async () => {
+  const backend = fakeBackend();
+  const { frontend } = attach(createSessions(backend, {
+    bootstrapReadMethods: ['account/rateLimits/read'] }));
+  await initialize(frontend);
+  await frontend.receive({ id: 'luna', method: 'account/rateLimits/read',
+    params: { supportsLunaReserve: true } });
+  assert.deepEqual(backend.requests.map(request => request.params),
+    [{ supportsLunaReserve: true }]);
+  await frontend.receive({ id: 'invalid', method: 'account/rateLimits/read',
+    params: { supportsLunaReserve: 1 } });
+  assert.equal(backend.requests.length, 1);
 });
 
 test('configRequirements/read accepts native absent and null params without changing them', async () => {
@@ -483,6 +497,40 @@ test('bootstrap cwd reads accept the same absolute Windows directory across casi
   await frontend.receive({ id: 'root-relative', method: 'config/read', params: { cwd: '\\GitStorageG\\VKodex' } });
   await frontend.receive({ id: 'other', method: 'config/read', params: { cwd: 'D:/GitStorageG/Other' } });
   assert.equal(backend.requests.length, 2);
+});
+
+test('native CLI catalogs stay on the pinned task and Windows workspace', async () => {
+  const backend = fakeBackend();
+  const { frontend } = attach(createSessions(backend, {
+    bootstrapReadMethods: ['collaborationMode/list', 'hooks/list', 'skills/list',
+      'plugin/list', 'app/installed', 'app/list', 'app/read'], ownCwd: 'D:/GitStorageG/VKodex' }));
+  await initialize(frontend);
+  for (const [method, params] of ([
+    ['collaborationMode/list', {}],
+    ['hooks/list', { cwds: ['d:\\gitstorageg\\vkodex'] }],
+    ['skills/list', { cwds: ['D:/GitStorageG/VKodex'], forceReload: true }],
+    ['plugin/list', { cwds: ['D:/GitStorageG/VKodex'], marketplaceKinds: null }],
+    ['app/installed', { threadId: taskId }],
+    ['app/list', { threadId: taskId, cursor: null, limit: null }],
+    ['app/read', { threadId: taskId, appIds: ['asdk_app_123', 'connector_openai_test'] }],
+  ] as Array<[string, JsonObject]>)) await frontend.receive({ id: method, method, params });
+  assert.deepEqual(backend.requests.map(request => request.method), [
+    'collaborationMode/list', 'hooks/list', 'skills/list', 'plugin/list',
+    'app/installed', 'app/list', 'app/read']);
+  for (const [method, params] of ([
+    ['collaborationMode/list', { policy: 'all' }],
+    ['hooks/list', { cwds: ['D:/GitStorageG/Other'] }],
+    ['skills/list', { cwds: ['D:/GitStorageG/VKodex', 'D:/Other'], forceReload: true }],
+    ['skills/list', { cwds: ['D:/GitStorageG/VKodex'], forceReload: 'yes' }],
+    ['plugin/list', { cwds: ['D:/GitStorageG/VKodex'], marketplaceKinds: ['all'] }],
+    ['app/installed', { threadId: 'other' }],
+    ['app/list', { threadId: taskId, cursor: null, limit: 1001 }],
+    ['app/read', { threadId: 'other', appIds: ['asdk_app_123'] }],
+    ['app/read', { threadId: taskId, appIds: ['../../../secret'] }],
+    ['app/read', { threadId: taskId, appIds: [] }],
+  ] as Array<[string, JsonObject]>)) await frontend.receive({ id: `bad-${method}`,
+    method, params });
+  assert.equal(backend.requests.length, 7);
 });
 
 test('pinned native resume parameters pass unchanged only under same-generation authority', async () => {
