@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
@@ -40,6 +40,23 @@ interface FileJob {
   queued?: boolean;
   /** The Codex turn that must finish before its outbox is collected. */
   turnId?: string;
+}
+interface StagedFile {
+  readonly key: string;
+  readonly path: string;
+  readonly relativePath: string;
+  readonly name: string;
+  readonly kind: "image" | "file";
+  readonly fingerprint: string;
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly bindingId: string;
+  readonly threadId: string;
+  readonly sourceId?: string;
+  readonly operationId: string;
+  readonly generation: number;
+  readonly stagedAt: number;
+  readonly turnId?: string;
 }
 class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
@@ -289,7 +306,9 @@ export class TaskFiles {
   private readonly collections = new Map<string, Promise<number>>();
   private stopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
-    private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS) {}
+    private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
+    /** Kept off in production until staged-file retention and disk admission are implemented. */
+    private readonly stageNewUploads = false) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private terminalTurns(bindingId: string): ReadonlySet<string> {
@@ -301,6 +320,62 @@ export class TaskFiles {
   private rememberDocument(record: VkDocumentRecord): void {
     const records = this.documentRegistry().filter(item => item.attachment !== record.attachment);
     this.store.setValue("vk-document-registry", [...records, record].slice(-4096));
+  }
+  private stageRoot(): string { return path.join(path.dirname(path.resolve(this.root)), `${path.basename(this.root)}-staging`); }
+  private stageIndexKey(bindingId: string, operationId: string): string { return `file-stage-index:${bindingId}:${operationId}`; }
+  private stageIndex(bindingId: string, operationId: string): Record<string, StagedFile> {
+    return this.store.getValue<Record<string, StagedFile>>(this.stageIndexKey(bindingId, operationId)) ?? {};
+  }
+  private async stageDirectory(job: FileJob, bindingId: string): Promise<string> {
+    return directory(this.stageRoot(), digest(bindingId), digest(job.operationId));
+  }
+  private async stagedContents(receipt: StagedFile, job: FileJob, bindingId: string, reuse?: Buffer): Promise<Buffer> {
+    const folder = await this.stageDirectory(job, bindingId);
+    // A transfer may advance the job's routing generation; the receipt keeps
+    // the generation at capture time as provenance for its immutable bytes.
+    if (receipt.bindingId !== bindingId || receipt.operationId !== job.operationId
+      || !receipt.threadId || !Number.isSafeInteger(receipt.stagedAt)
+      || (receipt.turnId !== undefined && receipt.turnId !== job.turnId)
+      || !/^[0-9a-f-]+\.bin$/u.test(path.basename(receipt.path))
+      || path.dirname(path.resolve(receipt.path)) !== folder || receipt.bytes > FILE_LIMITS.maxFileBytes || receipt.bytes < 0
+      || !/^[0-9a-f]{64}$/u.test(receipt.sha256)) throw new ActionRejectedError("Квитанция staged-файла повреждена; загрузка остановлена.");
+    let handle: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      const before = await lstat(receipt.path);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size !== receipt.bytes) throw new Error("invalid stage file");
+      handle = await open(receipt.path, "r");
+      const opened = await handle.stat();
+      if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new Error("changed stage file");
+      const contents = reuse ?? Buffer.allocUnsafe(receipt.bytes);
+      if (contents.length !== receipt.bytes) throw new Error("incorrect stage buffer");
+      let size = 0;
+      while (size < contents.length) {
+        const read = await handle.read(contents, size, Math.min(64 * 1024, contents.length - size), null);
+        if (!read.bytesRead) break;
+        size += read.bytesRead;
+      }
+      const extra = await handle.read(Buffer.alloc(1), 0, 1, null);
+      const after = await handle.stat();
+      if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || digest(contents) !== receipt.sha256) throw new Error("corrupt stage file");
+      return contents;
+    } catch {
+      throw new ActionRejectedError(`Staged-версия файла «${receipt.name}» отсутствует или повреждена; загрузка остановлена. Исходный файл не будет использован вместо неё.`);
+    } finally { await handle?.close(); }
+  }
+  private async stageFile(file: OutputFile, relativePath: string, fingerprint: string, key: string, job: FileJob, binding: Binding): Promise<StagedFile> {
+    const existing = this.stageIndex(binding.id, job.operationId)[key];
+    if (existing) return existing;
+    const folder = await this.stageDirectory(job, binding.id);
+    const target = path.join(folder, `${randomUUID()}.bin`);
+    const handle = await open(target, "wx", 0o600);
+    try { await handle.writeFile(file.contents); await handle.sync(); }
+    finally { await handle.close(); }
+    const receipt: StagedFile = { key, path: target, relativePath, name: file.name, kind: file.kind, fingerprint,
+      sha256: digest(file.contents), bytes: file.contents.length, bindingId: binding.id, threadId: binding.threadId,
+      ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), operationId: job.operationId,
+      generation: job.generation, stagedAt: Date.now(), ...(job.turnId ? { turnId: job.turnId } : {}) };
+    this.store.setValue(this.stageIndexKey(binding.id, job.operationId), { ...this.stageIndex(binding.id, job.operationId), [key]: receipt });
+    return receipt;
   }
   private async cleanupDocuments(except: readonly string[]): Promise<"removed" | "no-candidate" | "not-removed"> {
     if (!this.chat.cleanupDocuments) return "not-removed";
@@ -413,6 +488,7 @@ export class TaskFiles {
       const metadataKey = `file-scan:${binding.id}:${job.operationId}`;
       const scanned = this.store.getValue<Record<string, { fingerprint: string; key: string }>>(metadataKey) ?? {};
       const pending: { name: string; key: string; attachment: string; bytes: number }[] = [];
+      const processed = new Set<string>();
       let pendingBytes = 0;
       const flushPending = async (): Promise<void> => {
         if (!pending.length) return;
@@ -425,16 +501,19 @@ export class TaskFiles {
         });
         count += pending.length; pending.length = 0; pendingBytes = 0;
       };
-      const processFile = async (file: OutputFile, relativePath: string, fingerprint: string): Promise<void> => {
-          // Store only the metadata of a stable read. A crash during upload must
-          // not cause another full read or an ambiguous second upload.
+      const processFile = async (file: OutputFile, relativePath: string, fingerprint: string, staged?: StagedFile): Promise<void> => {
           const contentHash = digest(file.contents);
           const identity = job.keyFormat === "relative-path-v2"
             ? JSON.stringify([relativePath.replaceAll(path.sep, "/"), contentHash])
             : file.name + ":" + contentHash;
           const key = `file:${binding.id}:${job.operationId}:${digest(identity)}`;
-          scanned[relativePath] = { fingerprint, key };
-          this.store.setValue(metadataKey, scanned);
+          if (processed.has(key)) return;
+          if (staged && (staged.key !== key || staged.sha256 !== contentHash || staged.relativePath !== relativePath))
+            throw new ActionRejectedError("Квитанция staged-файла не соответствует его содержимому; загрузка остановлена.");
+          if (!staged) {
+            scanned[relativePath] = { fingerprint, key };
+            this.store.setValue(metadataKey, scanned);
+          }
           if (this.store.getValue<boolean>(`${key}:queued`)) return;
           if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) return;
           await this.check(binding, generation);
@@ -446,10 +525,14 @@ export class TaskFiles {
               this.store.enqueue(`${key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${file.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
               return;
             }
+            const receipt = staged ?? (this.stageNewUploads ? await this.stageFile(file, relativePath, fingerprint, key, job, binding) : undefined);
+            // When staging is enabled, VK receives verified staged bytes using
+            // the existing bounded buffer. Old jobs continue the old path.
+            const uploadBytes = staged || !receipt ? file.contents : await this.stagedContents(receipt, job, binding.id, file.contents);
             let cleanupAttempted = false;
             for (;;) {
               this.store.setValue(`${key}:upload-state`, "uploading");
-              try { attachment = await uploadFile(binding.peerId!, file.name, file.contents, file.kind); break; }
+              try { attachment = await uploadFile(binding.peerId!, receipt?.name ?? file.name, uploadBytes, receipt?.kind ?? file.kind); break; }
               catch (error) {
                 if (error instanceof FileUploadStorageFullError) {
                   this.store.setValue(`${key}:upload-state`, null);
@@ -468,6 +551,7 @@ export class TaskFiles {
                 await this.check(binding, generation);
                 this.store.setValue(`${key}:rejected`, true);
                 this.store.enqueue(`${key}:error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен. ${error.message}`, silent: true }, binding.id);
+                processed.add(key);
                 attachment = null;
                 break;
               }
@@ -483,10 +567,24 @@ export class TaskFiles {
           }
           if (pending.length && (pending.length >= FILE_LIMITS.maxFiles || pendingBytes + file.contents.length > FILE_LIMITS.maxTotalBytes)) await flushPending();
           pending.push({ name: file.name, key, attachment, bytes: file.contents.length });
+          processed.add(key);
           pendingBytes += file.contents.length;
           if (pending.length >= FILE_LIMITS.maxFiles || pendingBytes >= FILE_LIMITS.maxTotalBytes) await flushPending();
       };
       try {
+        // Durable staged receipts are recovered before scanning mutable source bytes.
+        for (const receipt of Object.values(this.stageIndex(binding.id, job.operationId))) {
+          if (this.store.getValue<boolean>(`${receipt.key}:queued`)) continue;
+          const uploadState = this.store.getValue<string>(`${receipt.key}:upload-state`);
+          if (uploadState === "uploading" || uploadState === "unknown") {
+            unknownFiles++;
+            this.store.enqueue(`${receipt.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${receipt.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
+            continue;
+          }
+          if (!manual && this.store.getValue<boolean>(`${receipt.key}:rejected`)) continue;
+          const contents = await this.stagedContents(receipt, job, binding.id);
+          await processFile({ name: receipt.name, contents, kind: receipt.kind }, receipt.relativePath, receipt.fingerprint, receipt);
+        }
         // Validate the whole tree before the first upload; this pass reads only
         // directory entries and metadata, not file contents.
         await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true, skipFile: () => true });

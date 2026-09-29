@@ -3135,7 +3135,7 @@ test("idle observations without file jobs do not write a file journal", t => {
 
 test("different relative paths with the same display name and bytes are distinct file versions", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-path-key-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   const prepared = await files.prepare(binding, "path-key", []);
   await mkdir(path.join(prepared.outboxDir, "a"));
   await writeFile(path.join(prepared.outboxDir, "a", "b.txt"), "same bytes");
@@ -3147,7 +3147,111 @@ test("different relative paths with the same display name and bytes are distinct
   assert.equal(s.chat.binaryUploads.length, 2);
   assert.equal(s.chat.binaryUploads[0]!.name, "a_b.txt");
   assert.equal(s.chat.binaryUploads[1]!.name, "a_b.txt");
+  const staged = s.store.getValue<Record<string, { relativePath: string; name: string; sha256: string }>>(`file-stage-index:${binding.id}:path-key`)!;
+  assert.deepEqual(new Set(Object.values(staged).map(receipt => receipt.relativePath.replaceAll(path.sep, "/"))), new Set(["a/b.txt", "a_b.txt"]));
+  assert.equal(new Set(Object.values(staged).map(receipt => receipt.name)).size, 1);
+  assert.equal(new Set(Object.values(staged).map(receipt => receipt.sha256)).size, 1);
   assert.equal(await files.collect(binding, true), 0);
+});
+
+test("new staging stays disabled until disk retention is qualified", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-disabled-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "stage-disabled", []);
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  files.finish(binding.id, "stage-disabled", "accepted", "finished-turn");
+  files.observe(binding.id, "idle", "finished-turn");
+  assert.equal(await files.collect(binding), 1);
+  assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-disabled`), null);
+});
+
+test("a staged version survives source mutation and restart before upload", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-restart-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "staged-restart", []);
+  files.finish(binding.id, "staged-restart", "accepted", "finished-turn");
+  const source = path.join(prepared.outboxDir, "result.txt");
+  await writeFile(source, "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  const staged = s.store.getValue<Record<string, { path: string; sha256: string; relativePath: string; threadId: string; operationId: string; generation: number; stagedAt: number }>>("file-stage-index:" + binding.id + ":staged-restart");
+  assert.ok(staged);
+  const receipt = Object.values(staged)[0]!;
+  assert.equal(receipt.relativePath, "result.txt");
+  assert.equal(receipt.threadId, binding.threadId);
+  assert.equal(receipt.operationId, "staged-restart");
+  assert.equal(receipt.generation, s.store.streamGeneration(binding.id));
+  assert.ok(Number.isSafeInteger(receipt.stagedAt));
+  assert.equal(await readFile(receipt.path, "utf8"), "first version");
+  await writeFile(source, "second version");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.collect(binding, true);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
+  assert.equal(await readFile(receipt.path, "utf8"), "first version");
+});
+
+test("a staged version remains recoverable when the native turn ID arrives after staging", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-late-turn-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "staged-late-turn", []);
+  files.finish(binding.id, "staged-late-turn", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  files.associateTurn(binding.id, "staged-late-turn", "native-turn-later");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
+});
+
+test("an incomplete stage cannot be treated as a durable upload version", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-incomplete-stage-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "incomplete-stage", []);
+  files.finish(binding.id, "incomplete-stage", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key === `file-stage-index:${binding.id}:incomplete-stage`) throw new Error("executor lost before stage receipt");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  assert.equal(s.chat.binaryUploads.length, 0);
+  assert.equal(s.store.getValue(`file-stage-index:${binding.id}:incomplete-stage`), null);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
+});
+
+test("a corrupt durable stage fails closed even when the source is still available", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-corrupt-stage-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "corrupt-stage", []);
+  files.finish(binding.id, "corrupt-stage", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:corrupt-stage`)!)[0]!;
+  await writeFile(receipt.path, "corrupt bytes");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await assert.rejects(restored.collect(binding, true), /отсутствует или повреждена/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
 });
 
 test("an ambiguous VK upload is not retried by automatic scan or /files after restart", async t => {
