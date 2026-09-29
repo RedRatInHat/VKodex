@@ -281,19 +281,25 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async health(): Promise<readonly HealthCheckResult[]> {
-    const readiness = await checkVkReadiness({
+    // Health is lower priority than user delivery. A probe queued behind a
+    // slow write cannot prove VK is down, and a timed-out health check would
+    // leave three more API calls in the same serialized delivery queue.
+    const deferred = this.queuedWrites > 0;
+    const readiness = deferred ? null : await checkVkReadiness({
       tokenPermissions: () => this.write(() => this.vk.api.groups.getTokenPermissions({})),
       longPollSettings: () => this.write(() => this.vk.api.groups.getLongPollSettings({ group_id: this.config.access.groupId })),
       longPollServer: () => this.write(() => this.vk.api.groups.getLongPollServer({ group_id: this.config.access.groupId })),
     });
-    const failed = readiness.filter(check => !check.ok);
+    const failed = readiness?.filter(check => !check.ok) ?? [];
     const writeAge = this.writeStartedAt ? Date.now() - this.writeStartedAt : 0;
     const writesState = writeAge > 30_000 ? "failed" : this.queuedWrites > 10 || this.lastWriteFailureAt > this.lastWriteSuccessAt ? "degraded" : "ok";
     const pollingActive = this.pollingStarted && this.vk.updates.isStarted;
     return [
       { name: "vk_inbound_reconciliation", state: this.reconcileError || (this.reconcileCheckedAt > 0 && Date.now() - this.reconcileCheckedAt > 120_000) ? "degraded" : this.recoveredAt && Date.now() - this.recoveredAt < 15 * 60_000 ? "degraded" : "ok", detail: this.reconcileError ? "Не удалось сверить входящие сообщения с VK." : this.recoveredAt && Date.now() - this.recoveredAt < 15 * 60_000 ? "Обнаружены и восстановлены сообщения, пропущенные Long Poll." : `Последняя сверка входящих: ${this.reconcileCheckedAt ? new Date(this.reconcileCheckedAt).toISOString() : "ещё не выполнена"}.` },
       { name: "vk_long_poll", state: pollingActive ? "ok" : "failed", detail: pollingActive ? "Локальный Bots Long Poll запущен." : "Внутренний polling-цикл vk-io не работает." },
-      { name: "vk_api", state: failed.length ? "failed" : "ok", detail: failed.length ? failed.map(check => check.detail).join(" ").slice(0, 500) : "Токен, сообщения, события и Long Poll server подтверждены VK." },
+      { name: "vk_api", state: deferred ? "degraded" : failed.length ? "failed" : "ok",
+        detail: deferred ? "Проверка VK API отложена до освобождения очереди отправки." : failed.length
+          ? failed.map(check => check.detail).join(" ").slice(0, 500) : "Токен, сообщения, события и Long Poll server подтверждены VK." },
       { name: "vk_writes", state: writesState, detail: `Запросов на запись в очереди: ${this.queuedWrites}${writeAge ? `; текущий выполняется ${Math.round(writeAge / 1_000)} с` : ""}.` },
     ];
   }

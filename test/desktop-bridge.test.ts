@@ -4610,6 +4610,35 @@ test("MP4 document uploads declare type, byte length and a large-file timeout", 
   assert.equal(upload.mock.callCount(), 1);
 });
 
+test("VK health does not queue readiness probes behind an in-flight message write", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  let releaseSend: (() => void) | undefined;
+  const methods: string[] = [];
+  t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
+    methods.push(method);
+    if (method !== "messages.send") throw new Error("health probed VK while a message write was pending");
+    return new Promise(resolve => {
+      releaseSend = () => resolve([{ peer_id: peerId, conversation_message_id: 42 }]);
+    });
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 0);
+  const sending = gateway.send(peerId, { text: "fixture" }, 123);
+  try {
+    for (let attempt = 0; attempt < 20 && !releaseSend; attempt++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(releaseSend, "message write must be in flight");
+    const result = await Promise.race([
+      gateway.health(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("health queued behind message write")), 200)),
+    ]);
+    assert.equal(result.find(check => check.name === "vk_api")?.state, "degraded");
+    assert.deepEqual(methods, ["messages.send"]);
+  } finally {
+    releaseSend?.();
+    await sending;
+  }
+  assert.deepEqual(methods, ["messages.send"]);
+});
+
 test("an ambiguous photo upload never falls back to a second document upload", async t => {
   const vk = new VK({ token: "fixture-token" });
   const photo = t.mock.method(vk.upload, "messagePhoto", async () => { throw new Error("photo response lost"); });
