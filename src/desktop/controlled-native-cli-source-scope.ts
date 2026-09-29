@@ -11,7 +11,9 @@ const internal = new WeakMap<object, Readonly<{
   journal: ControlledNativeCreationJournal; operationId: string; record: ControlledCreationJournalRecord;
   preflightReceiptPath: string; sourceHome: string; workspace: string;
 }>>();
-const refuse = (): never => { throw new Error('Controlled native CLI source scope unqualified'); };
+const refuse = (category = 'invalid'): never => {
+  throw new Error(`Controlled native CLI source scope unqualified (${category})`);
+};
 
 /** An in-process proof handle. It cannot be assembled from a manifest or an idle native read. */
 export interface ControlledNativeCliSourceScope {
@@ -34,35 +36,35 @@ export async function verifyControlledNativeCliSourceScope(scope: ControlledNati
   assertControlledNativeCliSourceScope(scope);
   const state = internal.get(scope)!;
   let current: ControlledCreationJournalRecord | null;
-  try { current = state.journal.get(state.operationId); } catch { return refuse(); }
-  if (!current) return refuse();
+  try { current = state.journal.get(state.operationId); } catch { return refuse('journal-read'); }
+  if (!current) return refuse('journal-missing');
   if (!isDeepStrictEqual(current, state.record) || current.state !== 'qualified' ||
       current.intent.sourceProofRequired !== true || current.started?.sourceProofRequired !== true ||
-      current.qualified?.sourceProofRequired !== true) refuse();
+      current.qualified?.sourceProofRequired !== true) refuse('journal-drift');
   const qualified = current.qualified;
-  if (!qualified) return refuse();
+  if (!qualified) return refuse('journal-incomplete');
   if (qualified.threadId !== scope.taskId ||
       qualified.sourceGeneration !== scope.sourceGeneration ||
-      !isDeepStrictEqual(qualified.effectivePolicy, scope.policy)) refuse();
+      !isDeepStrictEqual(qualified.effectivePolicy, scope.policy)) refuse('identity-drift');
   const identity = { operationId: current.intent.operationId, sourceId: current.intent.sourceId,
     sourceGeneration: current.intent.sourceGeneration };
   const preflight = await loadControlledNativeSourcePreflightReceipt(state.preflightReceiptPath,
-    identity, state.sourceHome, state.workspace).catch(() => refuse());
+    identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
   const proof = await proveControlledNativeSource(preflight, qualified.rolloutPath, qualified.threadId)
-    .catch(() => refuse());
-  const policyWorkspace = await realpath(qualified.effectivePolicy.cwd).catch(() => refuse());
+    .catch(() => refuse('rollout'));
+  const policyWorkspace = await realpath(qualified.effectivePolicy.cwd).catch(() => refuse('policy-cwd'));
   if (comparablePath(proof.rolloutPath) !== comparablePath(qualified.rolloutPath) ||
       comparablePath(preflight.sourceHome) !== comparablePath(scope.sourceHome) ||
       comparablePath(preflight.workspace) !== comparablePath(scope.workspace) ||
-      comparablePath(policyWorkspace) !== comparablePath(scope.workspace)) refuse();
+      comparablePath(policyWorkspace) !== comparablePath(scope.workspace)) refuse('path-drift');
   if (manifest) {
     let home: string, cwd: string;
     try { [home, cwd] = await Promise.all([realpath(manifest.home), realpath(manifest.cwd)]); }
-    catch { return refuse(); }
+    catch { return refuse('manifest-path'); }
     if (manifest.taskId !== scope.taskId ||
         comparablePath(home) !== comparablePath(scope.sourceHome) ||
         comparablePath(cwd) !== comparablePath(scope.workspace) ||
-        !isDeepStrictEqual(manifest.approvedTaskPolicy, scope.policy)) refuse();
+        !isDeepStrictEqual(manifest.approvedTaskPolicy, scope.policy)) refuse('manifest-drift');
   }
 }
 
@@ -90,6 +92,11 @@ export async function deriveControlledNativeCliSourceScope(options: Readonly<{
     record, preflightReceiptPath: options.preflightReceiptPath,
     sourceHome: options.sourceHome, workspace: options.workspace }));
   try { await verifyControlledNativeCliSourceScope(scope); }
-  catch { internal.delete(scope); return refuse(); }
+  catch (error) {
+    internal.delete(scope);
+    if (error instanceof Error && error.message.startsWith('Controlled native CLI source scope unqualified'))
+      throw error;
+    return refuse('verification');
+  }
   return scope;
 }
