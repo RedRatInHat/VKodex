@@ -15,6 +15,7 @@ import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
+import { comparablePath } from "../core/paths.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -381,23 +382,26 @@ export class BridgeRuntime {
    */
   private async mirrorRolloutFallback(binding: Binding): Promise<void> {
     const original = this.store.getBinding(binding.id);
-    if (!binding.attached || binding.peerId === null || !original?.attached || !sameTask(original, binding)) return;
+    const sameRollout = (current: Binding): boolean =>
+      (current.rolloutPath ? comparablePath(current.rolloutPath) : undefined)
+        === (binding.rolloutPath ? comparablePath(binding.rolloutPath) : undefined);
+    if (!binding.attached || binding.peerId === null || !original?.attached || !sameTask(original, binding) || !sameRollout(original)) return;
     const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
     const fallbackGeneration = this.fallbackGenerations.get(binding.id);
     const streamGeneration = this.store.streamGeneration(binding.id);
-    const currentPoll = (): boolean => !this.stopped
-      && this.fallbackGenerations.get(binding.id) === fallbackGeneration
-      && this.store.streamGeneration(binding.id) === streamGeneration;
-    // A rewritten Codex branch may assign new item IDs to answers already
-    // delivered from the old rollout. Without an owner snapshot there is no
-    // authoritative way to distinguish those from new direct-app turns.
-    // Recover only turns whose VK submission was durably accepted; wait for the
-    // live stream to reconcile the rest of the rebuilt history.
+    const currentPoll = (): boolean => {
+      const current = this.store.getBinding(binding.id);
+      return !this.stopped && this.fallbackGenerations.get(binding.id) === fallbackGeneration
+        && this.store.streamGeneration(binding.id) === streamGeneration && !!current && sameRollout(current);
+    };
+    // A rewritten branch may assign new item IDs to answers from the old
+    // rollout. Recovery compares the checkpoint's identities and semantic
+    // occurrences before admitting events from either VK or native input.
     const result = await this.historyRecovery.poll(binding.id, binding, checkpoint,
       this.store.oldestAcceptedTurnAt(binding.id), new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId)), this.now());
     if (!result || !currentPoll()) return;
     const current = this.store.getBinding(binding.id);
-    if (!current?.attached || !sameTask(current, binding)) return;
+    if (!current?.attached || !sameTask(current, binding) || !sameRollout(current)) return;
     if (result.failure) {
       this.store.setValue(`rollout-failure:${binding.id}`, { at: this.now(), kind: result.failure });
       return;
@@ -417,7 +421,7 @@ export class BridgeRuntime {
     }
     this.store.atomic(() => {
       const current = this.store.getBinding(binding.id);
-      if (!currentPoll() || !current?.attached || !sameTask(current, binding)) return;
+      if (!currentPoll() || !current?.attached || !sameTask(current, binding) || !sameRollout(current)) return;
       const inputTurnIds = new Set(events.filter(event => event.type === "user").map(event => event.turnId));
       for (const turn of this.store.acceptedTurns(binding.id)) inputTurnIds.add(turn.turnId);
       const eventTurns = new Set(events.map(event => event.turnId));

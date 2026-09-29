@@ -435,6 +435,63 @@ test("rollout fallback rebases a rebuilt branch and resumes new events without r
   assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("New direct answer")));
 });
 
+test("detached idle observation rebases after the existing catalog refresh discovers a rotated rollout", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-detached-rotation-"));
+  const oldPath = path.join(root, "old.jsonl");
+  const newPath = path.join(root, "new.jsonl");
+  await writeFile(oldPath, rolloutFinal(90_000, "old-final", "old-turn", "Already delivered"));
+  await writeFile(newPath, rolloutFinal(90_000, "old-final", "old-turn", "Already delivered")
+    + rolloutFinal(101_000, "new-final", "new-turn", "After native edit"));
+  s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: oldPath });
+  s.store.setValue(`projection:${s.binding.id}`, { since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], active: [],
+    seen: { '["old-turn","final","old-final"]': "known" }, semanticByIdentity: {}, rolloutPath: comparablePath(oldPath) });
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
+  s.store.setValue(`task-details:${s.binding.id}`, { title: "Fixture", status: "idle", workspace: "/fixture",
+    model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  let catalogPath = oldPath;
+  let catalogReads = 0;
+  s.desktop.listTasks = async () => { catalogReads++; return [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 2, rolloutPath: catalogPath }]; };
+  // Warm the panel catalog at the old path. It refreshes only every 30s of
+  // wall time, independent of the runtime's simulated observation clock.
+  await s.runtime.tick(false);
+  for (let i = 0; i < 20 && !catalogReads; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(catalogReads > 0);
+  catalogPath = newPath;
+  // Force the existing panel refresh interval to elapse without sleeping.
+  (s.runtime as unknown as { manager: { panels: { lastCatalogAt: number } } }).manager.panels.lastCatalogAt = 0;
+  const beforeWire = s.server.received.length;
+  for (let i = 0; i < 20 && !s.store.pendingDeliveries().some(item => item.view.text.includes("After native edit")); i++) {
+    await s.runtime.tick(false);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    s.advance(1_001);
+  }
+  assert.equal(s.store.getBinding(s.binding.id)?.rolloutPath, newPath);
+  assert.equal(s.store.getValue<{ rolloutPath?: string }>(`projection:${s.binding.id}`)?.rolloutPath, comparablePath(newPath));
+  const deliveries = s.store.pendingDeliveries().map(item => item.view.text);
+  assert.equal(deliveries.filter(text => text.includes("After native edit")).length, 1);
+  assert.equal(deliveries.some(text => text.includes("Already delivered")), false);
+  assert.deepEqual(s.server.received.slice(beforeWire).filter(message => String(message.method).includes("thread-follower")), []);
+});
+
+test("rotated rollout discards a late result from the old path", async t => {
+  let release!: (value: import("../src/core/task-history.js").TaskHistoryRecoveryResult) => void;
+  const pending = new Promise<import("../src/core/task-history.js").TaskHistoryRecoveryResult>(resolve => { release = resolve; });
+  const history: TaskHistoryRecovery = { enable() {}, disable() {}, poll: async () => pending };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, history);
+  const oldPath = "C:/old.jsonl", newPath = "C:/new.jsonl";
+  const old = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: oldPath });
+  const fallback = s.runtime as unknown as { mirrorRolloutFallback(binding: Binding): Promise<void> };
+  const reading = fallback.mirrorRolloutFallback(old);
+  s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 2, rolloutPath: newPath });
+  release({ events: [{ type: "final", id: "stale-final", turnId: "stale-turn", text: "Stale old answer" }],
+    historyRebuilt: false, checkpoint: { since: 90_000, lastObservedAt: 101_000, activeAtAttach: [], active: [],
+      seen: {}, rolloutPath: comparablePath(oldPath) }, failure: null });
+  await reading;
+  assert.equal(s.store.getValue(`projection:${old.id}`), null);
+  assert.equal(s.store.pendingDeliveries().some(item => item.view.text.includes("Stale old answer")), false);
+});
+
 test("rollout fallback reports an oversized record and recovers after the file is corrected", async t => {
   const s = runtimeSetup(t);
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
