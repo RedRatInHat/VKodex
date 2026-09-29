@@ -453,23 +453,25 @@ test("detached idle observation rebases after the existing catalog refresh disco
   let catalogPath = oldPath;
   let catalogReads = 0;
   s.desktop.listTasks = async () => { catalogReads++; return [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 2, rolloutPath: catalogPath }]; };
-  // Warm the panel catalog at the old path. It refreshes only every 30s of
-  // wall time, independent of the runtime's simulated observation clock.
-  await s.runtime.tick(false);
-  for (let i = 0; i < 20 && !catalogReads; i++) await new Promise<void>(resolve => setImmediate(resolve));
-  assert.ok(catalogReads > 0);
+  // Warm the panel catalog at the old path. The regular tick waits for its
+  // scheduled catalog read; yielding to the event loop does not guarantee
+  // that filesystem work has finished under a loaded CI runner.
+  await s.runtime.tick();
+  const warmedCatalogReads = catalogReads;
+  assert.ok(warmedCatalogReads > 0);
+  const beforeSent = s.sent.length;
   catalogPath = newPath;
   // Force the existing panel refresh interval to elapse without sleeping.
   (s.runtime as unknown as { manager: { panels: { lastCatalogAt: number } } }).manager.panels.lastCatalogAt = 0;
   const beforeWire = s.server.received.length;
-  for (let i = 0; i < 20 && !s.store.pendingDeliveries().some(item => item.view.text.includes("After native edit")); i++) {
-    await s.runtime.tick(false);
-    await new Promise<void>(resolve => setImmediate(resolve));
-    s.advance(1_001);
-  }
+  await s.runtime.tick(); // Catalog records the replacement rollout path.
+  assert.equal(catalogReads, warmedCatalogReads + 1);
+  assert.equal(s.store.getBinding(s.binding.id)?.rolloutPath, newPath);
+  s.advance(1_001);
+  await s.runtime.tick(); // History observer reads the updated binding.
   assert.equal(s.store.getBinding(s.binding.id)?.rolloutPath, newPath);
   assert.equal(s.store.getValue<{ rolloutPath?: string }>(`projection:${s.binding.id}`)?.rolloutPath, comparablePath(newPath));
-  const deliveries = s.store.pendingDeliveries().map(item => item.view.text);
+  const deliveries = [...s.store.pendingDeliveries().map(item => item.view.text), ...s.sent.slice(beforeSent).map(item => item.view.text)];
   assert.equal(deliveries.filter(text => text.includes("After native edit")).length, 1);
   assert.equal(deliveries.some(text => text.includes("Already delivered")), false);
   assert.deepEqual(s.server.received.slice(beforeWire).filter(message => String(message.method).includes("thread-follower")), []);
