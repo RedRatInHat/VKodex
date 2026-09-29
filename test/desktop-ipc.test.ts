@@ -2710,7 +2710,8 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   }
   assert.equal(turnId, "turn-125");
   assert.ok(calls.length > 126);
-  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 1));
+  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 1 &&
+    call.sortDirection === "asc"));
   let positiveReads = 0;
   assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => {
     positiveReads++;
@@ -2740,6 +2741,36 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
     threadId: "different-thread", data: [{ id: "wrong", status: "completed", itemsView: "full",
       items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
   })), DesktopUnavailableError);
+});
+
+test("terminal queue reconciliation survives appended turns but rejects a changed oldest page", async () => {
+  const turns = Array.from({ length: 45 }, (_, index) => ({ id: `turn-${index}`, status: "completed",
+    itemsView: "full", items: [{ type: "userMessage", clientId: index === 40 ? "queued-id" : `other-${index}` }] }));
+  const calls: IpcObject[] = [];
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    assert.equal(params.sortDirection, "asc");
+    const index = Number(params.cursor ?? 0);
+    return { data: turns.slice(index, index + 1), nextCursor: index + 1 < turns.length ? String(index + 1) : null };
+  };
+  const first = await scanTerminalQueuedInputTurn("thread", "queued-id", list);
+  assert.equal(first.done, false);
+  if (first.done) return;
+  turns.push({ id: "active-new", status: "inProgress", itemsView: "full",
+    items: [{ type: "userMessage", clientId: "unrelated-active" }] });
+  const second = await scanTerminalQueuedInputTurn("thread", "queued-id", list, first.cursor);
+  assert.equal(second.done, false);
+  if (second.done) return;
+  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "queued-id", list, second.cursor),
+    { done: true, turnId: "turn-40" });
+  assert.ok(calls.length <= 43, "each continuation rechecks only the oldest page");
+
+  const prefix = await scanTerminalQueuedInputTurn("thread", "missing", list);
+  assert.equal(prefix.done, false);
+  if (prefix.done) return;
+  turns[0] = { id: "turn-0", status: "completed", itemsView: "full",
+    items: [{ type: "userMessage", clientId: "edited-prefix" }] };
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", list, prefix.cursor), DesktopUnavailableError);
 });
 
 test("semantic transfer checkpoints ignore harmless file metadata changes but retain legacy checks", async () => {

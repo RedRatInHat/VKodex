@@ -60,7 +60,7 @@ export async function scanTerminalQueuedInputTurn(
     // Historical turns may contain very large transcripts. A 20-turn page
     // exceeded MetadataRpc's 64 MiB guard on real tasks; one turn per page
     // keeps the bounded scan usable without raising that memory ceiling.
-    const page = await list({ threadId, limit: 1, sortDirection: "desc", itemsView: "full",
+    const page = await list({ threadId, limit: 1, sortDirection: "asc", itemsView: "full",
       ...(cursor ? { cursor } : {}) });
     if (page.threadId !== undefined && page.threadId !== threadId ||
       !Array.isArray(page.data) || page.data.length > 1 ||
@@ -68,8 +68,10 @@ export async function scanTerminalQueuedInputTurn(
       throw new DesktopUnavailableError("Codex вернул неполную историю очереди.");
     return page as Page;
   };
-  const head = await read();
-  const headDigest = fingerprint(head);
+  // In ascending order the oldest page stays fixed when a new active turn is
+  // appended. Keep the existing cursor field name for persisted checkpoints.
+  const oldest = await read();
+  const headDigest = fingerprint(oldest);
   if (previous && headDigest !== previous.headDigest)
     throw new DesktopUnavailableError("История очереди изменилась во время проверки.");
   const cursors = new Set(previous?.seenCursors ?? []);
@@ -102,7 +104,7 @@ export async function scanTerminalQueuedInputTurn(
     return matched;
   };
   if (!previous) {
-    const matched = consume(head);
+    const matched = consume(oldest);
     if (matched) return { done: true, turnId: matched };
   }
   while (cursor !== null && calls < 20) {
