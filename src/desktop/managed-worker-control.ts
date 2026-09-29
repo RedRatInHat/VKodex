@@ -20,7 +20,7 @@ export interface ManagedWorkerControlDiagnosis {
   readonly failureCode: 'startup-unavailable' | 'backend-lost' | 'backend-loss-unconfirmed' |
     'owner-unconfirmed' | 'native-owner-unavailable' | 'stop-unconfirmed' | null;
   /** Optional v1 extension: fixed categories only; never a native error body. */
-  readonly bootstrapFailureCode?: 'effective-resume-policy-mismatch' |
+  readonly bootstrapFailureCode?: 'stock-policy-unqualified' | 'effective-resume-policy-mismatch' |
     'thread-read-unqualified' | 'pre-resume-history-not-empty' |
     'resume-settings-unqualified' | 'goal-or-queue-not-empty' |
     'initial-projection-unqualified' | 'actual-thread-settings-drift' |
@@ -158,7 +158,7 @@ const startupPhases = new Set(['not-started', 'private-loaded', 'host-registered
 const daemonStates = new Set(['new', 'starting', 'ready', 'failed', 'stopping', 'stopped']);
 const failureCodes = new Set(['startup-unavailable', 'backend-lost', 'backend-loss-unconfirmed',
   'owner-unconfirmed', 'native-owner-unavailable', 'stop-unconfirmed']);
-const bootstrapFailureCodes = new Set(['effective-resume-policy-mismatch',
+const bootstrapFailureCodes = new Set(['stock-policy-unqualified', 'effective-resume-policy-mismatch',
   'thread-read-unqualified', 'pre-resume-history-not-empty', 'resume-settings-unqualified',
   'goal-or-queue-not-empty', 'initial-projection-unqualified',
   'actual-thread-settings-drift', 'config-defaults-unavailable',

@@ -18,7 +18,8 @@ import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
-import { createManagedStockSettingsInitializer, type ManagedStockSettingsInitializer } from './managed-stock-settings-initializer.js';
+import { assertManagedStockSettingsPolicy, createManagedStockSettingsInitializer,
+  type ManagedStockSettingsInitializer } from './managed-stock-settings-initializer.js';
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
@@ -328,10 +329,18 @@ export class ManagedWorkerDaemon {
       if (manifest.epoch !== this.#options.epoch || !path.isAbsolute(manifest.registryPath) ||
         !path.isAbsolute(manifest.cliPath) || !path.isAbsolute(manifest.cwd) || !path.isAbsolute(manifest.home))
         throw new Error('Private manifest scope invalid');
-      if (this.#options.nativeStockQueue && !manifest.approvedTaskPolicy)
-        throw new Error('Managed native stock queue requires explicit approved task policy');
       this.#taskId = manifest.taskId;
       this.#startupPhase = 'private-loaded';
+      if (this.#options.nativeStockQueue) {
+        try {
+          if (!manifest.approvedTaskPolicy)
+            throw new Error('Managed native stock queue requires explicit approved task policy');
+          assertManagedStockSettingsPolicy(manifest.approvedTaskPolicy, manifest.taskId);
+        } catch {
+          this.#bootstrapFailureCode = 'stock-policy-unqualified';
+          throw new Error('Managed stock policy unavailable');
+        }
+      }
       this.#registry = new ManagedWorkerRegistry(manifest.registryPath);
       const reserved = this.#registry.get(manifest.home, manifest.familyRoot);
       if (!reserved || reserved.epoch !== manifest.epoch || reserved.state !== 'reserved')

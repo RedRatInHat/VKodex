@@ -877,7 +877,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   native: { enabled: boolean; early: boolean; available?: boolean } = { enabled: false, early: false },
   startup: 'normal' | 'bootstrap-fail' | 'policy-mismatch' |
     'control-bind-fail' | 'endpoint-collision' = 'normal',
-  stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | null = null,
+  stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | 'policy' | null = null,
   headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number,
   nativeTaskState = false, handoffCapability?: object) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
@@ -945,13 +945,15 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         home, cwd: home, cliPath, cliSha256: createHash('sha256').update('pinned-code').digest('hex'),
         initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
         resumeParams: { threadId: taskId, cwd: home, model: 'gpt-5.6-sol',
-          permissions: stock ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
+          permissions: stock && stockFailure !== 'policy' ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
           runtimeWorkspaceRoots: [home], config: { model_reasoning_effort: stock ? 'medium' : 'low' } },
         ...(stock ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
           model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'medium', cwd: home,
           runtimeWorkspaceRoots: [home], environments: [], approvalPolicy: 'never',
-          approvalsReviewer: 'user', activePermissionProfile: { id: ':danger-full-access', extends: null },
-          sandbox: { type: 'dangerFullAccess' }, serviceTier: null }) } : {}), registryPath,
+          approvalsReviewer: 'user', activePermissionProfile: { id: stockFailure === 'policy' ?
+            ':read-only' : ':danger-full-access', extends: null },
+          sandbox: stockFailure === 'policy' ? { type: 'readOnly', networkAccess: false } :
+            { type: 'dangerFullAccess' }, serviceTier: null }) } : {}), registryPath,
       }, keys: { fingerprintKey: Buffer.alloc(32, 1).toString('base64'),
         intentKey: Buffer.alloc(32, 2).toString('base64'),
         controlToken: Buffer.alloc(32, 3).toString('base64') }, privateDirectory }),
@@ -960,7 +962,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
       launch: () => { launches++; return backend as unknown as ChildProcessWithoutNullStreams; },
     },
   });
-  if (stockFailure === 'discovery' || stockFailure === 'notice') {
+  if (stockFailure === 'discovery' || stockFailure === 'notice' || stockFailure === 'policy') {
     try {
       await daemon.start();
       throw new Error(`stock ${stockFailure} unexpectedly reached ready`);
@@ -1153,6 +1155,23 @@ test('effective resume mismatch reports only its fixed category, never a raw set
     assert.equal(JSON.stringify(result).includes('default'), false);
     assert.equal(backend.exitCode, null);
   } finally { await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end(); }
+});
+
+test('stock route rejects incompatible approved permissions before backend launch', async () => {
+  const { daemon, backend, control, launches, registryPath, home, privateDirectory } =
+    await readyFixture({ allow: true }, { enabled: false, early: false }, 'normal', true, 'policy');
+  try {
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(daemon.metadata.startupPhase, 'private-loaded');
+    assert.equal(daemon.metadata.bootstrapFailureCode, 'stock-policy-unqualified');
+    assert.equal(launches, 0);
+    assert.equal(control, null);
+    await assert.rejects(readFile(path.join(privateDirectory, 'startup-control.v1.json')));
+    const registry = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(registry.get(home, 'own-family')?.state, 'reserved'); }
+    finally { registry.close(); }
+    assert.equal(backend.writes, 0);
+  } finally { backend.stdin.end(); }
 });
 
 test('control request helper reports an authenticated control termination during command reply', async () => {

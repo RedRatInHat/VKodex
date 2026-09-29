@@ -80,6 +80,18 @@ export interface ManagedStockInitialized {
   readInitialState(): Promise<NativeProjectionState>;
 }
 
+/** Stock settings writes require this exact approved permission tuple. Check it
+ * before starting a backend as well as immediately before constructing the writer. */
+export function assertManagedStockSettingsPolicy(policy: ApprovedTaskPolicy,
+  taskId: string): void {
+  if (policy.threadId !== taskId || policy.effort === null ||
+      policy.approvalPolicy !== 'never' ||
+      policy.approvalsReviewer !== 'user' ||
+      policy.activePermissionProfile.id !== ':danger-full-access' ||
+      policy.sandbox.type !== 'dangerFullAccess' ||
+      ![null, 'default'].includes(policy.serviceTier)) fail();
+}
+
 /** One settings write on an already resumed empty worker. It never creates,
  * resumes, stops, or retries a worker. Native `{}` only proves RPC ACK. */
 export class ManagedStockSettingsInitializer {
@@ -119,12 +131,7 @@ export class ManagedStockSettingsInitializer {
         !Number.isSafeInteger(options.bootstrap.generation) || options.bootstrap.generation < 1)
       fail();
     const policy = approveTaskPolicy(options.approvedTaskPolicy);
-    if (policy.threadId !== options.taskId || policy.effort === null ||
-        policy.approvalPolicy !== 'never' ||
-        policy.approvalsReviewer !== 'user' ||
-        policy.activePermissionProfile.id !== ':danger-full-access' ||
-        policy.sandbox.type !== 'dangerFullAccess' ||
-        ![null, 'default'].includes(policy.serviceTier)) fail();
+    assertManagedStockSettingsPolicy(policy, options.taskId);
     const defaults = copy(options.bootstrap.composerDefaults);
     if (defaults.taskId !== options.taskId || defaults.cwd !== policy.cwd) fail();
     this.#host = options.host; this.#adapterKey = options.adapterKey;

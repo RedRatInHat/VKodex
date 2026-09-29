@@ -178,12 +178,14 @@ test('versioned diagnosis returns only fixed startup metadata and no private cal
       'startup-or-warning': 0, turn: 0, item: 0, other: 0 },
     bootstrapPendingRequests: 0, bootstrapBoundary: null,
     lastRequestFailure: { category: 'settings-refused' as const, count: 2, atMs: 1780000000000 } };
-  let mode: 'normal' | 'category' | 'raw' = 'normal';
+  let mode: 'normal' | 'category' | 'stock-policy' | 'raw' = 'normal';
   const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
     status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: null, nativeRevision: 0 }),
     diagnose: () => mode === 'raw' ? { ...diagnosis, owner: { ...owner,
       lastRequestFailure: { category: 'C:/private/secret-token', count: 2, atMs: 1780000000000 } } } as never
-      : mode === 'category' ? { ...diagnosis, owner } : diagnosis,
+      : mode === 'category' ? { ...diagnosis, owner }
+      : mode === 'stock-policy' ? { ...diagnosis, startupPhase: 'private-loaded',
+        registryState: 'reserved', bootstrapFailureCode: 'stock-policy-unqualified' } : diagnosis,
     requestStop: async () => { throw new ManagedWorkerStopRefusedError(); } });
   const cap = await server.listen(); const client = await peer(cap);
   try {
@@ -193,6 +195,11 @@ test('versioned diagnosis returns only fixed startup metadata and no private cal
     client.send({ id: 'category', epoch, method: 'diagnose-v1' });
     assert.deepEqual(await client.read(), { id: 'category', result: { ownerEpoch: epoch,
       taskId: 'own', ...diagnosis, owner } });
+    mode = 'stock-policy';
+    client.send({ id: 'stock-policy', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'stock-policy', result: { ownerEpoch: epoch,
+      taskId: 'own', ...diagnosis, startupPhase: 'private-loaded',
+      registryState: 'reserved', bootstrapFailureCode: 'stock-policy-unqualified' } });
     mode = 'raw';
     client.send({ id: 'raw', epoch, method: 'diagnose-v1' });
     assert.deepEqual(await client.read(), { id: 'raw', error: 'diagnosis-unavailable' });
