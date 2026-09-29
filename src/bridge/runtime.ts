@@ -224,6 +224,9 @@ export class BridgeRuntime {
         if (turnId) {
           this.store.rememberAcceptedTurn(binding.id, turnId, operation.id);
           this.files?.finish(binding.id, operation.id, "accepted", turnId);
+          // The observer can publish the final before a lost turn/start
+          // acknowledgement is reconciled. Never reopen a completed turn.
+          if (this.mirror.hasObservedTerminal(binding.id, turnId)) this.store.settleAcceptedTurn(binding.id, turnId);
         } else if (submissionId) {
           this.store.rememberQueuedInput(binding.id, operation.id, submissionId);
           this.files?.markQueued(binding.id, operation.id);
@@ -588,6 +591,12 @@ export class BridgeRuntime {
     this.activity.tick();
     for (const binding of this.store.bindings()) {
       this.prepareBindingObservation(binding);
+      // A final can enter the durable VK outbox before an earlier, lost
+      // turn/start acknowledgement is recovered. Repair older stranded
+      // accepted-turn markers without reacquiring or replaying the task.
+      for (const turn of this.store.acceptedTurns(binding.id)) {
+        if (this.mirror.hasObservedTerminal(binding.id, turn.turnId)) this.store.settleAcceptedTurn(binding.id, turn.turnId);
+      }
       const generation = this.store.streamGeneration(binding.id);
       const suffix = JSON.stringify([binding.id, taskKey(binding), generation]);
       this.background(`history:${suffix}`, "history", () => this.mirrorRolloutFallback(binding), binding.id);

@@ -20,6 +20,13 @@ export class TaskMirror {
     }
   }
 
+  /** A terminal observation from this exact task epoch was already handled.
+   * The VK delivery journal owns any remaining send or retry independently. */
+  hasObservedTerminal(bindingId: string, turnId: string): boolean {
+    const binding = this.store.getBinding(bindingId);
+    return !!binding?.attached && this.matches(binding, this.store.getValue(`mirror-terminal:${bindingId}:${turnId}`));
+  }
+
   /** Reorder near-simultaneous input/output only. An input, goal, or recognized
    * initiation source is never required to publish visible assistant progress. */
   acceptObservation(bindingId: string, events: readonly TaskEvent[], inputTurnIds: readonly string[], activeTurnIds: readonly string[] = []): void {

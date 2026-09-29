@@ -28,6 +28,7 @@ import { taskDetails } from "../src/desktop/details.js";
 import { DesktopBridgeRuntime } from "../src/bridge/runtime.js";
 import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateTransport } from "../src/desktop/state-transport.js";
 import { BridgeStore } from "../src/bridge/store.js";
+import { TaskMirror } from "../src/bridge/mirror.js";
 import { captureRestartIntent, readRestartIntent } from "../src/desktop/restart-intent.js";
 import type { Binding, BridgeChat, MessageHandle, TaskTransferRecord, View } from "../src/bridge/contracts.js";
 
@@ -542,6 +543,72 @@ test("runtime reconciles an uncertain prompt from Codex history after restart", 
   assert.equal(s.store.inputState(inboxKey), "done");
   assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "native-turn", operationId }]);
   assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
+});
+
+test("late uncertain input reconciliation does not reopen a turn with an already recorded final", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "late-recovered-vk-operation";
+  const inboxKey = JSON.stringify([s.peerId, "message:late-final"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.finishInput(inboxKey, true);
+  const mirror = new TaskMirror(s.store);
+  mirror.acceptObservation(s.binding.id,
+    [{ type: "final", id: "native-final", turnId: "native-turn", text: "Finished" }], ["native-turn"]);
+  const finalDeliveriesBefore = s.store.finalDeliveries(s.binding.id, "native-turn");
+  assert.equal(finalDeliveriesBefore.length, 1);
+  s.desktop.findAcceptedInput = async (_task, id) => id === operationId ? "native-turn" : null;
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.equal(s.store.inputState(inboxKey), "done");
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), []);
+  assert.deepEqual(s.store.finalDeliveries(s.binding.id, "native-turn"), finalDeliveriesBefore);
+});
+
+test("runtime repairs a previously stranded accepted turn after its final was journaled", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "stranded-accepted-operation";
+  s.store.recordOperation(operationId, s.binding, "stranded-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberAcceptedTurn(s.binding.id, "native-turn", operationId);
+  new TaskMirror(s.store).acceptObservation(s.binding.id,
+    [{ type: "final", id: "native-final", turnId: "native-turn", text: "Finished" }], ["native-turn"]);
+  assert.equal(s.store.acceptedTurns(s.binding.id).length, 1);
+  await s.runtime.tick(false);
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), []);
+});
+
+test("late reconciliation settles a status-only terminal turn without waiting for final text", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "status-only-operation";
+  const inboxKey = JSON.stringify([s.peerId, "message:status-only"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.finishInput(inboxKey, true);
+  new TaskMirror(s.store).acceptObservation(s.binding.id,
+    [{ type: "status", id: "status:native-turn", turnId: "native-turn", status: "completed" }], ["native-turn"]);
+  assert.equal(s.store.finalDeliveries(s.binding.id, "native-turn").length, 0);
+  s.desktop.findAcceptedInput = async () => "native-turn";
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "accepted");
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), []);
+});
+
+test("a terminal marker from an earlier stream generation cannot settle a later accepted turn", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "new-epoch-operation";
+  s.store.recordOperation(operationId, s.binding, "new-epoch-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  new TaskMirror(s.store).acceptObservation(s.binding.id,
+    [{ type: "final", id: "old-final", turnId: "native-turn", text: "Old answer" }], ["native-turn"]);
+  s.store.setValue(`stream-generation:${s.binding.id}`, s.store.streamGeneration(s.binding.id) + 1);
+  s.store.rememberAcceptedTurn(s.binding.id, "native-turn", operationId);
+  await s.runtime.tick(false);
+  assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "native-turn", operationId }]);
 });
 
 test("runtime reconciles a managed queue receipt without inventing a turn or replaying the prompt", async t => {
