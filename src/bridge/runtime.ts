@@ -107,7 +107,10 @@ export class BridgeRuntime {
     this.inspectExternalOwner = adapters.inspectExternalOwner;
     for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
     this.gate = new AccessGate(access, store);
-    this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits) : undefined;
+    // The immutable staging implementation is qualified in isolation, but its
+    // retention/recovery path is not yet safe for unattended production. Keep
+    // the runtime gate closed until those receipts can be reconciled.
+    this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits, false) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
     this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot,
