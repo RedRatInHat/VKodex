@@ -88,6 +88,33 @@ function freezeTree<T>(value: T): T {
   return value;
 }
 
+function ownerReadShape(method: string, params: JsonObject, taskId: string, ownCwd: string): boolean {
+  const keysOnly = (allowed: readonly string[]) =>
+    Object.keys(params).every(key => allowed.includes(key));
+  const cursor = (value: unknown) => value === null ||
+    typeof value === 'string' && value.length <= 512;
+  const limit = (value: unknown) => Number.isSafeInteger(value) &&
+    typeof value === 'number' && value >= 1 && value <= 100;
+  if (method === 'config/read') return keysOnly(['cwd', 'includeLayers']) &&
+    params.cwd === ownCwd &&
+    (!Object.hasOwn(params, 'includeLayers') || params.includeLayers === false);
+  if (params.threadId !== taskId) return false;
+  if (method === 'thread/read') return keysOnly(['threadId', 'includeTurns']) &&
+    (!Object.hasOwn(params, 'includeTurns') || params.includeTurns === false);
+  if (method === 'thread/goal/get') return keysOnly(['threadId']);
+  if (method === 'thread/queue/list') return keysOnly(['threadId', 'cursor', 'limit']) &&
+    (!Object.hasOwn(params, 'cursor') || cursor(params.cursor)) &&
+    (!Object.hasOwn(params, 'limit') || limit(params.limit));
+  if (method === 'thread/turns/list') return keysOnly(['threadId', 'cursor', 'limit',
+    'sortDirection', 'itemsView']) &&
+    (!Object.hasOwn(params, 'cursor') || cursor(params.cursor)) &&
+    (!Object.hasOwn(params, 'limit') || limit(params.limit)) &&
+    (!Object.hasOwn(params, 'sortDirection') ||
+      params.sortDirection === 'asc' || params.sortDirection === 'desc') &&
+    (!Object.hasOwn(params, 'itemsView') || params.itemsView === 'full');
+  return false;
+}
+
 /**
  * Single-thread composition host. No daemon, signal handler, or scheduler.
  * The caller must authorize explicit stop and establish live-task safety; this
@@ -228,6 +255,37 @@ export class ManagedWorkerFrontendHost {
   commandQuiescence(controlKey: object): WorkerCommandQuiescence {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.quiescence(controlKey);
+  }
+
+  /** Exact owner-only read on this host's private App Server connection. The
+   * native frontend cannot call this method, and it never resumes a task or
+   * creates a second writer. The caller must still qualify response content. */
+  async ownerRead(controlKey: object, generation: number, method: string,
+    params: JsonObject): Promise<JsonObject> {
+    const policy = this.#commandPolicy;
+    if (!policy || controlKey !== policy.controlKey ||
+        !Number.isSafeInteger(generation) || generation < 1 ||
+        !jsonObject(params)) throw new Error('Owner read unavailable');
+    const value = strictJsonObject(params);
+    if (!ownerReadShape(method, value, this.#taskId, this.#ownCwd))
+      throw new Error('Owner read outside task scope');
+    const assertCurrent = () => {
+      if (this.#stopRequested || this.#state !== 'running' ||
+          this.#backendGeneration !== generation ||
+          !this.#rpc.isSessionCurrent(generation) || !this.#commands ||
+          policy.isOwnerCurrent({ ownerEpoch: policy.ownerEpoch,
+            backendGeneration: generation, threadId: this.#taskId }) !== true)
+        throw new Error('Owner read source changed');
+    };
+    assertCurrent();
+    const result = await this.#rpc.request(method, value, {
+      expectedGeneration: generation, assertBeforeWrite: assertCurrent,
+      timeoutMs: 30_000,
+    });
+    assertCurrent();
+    if (method === 'thread/read' && (!jsonObject(result.thread) ||
+        result.thread.id !== this.#taskId)) throw new Error('Owner read returned foreign task');
+    return structuredClone(result);
   }
 
   /** Durable accepted receipt IDs, not a terminal history proof. */

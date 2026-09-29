@@ -204,6 +204,45 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
   } finally { await managed.stop('test-cleanup'); }
 });
 
+test('owner-scoped state reads use the exact worker without opening or mutating another connection', async () => {
+  const child = new Child(), controlKey = {}, adapterKey = {};
+  let ownerCurrent = true;
+  const policy: WorkerCommandPolicy = { controlKey, ownerEpoch: randomUUID(),
+    journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-owner-read-')), 'operations.sqlite'),
+    fingerprintKey: randomBytes(32), isOwnerCurrent: () => ownerCurrent,
+    authorize: () => false };
+  const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
+    initializeRequest: init, adapterKey, backendTimeoutMs: 500, bootstrapReadMethods: [],
+    allowRequest: () => false, allowAnswer: () => false,
+    commandPolicy: policy, launch: () => child.asChild() });
+  await managed.start();
+  try {
+    const generation = managed.metadata.backendGeneration!;
+    await assert.rejects(managed.ownerRead({}, generation, 'thread/read', { threadId: taskId }));
+    await assert.rejects(managed.ownerRead(controlKey, generation, 'thread/read', { threadId: 'foreign' }));
+    await assert.rejects(managed.ownerRead(controlKey, generation, 'thread/start', { threadId: taskId }));
+    await assert.rejects(managed.ownerRead(controlKey, generation, 'thread/turns/list',
+      { threadId: taskId, limit: 101 }));
+    await assert.rejects(managed.ownerRead(controlKey, generation, 'config/read',
+      { cwd: 'C:/foreign' }));
+    assert.deepEqual(await managed.ownerRead(controlKey, generation, 'thread/read',
+      { threadId: taskId, includeTurns: false }), { thread: { id: taskId } });
+    const queue = managed.ownerRead(controlKey, generation, 'thread/queue/list',
+      { threadId: taskId, cursor: null, limit: 100 });
+    const wire = await sentMutation(child, 'thread/queue/list');
+    assert.equal(wire.method, 'thread/queue/list');
+    child.send({ id: wire.id, result: { data: [], nextCursor: null } });
+    assert.deepEqual(await queue, { data: [], nextCursor: null });
+    const goal = managed.ownerRead(controlKey, generation, 'thread/goal/get', { threadId: taskId });
+    const goalWire = await sentMutation(child, 'thread/goal/get');
+    ownerCurrent = false;
+    child.send({ id: goalWire.id, result: { goal: null } });
+    await assert.rejects(goal, /source changed/i);
+    await assert.rejects(managed.ownerRead(controlKey, generation, 'thread/read', { threadId: taskId }));
+    assert.equal(child.messages.filter(frame => frame.method === 'thread/read').length, 1);
+  } finally { await managed.stop('test-cleanup'); }
+});
+
 test('WebSocket restart retains backend PID and rejects old bearer on the new listener', async () => {
   const child = new Child(), key = {}; child.pid = 42_424; let launches = 0;
   const fixture = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own', initializeRequest: init,
