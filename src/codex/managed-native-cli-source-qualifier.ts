@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { performance } from 'node:perf_hooks';
 import type { ManagedWorkerFrontendHost } from './managed-worker-frontend-host.js';
 import { readNativeCliIdleEvidence } from './managed-native-cli-source-reader.js';
 import type { NativeCliStartProof } from './managed-native-cli-start-admission.js';
@@ -100,7 +101,35 @@ export class ManagedNativeCliSourceQualifier {
     if (revision !== undefined && this.#revision !== revision) fail('revision changed');
   }
 
+  /** Native startup can emit status notifications during the first read. Retry
+   * only this known pre-write race, with every attempt re-reading all sources.
+   * An unsettled stream or any different refusal remains closed. */
   async qualify(resume: NativeCliResumePolicy): Promise<NativeCliStartProof> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { return await this.#qualifyOnce(resume); }
+      catch (error) {
+        if (!(error instanceof Error) ||
+            error.message !== 'Native CLI source revision changed' || attempt === 2)
+          throw error;
+        await this.#waitForQuietRevision();
+      }
+    }
+    return fail('revision unsettled');
+  }
+
+  async #waitForQuietRevision(): Promise<void> {
+    const deadline = performance.now() + 1500;
+    let revision = this.#revision;
+    while (performance.now() < deadline) {
+      await new Promise<void>(resolve => setTimeout(resolve, 150));
+      this.#check();
+      if (this.#revision === revision) return;
+      revision = this.#revision;
+    }
+    fail('revision unsettled');
+  }
+
+  async #qualifyOnce(resume: NativeCliResumePolicy): Promise<NativeCliStartProof> {
     this.#check();
     const generation = this.#generation!, revision = this.#revision;
     const current = () => this.#check(revision);

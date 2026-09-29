@@ -5,7 +5,7 @@ import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
 import { qualifyNativeCliResumePolicy } from '../src/codex/native-cli-resume-policy.js';
 import { ManagedNativeCliSourceQualifier } from '../src/codex/managed-native-cli-source-qualifier.js';
-import type { ManagedWorkerNotification, ManagedWorkerPendingRequest } from
+import type { ManagedWorkerNotification, ManagedWorkerPendingRequest, WorkerObserverFailure } from
   '../src/codex/managed-worker-frontend-host.js';
 
 const taskId = '01a0eb7e-bec3-7a93-9641-8c4fb5f15d6a';
@@ -241,13 +241,16 @@ test('native resume supplies the exact read-only policy tuple, not optional comp
 test('CLI source qualifier fences live worker changes around complete idle reads', async () => {
   const controlKey = {}, adapterKey = {};
   let notify: ((event: ManagedWorkerNotification) => void) | null = null;
+  let failObserver: ((reason: WorkerObserverFailure) => void) | null = null;
   let ownerCurrent = true, noPendingAutoStart = true, unresolved = 0;
   let inFlight = 0, unconfirmed = false;
-  let acceptedQueue = false, acceptedReceipt = false, notifyDuringRead = false;
+  let acceptedQueue = false, acceptedReceipt = false, notificationsDuringRead = 0;
   const thread = { ...resumeResult().thread, updatedAt: 5 };
   const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
-    observeNotifications(key: object, listener: (event: ManagedWorkerNotification) => void) {
-      assert.equal(key, adapterKey); notify = listener; return () => { notify = null; };
+    observeNotifications(key: object, listener: (event: ManagedWorkerNotification) => void,
+      onFailure: (reason: WorkerObserverFailure) => void) {
+      assert.equal(key, adapterKey); notify = listener; failObserver = onFailure;
+      return () => { notify = null; failObserver = null; };
     },
     observePendingRequests(key: object, _listener: (event: ManagedWorkerPendingRequest) => void) {
       assert.equal(key, adapterKey); return () => {};
@@ -255,7 +258,8 @@ test('CLI source qualifier fences live worker changes around complete idle reads
     async ownerRead(key: object, generation: number, method: string) {
       assert.equal(key, controlKey); assert.equal(generation, 7);
       if (method === 'thread/read') {
-        if (notifyDuringRead) {
+        if (notificationsDuringRead > 0) {
+          notificationsDuringRead--;
           notify?.({ taskId, generation: 7,
             notification: { method: 'thread/settings/updated', params: { threadId: taskId } } });
         }
@@ -301,14 +305,21 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
     /auto|pending/i);
   noPendingAutoStart = true;
-  notifyDuringRead = true;
+  notificationsDuringRead = 1;
+  const settled = await qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId));
+  settled.assertCurrent();
+  notificationsDuringRead = Number.POSITIVE_INFINITY;
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
     /revision|changed/i);
-  notifyDuringRead = false;
+  notificationsDuringRead = 0;
   (notify as ((event: ManagedWorkerNotification) => void) | null)?.({ taskId, generation: 7,
     notification: { method: 'thread/settings/updated', params: { threadId: taskId } } });
   assert.throws(proof.assertCurrent, /revision|changed/i);
   ownerCurrent = false;
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)));
+  ownerCurrent = true;
+  (failObserver as ((reason: WorkerObserverFailure) => void) | null)?.('backend-lost');
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /observer/i);
   qualifier.close();
 });
