@@ -20,6 +20,8 @@ export interface ManagedNativeCliSourceQualifierOptions {
   readonly assertOwnerCurrent: () => boolean;
   /** Synchronous stock scheduler/goal proof; not inferred from an empty queue. */
   readonly noPendingAutoStart: () => boolean;
+  /** Controlled zero-turn source: reject any intervening native turn. */
+  readonly requireEmptyHistory?: true;
 }
 const fail = (reason: string): never => { throw new Error(`Native CLI source ${reason}`); };
 
@@ -151,6 +153,8 @@ export class ManagedNativeCliSourceQualifier {
       generation, expectedCwd: resume.cwd, expectedModel: resume.model,
       expectedEffort: resume.effort as string, assertCurrent: current });
     current();
+    if (this.#options.requireEmptyHistory && evidence.turnCount !== 0)
+      fail('controlled first-start history is no longer empty');
     const after = this.#options.host.commandQuiescence(this.#options.controlKey);
     if (after.inFlight !== 0 || after.unconfirmed !== false ||
         !isDeepStrictEqual(receipts,

@@ -6,6 +6,8 @@ import test from 'node:test';
 import { captureControlledNativeSourcePreflight, ControlledNativeSourceUnqualifiedError,
   loadControlledNativeSourcePreflightReceipt, persistControlledNativeSourcePreflightReceipt,
   proveControlledNativeSource, type ControlledNativeSourceIdentity } from '../src/desktop/controlled-native-source-proof.js';
+import { deriveControlledNativeCliSourceScope, assertControlledNativeCliSourceScope } from
+  '../src/desktop/controlled-native-cli-source-scope.js';
 
 const threadA = '00000000-0000-4000-8000-000000000001';
 const threadB = '00000000-0000-4000-8000-000000000002';
@@ -112,6 +114,20 @@ test('durable receipt recovers the pre-start absence proof after process restart
   const file = await rollout(f.home, threadA, f.workspace);
   const reloaded = await loadControlledNativeSourcePreflightReceipt(receipt, identity, f.home, f.workspace);
   assert.equal((await proveControlledNativeSource(reloaded, file, threadA)).threadId, threadA);
+});
+
+test('CLI source scope rejects an unqualified or forged source before canary admission', async () => {
+  const f = await setup(); const receipt = path.join(f.root, 'source-preflight.json');
+  const preflight = await captureControlledNativeSourcePreflight(identity, f.home, f.workspace);
+  await persistControlledNativeSourcePreflightReceipt(receipt, preflight);
+  const file = await rollout(f.home, threadA, f.workspace);
+  const journal = { get: () => ({ state: 'qualified', intent: { ...identity, sourceProofRequired: true },
+    qualified: { ...identity, sourceProofRequired: true, threadId: threadA, rolloutPath: file,
+      effectivePolicy: { threadId: threadA, cwd: f.workspace } } }) };
+  await assert.rejects(deriveControlledNativeCliSourceScope({ journal: journal as never,
+    operationId: identity.operationId, preflightReceiptPath: receipt,
+    sourceHome: f.home, workspace: f.workspace }), /scope/i);
+  assert.throws(() => assertControlledNativeCliSourceScope({} as never), /scope/i);
 });
 
 test('tampered durable receipt is rejected against the durable intent identity', async () => {

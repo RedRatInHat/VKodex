@@ -22,6 +22,11 @@ import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
+import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
+import { captureControlledNativeSourcePreflight, persistControlledNativeSourcePreflightReceipt } from
+  '../src/desktop/controlled-native-source-proof.js';
+import { deriveControlledNativeCliSourceScope, verifyControlledNativeCliSourceScope } from
+  '../src/desktop/controlled-native-cli-source-scope.js';
 
 test('daemon requires explicit follower and IPC policy before private state is read', () => {
   assert.throws(() => new ManagedWorkerDaemon({
@@ -136,6 +141,11 @@ test('native CLI WebSocket is opt-in and requires an isolated read-only policy',
     nativeStockQueue: {} as never }), /Native CLI WebSocket requires/);
   assert.throws(() => new ManagedWorkerDaemon({ ...common,
     oneShotFirstComposer: () => true }), /Native CLI WebSocket requires/);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    nativeCliWebSocket: { ...cli, singleAcceptedStart: true } }), /Native CLI WebSocket requires/);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    nativeCliWebSocket: { ...cli, singleAcceptedStart: true,
+      sourceScope: {} as never } }), /source scope/i);
 });
 
 test('native CLI WebSocket admits one qualified plain-text turn through the same durable worker', async () => {
@@ -177,6 +187,8 @@ test('native CLI WebSocket admits one qualified plain-text turn through the same
     const resumed = await client.request('resume', 'thread/resume', { threadId: own.taskId });
     assert.equal((resumed.result as { thread: { id: string } }).thread.id, own.taskId);
     await denied('external-scheduler'); externalIdle = true;
+    own.backend.terminalQueueClients = [];
+    await denied('preexisting-native-turn'); own.backend.terminalQueueClients = null;
     own.backend.queueEntries = [{ id: 'pending-queue' }];
     await denied('queued'); own.backend.queueEntries = [];
     own.backend.goalOverride = { id: 'pending-goal' };
@@ -206,11 +218,67 @@ test('native CLI WebSocket admits one qualified plain-text turn through the same
   }
 });
 
-test('refused stop during an active CLI turn preserves the attached WebSocket', async () => {
+test('controlled CLI source scope refuses journal, source, and manifest drift', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  try {
+    const scope = own.cliOptions!.sourceScope!;
+    await verifyControlledNativeCliSourceScope(scope);
+    await assert.rejects(verifyControlledNativeCliSourceScope(scope, {
+      taskId: randomUUID(), home: own.home, cwd: own.home, approvedTaskPolicy: scope.policy }),
+    /scope/i);
+    await assert.rejects(verifyControlledNativeCliSourceScope(scope, {
+      taskId: own.taskId, home: own.home, cwd: own.home,
+      approvedTaskPolicy: { ...scope.policy, model: 'different' } }), /scope/i);
+    await writeFile(path.join(own.home, 'sessions', `${randomUUID()}.jsonl`),
+      `${JSON.stringify({ type: 'session_meta', payload: { id: randomUUID(),
+        session_id: randomUUID(), cwd: own.home } })}\n`);
+    await assert.rejects(verifyControlledNativeCliSourceScope(scope), /unqualified/i);
+    own.creationJournal!.close();
+    await assert.rejects(verifyControlledNativeCliSourceScope(scope), /scope/i);
+  } finally {
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-drift-stop');
+  }
+});
+
+test('native CLI WebSocket without a controlled source remains read-only', async () => {
   const capability = {};
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
     'normal', false, null, undefined, undefined, false, undefined, undefined,
     { capability, noPendingExternalAutoStart: () => true });
+  const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
+  try {
+    await client.request('initialize', 'initialize', { clientInfo: { name: 'fixture' }, capabilities: {} });
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    assert.ok((await client.request('resume', 'thread/resume', { threadId: own.taskId })).result);
+    const params = { threadId: own.taskId, clientUserMessageId: randomUUID(),
+      input: [{ type: 'text', text: 'must not start' }], turnTrigger: null, toolOutput: null,
+      responsesapiClientMetadata: null, additionalContext: null, environments: null,
+      cwd: own.home, runtimeWorkspaceRoots: [own.home], approvalPolicy: 'never',
+      approvalsReviewer: 'user', sandboxPolicy: null, permissions: ':read-only',
+      model: 'gpt-5.6-sol', serviceTier: null, serviceTierForTurn: null, effort: 'low',
+      summary: null, personality: null, outputSchema: null,
+      collaborationMode: { mode: 'default', settings: { model: 'gpt-5.6-sol',
+        reasoning_effort: 'low', developer_instructions: null } },
+      multiAgentMode: null, cyberAccessProgram: null };
+    const reply = await client.request('start-without-source', 'turn/start', params);
+    assert.equal((reply.error as { code: number }).code, -32602);
+    assert.equal(own.backend.writes, 0);
+    assert.ok((await client.request('read-after-refusal', 'thread/read',
+      { threadId: own.taskId, includeTurns: true })).result);
+  } finally {
+    client.socket.terminate();
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'read-only-stop');
+  }
+});
+
+test('refused stop during an active CLI turn preserves the attached WebSocket', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
   const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
   try {
     await client.request('initialize', 'initialize', { clientInfo: { name: 'fixture' }, capabilities: {} });
@@ -1119,6 +1187,45 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   const registry = new ManagedWorkerRegistry(registryPath);
   const reserved = registry.reserve(home, 'own-family'); registry.close();
   const taskId = stock || nativeCliWebSocket ? randomUUID() : 'own-zero-turn';
+  const cliPolicy = nativeCliWebSocket && cliApprovedPolicy ? approveTaskPolicy({ threadId: taskId,
+    model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'low', cwd: home,
+    runtimeWorkspaceRoots: [home], environments: [{ environmentId: 'local', cwd: home,
+      runtimeWorkspaceRoots: [home] }], approvalPolicy: 'never', approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':read-only', extends: null },
+    sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null }) : null;
+  let cliOptions = nativeCliWebSocket;
+  let creationJournal: ControlledNativeCreationJournal | null = null;
+  if (nativeCliWebSocket?.singleAcceptedStart && cliPolicy) {
+    const operationId = randomUUID(), sourceGeneration = randomUUID();
+    const identity = { operationId, sourceGeneration, sourceId: 'isolated-cli-fixture' };
+    await mkdir(path.join(home, 'sessions'));
+    const preflight = await captureControlledNativeSourcePreflight(identity, home, home);
+    const receiptPath = path.join(privateDirectory, 'source-preflight.json');
+    await persistControlledNativeSourcePreflightReceipt(receiptPath, preflight);
+    const rolloutPath = path.join(home, 'sessions', `${taskId}.jsonl`);
+    await writeFile(rolloutPath, `${JSON.stringify({ type: 'session_meta', payload: {
+      id: taskId, session_id: taskId, cwd: home } })}\n`);
+    creationJournal = new ControlledNativeCreationJournal(path.join(privateDirectory, 'creation.sqlite'));
+    const { threadId: _threadId, serviceTier: _serviceTier, environments: _environments,
+      ...fixed } = cliPolicy;
+    const intent = { ...identity, creatorNonce: randomUUID(), sourceProofRequired: true as const,
+      requestedPolicy: { ...fixed, allowedServiceTiers: [null],
+        allowedEnvironments: [cliPolicy.environments] } };
+    const started = { ...intent, threadId: taskId, selectedEffective: {
+      model: cliPolicy.model, modelProvider: cliPolicy.modelProvider,
+      reasoningEffort: cliPolicy.effort, serviceTier: cliPolicy.serviceTier, cwd: cliPolicy.cwd,
+      approvalPolicy: cliPolicy.approvalPolicy, environments: cliPolicy.environments,
+      runtimeWorkspaceRoots: cliPolicy.runtimeWorkspaceRoots,
+      approvalsReviewer: cliPolicy.approvalsReviewer,
+      activePermissionProfile: cliPolicy.activePermissionProfile, sandbox: cliPolicy.sandbox } };
+    await creationJournal.persistIntent(intent);
+    await creationJournal.persistStarted(started);
+    await creationJournal.persistQualified({ ...started, effectivePolicy: cliPolicy,
+      rolloutPath, status: 'qualified-zero-turn' });
+    const sourceScope = await deriveControlledNativeCliSourceScope({ journal: creationJournal,
+      operationId, preflightReceiptPath: receiptPath, sourceHome: home, workspace: home });
+    cliOptions = { ...nativeCliWebSocket, sourceScope };
+  }
   const backend = new Backend(taskId, home), brokers: Broker[] = [], probeBrokers: Broker[] = [],
     handlerErrors: string[] = [];
   const ownerId = stock ? randomUUID() : 'local-owner';
@@ -1131,7 +1238,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
     ...(oneShotFirstComposer ? { oneShotFirstComposer } : {}),
-    ...(nativeCliWebSocket ? { nativeCliWebSocket } : {}),
+    ...(cliOptions ? { nativeCliWebSocket: cliOptions } : {}),
     ...(nativeTaskState ? { nativeTaskState: true as const } : {}),
     ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
       assertControlledNativeBaseline: () => stockFailure !== 'baseline',
@@ -1178,7 +1285,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         resumeParams: { threadId: taskId, cwd: home, model: 'gpt-5.6-sol',
           permissions: stock && stockFailure !== 'policy' ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
           runtimeWorkspaceRoots: [home], config: { model_reasoning_effort: stock ? 'medium' : 'low' } },
-        ...(stock || nativeCliWebSocket && cliApprovedPolicy ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
+        ...(cliPolicy ? { approvedTaskPolicy: cliPolicy } : stock ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
           model: 'gpt-5.6-sol', modelProvider: 'openai', effort: stock ? 'medium' : 'low', cwd: home,
           runtimeWorkspaceRoots: [home], environments: stock ? [] :
             [{ environmentId: 'local', cwd: home, runtimeWorkspaceRoots: [home] }], approvalPolicy: 'never',
@@ -1217,7 +1324,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   }
   else await assert.rejects(daemon.start(), /startup unavailable/);
   return { daemon, backend, brokers, probeBrokers, handlerErrors, reserved, home, taskId, registryPath,
-    privateDirectory, launches, observations, control };
+    privateDirectory, launches, observations, control, creationJournal, cliOptions };
 }
 
 test('backend spawn specification strips synthetic bridge hooks and retains TLS and proxy settings', () => {

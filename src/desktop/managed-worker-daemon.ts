@@ -33,6 +33,8 @@ import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server
 import { deriveManagedTaskStateToken } from './managed-worker-task-state-token.js';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
+import { assertControlledNativeCliSourceScope, verifyControlledNativeCliSourceScope,
+  type ControlledNativeCliSourceScope } from './controlled-native-cli-source-scope.js';
 
 type State = 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
 type Row = Record<string, unknown>;
@@ -89,6 +91,8 @@ export interface ManagedWorkerDaemonOptions {
     noPendingExternalAutoStart: () => boolean;
     /** Optional isolated acceptance budget; never inferred for production. */
     singleAcceptedStart?: true;
+    /** Required for a controlled first CLI start. Derived from a qualified creation journal. */
+    sourceScope?: ControlledNativeCliSourceScope;
   }>;
   /** Explicit isolated first-turn route. The callback must validate its own
    * one-shot challenge; the private intent store caps distinct starts at one. */
@@ -181,12 +185,16 @@ export class ManagedWorkerDaemon {
     if (cli !== undefined && (!object(cli) ||
       !isDeepStrictEqual(Object.keys(cli).sort(),
         ['capability', 'noPendingExternalAutoStart',
-          ...(cli.singleAcceptedStart === undefined ? [] : ['singleAcceptedStart'])].sort()) || !cli.capability ||
+          ...(cli.singleAcceptedStart === undefined ? [] : ['singleAcceptedStart']),
+          ...(cli.sourceScope === undefined ? [] : ['sourceScope'])].sort()) || !cli.capability ||
       typeof cli.capability !== 'object' ||
       typeof cli.noPendingExternalAutoStart !== 'function' ||
       cli.singleAcceptedStart !== undefined && cli.singleAcceptedStart !== true ||
+      cli.singleAcceptedStart === true && cli.sourceScope === undefined ||
+      cli.sourceScope !== undefined && cli.singleAcceptedStart !== true ||
       stock !== undefined || options.oneShotFirstComposer !== undefined))
       throw new TypeError('Native CLI WebSocket requires an isolated scheduler proof');
+    if (cli?.sourceScope !== undefined) assertControlledNativeCliSourceScope(cli.sourceScope);
     if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
       throw new TypeError('Managed native task-state listener requires explicit opt-in');
     if (options.oneShotFirstComposer !== undefined &&
@@ -397,6 +405,8 @@ export class ManagedWorkerDaemon {
             approved.sandbox.type !== 'readOnly' || approved.sandbox.networkAccess !== false ||
             !['default', null].includes(approved.serviceTier))
           throw new Error('Native CLI read-only policy unavailable');
+        if (this.#options.nativeCliWebSocket.sourceScope)
+          await verifyControlledNativeCliSourceScope(this.#options.nativeCliWebSocket.sourceScope, manifest);
       }
       this.#registry = new ManagedWorkerRegistry(manifest.registryPath);
       const reserved = this.#registry.get(manifest.home, manifest.familyRoot);
@@ -492,7 +502,10 @@ export class ManagedWorkerDaemon {
       const cliAdmission = this.#options.nativeCliWebSocket ? new ManagedNativeCliStartAdmission({
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, controlKey,
         ...(this.#options.nativeCliWebSocket.singleAcceptedStart ? { singleAcceptedStart: true as const } : {}),
-        qualify: resume => {
+        qualify: async resume => {
+          const sourceScope = this.#options.nativeCliWebSocket?.sourceScope;
+          if (!sourceScope) throw new Error('Native CLI controlled source unavailable');
+          await verifyControlledNativeCliSourceScope(sourceScope, manifest);
           if (!this.#cliQualifier) throw new Error('Native CLI source unavailable');
           return this.#cliQualifier.qualify(resume);
         },
@@ -709,6 +722,7 @@ export class ManagedWorkerDaemon {
             !this.#ingressRevoked && this.#headlessPending === 0 &&
             this.#owner?.noPendingNativeCliAutoStart() === true &&
             this.#options.nativeCliWebSocket?.noPendingExternalAutoStart() === true,
+          ...(this.#options.nativeCliWebSocket.sourceScope ? { requireEmptyHistory: true as const } : {}),
         });
         this.#cliQualifier.start();
       }
