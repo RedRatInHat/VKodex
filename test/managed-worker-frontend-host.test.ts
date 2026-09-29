@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import WebSocket from 'ws';
 import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
+import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
 import type { ManagedWorkerNotification } from '../src/codex/managed-worker-frontend-host.js';
 import type { WorkerCommand, WorkerCommandPolicy } from '../src/codex/managed-worker-command-dispatcher.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
@@ -143,6 +144,64 @@ test('opt-in WebSocket host accepts native initialize/read without a JSONL auth 
       assert.deepEqual((await client.next()).result, { thread: { id: taskId } });
     } finally { client.close(); }
   } finally { await fixture.stop('test-cleanup'); }
+});
+
+test('opt-in CLI start crosses the WebSocket only through the durable same-worker command path', async () => {
+  const child = new Child(), adapterKey = {}, controlKey = {};
+  const ownerEpoch = randomUUID(), clientId = randomUUID();
+  const journalPath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-cli-start-host-')), 'operations.sqlite');
+  const settings = { cwd: 'C:/own', runtimeWorkspaceRoots: ['C:/own'],
+    approvalPolicy: 'never', approvalsReviewer: 'user', permissions: ':read-only',
+    sandboxPolicy: { type: 'readOnly', networkAccess: false }, model: 'gpt-5.6-sol', serviceTier: 'default',
+    effort: 'low', summary: null, personality: null,
+    collaborationMode: { mode: 'default', settings: null } };
+  const params = { threadId: taskId, clientUserMessageId: clientId,
+    input: [{ type: 'text', text: 'isolated host turn' }], turnTrigger: null,
+    toolOutput: null, responsesapiClientMetadata: null, additionalContext: null,
+    environments: null, cwd: settings.cwd, runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots,
+    approvalPolicy: settings.approvalPolicy, approvalsReviewer: settings.approvalsReviewer,
+    sandboxPolicy: null, permissions: settings.permissions, model: settings.model,
+    serviceTier: settings.serviceTier, serviceTierForTurn: null, effort: settings.effort,
+    summary: null, personality: null, outputSchema: null,
+    collaborationMode: settings.collaborationMode, multiAgentMode: null,
+    cyberAccessProgram: null };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch, controlKey,
+    qualify: async () => ({ taskId, ownerEpoch,
+      backendGeneration: 1, semanticRevision: 1,
+      effectiveSettings: settings, idle: true, nativeQueueEmpty: true,
+      noPendingAutoStart: true, assertCurrent: () => {},
+    }) });
+  const policy: WorkerCommandPolicy = { controlKey, ownerEpoch, journalPath,
+    fingerprintKey: randomBytes(32), isOwnerCurrent: () => true,
+    authorize: ({ params: command }) => command.model === settings.model };
+  const options = { taskId, ownCwd: 'C:/own', initializeRequest: init, adapterKey,
+    frontendProtocol: 'websocket' as const, backendTimeoutMs: 500,
+    bootstrapReadMethods: [], allowRequest: () => false, allowAnswer: () => false,
+    commandPolicy: policy, frontendStartAdmission: admission, launch: () => child.asChild() };
+  const { commandPolicy: _unused, ...noCommandPolicy } = options;
+  assert.throws(() => new ManagedWorkerFrontendHost(noCommandPolicy), TypeError);
+  assert.throws(() => new ManagedWorkerFrontendHost({ ...options,
+    frontendProtocol: 'jsonl' }), TypeError);
+  assert.throws(() => new ManagedWorkerFrontendHost({ ...options,
+    commandPolicy: { ...policy, controlKey: {} } }), TypeError);
+  const managed = new ManagedWorkerFrontendHost(options);
+  await managed.start();
+  try {
+    const client = await websocketClient(managed.frontendWebSocketCapability(adapterKey));
+    try {
+      client.send({ id: 'init', method: 'initialize', params: init });
+      assert.equal((await client.next()).id, 'init');
+      client.send({ id: 2, method: 'turn/start', params });
+      const wire = await sentMutation(child);
+      assert.deepEqual(wire.params, params);
+      child.send({ id: wire.id, result: { turn: { id: 'native-turn-ok', status: 'inProgress' } } });
+      assert.deepEqual((await client.next()).result,
+        { turn: { id: 'native-turn-ok', status: 'inProgress' } });
+      assert.deepEqual(managed.acceptedCommandReceipts(controlKey),
+        [{ method: 'turn/start', receiptId: 'native-turn-ok' }]);
+      assert.equal(child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    } finally { client.close(); }
+  } finally { await managed.stop('test-cleanup'); }
 });
 
 test('WebSocket restart retains backend PID and rejects old bearer on the new listener', async () => {

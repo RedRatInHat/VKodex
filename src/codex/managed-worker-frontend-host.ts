@@ -9,6 +9,7 @@ import { PersistentFrontendLocalTransport } from './frontend-local-transport.js'
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
 import { PersistentFrontendWebSocketTransport } from './frontend-websocket-transport.js';
 import { ManagedWorkerCommandDispatcher, captureWorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
+import { ManagedNativeCliStartAdmission } from './managed-native-cli-start-admission.js';
 import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse, WorkerCommandQuiescence,
   SettingsCommand } from './managed-worker-command-dispatcher.js';
 import type { WorkerOperation, SettingsOperation } from './managed-worker-operation-journal.js';
@@ -37,6 +38,8 @@ export interface ManagedWorkerFrontendHostOptions extends RequestPolicy {
   readonly backendTimeoutMs?: number;
   readonly trustedLocalFrontend?: boolean;
   readonly resumeAuthority?: ResumeAuthority;
+  /** Explicit read-only CLI subset, bound to this same durable command policy. */
+  readonly frontendStartAdmission?: ManagedNativeCliStartAdmission;
   /** Explicit owner-only commands. Native frontend read/rejoin remains separate. */
   readonly commandPolicy?: WorkerCommandPolicy;
 }
@@ -100,6 +103,7 @@ export class ManagedWorkerFrontendHost {
   readonly #frontendProtocol: FrontendProtocol;
   readonly #trustedLocalFrontend: boolean;
   readonly #resumeAuthority: ResumeAuthority | null;
+  readonly #frontendStartAdmission: ManagedNativeCliStartAdmission | null;
   readonly #requestPolicy: RequestPolicy;
   readonly #rpc: AppServerConnection;
   readonly #commandPolicy: WorkerCommandPolicy | null;
@@ -131,6 +135,10 @@ export class ManagedWorkerFrontendHost {
       typeof options.allowAnswer !== 'function' ||
       (options.allowError !== undefined && typeof options.allowError !== 'function') ||
       (options.resumeAuthority !== undefined && typeof options.resumeAuthority !== 'function') ||
+      (options.frontendStartAdmission !== undefined &&
+        (!(options.frontendStartAdmission instanceof ManagedNativeCliStartAdmission) ||
+          options.frontendProtocol !== 'websocket' || !options.commandPolicy ||
+          !options.frontendStartAdmission.matchesPolicy(options.taskId, options.commandPolicy))) ||
       (options.frontendProtocol !== undefined && options.frontendProtocol !== 'jsonl' &&
         options.frontendProtocol !== 'websocket') ||
       (options.trustedLocalFrontend !== undefined && typeof options.trustedLocalFrontend !== 'boolean'))
@@ -149,6 +157,7 @@ export class ManagedWorkerFrontendHost {
     this.#frontendProtocol = options.frontendProtocol ?? 'jsonl';
     this.#trustedLocalFrontend = options.trustedLocalFrontend ?? false;
     this.#resumeAuthority = options.resumeAuthority ?? null;
+    this.#frontendStartAdmission = options.frontendStartAdmission ?? null;
     this.#requestPolicy = Object.freeze({ allowRequest: options.allowRequest,
       allowAnswer: options.allowAnswer, ...(options.allowError ? { allowError: options.allowError } : {}) });
     this.#commandPolicy = options.commandPolicy === undefined ? null : captureWorkerCommandPolicy(options.commandPolicy);
@@ -159,12 +168,18 @@ export class ManagedWorkerFrontendHost {
       return launch();
     }, this.#initializeRequest, timeout);
     this.#rpc.onDisconnect(() => this.#loseBackend());
+    if (this.#frontendStartAdmission && this.#commandPolicy)
+      this.#frontendStartAdmission.bindHost(this, this.#taskId, this.#commandPolicy);
     // Constructor-only policy validation before any worker launch or listener.
     new PersistentFrontendSessions({ backendFactory: () => this.#rpc,
       initializeRequest: this.#initializeRequest, taskId: this.#taskId,
       ownCwd: this.#ownCwd, bootstrapReadMethods: this.#bootstrapReadMethods,
       trustedLocalFrontend: this.#trustedLocalFrontend,
-      resumeAuthority: this.#resumeAuthority });
+      resumeAuthority: this.#resumeAuthority,
+      frontendStart: this.#frontendStartAdmission ? {
+        ownerEpoch: this.#frontendStartAdmission.ownerEpoch,
+        run: context => this.#frontendStartAdmission!.run(context),
+      } : null });
   }
 
   get metadata(): ManagedWorkerFrontendMetadata {
@@ -414,7 +429,12 @@ export class ManagedWorkerFrontendHost {
         initializeRequest: this.#initializeRequest, taskId: this.#taskId,
         ownCwd: this.#ownCwd, bootstrapReadMethods: this.#bootstrapReadMethods,
         trustedLocalFrontend: this.#trustedLocalFrontend,
-        resumeAuthority: this.#resumeAuthority, requestInbox: inbox,
+        resumeAuthority: this.#resumeAuthority,
+        frontendStart: this.#frontendStartAdmission ? {
+          ownerEpoch: this.#frontendStartAdmission.ownerEpoch,
+          run: context => this.#frontendStartAdmission!.run(context),
+        } : null,
+        requestInbox: inbox,
       });
       await this.#listenFrontend();
     } catch (error) {

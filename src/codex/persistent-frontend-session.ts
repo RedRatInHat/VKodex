@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import type { AppServerRequestOptions, AppServerInitializedSession,
   AppServerResponseEnvelope } from './app-server-connection.js';
+import type { WorkerCommandResponse } from './managed-worker-command-dispatcher.js';
 
 type JsonObject = Record<string, unknown>;
 type Frame = JsonObject;
@@ -14,6 +15,12 @@ interface FrontendBackend {
   request(method: string, params?: JsonObject, options?: AppServerRequestOptions): Promise<unknown>;
 }
 type ResumeAuthority = (context: Readonly<{ taskId: string; generation: number }>) => unknown;
+interface FrontendStart {
+  readonly ownerEpoch: string;
+  /** Owner-controlled durable dispatcher only. Never call backend.request directly. */
+  readonly run: (context: Readonly<{ taskId: string; generation: number;
+    params: JsonObject }>) => Promise<WorkerCommandResponse>;
+}
 interface SessionOptions {
   readonly backendFactory: (initializeRequest: Readonly<JsonObject>) => FrontendBackend;
   readonly initializeRequest: JsonObject;
@@ -22,6 +29,7 @@ interface SessionOptions {
   readonly ownCwd?: string | null;
   readonly trustedLocalFrontend?: boolean;
   readonly resumeAuthority?: ResumeAuthority | null;
+  readonly frontendStart?: FrontendStart | null;
   readonly requestInbox?: FrontendRequestInbox | null;
 }
 interface FrontendAttachment {
@@ -60,6 +68,7 @@ const bootstrapMethods = Object.freeze([
   'app/installed', 'app/list', 'app/read',
 ]);
 const maxReadyRequests = 128;
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const nullable = (value: unknown, check: (value: unknown) => boolean): boolean => value === null || check(value);
 const textValue = (value: unknown): value is string => typeof value === 'string';
 const cursorValue = (value: unknown): boolean => nullable(value, textValue);
@@ -244,16 +253,18 @@ export class PersistentFrontendSessions {
   private readonly ownCwd: string | null;
   private readonly trustedLocalFrontend: boolean;
   private readonly resumeAuthority: ResumeAuthority | null;
+  private readonly frontendStart: FrontendStart | null;
   private readonly requestInbox: FrontendRequestInbox | null;
   private readonly inboxOwner: Readonly<{ threadId: string; generation: number }> | null;
   private nextAttachmentGeneration = 0;
   private active: FrontendAttachment | null = null;
   private sessionPromise: Promise<AppServerInitializedSession> | null = null;
   private pinnedSession: AppServerInitializedSession | null = null;
+  private startInFlight = false;
 
   constructor({ backendFactory, initializeRequest, taskId,
     bootstrapReadMethods = [], ownCwd = null, trustedLocalFrontend = false,
-    resumeAuthority = null, requestInbox = null }: SessionOptions) {
+    resumeAuthority = null, frontendStart = null, requestInbox = null }: SessionOptions) {
     if (typeof backendFactory !== 'function' ||
       !object(initializeRequest) || !object(initializeRequest.clientInfo) ||
       !object(initializeRequest.capabilities) ||
@@ -264,7 +275,10 @@ export class PersistentFrontendSessions {
       !bootstrapReadMethods.every(method => bootstrapMethods.includes(method)) ||
       !(ownCwd === null || (typeof ownCwd === 'string' && ownCwd.length > 0)) ||
       typeof trustedLocalFrontend !== 'boolean' ||
-      !(resumeAuthority === null || typeof resumeAuthority === 'function')) {
+      !(resumeAuthority === null || typeof resumeAuthority === 'function') ||
+      !(frontendStart === null || (object(frontendStart) &&
+        typeof frontendStart.ownerEpoch === 'string' && uuid.test(frontendStart.ownerEpoch) &&
+        typeof frontendStart.run === 'function'))) {
       throw new TypeError('Invalid explicit bootstrap read policy');
     }
     if (requestInbox !== null && (!object(requestInbox) ||
@@ -294,6 +308,9 @@ export class PersistentFrontendSessions {
     // The embedding launcher must derive this from saved native state, never
     // from the inbound frontend frame. It is opt-in and synchronous.
     this.resumeAuthority = resumeAuthority;
+    this.frontendStart = frontendStart === null ? null : Object.freeze({
+      ownerEpoch: frontendStart.ownerEpoch, run: frontendStart.run,
+    });
     this.requestInbox = requestInbox;
     this.inboxOwner = requestInbox ? structuredClone(requestInbox.owner) : null;
   }
@@ -471,6 +488,53 @@ export class PersistentFrontendSessions {
         const pinned = this.pinnedSession;
         if (!pinned) return 'not-ready';
         const method = frame.method;
+        if (method === 'turn/start' && this.frontendStart) {
+          const params = frame.params;
+          if (!object(params) || params.threadId !== this.taskId ||
+              typeof params.clientUserMessageId !== 'string' ||
+              !params.clientUserMessageId || !Array.isArray(params.input) ||
+              params.input.length === 0) {
+            safeSend(error(id, -32602, 'Native start request incompatible with task'));
+            return 'start-invalid';
+          }
+          if (this.startInFlight || pending.size >= maxReadyRequests) {
+            safeSend(error(id, -32001, 'Native start admission busy'));
+            return 'start-busy';
+          }
+          const requestRecord = { method, params: structuredClone(params) };
+          pending.set(id, requestRecord);
+          this.startInFlight = true;
+          try {
+            const observed = await this.frontendStart.run({ taskId: this.taskId,
+              generation: pinned.generation, params: structuredClone(params) });
+            const op = observed?.operation, result = observed?.response;
+            const exact = op && op.ownerEpoch === this.frontendStart.ownerEpoch &&
+              op.backendGeneration === pinned.generation && op.threadId === this.taskId &&
+              op.clientUserMessageId === params.clientUserMessageId && op.method === 'turn/start' &&
+              uuid.test(op.operationId) && /^[a-f0-9]{64}$/u.test(op.fingerprint) &&
+              Number.isSafeInteger(op.revision) && op.revision >= 1;
+            if (exact && op.state === 'accepted' && object(result) &&
+                object(result.turn) && typeof result.turn.id === 'string' &&
+                result.turn.id === op.receiptId) {
+              safeSend({ id, result: structuredClone(result) });
+              return 'start-accepted';
+            }
+            if (exact && op.state === 'rejected' && op.receiptId === null &&
+                typeof op.rejectionCode === 'number' &&
+                [-32600, -32601, -32602].includes(op.rejectionCode)) {
+              safeSend(error(id, op.rejectionCode, 'Native start rejected'));
+              return 'start-rejected';
+            }
+            safeSend(error(id, -32001, 'Native start outcome unknown; do not replay blindly'));
+            return 'start-unknown';
+          } catch {
+            safeSend(error(id, -32001, 'Native start outcome unknown; do not replay blindly'));
+            return 'start-unknown';
+          } finally {
+            this.startInFlight = false;
+            pending.delete(id);
+          }
+        }
         const kind = requestKind(frame.method, frame.params, this.taskId) ||
           (frame.method === 'thread/resume' ? authorizedResume(frame.params,
             this.taskId, pinned.generation, this.resumeAuthority) : null) ||

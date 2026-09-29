@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
+import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
 
 const taskId = '01a0eb7e-bec3-7a93-9641-8c4fb5f15d6a';
 const ownerEpoch = 'f2945262-91bd-42ed-ac48-77dbca48a138';
@@ -8,7 +9,7 @@ const clientId = '76c8caee-85da-4125-8bb6-7b602239783a';
 const settings = {
   cwd: 'D:\\GitStorageG\\VKodex', runtimeWorkspaceRoots: ['D:\\GitStorageG\\VKodex'],
   approvalPolicy: 'never', approvalsReviewer: 'user', permissions: ':read-only',
-  sandboxPolicy: { type: 'readOnly' }, model: 'gpt-5.6-sol', serviceTier: 'default',
+  sandboxPolicy: { type: 'readOnly', networkAccess: false }, model: 'gpt-5.6-sol', serviceTier: 'default',
   effort: 'low', summary: null, collaborationMode: { mode: 'default', settings: null },
   personality: null,
 };
@@ -60,4 +61,59 @@ test('native CLI start rejects source, settings, context, and input drift', () =
     { taskId, ownerEpoch, effectiveSettings: settings }));
   assert.throws(() => prepareNativeCliTurnStart(start(), { taskId, ownerEpoch,
     effectiveSettings: { ...settings, permissions: ':danger-full-access' } }));
+  assert.throws(() => prepareNativeCliTurnStart(start(), { taskId, ownerEpoch,
+    effectiveSettings: { ...settings, sandboxPolicy: { type: 'readOnly', networkAccess: true } } }));
+});
+
+test('CLI admission rechecks same-worker queue proof before durable host write', async () => {
+  const controlKey = {}; let current = true; let writes = 0;
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence(key: object) { assert.equal(key, controlKey);
+      return { inFlight: 0, unconfirmed: false }; },
+    async executeCommandWithResponse(key: object, command: ReturnType<typeof prepareNativeCliTurnStart>,
+      beforeWrite?: () => void) {
+      assert.equal(key, controlKey);
+      beforeWrite?.(); writes++;
+      return { operation: { ownerEpoch, backendGeneration: 7, threadId: taskId,
+        operationId: command.operationId, clientUserMessageId: clientId,
+        method: 'turn/start' as const, fingerprint: 'a'.repeat(64), revision: 1,
+        state: 'accepted' as const, receiptId: 'native-turn', rejectionCode: null },
+      response: { turn: { id: 'native-turn' } } };
+    } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch,
+    controlKey, qualify: async () => ({ taskId, ownerEpoch,
+      backendGeneration: 7, semanticRevision: 4, effectiveSettings: settings,
+      idle: true as const, nativeQueueEmpty: true as const,
+      noPendingAutoStart: true as const,
+      assertCurrent: () => { if (!current) throw new Error('stale'); },
+    }) });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  assert.throws(() => admission.bindHost(host, taskId, { ownerEpoch, controlKey }), /mismatch/);
+  const accepted = await admission.run({ taskId, generation: 7, params: start() });
+  assert.equal(accepted.operation.receiptId, 'native-turn');
+  assert.equal(writes, 1);
+  current = false;
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /stale/);
+  assert.equal(writes, 1);
+  current = true; host.metadata.backendGeneration = 8;
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /generation/);
+  assert.equal(writes, 1);
+});
+
+test('CLI admission refuses an occupied queue and unsettled command ledger', async () => {
+  const controlKey = {}; let writes = 0; let queued = true; let unsettled = false;
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence: () => ({ inFlight: 0, unconfirmed: unsettled }),
+    executeCommandWithResponse: async () => { writes++; throw new Error('should not write'); } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch,
+    controlKey, qualify: async () => ({ taskId, ownerEpoch,
+      backendGeneration: 7, semanticRevision: 4, effectiveSettings: settings,
+      idle: true as const, nativeQueueEmpty: !queued as true,
+      noPendingAutoStart: true as const, assertCurrent: () => {},
+    }) });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /proof/);
+  queued = false; unsettled = true;
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /unsettled/);
+  assert.equal(writes, 0);
 });

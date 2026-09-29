@@ -939,6 +939,80 @@ test('foreign tasks, settings, queue writes and arbitrary requests never reach b
   assert.ok(frames.slice(1).every(frame => frame.error && !frame.result));
 });
 
+test('opt-in native CLI start returns only a matching durable worker receipt, never raw backend RPC', async () => {
+  const backend = fakeBackend();
+  const clientUserMessageId = '1d9a5c7c-1c7f-4f72-a315-c6607930d10c';
+  const ownerEpoch = 'd2a53334-a43f-4765-a3c8-a818ed68fe0f';
+  const turnId = 'isolated-turn';
+  const params = { threadId: taskId, clientUserMessageId,
+    input: [{ type: 'text', text: 'isolated native CLI acceptance' }] };
+  let calls = 0;
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+    run: async ({ taskId: scopedTask, generation, params: incoming }) => {
+      calls++;
+      assert.equal(scopedTask, taskId);
+      assert.equal(generation, 7);
+      assert.deepEqual(incoming, params);
+      return { operation: { ownerEpoch, backendGeneration: 7, threadId: taskId,
+        operationId: 'db27d91f-0f3d-4859-a764-48a58d65e74d', clientUserMessageId,
+        method: 'turn/start' as const, fingerprint: 'a'.repeat(64), revision: 1,
+        state: 'accepted' as const, receiptId: turnId, rejectionCode: null },
+      response: { turn: { id: turnId, status: 'inProgress' } } };
+    } } });
+  const { frames, frontend } = attach(sessions); await initialize(frontend);
+  assert.equal(await frontend.receive({ id: 2, method: 'turn/start', params }), 'start-accepted');
+  assert.equal(calls, 1);
+  assert.deepEqual(frames[1], { id: 2, result: { turn: { id: turnId, status: 'inProgress' } } });
+  assert.equal(await frontend.receive({ id: 3, method: 'turn/start', params: {
+    ...params, threadId: 'foreign',
+  } }), 'start-invalid');
+  assert.equal(backend.requests.length, 0);
+  assert.equal(calls, 1);
+});
+
+test('native CLI start unknown after disconnect is fenced and never dispatched twice', async () => {
+  const backend = fakeBackend();
+  const ownerEpoch = 'd2a53334-a43f-4765-a3c8-a818ed68fe0f';
+  const clientUserMessageId = '1d9a5c7c-1c7f-4f72-a315-c6607930d10c';
+  const params = { threadId: taskId, clientUserMessageId,
+    input: [{ type: 'text', text: 'isolated native CLI acceptance' }] };
+  const pending = deferred<unknown>(); let calls = 0;
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+    run: async () => { calls++; return pending.promise as Promise<never>; } } });
+  const a = attach(sessions); await initialize(a.frontend);
+  const first = a.frontend.receive({ id: 2, method: 'turn/start', params });
+  a.frontend.detach();
+  const b = attach(sessions); await initialize(b.frontend);
+  assert.equal(await b.frontend.receive({ id: 3, method: 'turn/start', params }), 'start-busy');
+  pending.resolve({ operation: { ownerEpoch, backendGeneration: 7, threadId: taskId,
+    operationId: 'db27d91f-0f3d-4859-a764-48a58d65e74d', clientUserMessageId,
+    method: 'turn/start', fingerprint: 'a'.repeat(64), revision: 1,
+    state: 'unknown', receiptId: null, rejectionCode: null }, response: null });
+  assert.equal(await first, 'start-unknown');
+  assert.equal(a.frames.length, 1);
+  assert.equal(calls, 1);
+  assert.equal(backend.requests.length, 0);
+});
+
+test('native CLI start refuses a foreign receipt even when callback claims acceptance', async () => {
+  const backend = fakeBackend();
+  const ownerEpoch = 'd2a53334-a43f-4765-a3c8-a818ed68fe0f';
+  const clientUserMessageId = '1d9a5c7c-1c7f-4f72-a315-c6607930d10c';
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+    run: async () => ({ operation: { ownerEpoch, backendGeneration: 7, threadId: 'foreign',
+      operationId: 'db27d91f-0f3d-4859-a764-48a58d65e74d', clientUserMessageId,
+      method: 'turn/start' as const, fingerprint: 'a'.repeat(64), revision: 1,
+      state: 'accepted' as const, receiptId: 'foreign-turn', rejectionCode: null },
+    response: { turn: { id: 'foreign-turn' } } }),
+  } });
+  const { frames, frontend } = attach(sessions); await initialize(frontend);
+  assert.equal(await frontend.receive({ id: 2, method: 'turn/start', params: {
+    threadId: taskId, clientUserMessageId, input: [{ type: 'text', text: 'test' }],
+  } }), 'start-unknown');
+  assert.equal(frames[1]!.error!.code, -32001);
+  assert.equal(backend.requests.length, 0);
+});
+
 test('notifications are task-scoped and detached generation cannot receive late events', async () => {
   const backend = fakeBackend();
   const sessions = createSessions(backend);

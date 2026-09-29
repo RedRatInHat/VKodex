@@ -83,6 +83,8 @@ export function prepareNativeCliTurnStart(params: unknown,
   const effective = scope.effectiveSettings;
   if (!object(effective) || effective.permissions !== ':read-only' ||
       effective.approvalPolicy !== 'never' ||
+      !object(effective.sandboxPolicy) || effective.sandboxPolicy.type !== 'readOnly' ||
+      effective.sandboxPolicy.networkAccess !== false ||
       typeof effective.model !== 'string' || !effective.model ||
       typeof effective.cwd !== 'string' || !effective.cwd ||
       !Array.isArray(effective.runtimeWorkspaceRoots) ||
