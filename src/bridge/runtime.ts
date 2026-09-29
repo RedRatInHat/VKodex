@@ -31,6 +31,9 @@ interface MaintenanceJob {
   readonly work: Promise<void>;
 }
 
+/** Cold rollout reads can each parse up to 16 MiB; keep their aggregate burst bounded. */
+const MAX_CONCURRENT_ROLLOUT_FALLBACK_POLLS = 4;
+
 export class BridgeRuntime {
   private readonly gate: AccessGate;
   private readonly delivery: DeliveryWorker;
@@ -68,6 +71,8 @@ export class BridgeRuntime {
   private readonly observedTasks = new Map<string, Binding>();
   private readonly fallbackGenerations = new Map<string, number>();
   private readonly enabledFallbacks = new Set<string>();
+  /** Next position in the stable binding order for a detached-rollout poll. */
+  private historyPollCursor = 0;
   /** Native resume of a large task may take minutes; it must not hold the health/update loop. */
   private readonly connecting = new Map<string, Promise<void>>();
   private readonly connectionGenerations = new Map<string, number>();
@@ -688,7 +693,8 @@ export class BridgeRuntime {
     this.manager.panels.transfers.tick();
     this.closeInactiveSubscriptions();
     this.activity.tick();
-    for (const binding of this.store.bindings()) {
+    const bindings = this.store.bindings();
+    for (const binding of bindings) {
       this.prepareBindingObservation(binding);
       // A final can enter the durable VK outbox before an earlier, lost
       // turn/start acknowledgement is recovered. Repair older stranded
@@ -698,11 +704,38 @@ export class BridgeRuntime {
       }
       const generation = this.store.streamGeneration(binding.id);
       const suffix = JSON.stringify([binding.id, taskKey(binding), generation]);
-      this.background(`history:${suffix}`, "history", () => this.mirrorRolloutFallback(binding), binding.id);
       this.background(`connection:${suffix}`, "connection", setPhase => this.maintainBinding(binding, generation, setPhase), binding.id);
     }
+    this.scheduleRolloutFallbacks(bindings);
     this.background("panels", "panels", () => this.manager.panels.tick());
     void this.delivery.flush().catch(() => {});
+  }
+
+  /**
+   * Do not turn every detached task into a pending promise: a cold rollout
+   * reader can allocate and parse a large window. Scheduling only open slots
+   * keeps CPU and RSS bounded, while the cursor eventually gives every
+   * enabled fallback a turn.
+   */
+  private scheduleRolloutFallbacks(bindings: readonly Binding[]): void {
+    const candidates = bindings.filter(binding => binding.attached && binding.peerId !== null
+      && !!binding.rolloutPath && this.enabledFallbacks.has(binding.id));
+    if (!candidates.length) { this.historyPollCursor = 0; return; }
+    const active = [...this.maintenance.values()].filter(job => job.phase === "history").length;
+    const slots = Math.max(0, MAX_CONCURRENT_ROLLOUT_FALLBACK_POLLS - active);
+    if (!slots) return;
+    const start = this.historyPollCursor % candidates.length;
+    let scheduled = 0;
+    for (let offset = 0; offset < candidates.length && scheduled < slots; offset++) {
+      const index = (start + offset) % candidates.length;
+      const binding = candidates[index]!;
+      const generation = this.store.streamGeneration(binding.id);
+      const key = `history:${JSON.stringify([binding.id, taskKey(binding), generation])}`;
+      if (this.maintenance.has(key)) continue;
+      this.background(key, "history", () => this.mirrorRolloutFallback(binding), binding.id);
+      scheduled++;
+      this.historyPollCursor = (index + 1) % candidates.length;
+    }
   }
 
   private async maintainBinding(listed: Binding, generation: number, setPhase: (phase: string) => void): Promise<void> {

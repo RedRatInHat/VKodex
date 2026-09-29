@@ -1014,8 +1014,10 @@ test("a cold VK target connects and dispatches while another binding's history p
     async poll(id) { if (id === unrelatedId) { entered(); await stalled; } return null; },
   };
   const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
-  const unrelated = { ...ref, threadId: "stalled-history", title: "Stalled history", workspace: "/fixture", updatedAt: 1 };
+  const unrelated = { ...ref, threadId: "stalled-history", title: "Stalled history", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: "C:/profiles/work/sessions/stalled-history.jsonl" };
   const other = s.store.ensureBinding(unrelated); unrelatedId = other.id; s.store.setChat(other.id, s.peerId + 1, 18);
+  s.store.setValue(`task-stream-mode:${other.id}`, "detached");
   s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }, unrelated];
   let submitted = false;
   s.desktop.submitWithReceipt = async () => {
@@ -1082,6 +1084,60 @@ test("a stalled fallback does not block another binding's background attach and 
     assert.ok(survivorPolls >= 1, "released survivor must keep polling independently");
   } finally {
     clearTimeout(timer); release(); await background;
+  }
+});
+
+test("rollout fallback polls no more than four detached tasks at once and rotates through all candidates", async t => {
+  const enabled = new Set<string>();
+  const releases = new Map<string, () => void>();
+  const started: string[] = [];
+  let active = 0; let maximumActive = 0;
+  let startedSignal!: () => void;
+  const firstWave = new Promise<void>(resolve => { startedSignal = resolve; });
+  const history: TaskHistoryRecovery = {
+    enable(id) { enabled.add(id); }, disable(id) { enabled.delete(id); },
+    async poll(id) {
+      if (!enabled.has(id)) return null;
+      started.push(id); active++; maximumActive = Math.max(maximumActive, active);
+      if (started.length === 4) startedSignal();
+      await new Promise<void>(resolve => { releases.set(id, resolve); });
+      active--;
+      return null;
+    },
+  };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, history);
+  const tasks = Array.from({ length: 6 }, (_, index) => ({ ...ref, threadId: `fair-fallback-${index}`,
+    title: `Fair fallback ${index}`, workspace: `/fair-${index}`, updatedAt: index + 1,
+    rolloutPath: `C:/profiles/work/sessions/fair-fallback-${index}.jsonl` }));
+  const bindings = tasks.map((task, index) => {
+    const binding = s.store.ensureBinding(task);
+    s.store.setChat(binding.id, s.peerId + index + 1, index + 1);
+    s.store.setValue(`task-stream-mode:${binding.id}`, "detached");
+    return binding;
+  });
+  s.desktop.listTasks = async () => tasks;
+  const waitFor = async (signal: Promise<void>, reason: string) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([signal, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(reason)), 250); })]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  try {
+    await s.runtime.tick(false);
+    await waitFor(firstWave, "four detached fallback polls did not start");
+    assert.equal(active, 4);
+    assert.equal(maximumActive, 4);
+    assert.equal(new Set(started).size, 4);
+
+    for (const id of [...releases.keys()]) releases.get(id)!();
+    await new Promise(resolve => setImmediate(resolve));
+    await s.runtime.tick(false);
+    for (let attempt = 0; attempt < 20 && started.length < bindings.length; attempt++) await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(maximumActive, 4);
+    assert.deepEqual(new Set(started), new Set(bindings.map(binding => binding.id)));
+  } finally {
+    for (const release of releases.values()) release();
   }
 });
 
@@ -1244,6 +1300,11 @@ test("a late fallback poll cannot overwrite the live checkpoint acquired for a V
     }, close() {},
   };
   const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
+  const detached = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: "C:/profiles/work/sessions/fresh-connection.jsonl" };
+  s.store.ensureBinding(detached);
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
+  s.desktop.listTasks = async () => [detached];
   s.desktop.submitWithReceipt = async () => {
     assert.equal(started, true); return { mode: "start", turnId: "accepted-turn" };
   };
