@@ -250,6 +250,43 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       ...(this.#lastRequestFailure ? { lastRequestFailure: this.#lastRequestFailure } : {}) });
   }
 
+  /** Owner-local necessary condition for native CLI source qualification. This
+   * does not prove process-family ownership or an external scheduler's state. */
+  noPendingNativeCliAutoStart(): boolean {
+    try {
+      const projection = this.#projection;
+      const host = this.#options.host;
+      if (!projection || this.#generation === null || !this.#ownerCurrent() ||
+          !['connected', 'disconnected'].includes(this.#state) ||
+          host.metadata.state !== 'running' ||
+          this.#queueAdapter || this.#options.qualifyContinuation ||
+          this.#grants.size !== 0 || this.#queueGrants.size !== 0 ||
+          this.#pendingEvents !== 0 || this.#deferredBroadcasts.length !== 0 ||
+          projection.id !== this.#options.taskId ||
+          !Array.isArray(projection.requests) || projection.requests.length !== 0 ||
+          !Array.isArray(projection.turns) || projection.turns.some(turn =>
+            !['completed', 'interrupted', 'failed'].includes(turn.status)) ||
+          projection.threadRuntimeStatus?.type !== 'idle' ||
+          projection.nativeQueue !== undefined &&
+            (!Array.isArray(projection.nativeQueue) || projection.nativeQueue.length !== 0) ||
+          projection.queuedFollowUps !== undefined &&
+            (!Array.isArray(projection.queuedFollowUps) || projection.queuedFollowUps.length !== 0) ||
+          !host.commandQuiescence || !host.requestQuiescence ||
+          !host.acceptedCommandReceipts || !host.acceptedQueueInputs) return false;
+      const requests = host.requestQuiescence(this.#options.controlKey);
+      const commands = host.commandQuiescence(this.#options.controlKey);
+      const terminalTurnIds = new Set(projection.turns.filter(turn =>
+        ['completed', 'interrupted', 'failed'].includes(turn.status)).map(turn => turn.turnId));
+      const receipts = host.acceptedCommandReceipts(this.#options.controlKey);
+      return requests.generation === this.#generation && requests.unresolved === 0 &&
+        commands.inFlight === 0 && commands.unconfirmed === false &&
+        receipts.every(receipt => receipt.method === 'turn/start' &&
+          terminalTurnIds.has(receipt.receiptId)) &&
+        host.acceptedQueueInputs(this.#options.controlKey).length === 0 &&
+        this.#ownerCurrent() && host.metadata.state === 'running';
+    } catch { return false; }
+  }
+
   onRequestFailure(category: IpcRequestFailureCategory): void {
     this.#lastRequestFailure = Object.freeze({ category,
       count: Math.min((this.#lastRequestFailure?.count ?? 0) + 1, diagnosticCap), atMs: Date.now() });

@@ -31,6 +31,110 @@ function state(): NativeProjectionState {
     latestTokenUsageInfo: null, hasUnreadTurn: false, updatedAt: 1 };
 }
 
+test('native CLI auto-start absence requires a live, current, isolated idle owner', async () => {
+  let current = true;
+  const f = await fixture(async () => state(), undefined, undefined, false,
+    undefined, () => current);
+  try {
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    await f.owner.start();
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
+    current = false;
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    current = true;
+    f.child.send('thread/status/changed', { threadId: taskId, status: { type: 'active' } });
+    await waitUntil(() => f.owner.metadata.revision > 1);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+  assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+});
+
+test('native CLI auto-start absence refuses stock queue and continuation capability', async () => {
+  for (const mode of ['stock', 'continuation'] as const) {
+    const f = await fixture(async () => mode === 'stock' ? state() : continuationState(),
+      undefined, undefined, mode === 'continuation',
+      mode === 'continuation' ? async fence => continuationEvidence(fence) : undefined,
+      () => true, mode === 'stock');
+    try {
+      await f.owner.start();
+      assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+  }
+});
+
+test('native CLI auto-start absence refuses pending host requests and commands', async () => {
+  const f = await fixture();
+  const requests = f.host.requestQuiescence.bind(f.host);
+  const commands = f.host.commandQuiescence.bind(f.host);
+  const receipts = f.host.acceptedCommandReceipts.bind(f.host);
+  const queued = f.host.acceptedQueueInputs.bind(f.host);
+  try {
+    await f.owner.start();
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
+    f.host.requestQuiescence = key => ({ ...requests(key), unresolved: 1 });
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    f.host.requestQuiescence = requests;
+    f.host.commandQuiescence = key => ({ ...commands(key), inFlight: 1 });
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    f.host.commandQuiescence = commands;
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
+    f.host.acceptedCommandReceipts = () => [{ method: 'turn/start', receiptId: 'accepted' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    f.host.acceptedCommandReceipts = receipts;
+    f.host.acceptedQueueInputs = () => [{ clientUserMessageId: 'queued', submissionId: 'accepted' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+  } finally {
+    f.host.requestQuiescence = requests; f.host.commandQuiescence = commands;
+    f.host.acceptedCommandReceipts = receipts; f.host.acceptedQueueInputs = queued;
+    f.owner.close(); await f.host.stop('test-cleanup');
+  }
+});
+
+test('native CLI auto-start absence accepts only turn receipts proven terminal in current history', async () => {
+  const f = await fixture(async () => continuationState());
+  const receipts = f.host.acceptedCommandReceipts.bind(f.host);
+  try {
+    await f.owner.start();
+    f.host.acceptedCommandReceipts = () => [{ method: 'turn/start', receiptId: 'completed-old' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
+    f.host.acceptedCommandReceipts = () => [{ method: 'turn/start', receiptId: 'missing-turn' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    f.host.acceptedCommandReceipts = () => [{ method: 'thread/queue/add', receiptId: 'completed-old' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'busy-turn', status: 'inProgress', items: [] } });
+    await waitUntil(() => f.owner.metadata.revision > 1);
+    f.host.acceptedCommandReceipts = () => [{ method: 'turn/start', receiptId: 'busy-turn' }];
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+  } finally {
+    f.host.acceptedCommandReceipts = receipts;
+    f.owner.close(); await f.host.stop('test-cleanup');
+  }
+});
+
+test('native CLI auto-start absence refuses a nonterminal projected turn', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'busy-turn', status: 'inProgress', items: [] } });
+    await waitUntil(() => f.owner.metadata.revision > 1);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('native CLI auto-start absence refuses projected requests', async () => {
+  const f = await fixture();
+  try {
+    await f.owner.start();
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
+    f.child.stdout.write(`${JSON.stringify({ id: 71, method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, turnId: 'unobserved-turn', itemId: 'question', questions: [] } })}\n`);
+    await waitUntil(() => f.owner.metadata.revision > 1);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('managed bridge observation snapshots one native generation and fails closed on owner retirement', async () => {
   const f = await fixture();
   try {
@@ -442,6 +546,7 @@ test('stock queue backend event during qualification invalidates the pending act
     block = true; submitQueue(f.broker, stockEntry(), 'queue-fenced');
     await started;
     assert.equal(f.owner.metadata.pendingNativeOperations, 1);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
     assert.equal(f.owner.retiredWithoutNativeIngress(), false);
     assert.equal(f.owner.metadata.pendingEvents, 0);
     f.child.send('thread/queue/changed', { threadId: taskId });
@@ -687,6 +792,7 @@ test('bounded queue event tail retires only native owner when attribution stalls
           content: [{ type: 'text', text: entry.text }] }] } });
     await started;
     assert.ok(f.owner.metadata.pendingEvents > 0);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
     const usage = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0,
       cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
     for (let index = 0; index < 129; index++) f.child.send('thread/tokenUsage/updated',
@@ -1120,6 +1226,7 @@ test('opt-in first Composer owner fence observes zero work before reservation an
   f = await fixture(async () => composerState(), undefined, undefined, true,
     undefined, () => true, false, {}, scope => {
       phases.push(scope.phase);
+      assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
       const operation = f.host.commandStatusForIntent(f.controlKey, scope.command);
       assert.equal(operation?.state ?? null,
         scope.phase === 'before-reservation' ? null : 'dispatching');
