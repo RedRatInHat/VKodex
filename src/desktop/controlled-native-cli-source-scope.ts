@@ -52,11 +52,15 @@ export async function verifyControlledNativeCliSourceScope(scope: ControlledNati
     identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
   const proof = await proveControlledNativeSource(preflight, qualified.rolloutPath, qualified.threadId)
     .catch(() => refuse('rollout'));
+  // The qualified path may traverse a Windows junction (notably on CI).
+  // proveControlledNativeSource already checked the actual file and sole rollout;
+  // compare its canonical target, not the lexical spelling in the journal.
+  const qualifiedRollout = await realpath(qualified.rolloutPath).catch(() => refuse('rollout-path'));
   const policyWorkspace = await realpath(qualified.effectivePolicy.cwd).catch(() => refuse('policy-cwd'));
-  if (comparablePath(proof.rolloutPath) !== comparablePath(qualified.rolloutPath) ||
-      comparablePath(preflight.sourceHome) !== comparablePath(scope.sourceHome) ||
-      comparablePath(preflight.workspace) !== comparablePath(scope.workspace) ||
-      comparablePath(policyWorkspace) !== comparablePath(scope.workspace)) refuse('path-drift');
+  if (comparablePath(proof.rolloutPath) !== comparablePath(qualifiedRollout)) refuse('rollout-path');
+  if (comparablePath(preflight.sourceHome) !== comparablePath(scope.sourceHome)) refuse('source-home');
+  if (comparablePath(preflight.workspace) !== comparablePath(scope.workspace)) refuse('workspace');
+  if (comparablePath(policyWorkspace) !== comparablePath(scope.workspace)) refuse('policy-cwd');
   if (manifest) {
     let home: string, cwd: string;
     try { [home, cwd] = await Promise.all([realpath(manifest.home), realpath(manifest.cwd)]); }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, symlink, writeFile, readFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { connect } from 'node:net';
 import { Duplex, PassThrough } from 'node:stream';
@@ -242,6 +242,21 @@ test('controlled CLI source scope refuses journal, source, and manifest drift', 
     await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-drift-stop');
   }
 });
+
+test('controlled CLI source scope accepts a journal rollout through a Windows junction',
+  { skip: process.platform !== 'win32' }, async () => {
+    const capability = {};
+    const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+      'normal', false, null, undefined, undefined, false, undefined, undefined,
+      { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true }, true, true);
+    try {
+      await verifyControlledNativeCliSourceScope(own.cliOptions!.sourceScope!, {
+        taskId: own.taskId, home: own.home, cwd: own.home,
+        approvedTaskPolicy: own.cliOptions!.sourceScope!.policy });
+    } finally {
+      await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-junction-stop');
+    }
+  });
 
 test('native CLI WebSocket without a controlled source remains read-only', async () => {
   const capability = {};
@@ -1176,7 +1191,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   nativeTaskState = false, handoffCapability?: object,
   oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>,
   nativeCliWebSocket?: NonNullable<ManagedWorkerDaemonOptions['nativeCliWebSocket']>,
-  cliApprovedPolicy = true) {
+  cliApprovedPolicy = true, cliRolloutJunction = false) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -1202,9 +1217,15 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
     const preflight = await captureControlledNativeSourcePreflight(identity, home, home);
     const receiptPath = path.join(privateDirectory, 'source-preflight.json');
     await persistControlledNativeSourcePreflightReceipt(receiptPath, preflight);
-    const rolloutPath = path.join(home, 'sessions', `${taskId}.jsonl`);
-    await writeFile(rolloutPath, `${JSON.stringify({ type: 'session_meta', payload: {
+    const physicalRolloutPath = path.join(home, 'sessions', `${taskId}.jsonl`);
+    await writeFile(physicalRolloutPath, `${JSON.stringify({ type: 'session_meta', payload: {
       id: taskId, session_id: taskId, cwd: home } })}\n`);
+    let rolloutPath = physicalRolloutPath;
+    if (cliRolloutJunction) {
+      const alias = path.join(root, 'sessions-alias');
+      await symlink(path.join(home, 'sessions'), alias, 'junction');
+      rolloutPath = path.join(alias, `${taskId}.jsonl`);
+    }
     creationJournal = new ControlledNativeCreationJournal(path.join(privateDirectory, 'creation.sqlite'));
     const { threadId: _threadId, serviceTier: _serviceTier, environments: _environments,
       ...fixed } = cliPolicy;
