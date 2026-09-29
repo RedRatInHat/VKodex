@@ -947,7 +947,7 @@ test('opt-in native CLI start returns only a matching durable worker receipt, ne
   const params = { threadId: taskId, clientUserMessageId,
     input: [{ type: 'text', text: 'isolated native CLI acceptance' }] };
   let calls = 0;
-  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch, observeResume: () => {},
     run: async ({ taskId: scopedTask, generation, params: incoming }) => {
       calls++;
       assert.equal(scopedTask, taskId);
@@ -977,7 +977,7 @@ test('native CLI start unknown after disconnect is fenced and never dispatched t
   const params = { threadId: taskId, clientUserMessageId,
     input: [{ type: 'text', text: 'isolated native CLI acceptance' }] };
   const pending = deferred<unknown>(); let calls = 0;
-  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch, observeResume: () => {},
     run: async () => { calls++; return pending.promise as Promise<never>; } } });
   const a = attach(sessions); await initialize(a.frontend);
   const first = a.frontend.receive({ id: 2, method: 'turn/start', params });
@@ -998,7 +998,7 @@ test('native CLI start refuses a foreign receipt even when callback claims accep
   const backend = fakeBackend();
   const ownerEpoch = 'd2a53334-a43f-4765-a3c8-a818ed68fe0f';
   const clientUserMessageId = '1d9a5c7c-1c7f-4f72-a315-c6607930d10c';
-  const sessions = createSessions(backend, { frontendStart: { ownerEpoch,
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch, observeResume: () => {},
     run: async () => ({ operation: { ownerEpoch, backendGeneration: 7, threadId: 'foreign',
       operationId: 'db27d91f-0f3d-4859-a764-48a58d65e74d', clientUserMessageId,
       method: 'turn/start' as const, fingerprint: 'a'.repeat(64), revision: 1,

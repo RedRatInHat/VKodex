@@ -206,6 +206,8 @@ export class ManagedWorkerFrontendHost {
       frontendStart: this.#frontendStartAdmission ? {
         ownerEpoch: this.#frontendStartAdmission.ownerEpoch,
         run: context => this.#frontendStartAdmission!.run(context),
+        observeResume: context => this.#frontendStartAdmission!.recordResume(
+          this, context.generation, context.result),
       } : null });
   }
 
@@ -491,6 +493,8 @@ export class ManagedWorkerFrontendHost {
         frontendStart: this.#frontendStartAdmission ? {
           ownerEpoch: this.#frontendStartAdmission.ownerEpoch,
           run: context => this.#frontendStartAdmission!.run(context),
+          observeResume: context => this.#frontendStartAdmission!.recordResume(
+            this, context.generation, context.result),
         } : null,
         requestInbox: inbox,
       });

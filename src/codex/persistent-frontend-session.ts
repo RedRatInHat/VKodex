@@ -17,6 +17,9 @@ interface FrontendBackend {
 type ResumeAuthority = (context: Readonly<{ taskId: string; generation: number }>) => unknown;
 interface FrontendStart {
   readonly ownerEpoch: string;
+  /** The pinned backend's actual successful ID-only resume result, before CLI delivery. */
+  readonly observeResume: (context: Readonly<{ taskId: string; generation: number;
+    result: JsonObject }>) => void;
   /** Owner-controlled durable dispatcher only. Never call backend.request directly. */
   readonly run: (context: Readonly<{ taskId: string; generation: number;
     params: JsonObject }>) => Promise<WorkerCommandResponse>;
@@ -278,6 +281,7 @@ export class PersistentFrontendSessions {
       !(resumeAuthority === null || typeof resumeAuthority === 'function') ||
       !(frontendStart === null || (object(frontendStart) &&
         typeof frontendStart.ownerEpoch === 'string' && uuid.test(frontendStart.ownerEpoch) &&
+        typeof frontendStart.observeResume === 'function' &&
         typeof frontendStart.run === 'function'))) {
       throw new TypeError('Invalid explicit bootstrap read policy');
     }
@@ -310,6 +314,7 @@ export class PersistentFrontendSessions {
     this.resumeAuthority = resumeAuthority;
     this.frontendStart = frontendStart === null ? null : Object.freeze({
       ownerEpoch: frontendStart.ownerEpoch, run: frontendStart.run,
+      observeResume: frontendStart.observeResume,
     });
     this.requestInbox = requestInbox;
     this.inboxOwner = requestInbox ? structuredClone(requestInbox.owner) : null;
@@ -585,6 +590,22 @@ export class PersistentFrontendSessions {
           if ('result' in envelope && kind === 'catalog' && !result) {
             safeSend(error(id, -32001, 'Worker catalog response unavailable'));
             attachment.detach(); return;
+          }
+          if (kind === 'rejoin' && 'result' in envelope && this.frontendStart) {
+            try {
+              const returned: unknown = this.frontendStart.observeResume({
+                taskId: this.taskId, generation: pinned.generation,
+                result: structuredClone(envelope.result),
+              });
+              if (returned !== undefined) {
+                if (returned && typeof returned === 'object' && 'then' in returned &&
+                    typeof returned.then === 'function') void Promise.resolve(returned).catch(() => {});
+                throw new TypeError('Native resume observer must be synchronous');
+              }
+            } catch {
+              safeSend(error(id, -32001, 'Native resume evidence unavailable'));
+              attachment.detach(); return;
+            }
           }
           safeSend({ id, ...('result' in envelope ?
             { result } : { error: envelope.error }) });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
 import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
+import { qualifyNativeCliResumePolicy } from '../src/codex/native-cli-resume-policy.js';
 
 const taskId = '01a0eb7e-bec3-7a93-9641-8c4fb5f15d6a';
 const ownerEpoch = 'f2945262-91bd-42ed-ac48-77dbca48a138';
@@ -26,6 +27,17 @@ function start(overrides: Record<string, unknown> = {}) {
     summary: null, personality: null, outputSchema: null,
     collaborationMode: settings.collaborationMode, multiAgentMode: null,
     cyberAccessProgram: null, ...overrides };
+}
+function resumeResult() {
+  return { thread: { id: taskId, status: { type: 'idle' }, turns: [],
+    model: settings.model, reasoningEffort: settings.effort, cwd: settings.cwd,
+    environments: [{ environmentId: 'local', cwd: settings.cwd,
+      runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots }] },
+  model: settings.model, reasoningEffort: settings.effort, serviceTier: settings.serviceTier,
+  cwd: settings.cwd, runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots,
+  approvalPolicy: 'never', approvalsReviewer: 'user',
+  sandbox: { type: 'readOnly', networkAccess: false },
+  activePermissionProfile: { id: ':read-only', extends: null } };
 }
 
 test('native CLI read-only start compiles exact scope with stable operation identity', () => {
@@ -90,6 +102,8 @@ test('CLI admission rechecks same-worker queue proof before durable host write',
     }) });
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
   assert.throws(() => admission.bindHost(host, taskId, { ownerEpoch, controlKey }), /mismatch/);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /resume/i);
+  admission.recordResume(host, 7, resumeResult());
   const accepted = await admission.run({ taskId, generation: 7, params: start() });
   assert.equal(accepted.operation.receiptId, 'native-turn');
   assert.equal(writes, 1);
@@ -113,9 +127,51 @@ test('CLI admission refuses an occupied queue and unsettled command ledger', asy
       noPendingAutoStart: true as const, assertCurrent: () => {},
     }) });
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  admission.recordResume(host, 7, resumeResult());
   await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /proof/);
   queued = false; unsettled = true;
   await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /unsettled/);
+  assert.equal(writes, 0);
+});
+
+test('CLI admission invalidates an in-flight proof when native resume changes', async () => {
+  const controlKey = {}; let release!: () => void; let writes = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence: () => ({ inFlight: 0, unconfirmed: false }),
+    executeCommandWithResponse: async () => { writes++; throw new Error('unexpected write'); } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch, controlKey,
+    qualify: async () => { await gate; return { taskId, ownerEpoch,
+      backendGeneration: 7, semanticRevision: 1, effectiveSettings: settings,
+      idle: true as const, nativeQueueEmpty: true as const,
+      noPendingAutoStart: true as const, assertCurrent: () => {},
+    }; } });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  admission.recordResume(host, 7, resumeResult());
+  const pending = admission.run({ taskId, generation: 7, params: start() });
+  admission.recordResume(host, 7, resumeResult());
+  release();
+  await assert.rejects(pending, /resume evidence changed/i);
+  assert.equal(writes, 0);
+  admission.recordResume(host, 7, { bad: true });
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /resume evidence unavailable/i);
+});
+
+test('CLI admission rejects a proof whose permissions differ from native resume', async () => {
+  const controlKey = {}; let writes = 0;
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence: () => ({ inFlight: 0, unconfirmed: false }),
+    executeCommandWithResponse: async () => { writes++; throw new Error('unexpected write'); } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch, controlKey,
+    qualify: async () => ({ taskId, ownerEpoch, backendGeneration: 7,
+      semanticRevision: 2, effectiveSettings: { ...settings, serviceTier: null },
+      idle: true, nativeQueueEmpty: true, noPendingAutoStart: true,
+      assertCurrent: () => {},
+    }) });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  admission.recordResume(host, 7, resumeResult());
+  await assert.rejects(admission.run({ taskId, generation: 7,
+    params: start({ serviceTier: null }) }), /resume and current settings disagree/i);
   assert.equal(writes, 0);
 });
 
@@ -156,4 +212,22 @@ test('CLI source reader requires stable terminal history, empty native queue and
     return host.ownerRead(key, generation, method, params);
   } };
   await assert.rejects(readNativeCliIdleEvidence({ ...options, host: drift }), /unstable/i);
+});
+
+test('native resume supplies the exact read-only policy tuple, not optional composer defaults', () => {
+  const resume = resumeResult();
+  const qualified = qualifyNativeCliResumePolicy(resume, taskId);
+  assert.deepEqual(qualified, { cwd: settings.cwd,
+    runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots,
+    model: settings.model, effort: settings.effort,
+    serviceTier: settings.serviceTier, approvalPolicy: 'never',
+    approvalsReviewer: 'user', permissions: ':read-only',
+    sandboxPolicy: { type: 'readOnly', networkAccess: false } });
+  for (const value of [
+    { ...resume, approvalPolicy: 'on-request' },
+    { ...resume, sandbox: { type: 'readOnly', networkAccess: true } },
+    { ...resume, activePermissionProfile: { id: ':danger-full-access' } },
+    { ...resume, thread: { ...resume.thread, model: 'different' } },
+    { ...resume, runtimeWorkspaceRoots: ['foreign'] },
+  ]) assert.throws(() => qualifyNativeCliResumePolicy(value, taskId));
 });

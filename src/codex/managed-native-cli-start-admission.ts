@@ -1,6 +1,9 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { HomogeneousQueueSettings } from './homogeneous-queue-policy.js';
 import type { WorkerCommand, WorkerCommandResponse } from './managed-worker-command-dispatcher.js';
 import { prepareNativeCliTurnStart } from './native-cli-turn-start.js';
+import { qualifyNativeCliResumePolicy } from './native-cli-resume-policy.js';
+import type { NativeCliResumePolicy } from './native-cli-resume-policy.js';
 
 type JsonObject = Record<string, unknown>;
 interface Host {
@@ -47,6 +50,8 @@ export class ManagedNativeCliStartAdmission {
   readonly #options: ManagedNativeCliStartAdmissionOptions;
   #boundHost: Host | null = null;
   #qualifying = false;
+  #resume: Readonly<{ generation: number; revision: number; policy: NativeCliResumePolicy }> | null = null;
+  #resumeRevision = 0;
 
   constructor(options: ManagedNativeCliStartAdmissionOptions) {
     if (!options || typeof options.taskId !== 'string' || !options.taskId ||
@@ -72,6 +77,24 @@ export class ManagedNativeCliStartAdmission {
     this.#boundHost = host;
   }
 
+  /** Called only from the pinned App Server's successful native resume result,
+   * before that response is relayed to the CLI. An active or differently
+   * configured task may still be read by CLI, but earns no start evidence. */
+  recordResume(host: Host, generation: number, result: unknown): void {
+    this.#resume = null;
+    this.#resumeRevision++;
+    if (!this.#boundHost || host !== this.#boundHost ||
+        !Number.isSafeInteger(generation) || generation < 1 ||
+        host.metadata.state !== 'running' ||
+        host.metadata.taskId !== this.#options.taskId ||
+        host.metadata.backendGeneration !== generation)
+      throw new Error('Native CLI resume source unavailable');
+    try {
+      const policy = qualifyNativeCliResumePolicy(result, this.#options.taskId);
+      this.#resume = Object.freeze({ generation, revision: this.#resumeRevision, policy });
+    } catch { /* Native rejoin remains visible; CLI start stays closed. */ }
+  }
+
   async run({ taskId, generation, params }: Readonly<{ taskId: string;
     generation: number; params: JsonObject }>): Promise<WorkerCommandResponse> {
     if (this.#qualifying || taskId !== this.#options.taskId ||
@@ -86,11 +109,18 @@ export class ManagedNativeCliStartAdmission {
         throw new Error('Native CLI worker generation changed');
     };
     exactHost();
+    const resume = this.#resume;
+    if (!resume || resume.generation !== generation)
+      throw new Error('Native CLI resume evidence unavailable');
+    const exactResume = () => {
+      if (this.#resume !== resume || this.#resumeRevision !== resume.revision)
+        throw new Error('Native CLI resume evidence changed');
+    };
     this.#qualifying = true;
     let proof: NativeCliStartProof;
     try { proof = await this.#options.qualify(); }
     finally { this.#qualifying = false; }
-    exactHost();
+    exactHost(); exactResume();
     if (!proof || proof.taskId !== taskId || proof.ownerEpoch !== this.ownerEpoch ||
         proof.backendGeneration !== generation ||
         !Number.isSafeInteger(proof.semanticRevision) || proof.semanticRevision < 0 ||
@@ -103,11 +133,17 @@ export class ManagedNativeCliStartAdmission {
       throw new Error('Native CLI command ledger unsettled');
     const command = prepareNativeCliTurnStart(params, { taskId,
       ownerEpoch: this.ownerEpoch, effectiveSettings: proof.effectiveSettings });
-    exactHost(); assertSync(proof);
+    const effective = proof.effectiveSettings;
+    for (const key of ['cwd', 'runtimeWorkspaceRoots', 'approvalPolicy',
+      'approvalsReviewer', 'permissions', 'sandboxPolicy', 'model',
+      'serviceTier', 'effort'] as const)
+      if (!isDeepStrictEqual(effective[key], resume.policy[key]))
+        throw new Error('Native CLI resume and current settings disagree');
+    exactHost(); exactResume(); assertSync(proof);
     // No await between this final semantic fence and the command dispatcher's
     // own synchronous before-write callback and generation/owner checks.
     return host.executeCommandWithResponse(this.#options.controlKey, command, () => {
-      exactHost(); assertSync(proof);
+      exactHost(); exactResume(); assertSync(proof);
     });
   }
 }

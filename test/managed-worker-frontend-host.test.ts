@@ -165,6 +165,17 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
     summary: null, personality: null, outputSchema: null,
     collaborationMode: settings.collaborationMode, multiAgentMode: null,
     cyberAccessProgram: null };
+  const resumeParams = { threadId: taskId };
+  const resumeResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
+    model: settings.model, reasoningEffort: settings.effort, cwd: settings.cwd,
+    environments: [{ environmentId: 'local', cwd: settings.cwd,
+      runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots }] },
+  model: settings.model, reasoningEffort: settings.effort,
+  serviceTier: settings.serviceTier, cwd: settings.cwd,
+  runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots,
+  approvalPolicy: settings.approvalPolicy, approvalsReviewer: settings.approvalsReviewer,
+  sandbox: settings.sandboxPolicy,
+  activePermissionProfile: { id: ':read-only', extends: null } };
   const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch, controlKey,
     qualify: async () => ({ taskId, ownerEpoch,
       backendGeneration: 1, semanticRevision: 1,
@@ -177,6 +188,8 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
   const options = { taskId, ownCwd: 'C:/own', initializeRequest: init, adapterKey,
     frontendProtocol: 'websocket' as const, backendTimeoutMs: 500,
     bootstrapReadMethods: [], allowRequest: () => false, allowAnswer: () => false,
+    resumeAuthority: ({ taskId: scopedTask, generation }: { taskId: string; generation: number }) =>
+      ({ taskId: scopedTask, generation, params: resumeParams }),
     commandPolicy: policy, frontendStartAdmission: admission, launch: () => child.asChild() };
   const { commandPolicy: _unused, ...noCommandPolicy } = options;
   assert.throws(() => new ManagedWorkerFrontendHost(noCommandPolicy), TypeError);
@@ -191,6 +204,10 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
     try {
       client.send({ id: 'init', method: 'initialize', params: init });
       assert.equal((await client.next()).id, 'init');
+      client.send({ id: 1, method: 'thread/resume', params: resumeParams });
+      const resumeWire = await sentMutation(child, 'thread/resume');
+      child.send({ id: resumeWire.id, result: resumeResult });
+      assert.deepEqual((await client.next()).result, resumeResult);
       client.send({ id: 2, method: 'turn/start', params });
       const wire = await sentMutation(child);
       assert.deepEqual(wire.params, params);
@@ -199,6 +216,15 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
         { turn: { id: 'native-turn-ok', status: 'inProgress' } });
       assert.deepEqual(managed.acceptedCommandReceipts(controlKey),
         [{ method: 'turn/start', receiptId: 'native-turn-ok' }]);
+      assert.equal(child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+      client.send({ id: 3, method: 'thread/resume', params: resumeParams });
+      const activeWire = await sentMutation(child, 'thread/resume', 2);
+      const activeResume = { ...resumeResult, thread: { ...resumeResult.thread,
+        status: { type: 'active' } } };
+      child.send({ id: activeWire.id, result: activeResume });
+      assert.deepEqual((await client.next()).result, activeResume);
+      client.send({ id: 4, method: 'turn/start', params });
+      assert.equal(((await client.next()).error as { code: number }).code, -32001);
       assert.equal(child.messages.filter(frame => frame.method === 'turn/start').length, 1);
     } finally { client.close(); }
   } finally { await managed.stop('test-cleanup'); }
@@ -1078,9 +1104,9 @@ test('a written mutation without a response remains unknown and blocks a new com
     assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
   } finally { await f.managed.stop('test-cleanup'); }
 });
-async function sentMutation(child: Child, method = 'turn/start'): Promise<Frame> {
+async function sentMutation(child: Child, method = 'turn/start', occurrence = 1): Promise<Frame> {
   for (let tries = 0; tries < 50; tries++) {
-    const frame = child.messages.find(value => value.method === method);
+    const frame = child.messages.filter(value => value.method === method)[occurrence - 1];
     if (frame) return frame;
     await new Promise(resolve => setImmediate(resolve));
   }
