@@ -12,6 +12,7 @@ import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
+import type { ProcessIdentity } from "../src/codex/managed-worker-registry.js";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -3727,6 +3728,104 @@ test("a staged version remains recoverable when the native turn ID arrives after
   assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
 });
 
+test("explicit recovery releases only absent reserved bytes whose original writer is proven gone", async t => {
+  const s = setup(t); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-writer-recovery-"));
+  const birth = "123456789";
+  const writer = { pid: 41234, birthTicks: birth } satisfies ProcessIdentity;
+  const reservedPath = path.join(root, "unwritten.bin");
+  const existingPath = path.join(root, "written.bin");
+  const legacyPath = path.join(root, "legacy.bin");
+  assert.equal(s.store.reserveStage("unwritten", "binding", "operation", 11, reservedPath, undefined, writer), "reserved");
+  assert.equal(s.store.reserveStage("written", "binding", "operation", 13, existingPath, undefined, writer), "reserved");
+  assert.equal(s.store.reserveStage("legacy", "binding", "operation", 17, legacyPath), "reserved");
+  await writeFile(existingPath, "written bytes");
+  let observed: ProcessIdentity | null = writer;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+    () => observed);
+  assert.equal(await files.reconcileAbandonedStageReservations(), 0, "a live writer retains its lease");
+  assert.equal(s.store.stageReservedBytes(), 41);
+  observed = { pid: writer.pid, birthTicks: "987654321" };
+  assert.equal(await files.reconcileAbandonedStageReservations(), 1, "a reused PID proves the original writer is gone");
+  assert.equal(s.store.stageReservedBytes(), 30, "existing staged bytes and legacy reservation stay charged");
+  assert.equal(await readFile(existingPath, "utf8"), "written bytes");
+  assert.equal(await files.reconcileAbandonedStageReservations(), 0);
+});
+
+test("reserved-stage recovery is bounded and retains uncertain writer evidence", async t => {
+  const s = setup(t); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-writer-bounded-"));
+  const writer = { pid: 41235, birthTicks: "123456789" } satisfies ProcessIdentity;
+  for (let index = 0; index < 3; index++)
+    s.store.reserveStage(`bounded-${index}`, "binding", "operation", 1, path.join(root, `${index}.bin`), undefined, writer);
+  let calls = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+    () => { calls++; throw new Error("identity query unavailable"); });
+  assert.equal(await files.reconcileAbandonedStageReservations(2), 0);
+  assert.equal(calls, 2);
+  assert.equal(s.store.stageReservedBytes(), 3);
+  const uncertain = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+    () => undefined as unknown as ProcessIdentity | null);
+  assert.equal(await uncertain.reconcileAbandonedStageReservations(2), 0, "missing observer result is not proof");
+  const absent = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined, () => null);
+  assert.equal(await absent.reconcileAbandonedStageReservations(2), 2);
+  assert.equal(s.store.stageReservedBytes(), 1);
+  assert.equal(await absent.reconcileAbandonedStageReservations(2), 1);
+  assert.equal(s.store.stageReservedBytes(), 0);
+});
+
+test("reserved-stage recovery reaches a dead writer after 64 live reservations across explicit calls", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recovery-page-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const live = { pid: 41237, birthTicks: "123456789" } satisfies ProcessIdentity;
+  const dead = { pid: 41238, birthTicks: "123456789" } satisfies ProcessIdentity;
+  const first = new BridgeStore(filename);
+  for (let index = 0; index < 65; index++) {
+    const key = `page-${String(index).padStart(3, "0")}`;
+    assert.equal(first.reserveStage(key, "binding", "operation", 1, path.join(root, `${key}.bin`),
+      undefined, index === 64 ? dead : live), "reserved");
+  }
+  const observe = (pid: number): ProcessIdentity | null => pid === live.pid ? live : null;
+  const scan = new TaskFiles(root, first, new Chat(), new AccessGate(access, first), undefined, false,
+    undefined, undefined, observe);
+  assert.equal(await scan.reconcileAbandonedStageReservations(), 0);
+  first.close();
+  const reopened = new BridgeStore(filename); t.after(() => reopened.close());
+  const resumed = new TaskFiles(root, reopened, new Chat(), new AccessGate(access, reopened), undefined, false,
+    undefined, undefined, observe);
+  assert.equal(await resumed.reconcileAbandonedStageReservations(), 1);
+  assert.equal(reopened.stageReservedBytes(), 64);
+});
+
+test("abandoned-stage audit survives restart while the same file key can be staged again", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-abandoned-audit-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const writer = { pid: 41236, birthTicks: "123456789" } satisfies ProcessIdentity;
+  const store = new BridgeStore(filename); t.after(() => store.close());
+  const stagePath = path.join(root, "old.bin");
+  assert.equal(store.reserveStage("retry", "binding", "operation", 5, stagePath, undefined, writer), "reserved");
+  const files = new TaskFiles(root, store, new Chat(), new AccessGate(access, store), undefined, false,
+    undefined, undefined, () => null);
+  assert.equal(await files.reconcileAbandonedStageReservations(), 1);
+  assert.equal(store.reserveStage("retry", "binding", "operation", 5, path.join(root, "new.bin")), "reserved");
+  const audit = new DatabaseConstructor(filename, { readonly: true }); t.after(() => audit.close());
+  assert.deepEqual(audit.prepare(`SELECT file_key, path, writer_pid, writer_birth FROM bridge_stage_abandoned`).all(),
+    [{ file_key: "retry", path: stagePath, writer_pid: writer.pid, writer_birth: writer.birthTicks }]);
+});
+
+test("reserved-stage recovery cannot discard a receipted or ready version", async t => {
+  const s = setup(t); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-receipt-guard-"));
+  const writer = { pid: 41237, birthTicks: "123456789" } satisfies ProcessIdentity;
+  const receipted = path.join(root, "receipted.bin");
+  const ready = path.join(root, "ready.bin");
+  assert.equal(s.store.reserveStage("receipted", "binding", "operation", 7, receipted, undefined, writer), "reserved");
+  assert.equal(s.store.reserveStage("ready", "binding", "operation", 9, ready, undefined, writer), "reserved");
+  s.store.setValue("file-stage-index:binding:operation", { receipted: { path: receipted } });
+  s.store.markStageReady("ready", ready);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined, () => null);
+  assert.equal(await files.reconcileAbandonedStageReservations(), 0);
+  assert.equal(s.store.stageReservedBytes(), 16);
+  assert.equal(s.store.abandonedStageCandidates().length, 1, "ready versions never enter the recovery scan");
+});
+
 test("an incomplete stage cannot be treated as a durable upload version", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-incomplete-stage-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
@@ -3743,6 +3842,8 @@ test("an incomplete stage cannot be treated as a durable upload version", async 
   assert.equal(s.chat.binaryUploads.length, 0);
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:incomplete-stage`), null);
   assert.equal(s.store.stageReservedBytes(binding.id, "incomplete-stage"), "first version".length);
+  assert.equal(s.store.abandonedStageCandidates().length, process.platform === "win32" ? 1 : 0,
+    "platforms without the Windows birth observer retain legacy reservations");
   const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   await assert.rejects(restored.collect(binding, true), /незавершённая staged/u);
   assert.equal(s.chat.binaryUploads.length, 0);

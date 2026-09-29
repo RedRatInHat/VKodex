@@ -10,6 +10,7 @@ import type { Binding, BridgeChat } from "./contracts.js";
 import { FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
+import { readWindowsProcessIdentity } from "../desktop/windows-process-identity.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 30_000 };
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
@@ -344,6 +345,7 @@ export class TaskFiles {
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
   private reconciliation: Promise<number> | null = null;
+  private stageWriterIdentity: ReturnType<typeof readWindowsProcessIdentity> = null;
   private stopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
@@ -353,7 +355,8 @@ export class TaskFiles {
     private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
       const free = await statfs(folder);
       return BigInt(free.bavail) * BigInt(free.bsize);
-    }) {}
+    },
+    private readonly observeStageWriter: typeof readWindowsProcessIdentity = readWindowsProcessIdentity) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private terminalTurns(bindingId: string): ReadonlySet<string> {
@@ -425,7 +428,19 @@ export class TaskFiles {
     if (observedFree < BigInt(MIN_STAGE_FREE_BYTES + file.contents.length))
       throw new StageQuotaError("Недостаточно свободного места для staged-файла и резерва диска. Загрузка в VK остановлена.");
     const target = path.join(folder, `${randomUUID()}.bin`);
-    const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target, observedFree);
+    // The existing Windows observer supplies a kernel birth identity. Other
+    // platforms keep their reservations charged as legacy rows on a crash.
+    let writer = undefined;
+    if (process.platform === "win32") {
+      let observed = this.stageWriterIdentity;
+      try { observed ??= this.observeStageWriter(process.pid); }
+      catch { throw new ActionRejectedError("Не удалось подтвердить процесс записи staged-файла; загрузка остановлена."); }
+      if (!observed || observed.pid !== process.pid)
+        throw new ActionRejectedError("Не удалось подтвердить процесс записи staged-файла; загрузка остановлена.");
+      this.stageWriterIdentity = observed;
+      writer = observed;
+    }
+    const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target, observedFree, writer);
     if (reservation === "limit") throw new StageQuotaError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
     if (reservation === "existing") throw new ActionRejectedError("Обнаружена незавершённая staged-версия файла. Загрузка остановлена до сверки сохранённых данных; повтор не создаст другую версию автоматически.");
     const handle = await open(target, "wx", 0o600);
@@ -456,6 +471,24 @@ export class TaskFiles {
     const work = this.reconcileStagedArtifactsNow(now).finally(() => { this.reconciliation = null; });
     this.reconciliation = work;
     return work;
+  }
+  /** Explicit, bounded repair for a reservation whose writer died before
+   * durable receipt creation. It never moves or removes staged bytes. */
+  async reconcileAbandonedStageReservations(limit = 64): Promise<number> {
+    let abandoned = 0;
+    for (const candidate of this.store.abandonedStageCandidates(limit)) {
+      let observed;
+      try { observed = this.observeStageWriter(candidate.writer.pid); }
+      catch { continue; }
+      if (observed !== null && (!observed || observed.pid !== candidate.writer.pid
+        || !/^[1-9]\d{0,23}$/u.test(observed.birthTicks) || observed.birthTicks === candidate.writer.birthTicks)) continue;
+      // ENOENT alone proves absence. Permission and I/O failures retain quota.
+      try { await lstat(candidate.path); continue; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue; }
+      try { if (this.store.abandonStageReservation(candidate)) abandoned++; }
+      catch { /* Invalid or inaccessible receipt state keeps the reservation. */ }
+    }
+    return abandoned;
   }
   private async reconcileStagedArtifactsNow(now: number): Promise<number> {
     if (!Number.isSafeInteger(now) || now < STAGE_RETENTION_MS) throw new RangeError("Invalid stage reconciliation time");

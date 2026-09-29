@@ -237,12 +237,18 @@ export class BridgeStore {
       CREATE TABLE IF NOT EXISTS bridge_stage_reservations (
         file_key TEXT PRIMARY KEY, binding_id TEXT NOT NULL, operation_id TEXT NOT NULL,
         bytes INTEGER NOT NULL CHECK(bytes >= 0), path TEXT NOT NULL UNIQUE,
-        state TEXT NOT NULL CHECK(state IN ('reserved', 'ready')), created_at INTEGER NOT NULL
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'ready')), created_at INTEGER NOT NULL,
+        writer_pid INTEGER, writer_birth TEXT
       );
       CREATE TABLE IF NOT EXISTS bridge_stage_recycling (
         file_key TEXT PRIMARY KEY REFERENCES bridge_stage_reservations(file_key),
         state TEXT NOT NULL CHECK(state IN ('pending', 'recycled')),
         updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS bridge_stage_abandoned (
+        id INTEGER PRIMARY KEY, file_key TEXT NOT NULL, binding_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL, bytes INTEGER NOT NULL, path TEXT NOT NULL,
+        writer_pid INTEGER NOT NULL, writer_birth TEXT NOT NULL, abandoned_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
@@ -284,6 +290,12 @@ export class BridgeStore {
     const deliveryColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_delivery)").all() as { name: string }[]).map(column => column.name));
     if (!deliveryColumns.has("priority_revision")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN priority_revision INTEGER NOT NULL DEFAULT 0");
     if (!deliveryColumns.has("turn_id")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN turn_id TEXT");
+    const stageColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_stage_reservations)").all() as { name: string }[]).map(column => column.name));
+    if (!stageColumns.has("writer_pid")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_pid INTEGER");
+    if (!stageColumns.has("writer_birth")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_birth TEXT");
+    this.db.exec(`CREATE INDEX IF NOT EXISTS bridge_stage_reserved_writer
+      ON bridge_stage_reservations(created_at, file_key)
+      WHERE state = 'reserved' AND writer_pid IS NOT NULL AND writer_birth IS NOT NULL`);
     // Existing JSON stage receipts remain authoritative for recovery. Mirror
     // them into the additive admission ledger so upgrades count their bytes.
     this.atomic(() => {
@@ -857,9 +869,10 @@ export class BridgeStore {
   /** Reservations stay charged after a crash until a separate reconciler safely
    * resolves them. Existing keys never get a new path or byte count. */
   reserveStage(fileKey: string, bindingId: string, operationId: string, bytes: number, stagedPath: string,
-    observedFreeBytes?: bigint): "reserved" | "existing" | "limit" {
+    observedFreeBytes?: bigint, writer?: ManagedOwnerProcessIdentity): "reserved" | "existing" | "limit" {
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 200 * 1024 * 1024 || !stagedPath) throw new RangeError("Invalid staged file reservation");
     if (observedFreeBytes !== undefined && (typeof observedFreeBytes !== "bigint" || observedFreeBytes < 0n)) throw new RangeError("Invalid stage free-space observation");
+    if (writer !== undefined) managedIdentity(writer, "stage writer");
     if (this.stageLegacyUnaccounted) return "limit";
     return this.atomic(() => {
       const existing = this.db.prepare("SELECT binding_id, operation_id, bytes, path FROM bridge_stage_reservations WHERE file_key = ?")
@@ -877,9 +890,66 @@ export class BridgeStore {
         || operationBytes + bytes > 512 * 1024 * 1024 || globalBytes + bytes > 2 * 1024 * 1024 * 1024
         || this.stageReservedCount(bindingId, operationId) >= BridgeStore.MAX_STAGE_FILES_PER_OPERATION
         || this.stageReservedCount() >= BridgeStore.MAX_STAGE_FILES_GLOBAL) return "limit";
-      this.db.prepare("INSERT INTO bridge_stage_reservations(file_key, binding_id, operation_id, bytes, path, state, created_at) VALUES (?, ?, ?, ?, ?, 'reserved', ?)")
-        .run(fileKey, bindingId, operationId, bytes, stagedPath, Date.now());
+      this.db.prepare("INSERT INTO bridge_stage_reservations(file_key, binding_id, operation_id, bytes, path, state, created_at, writer_pid, writer_birth) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?, ?)")
+        .run(fileKey, bindingId, operationId, bytes, stagedPath, Date.now(), writer?.pid ?? null, writer?.birthTicks ?? null);
       return "reserved";
+    });
+  }
+
+  /** A small page of reservations with durable writer evidence. Legacy rows are
+   * deliberately excluded: age alone cannot prove their writer is gone. */
+  abandonedStageCandidates(limit = 64): readonly { key: string; bindingId: string; operationId: string; path: string; writer: ManagedOwnerProcessIdentity }[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new RangeError("Invalid stage recovery limit");
+    const rows = this.atomic(() => {
+      const cursorKey = "stage-abandoned-recovery-cursor";
+      const saved = this.getValue<{ createdAt: number; key: string }>(cursorKey);
+      const cursor = saved && Number.isSafeInteger(saved.createdAt) && saved.createdAt > 0
+        && typeof saved.key === "string" && saved.key ? saved : null;
+      type Row = { file_key: string; binding_id: string; operation_id: string; path: string;
+        writer_pid: number; writer_birth: string; created_at: number };
+      const select = (after: typeof cursor): Row[] => after
+        ? this.db.prepare(`SELECT file_key, binding_id, operation_id, path, writer_pid, writer_birth, created_at
+          FROM bridge_stage_reservations WHERE state = 'reserved' AND writer_pid IS NOT NULL AND writer_birth IS NOT NULL
+          AND (created_at, file_key) > (?, ?) ORDER BY created_at, file_key LIMIT ?`)
+          .all(after.createdAt, after.key, limit) as Row[]
+        : this.db.prepare(`SELECT file_key, binding_id, operation_id, path, writer_pid, writer_birth, created_at
+          FROM bridge_stage_reservations WHERE state = 'reserved' AND writer_pid IS NOT NULL AND writer_birth IS NOT NULL
+          ORDER BY created_at, file_key LIMIT ?`).all(limit) as Row[];
+      const page = select(cursor);
+      const result = page.length ? page : cursor ? select(null) : page;
+      const last = result.at(-1);
+      this.setValue(cursorKey, last ? { createdAt: last.created_at, key: last.file_key } : null);
+      return result;
+    });
+    return rows.flatMap(row => {
+      try { return [{ key: row.file_key, bindingId: row.binding_id, operationId: row.operation_id,
+        path: row.path, writer: managedIdentity({ pid: row.writer_pid, birthTicks: row.writer_birth }, "stage writer") }]; }
+      catch { return []; }
+    });
+  }
+
+  /** Called only after external proof that this exact writer has exited and
+   * the stage path is absent. A receipt or changed row keeps the charge. */
+  abandonStageReservation(candidate: { key: string; bindingId: string; operationId: string; path: string; writer: ManagedOwnerProcessIdentity }): boolean {
+    return this.atomic(() => {
+      const receipt = this.getValue<Record<string, unknown>>(`file-stage-index:${candidate.bindingId}:${candidate.operationId}`);
+      if (receipt !== null && (typeof receipt !== "object" || Array.isArray(receipt) || candidate.key in receipt)) return false;
+      const args = [candidate.key, candidate.bindingId, candidate.operationId, candidate.path,
+        candidate.writer.pid, candidate.writer.birthTicks, candidate.key] as const;
+      const condition = `file_key = ? AND binding_id = ? AND operation_id = ? AND path = ?
+        AND state = 'reserved' AND writer_pid = ? AND writer_birth = ?
+        AND NOT EXISTS (SELECT 1 FROM bridge_stage_recycling WHERE file_key = ?)`;
+      const recorded = this.db.prepare(`INSERT INTO bridge_stage_abandoned
+        (file_key, binding_id, operation_id, bytes, path, writer_pid, writer_birth, abandoned_at)
+        SELECT file_key, binding_id, operation_id, bytes, path, writer_pid, writer_birth, ?
+        FROM bridge_stage_reservations WHERE ${condition}`).run(Date.now(), ...args);
+      if (recorded.changes !== 1) return false;
+      const result = this.db.prepare(`DELETE FROM bridge_stage_reservations WHERE file_key = ? AND binding_id = ?
+        AND operation_id = ? AND path = ? AND state = 'reserved' AND writer_pid = ? AND writer_birth = ?
+        AND NOT EXISTS (SELECT 1 FROM bridge_stage_recycling WHERE file_key = ?)`)
+        .run(...args);
+      if (result.changes !== 1) throw new Error("Stage abandonment audit was not paired with release");
+      return true;
     });
   }
 
