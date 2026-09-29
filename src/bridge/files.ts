@@ -368,6 +368,9 @@ export class TaskFiles {
     if (receipt.bindingId !== bindingId || receipt.operationId !== job.operationId
       || !receipt.threadId || !Number.isSafeInteger(receipt.stagedAt)
       || (receipt.turnId !== undefined && receipt.turnId !== job.turnId)
+      || typeof receipt.relativePath !== "string" || !receipt.relativePath
+      || receipt.name !== safeFileName(receipt.relativePath.replaceAll(path.sep, "_"), "file")
+      || receipt.kind !== (imageName(path.basename(receipt.relativePath)) ? "image" : "file")
       || !/^[0-9a-f-]+\.bin$/u.test(path.basename(receipt.path))
       || path.dirname(path.resolve(receipt.path)) !== folder || receipt.bytes > FILE_LIMITS.maxFileBytes || receipt.bytes < 0
       || !/^[0-9a-f]{64}$/u.test(receipt.sha256)) throw new ActionRejectedError("Квитанция staged-файла повреждена; загрузка остановлена.");

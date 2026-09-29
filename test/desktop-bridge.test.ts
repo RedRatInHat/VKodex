@@ -3570,6 +3570,30 @@ test("a corrupt durable stage fails closed even when the source is still availab
   assert.equal(s.chat.binaryUploads.length, 0);
 });
 
+test("a staged receipt cannot change the uploaded filename or file kind", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-metadata-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "metadata-integrity", []);
+  files.finish(binding.id, "metadata-integrity", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  const indexKey = `file-stage-index:${binding.id}:metadata-integrity`;
+  const index = s.store.getValue<Record<string, { name: string; kind: "image" | "file" }>>(indexKey)!;
+  const [key, receipt] = Object.entries(index)[0]!;
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  s.store.setValue(indexKey, { ...index, [key]: { ...receipt, name: "other.txt" } });
+  await assert.rejects(restored.collect(binding, true), /Квитанция staged-файла повреждена/u);
+  s.store.setValue(indexKey, { ...index, [key]: { ...receipt, kind: "image" } });
+  await assert.rejects(restored.collect(binding, true), /Квитанция staged-файла повреждена/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
+});
+
 test("an ambiguous VK upload is not retried by automatic scan or /files after restart", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-unknown-upload-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
