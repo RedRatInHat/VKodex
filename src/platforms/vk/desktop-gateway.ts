@@ -365,9 +365,11 @@ export class DesktopVkGateway implements BridgeChat {
     const source = { values: [{ value: contents, filename: name, contentLength: contents.length,
       ...(/\.mp4$/iu.test(name) ? { contentType: "video/mp4" } : {}) }], timeout: 600_000 };
     let attachment: string | undefined;
-    if (kind === "image") {
-      try { attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString(); }
-      catch { /* Preserve unsupported image formats as documents. */ }
+    // GIF/WebP take the document route directly. A failed photo call can mean
+    // that VK accepted the bytes but its receipt was lost; falling back to a
+    // document in that case would upload the same version twice.
+    if (kind === "image" && /\.(?:png|jpe?g)$/iu.test(name)) {
+      attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString();
     }
     if (!attachment) {
       // vk-io forwards upload-server errors to docs.save as if they were a

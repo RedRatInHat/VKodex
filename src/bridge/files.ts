@@ -18,6 +18,10 @@ interface OutputFileReadOptions {
   /** Keep valid siblings when one output file is too large. */
   readonly skipOversizedFiles?: boolean;
   readonly onSkippedFile?: (error: OutputFilesError) => void;
+  /** A stable, previously processed file need not be loaded again. */
+  readonly skipFile?: (relativePath: string, fingerprint: string) => boolean;
+  /** Process one bounded file buffer at a time instead of retaining the whole outbox. */
+  readonly onFile?: (file: OutputFile, relativePath: string, fingerprint: string) => Promise<void>;
 }
 interface FileJob {
   operationId: string;
@@ -25,6 +29,12 @@ interface FileJob {
   directory: string;
   state: "prepared" | "accepted" | "rejected" | "uncertain";
   done: boolean;
+  /** Completion is persisted so late output remains eligible after restart. */
+  completed?: boolean;
+  /** Legacy producers are rescanned automatically for a bounded period. */
+  autoScanUntil?: number | undefined;
+  nextScanAt?: number | undefined;
+  scanDelayMs?: number;
   queued?: boolean;
   /** The Codex turn that must finish before its outbox is collected. */
   turnId?: string;
@@ -33,11 +43,16 @@ class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
 }
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
+const fileFingerprint = (stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }): string =>
+  `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
 const mebibytes = (bytes: number): number => Math.ceil(bytes / (1024 * 1024));
 const VK_DOCUMENT_PAGE_LIMIT = 1024 * 1024;
 const MAX_OUTPUT_ENTRIES = 4_096;
 const VK_DOCUMENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const INITIAL_LATE_SCAN_MS = 60_000;
+const MAX_LATE_SCAN_MS = 60 * 60_000;
+const LATE_SCAN_WINDOW_MS = 48 * 60 * 60_000;
 function isOwnedDocumentRecord(record: VkDocumentRecord): boolean {
   if (!record.fileKey.startsWith("file:")) return false;
   const match = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(record.attachment);
@@ -205,6 +220,8 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
       if (before.isDirectory()) { await walk(file, depth + 1); continue; }
       if (!before.isFile()) continue;
       await checkPath(file);
+      const relativePath = path.relative(canonicalRoot, file);
+      if (options.skipFile?.(relativePath, fileFingerprint(before))) continue;
       if (!options.allowBatchOverflow && files.length >= limits.maxFiles) throw new OutputFilesError(`В одной выдаче можно отправить не больше ${limits.maxFiles} файлов.`);
       if (before.size > limits.maxFileBytes) {
         const error = new OutputFilesError(`Файл «${safeFileName(entry, "file")}» занимает ${mebibytes(before.size)} МиБ при лимите ${mebibytes(limits.maxFileBytes)} МиБ.`);
@@ -212,20 +229,19 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
         throw error;
       }
       if (!options.allowBatchOverflow && total + before.size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
-      const handle = await open(file, "r"); const chunks: Buffer[] = []; let size = 0;
+      const handle = await open(file, "r"); const contents = Buffer.allocUnsafe(before.size); let size = 0;
       try {
         const opened = await handle.stat();
         if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new OutputFilesError("Выходной файл изменился во время чтения.", true);
-        while (true) {
-          const buffer = Buffer.alloc(Math.min(64 * 1024, limits.maxFileBytes - size + 1));
-          const read = await handle.read(buffer, 0, buffer.length, null); if (!read.bytesRead) break;
+        while (size < contents.length) {
+          const read = await handle.read(contents, size, Math.min(64 * 1024, contents.length - size), null); if (!read.bytesRead) break;
           size += read.bytesRead;
-          if (size > limits.maxFileBytes) throw new OutputFilesError(`Файл «${safeFileName(entry, "file")}» превышает лимит ${mebibytes(limits.maxFileBytes)} МиБ.`);
           if (!options.allowBatchOverflow && total + size > limits.maxTotalBytes) throw new OutputFilesError(`Суммарный размер выдачи превышает ${mebibytes(limits.maxTotalBytes)} МиБ.`);
-          chunks.push(buffer.subarray(0, read.bytesRead));
         }
+        const extra = await handle.read(Buffer.alloc(1), 0, 1, null);
+        if (extra.bytesRead) throw new OutputFilesError("Выходной файл изменился во время чтения.", true);
         const after = await handle.stat();
-        if (after.size !== size || after.mtimeMs !== before.mtimeMs) throw new OutputFilesError("Выходной файл ещё записывается; отправка будет повторена позже.", true);
+        if (after.size !== size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new OutputFilesError("Выходной файл ещё записывается; отправка будет повторена позже.", true);
         await checkPath(file);
       } catch (error) {
         if (options.skipOversizedFiles && error instanceof OutputFilesError && /лимит|превышает/iu.test(error.message)) {
@@ -234,7 +250,9 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
         throw error;
       } finally { await handle.close(); }
       total += size;
-      files.push({ name: safeFileName(path.relative(canonicalRoot, file).replaceAll(path.sep, "_"), "file"), contents: Buffer.concat(chunks, size), kind: imageName(entry) ? "image" : "file" });
+      const output = { name: safeFileName(relativePath.replaceAll(path.sep, "_"), "file"), contents, kind: imageName(entry) ? "image" : "file" } as const;
+      if (options.onFile) await options.onFile(output, relativePath, fileFingerprint(before));
+      else files.push(output);
     }
   };
   await walk(canonicalRoot, 0); return files;
@@ -273,6 +291,9 @@ export class TaskFiles {
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
+  private terminalTurns(bindingId: string): ReadonlySet<string> {
+    return new Set(this.store.getValue<string[]>(`file-terminal-turns:${bindingId}`) ?? []);
+  }
   private documentRegistry(): VkDocumentRecord[] {
     return this.store.getValue<VkDocumentRecord[]>("vk-document-registry") ?? [];
   }
@@ -320,12 +341,14 @@ export class TaskFiles {
     }
     await this.check(binding, generation);
     this.completed.delete(binding.id);
-    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, state: "prepared", done: false }]);
+    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, state: "prepared", done: false, completed: false }]);
     return { inputFiles, outboxDir };
   }
   finish(bindingId: string, operationId: string, state: "accepted" | "rejected" | "uncertain", turnId?: string): void {
+    const terminal = !!turnId && this.terminalTurns(bindingId).has(turnId);
     this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId
-      ? { ...job, state, ...(turnId ? { turnId } : {}) }
+      ? { ...job, state, ...(turnId ? { turnId } : {}),
+        ...(state === "accepted" && terminal ? { completed: true, autoScanUntil: Date.now() + LATE_SCAN_WINDOW_MS, nextScanAt: 0 } : {}) }
       : job));
   }
   markQueued(bindingId: string, operationId: string): void {
@@ -336,16 +359,24 @@ export class TaskFiles {
   }
   associateTurn(bindingId: string, operationId: string, turnId: string): void {
     if (!this.jobs(bindingId).some(job => job.operationId === operationId && !job.turnId)) return;
+    const terminal = this.terminalTurns(bindingId).has(turnId);
     this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId && !job.turnId
-      ? { ...job, turnId, done: false, queued: false }
+      ? { ...job, turnId, done: false, queued: false, completed: terminal,
+        autoScanUntil: terminal ? Date.now() + LATE_SCAN_WINDOW_MS : undefined, nextScanAt: terminal ? 0 : undefined }
       : job));
   }
   observe(bindingId: string, status: TaskDetails["status"], turnId?: string | null): void {
     if (["idle", "failed", "interrupted"].includes(status)) {
       this.completed.add(bindingId);
+      this.save(bindingId, this.jobs(bindingId).map(job => job.state === "accepted" && (job.turnId ? job.turnId === turnId : true)
+        ? { ...job, completed: true,
+          autoScanUntil: job.autoScanUntil ?? (job.completed === undefined && job.done ? Date.now() : Date.now() + LATE_SCAN_WINDOW_MS),
+          nextScanAt: job.completed === false ? 0 : job.nextScanAt } : job));
       if (turnId) {
         const turns = this.completedTurns.get(bindingId) ?? new Set<string>();
         turns.add(turnId); this.completedTurns.set(bindingId, turns);
+        const persisted = this.terminalTurns(bindingId);
+        if (!persisted.has(turnId)) this.store.setValue(`file-terminal-turns:${bindingId}`, [...persisted, turnId].slice(-128));
       }
     } else if (!this.completedTurns.get(bindingId)?.size) this.completed.delete(bindingId);
   }
@@ -357,44 +388,59 @@ export class TaskFiles {
   private async collectNow(binding: Binding, manual: boolean): Promise<number> {
     const generation = this.store.streamGeneration(binding.id); await this.check(binding, generation);
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
-    let count = 0; let retryableFailure: OutputFilesError | null = null;
-    const completedTurns = this.completedTurns.get(binding.id) ?? new Set<string>();
-    for (const job of this.jobs(binding.id).filter(job => job.generation === generation && job.state === "accepted" && !job.queued
-      && (manual || (!job.done && (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id)))))) {
+    const uploadFile = this.chat.uploadFile.bind(this.chat);
+    let count = 0; let unknownFiles = 0; let retryableFailure: OutputFilesError | null = null;
+    const completedTurns = new Set([...(this.completedTurns.get(binding.id) ?? []), ...this.terminalTurns(binding.id)]);
+    const eligible = this.jobs(binding.id).filter(job => {
+      if (job.generation !== generation || job.state !== "accepted" || job.queued) return false;
+      if (manual) return true;
+      const completed = job.completed === true || (job.completed === undefined && job.done)
+        || (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id));
+      return completed && (!job.done || ((job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil)
+        && (job.nextScanAt === undefined || Date.now() >= job.nextScanAt)));
+    });
+    for (const job of eligible) {
       const outbox = await directory(this.root, job.directory, "outbox");
-      let outputFiles: Awaited<ReturnType<typeof readOutputFiles>>;
       const skipped: OutputFilesError[] = [];
-      try {
-        outputFiles = await readOutputFiles(outbox, FILE_LIMITS, {
-          allowBatchOverflow: true, skipOversizedFiles: true, onSkippedFile: error => skipped.push(error),
+      const metadataKey = `file-scan:${binding.id}:${job.operationId}`;
+      const scanned = this.store.getValue<Record<string, { fingerprint: string; key: string }>>(metadataKey) ?? {};
+      const pending: { name: string; key: string; attachment: string; bytes: number }[] = [];
+      let pendingBytes = 0;
+      const flushPending = async (): Promise<void> => {
+        if (!pending.length) return;
+        await this.check(binding, generation);
+        const batchKey = `files:${binding.id}:${job.operationId}:${digest(pending.map(item => item.key).join("|"))}`;
+        const names = pending.map(item => item.name).join("\n");
+        this.store.atomic(() => {
+          this.store.enqueue(batchKey, binding.peerId!, { text: pending.length === 1 ? pending[0]!.name : `Файлы (${pending.length}):\n${names}`, attachments: pending.map(item => item.attachment) }, binding.id);
+          for (const item of pending) this.store.setValue(`${item.key}:queued`, true);
         });
-      }
-      catch (error) {
-        if (!(error instanceof OutputFilesError)) throw error;
-        this.store.enqueue(`files-error:${binding.id}:${job.operationId}`, binding.peerId!, {
-          text: `Не удалось забрать файлы одного запроса: ${error.message} Более новые выдачи продолжат отправляться. Исправь эту выдачу и отправь /files.`, silent: true,
-        }, binding.id);
-        if (error.retryable) retryableFailure ??= error;
-        else this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
-        continue;
-      }
-      for (const error of skipped) this.store.enqueue(`files-error:${binding.id}:${job.operationId}:${digest(error.message)}`, binding.peerId!, {
-        text: `Файл не добавлен в очередь VK: ${error.message} Допустимые файлы из этой же выдачи продолжают отправляться.`, silent: true,
-      }, binding.id);
-      for (const batch of batchOutputFiles(outputFiles)) {
-        const pending: { file: OutputFile; key: string; attachment: string }[] = [];
-        for (const file of batch) {
+        count += pending.length; pending.length = 0; pendingBytes = 0;
+      };
+      const processFile = async (file: OutputFile, relativePath: string, fingerprint: string): Promise<void> => {
+          // Store only the metadata of a stable read. A crash during upload must
+          // not cause another full read or an ambiguous second upload.
           const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
-          if (this.store.getValue<boolean>(`${key}:queued`)) continue;
-          if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) continue;
+          scanned[relativePath] = { fingerprint, key };
+          this.store.setValue(metadataKey, scanned);
+          if (this.store.getValue<boolean>(`${key}:queued`)) return;
+          if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) return;
           await this.check(binding, generation);
           let attachment = this.store.getValue<string>(`${key}:uploaded`);
           if (!attachment) {
+            const uploadState = this.store.getValue<string>(`${key}:upload-state`);
+            if (uploadState === "uploading" || uploadState === "unknown") {
+              unknownFiles++;
+              this.store.enqueue(`${key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${file.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
+              return;
+            }
             let cleanupAttempted = false;
             for (;;) {
-              try { attachment = await this.chat.uploadFile(binding.peerId!, file.name, file.contents, file.kind); break; }
+              this.store.setValue(`${key}:upload-state`, "uploading");
+              try { attachment = await uploadFile(binding.peerId!, file.name, file.contents, file.kind); break; }
               catch (error) {
                 if (error instanceof FileUploadStorageFullError) {
+                  this.store.setValue(`${key}:upload-state`, null);
                   if (cleanupAttempted) throw error;
                   cleanupAttempted = true;
                   const cleanup = await this.cleanupDocuments([]);
@@ -402,7 +448,11 @@ export class TaskFiles {
                   if (cleanup !== "removed") throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено, а очистка не подтвердила удаление. Файл не отправлен; проверь доступ к документам VK или освободи место вручную, затем повтори /files.");
                   continue;
                 }
-                if (!(error instanceof FileUploadRejectedError)) throw error;
+                if (!(error instanceof FileUploadRejectedError)) {
+                  this.store.setValue(`${key}:upload-state`, "unknown");
+                  throw new ActionRejectedError(`Результат загрузки файла «${file.name}» в VK неизвестен. Повтор остановлен, чтобы не создать дубль. Проверь документ в VK перед новой попыткой.`);
+                }
+                this.store.setValue(`${key}:upload-state`, null);
                 await this.check(binding, generation);
                 this.store.setValue(`${key}:rejected`, true);
                 this.store.enqueue(`${key}:error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен. ${error.message}`, silent: true }, binding.id);
@@ -410,26 +460,62 @@ export class TaskFiles {
                 break;
               }
             }
-            if (!attachment) continue;
-            const document = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(attachment);
-            if (document) this.rememberDocument({ attachment, ownerId: Number(document[1]), documentId: Number(document[2]), name: file.name, uploadedAt: Date.now(), fileKey: key });
-            this.store.setValue(`${key}:uploaded`, attachment);
+            if (!attachment) return;
+            const uploadedAttachment = attachment;
+            const document = /^doc(-?\d+)_([0-9]+)(?:_|$)/u.exec(uploadedAttachment);
+            this.store.atomic(() => {
+              if (document) this.rememberDocument({ attachment: uploadedAttachment, ownerId: Number(document[1]), documentId: Number(document[2]), name: file.name, uploadedAt: Date.now(), fileKey: key });
+              this.store.setValue(`${key}:uploaded`, uploadedAttachment);
+              this.store.setValue(`${key}:upload-state`, "uploaded");
+            });
           }
-          pending.push({ file, key, attachment });
-        }
-        if (pending.length) {
-          await this.check(binding, generation);
-          const batchKey = `files:${binding.id}:${job.operationId}:${digest(pending.map(item => item.key).join("|"))}`;
-          const names = pending.map(item => item.file.name).join("\n");
-          this.store.atomic(() => {
-            this.store.enqueue(batchKey, binding.peerId!, { text: pending.length === 1 ? pending[0]!.file.name : `Файлы (${pending.length}):\n${names}`, attachments: pending.map(item => item.attachment) }, binding.id);
-            for (const item of pending) this.store.setValue(`${item.key}:queued`, true);
-          }); count += pending.length;
-        }
+          if (pending.length && (pending.length >= FILE_LIMITS.maxFiles || pendingBytes + file.contents.length > FILE_LIMITS.maxTotalBytes)) await flushPending();
+          pending.push({ name: file.name, key, attachment, bytes: file.contents.length });
+          pendingBytes += file.contents.length;
+          if (pending.length >= FILE_LIMITS.maxFiles || pendingBytes >= FILE_LIMITS.maxTotalBytes) await flushPending();
+      };
+      try {
+        // Validate the whole tree before the first upload; this pass reads only
+        // directory entries and metadata, not file contents.
+        await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true, skipFile: () => true });
+        await readOutputFiles(outbox, FILE_LIMITS, {
+          allowBatchOverflow: true, skipOversizedFiles: true, onSkippedFile: error => skipped.push(error),
+          skipFile: (relativePath, fingerprint) => {
+            const known = scanned[relativePath];
+            if (!known || known.fingerprint !== fingerprint) return false;
+            if (this.store.getValue<boolean>(`${known.key}:queued`)) return true;
+            const uploadState = this.store.getValue<string>(`${known.key}:upload-state`);
+            if (uploadState === "uploading" || uploadState === "unknown") {
+              unknownFiles++;
+              this.store.enqueue(`${known.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
+              return true;
+            }
+            return !manual && !!this.store.getValue<boolean>(`${known.key}:rejected`);
+          },
+          onFile: processFile,
+        });
+        await flushPending();
+      } catch (error) {
+        if (!(error instanceof OutputFilesError)) throw error;
+        this.store.enqueue(`files-error:${binding.id}:${job.operationId}`, binding.peerId!, {
+          text: `Не удалось забрать файлы одного запроса: ${error.message} Более новые выдачи продолжат отправляться. Исправь эту выдачу и отправь /files.`, silent: true,
+        }, binding.id);
+        if (error.retryable) retryableFailure ??= error;
+        else this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId
+          ? { ...item, done: true, completed: true, nextScanAt: Number.MAX_SAFE_INTEGER } : item));
+        continue;
       }
-      this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId ? { ...item, done: true } : item));
+      for (const error of skipped) this.store.enqueue(`files-error:${binding.id}:${job.operationId}:${digest(error.message)}`, binding.peerId!, {
+        text: `Файл не добавлен в очередь VK: ${error.message} Допустимые файлы из этой же выдачи продолжают отправляться.`, silent: true,
+      }, binding.id);
+      this.save(binding.id, this.jobs(binding.id).map(item => item.operationId === job.operationId
+        ? { ...item, done: true, completed: item.completed ?? true,
+          autoScanUntil: item.autoScanUntil ?? (item.completed === false ? undefined : Date.now()),
+          nextScanAt: Date.now() + (item.scanDelayMs ?? INITIAL_LATE_SCAN_MS),
+          scanDelayMs: Math.min((item.scanDelayMs ?? INITIAL_LATE_SCAN_MS) * 2, MAX_LATE_SCAN_MS) } : item));
     }
     if (retryableFailure && !manual) throw retryableFailure;
+    if (!count && unknownFiles) throw new ActionRejectedError("Есть файл с неизвестным результатом загрузки в VK. Повтор остановлен, чтобы не создать дубль; проверь документы VK перед новой попыткой.");
     return count;
   }
   tick(): Promise<void> {
@@ -437,9 +523,12 @@ export class TaskFiles {
     this.working = this.flush().finally(() => { this.working = null; }); return this.working;
   }
   private async flush(): Promise<void> {
-    for (const id of this.completed) {
+    for (const id of new Set([...this.completed, ...this.store.bindings().map(binding => binding.id)])) {
       const generation = this.store.streamGeneration(id);
-      if (this.stopped || Date.now() < (this.retries.get(id) ?? 0) || !this.jobs(id).some(job => job.generation === generation && job.state === "accepted" && !job.done)) continue;
+      if (this.stopped || Date.now() < (this.retries.get(id) ?? 0) || !this.jobs(id).some(job => job.generation === generation && job.state === "accepted" && !job.queued
+        && (job.completed === true || (job.completed === undefined && job.done) || (!job.done && this.completed.has(id)))
+        && (!job.done || ((job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil)
+          && (job.nextScanAt === undefined || Date.now() >= job.nextScanAt))))) continue;
       const binding = this.store.getBinding(id); if (!binding?.attached || binding.peerId === null) continue;
       try { await this.collect(binding); this.retries.delete(id); }
       catch (error) {

@@ -514,6 +514,19 @@ export class BridgeStore {
     return record?.version === 2 && !["complete", "cancelled", "switched"].includes(record.phase);
   }
 
+  /** Carry accepted VK outboxes across a transfer fence, not ordinary rebinds. */
+  private carryTransferFileJobs(bindingId: string, from: number, to: number): void {
+    const key = `file-jobs:${bindingId}`;
+    const jobs = this.getValue<unknown>(key);
+    if (!Array.isArray(jobs)) return;
+    this.setValue(key, jobs.map(value => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+      const job = value as Record<string, unknown>;
+      return job.state === "accepted" && job.generation === from
+        ? { ...job, generation: to, nextScanAt: 0 } : value;
+    }));
+  }
+
   beginTransfer(record: TaskTransferRecord): void {
     this.atomic(() => {
       const current = this.transfer(record.bindingId);
@@ -522,7 +535,9 @@ export class BridgeStore {
       const binding = this.getBinding(record.bindingId);
       if (!binding || taskKey(binding) !== taskKey(record.source)) throw new Error("Transfer source binding changed");
       // Invalidate input already preparing attachments before this transfer began.
-      this.setValue(`stream-generation:${record.bindingId}`, this.streamGeneration(record.bindingId) + 1);
+      const generation = this.streamGeneration(record.bindingId);
+      this.carryTransferFileJobs(record.bindingId, generation, generation + 1);
+      this.setValue(`stream-generation:${record.bindingId}`, generation + 1);
       this.markTransfer(record);
     });
   }
@@ -616,7 +631,14 @@ export class BridgeStore {
       // exactly one new initial handoff; the previous task's marker must not be
       // inherited by the target.
       this.setValue(`desktop-handoff:${record.bindingId}`, null);
-      this.setValue(`stream-generation:${record.bindingId}`, this.streamGeneration(record.bindingId) + 1);
+      const sourceGeneration = this.streamGeneration(record.bindingId);
+      const targetGeneration = sourceGeneration + 1;
+      // A verified transfer keeps the same VK binding and outbox. Move its
+      // accepted file jobs with the stream fence so a late file or an upload
+      // already in flight remains reconcilable against the target binding.
+      // Ordinary detach/rebind deliberately does not perform this migration.
+      this.carryTransferFileJobs(record.bindingId, sourceGeneration, targetGeneration);
+      this.setValue(`stream-generation:${record.bindingId}`, targetGeneration);
       this.updateTransfer(record, { phase: "switched", target });
       return this.getBinding(record.bindingId)!;
     });

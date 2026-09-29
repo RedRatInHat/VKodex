@@ -122,16 +122,13 @@ export class VkGateway implements ChatGateway {
   }
 
   private async uploadFile(peerId: number, file: OutboundFile): Promise<unknown> {
-    if (file.kind === "image") {
-      try {
-        return await this.vk.upload.messagePhoto({
-          peer_id: peerId,
-          source: { value: file.path, filename: file.name },
-        });
-      } catch {
-        // Some image containers/codecs are not accepted by VK's photo endpoint.
-        // Sending them as documents is preferable to losing the artifact.
-      }
+    // Never turn an ambiguous photo response into a second upload. Formats
+    // which may not be accepted by the photo endpoint use documents directly.
+    if (file.kind === "image" && /\.(?:png|jpe?g)$/iu.test(file.name)) {
+      return this.vk.upload.messagePhoto({
+        peer_id: peerId,
+        source: { value: file.path, filename: file.name },
+      });
     }
 
     return this.vk.upload.messageDocument({

@@ -3105,6 +3105,187 @@ test("files enter the same task and completed output is uploaded once across ret
   assert.equal(s.desktop.submissions.length, 1);
 });
 
+test("an automatic tick delivers a file added after a completed turn's empty outbox scan exactly once", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-late-file-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "late-output", []);
+  files.finish(binding.id, "late-output", "accepted", "completed-turn");
+  files.observe(binding.id, "idle", "completed-turn");
+  await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 0);
+
+  await writeFile(path.join(prepared.outboxDir, "late.txt"), "late result");
+  now += 60_000;
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "late result");
+  await restored.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("an ambiguous VK upload is not retried by automatic scan or /files after restart", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-unknown-upload-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "unknown-upload", []);
+  files.finish(binding.id, "unknown-upload", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
+  files.observe(binding.id, "idle", "completed-turn");
+  const upload = t.mock.method(s.chat, "uploadFile", async () => { throw new Error("response lost"); });
+  await assert.rejects(files.collect(binding), /Результат загрузки файла.*неизвестен/u);
+  assert.equal(upload.mock.callCount(), 1);
+
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick();
+  await assert.rejects(restored.collect(binding, true), /неизвестным результатом загрузки/u);
+  assert.equal(upload.mock.callCount(), 1);
+});
+
+test("late reconciliation skips unchanged queued bytes but reads a new file and changed version", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-late-scan-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "scan-output", []);
+  files.finish(binding.id, "scan-output", "accepted", "completed-turn");
+  const largePath = path.join(prepared.outboxDir, "large.bin");
+  await writeFile(largePath, Buffer.alloc(8 * 1024 * 1024, 1));
+  files.observe(binding.id, "idle", "completed-turn");
+  await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+
+  const originalAlloc = Buffer.allocUnsafe;
+  let largeAllocations = 0;
+  t.mock.method(Buffer, "allocUnsafe", (size: number) => {
+    if (size >= 8 * 1024 * 1024) largeAllocations++;
+    return originalAlloc(size);
+  });
+  await writeFile(path.join(prepared.outboxDir, "late.txt"), "late");
+  now += 60_000;
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick(); await s.worker.flush();
+  assert.equal(largeAllocations, 0);
+  assert.deepEqual(s.chat.binaryUploads.map(upload => upload.name), ["large.bin", "late.txt"]);
+
+  await writeFile(largePath, Buffer.alloc(8 * 1024 * 1024, 2));
+  now += 120_000;
+  await restored.tick(); await s.worker.flush();
+  assert.equal(largeAllocations, 1);
+  assert.equal(s.chat.binaryUploads.length, 3);
+  assert.equal(s.chat.binaryUploads[2]!.contents[0], 2);
+});
+
+test("legacy completed file jobs receive one migration scan after restart", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-legacy-scan-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "legacy-output", []);
+  files.finish(binding.id, "legacy-output", "accepted", "completed-turn");
+  s.store.setValue(`file-jobs:${binding.id}`, s.store.getValue<Record<string, unknown>[]>(`file-jobs:${binding.id}`)!.map(job => ({
+    ...job, done: true, completed: undefined, nextScanAt: undefined,
+  })));
+  await writeFile(path.join(prepared.outboxDir, "legacy-late.txt"), "legacy");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+  await restored.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("automatic late reconciliation is bounded and /files still recovers an older outbox", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-late-window-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "old-output", []);
+  files.finish(binding.id, "old-output", "accepted", "completed-turn");
+  files.observe(binding.id, "idle", "completed-turn");
+  await files.tick();
+
+  now += 48 * 60 * 60_000 + 1;
+  await writeFile(path.join(prepared.outboxDir, "older.txt"), "manual recovery");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick();
+  assert.equal(s.chat.binaryUploads.length, 0);
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("manual /files before turn completion does not consume the later automatic scan window", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-preterminal-files-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "preterminal-output", []);
+  files.finish(binding.id, "preterminal-output", "accepted", "pending-turn");
+  await writeFile(path.join(prepared.outboxDir, "first.txt"), "first");
+  assert.equal(await files.collect(binding, true), 1);
+  await writeFile(path.join(prepared.outboxDir, "second.txt"), "second");
+  now += 60_000;
+  await files.tick();
+  assert.equal(s.chat.binaryUploads.length, 1);
+
+  files.observe(binding.id, "idle", "pending-turn");
+  await files.tick();
+  assert.equal(s.chat.binaryUploads.length, 2);
+});
+
+test("a terminal turn observed before its file job is accepted survives restart", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-terminal-race-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "late-ack", []);
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "result");
+  files.observe(binding.id, "idle", "quick-turn");
+  files.finish(binding.id, "late-ack", "accepted", "quick-turn");
+
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await restored.tick();
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("accepted source outbox survives both transfer generation fences", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const binding = s.store.getBinding(record.bindingId)!;
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-file-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "source-output", []);
+  files.finish(binding.id, "source-output", "accepted", "source-turn");
+  files.observe(binding.id, "idle", "source-turn");
+  await writeFile(path.join(prepared.outboxDir, "late.txt"), "source result");
+
+  s.store.beginTransfer(record);
+  const target = s.store.switchTransfer(record, { ...task, threadId: "target-task", sourceId: "work" });
+  assert.equal(await files.collect(target, true), 1);
+  await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.equal(s.chat.sent.filter(item => item.view.attachments?.length).length, 1);
+  assert.equal(await files.collect(target, true), 0);
+});
+
+test("transfer during upload reconciles the returned receipt without uploading twice", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const binding = s.store.getBinding(record.bindingId)!;
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-transfer-upload-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "uploading-source", []);
+  files.finish(binding.id, "uploading-source", "accepted", "source-turn");
+  files.observe(binding.id, "idle", "source-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "source result");
+
+  let release!: (attachment: string) => void;
+  let entered!: () => void;
+  const uploadEntered = new Promise<void>(resolve => { entered = resolve; });
+  const uploadResult = new Promise<string>(resolve => { release = resolve; });
+  const upload = t.mock.method(s.chat, "uploadFile", async () => { entered(); return uploadResult; });
+  const collecting = files.collect(binding);
+  await uploadEntered;
+  s.store.beginTransfer(record);
+  const target = s.store.switchTransfer(record, { ...task, threadId: "target-task", sourceId: "work" });
+  release("doc-202_1");
+  await assert.rejects(collecting, /больше не подключена/u);
+  assert.equal(await files.collect(target, true), 1);
+  await s.worker.flush();
+  assert.equal(upload.mock.callCount(), 1);
+  assert.equal(s.chat.sent.filter(item => item.view.attachments?.length).length, 1);
+});
+
 test("large VK documents stream to disk and incomplete oversized downloads are removed", async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stream-test-"));
   const target = path.join(root, "streamed.bin");
@@ -3385,6 +3566,26 @@ test("MP4 document uploads declare type, byte length and a large-file timeout", 
   const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
   assert.equal(await gateway.uploadFile(peerId, "trailer.MP4", bytes, "file"), "doc-202_17");
   assert.equal(upload.mock.callCount(), 1);
+});
+
+test("an ambiguous photo upload never falls back to a second document upload", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  const photo = t.mock.method(vk.upload, "messagePhoto", async () => { throw new Error("photo response lost"); });
+  const document = t.mock.method(vk.upload, "conduct", async () => ({ type: "doc", doc: { owner_id: -202, id: 18 } }));
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  await assert.rejects(gateway.uploadFile(peerId, "result.png", Buffer.from("fixture"), "image"), /photo response lost/u);
+  assert.equal(photo.mock.callCount(), 1);
+  assert.equal(document.mock.callCount(), 0);
+});
+
+test("WebP images use VK documents directly without a speculative photo attempt", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  const photo = t.mock.method(vk.upload, "messagePhoto", async () => { throw new Error("unexpected photo upload"); });
+  const document = t.mock.method(vk.upload, "conduct", async () => ({ type: "doc", doc: { owner_id: -202, id: 18 } }));
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  assert.equal(await gateway.uploadFile(peerId, "preview.webp", Buffer.from("fixture"), "image"), "doc-202_18");
+  assert.equal(photo.mock.callCount(), 0);
+  assert.equal(document.mock.callCount(), 1);
 });
 
 test("manager restores a persisted VK burst into one task turn after restart", async t => {
