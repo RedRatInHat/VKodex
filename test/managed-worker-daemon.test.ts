@@ -461,7 +461,10 @@ test('stock daemon routes two native queue sends through one journaled backend a
     { enabled: true, early: false }, 'normal', true);
   const broker = own.brokers[0]!;
   const wait = async (check: () => boolean) => {
-    const deadline = Date.now() + 3_000;
+    // The stock queue path traverses the broker, owner, journal, and fake
+    // App Server. CI can schedule those processes slowly under Windows;
+    // this test checks eventual ordering, not a three-second SLA.
+    const deadline = Date.now() + 12_000;
     while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
     assert.ok(check(), JSON.stringify({ methods: own.backend.methods,
       native: own.daemon.metadata.nativeState, errors: own.handlerErrors }));
