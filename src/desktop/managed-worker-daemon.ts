@@ -24,6 +24,7 @@ import { assertManagedStockSettingsPolicy, createManagedStockSettingsInitializer
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
+import { oneShotComposerCommandAuthorized } from './one-shot-composer-command.js';
 import { ManagedStockVkSubmitter, managedVkStockCommandId,
   type ManagedStockVkLease } from './managed-stock-vk-submit.js';
 import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server.js';
@@ -483,6 +484,8 @@ export class ManagedWorkerDaemon {
           p.permissions !== ':read-only' || !(inheritedModel || directModel) ||
           p.approvalPolicy !== 'never' && p.approvalPolicy !== 'on-request' ||
           p.sandboxPolicy !== undefined && p.sandboxPolicy !== null) return false;
+        if (this.#options.oneShotFirstComposer &&
+            !oneShotComposerCommandAuthorized(this.#intentStore, scope)) return false;
         // A journal-reserved dispatch may finish after new admission closes.
         if (!this.#admissionOpen) {
           const admitted = this.#host?.commandStatusForIntent(controlKey, {

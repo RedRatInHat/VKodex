@@ -13,6 +13,7 @@ import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-opera
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
+import { oneShotComposerCommandAuthorized } from '../src/desktop/one-shot-composer-command.js';
 import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { ManagedWorkerControlClient } from '../src/desktop/managed-worker-control-client.js';
@@ -36,6 +37,30 @@ test('one-shot first Composer cannot be enabled without a callback or alongside 
     /One-shot first Composer/);
   assert.throws(() => new ManagedWorkerDaemon({ ...common, oneShotFirstComposer: () => true,
     nativeStockQueue: {} as never }), /One-shot first Composer/);
+});
+
+test('one-shot command policy admits only the exact persisted first Composer intent', () => {
+  const operationId = randomUUID(), clientUserMessageId = randomUUID();
+  const scope = { ownerEpoch: randomUUID(), backendGeneration: 1, threadId: 'own-zero-turn',
+    operationId, method: 'turn/start' as const,
+    params: { threadId: 'own-zero-turn', clientUserMessageId, input: [{ type: 'text', text: 'canary' }] } };
+  const record = { operationId, clientUserMessageId,
+    intent: { envelope: {}, command: { operationId, method: 'turn/start' as const,
+      params: structuredClone(scope.params) }, uiParams: { source: 'Composer' }, localMetadata: null,
+    admission: { ownerEpoch: scope.ownerEpoch, backendGeneration: scope.backendGeneration,
+      snapshot: { id: scope.threadId }, composer: { snapshot: { turns: [] } } } } };
+  const store = { get: (id: string) => id === operationId ? record : null };
+  assert.equal(oneShotComposerCommandAuthorized(null, scope), false);
+  assert.equal(oneShotComposerCommandAuthorized(store, scope), true);
+  assert.equal(oneShotComposerCommandAuthorized({ get: () => null }, scope), false);
+  assert.equal(oneShotComposerCommandAuthorized(store, { ...scope,
+    params: { ...scope.params, input: [{ type: 'text', text: 'other' }] } }), false);
+  assert.equal(oneShotComposerCommandAuthorized({ get: () => ({ ...record,
+    intent: { ...record.intent, uiParams: null } }) }, scope), false);
+  assert.equal(oneShotComposerCommandAuthorized({ get: () => ({ ...record,
+    intent: { ...record.intent, admission: { ...record.intent.admission,
+      composer: { snapshot: { turns: [{ id: 'older' }] } } } } }) }, scope), false);
+  assert.equal(oneShotComposerCommandAuthorized({ get: () => { throw new Error('bad seal'); } }, scope), false);
 });
 
 test('opt-in native task-state listener publishes initial and changed state without another backend request', async () => {
