@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import path from 'node:path';
 import type { AppServerRequestOptions, AppServerInitializedSession,
   AppServerResponseEnvelope } from './app-server-connection.js';
 
@@ -69,7 +70,10 @@ const oneOf = (value: unknown, choices: readonly string[]): boolean =>
 const stringArray = (value: unknown): boolean => nullable(value, items => Array.isArray(items) &&
   items.every(textValue));
 const cwdValue = (value: unknown, ownCwd: string | null): boolean => nullable(value, cwd =>
-  typeof ownCwd === 'string' && cwd === ownCwd);
+  typeof ownCwd === 'string' && typeof cwd === 'string' &&
+  path.win32.isAbsolute(ownCwd) && path.win32.isAbsolute(cwd) &&
+  path.win32.parse(ownCwd).root.length > 1 && path.win32.parse(cwd).root.length > 1 &&
+  path.win32.resolve(cwd).toLowerCase() === path.win32.resolve(ownCwd).toLowerCase());
 function bootstrapKind(method: string, params: unknown, taskId: string,
   ownCwd: string | null, trustedLocalFrontend: boolean): Kind | null {
   if (method === 'configRequirements/read' &&

@@ -467,6 +467,24 @@ test('configRequirements/read accepts native absent and null params without chan
   assert.equal(backend.requests.length, 3);
 });
 
+test('bootstrap cwd reads accept the same absolute Windows directory across casing and separators', async () => {
+  const backend = fakeBackend();
+  const { frontend } = attach(createSessions(backend, {
+    bootstrapReadMethods: ['config/read', 'permissionProfile/list'], ownCwd: 'D:\\GitStorageG\\VKodex' }));
+  await initialize(frontend);
+  await frontend.receive({ id: 'config', method: 'config/read',
+    params: { cwd: 'd:/gitstorageg/vkodex/' } });
+  await frontend.receive({ id: 'permissions', method: 'permissionProfile/list',
+    params: { cwd: 'd:/gitstorageg/vkodex' } });
+  assert.deepEqual(backend.requests.map(request => request.method),
+    ['config/read', 'permissionProfile/list']);
+  await frontend.receive({ id: 'relative', method: 'config/read', params: { cwd: 'VKodex' } });
+  await frontend.receive({ id: 'drive-relative', method: 'config/read', params: { cwd: 'D:VKodex' } });
+  await frontend.receive({ id: 'root-relative', method: 'config/read', params: { cwd: '\\GitStorageG\\VKodex' } });
+  await frontend.receive({ id: 'other', method: 'config/read', params: { cwd: 'D:/GitStorageG/Other' } });
+  assert.equal(backend.requests.length, 2);
+});
+
 test('pinned native resume parameters pass unchanged only under same-generation authority', async () => {
   const backend = fakeBackend();
   const original = { threadId: taskId, history: null, path: 'C:/own/rollout.jsonl',
