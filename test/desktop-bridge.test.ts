@@ -3350,7 +3350,8 @@ test("stageFile submits its free-space snapshot to transactional admission", asy
 
 test("a staging quota failure does not strand uploaded siblings in one batch", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-sibling-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const freeBytes = async () => 8n * 1024n * 1024n * 1024n;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined, freeBytes);
   const prepared = await files.prepare(binding, "stage-quota-sibling", []);
   files.finish(binding.id, "stage-quota-sibling", "accepted", "finished-turn");
   for (const name of ["a-good.txt", "b-blocked.txt", "c-good.txt"]) await writeFile(path.join(prepared.outboxDir, name), name);
@@ -3365,7 +3366,7 @@ test("a staging quota failure does not strand uploaded siblings in one batch", a
   assert.deepEqual(batch?.view.attachments, ["doc-202_1", "doc-202_2"]);
   await s.worker.flush();
   assert.ok(s.chat.sent.some(item => item.view.attachments?.join(",") === "doc-202_1,doc-202_2"));
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined, freeBytes);
   assert.equal(await restored.collect(binding), 0);
   assert.equal(s.chat.binaryUploads.length, 2);
   admission.mock.restore();
@@ -3375,7 +3376,8 @@ test("a staging quota failure does not strand uploaded siblings in one batch", a
 
 test("a staging quota failure after a full batch preserves that batch and a newer job", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-boundary-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined,
+    async () => 8n * 1024n * 1024n * 1024n);
   const first = await files.prepare(binding, "stage-quota-boundary", []);
   files.finish(binding.id, "stage-quota-boundary", "accepted");
   for (let index = 0; index < 11; index++) await writeFile(path.join(first.outboxDir, `${String(index).padStart(2, "0")}.txt`), "fixture");
@@ -4051,7 +4053,8 @@ test("a stale idle snapshot cannot collect a new turn's outbox before that exact
 
 test("an outbox with more than ten files is delivered in batches without blocking newer turns", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined,
+    async () => 8n * 1024n * 1024n * 1024n);
   const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", "accepted");
   for (let index = 0; index <= 10; index++) await writeFile(path.join(invalid.outboxDir, `${index}.txt`), "fixture");
   const valid = await files.prepare(binding, "valid-output", []); files.finish(binding.id, "valid-output", "accepted");
