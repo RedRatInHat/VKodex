@@ -2710,7 +2710,7 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   }
   assert.equal(turnId, "turn-125");
   assert.ok(calls.length > 126);
-  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 20));
+  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 1));
   let positiveReads = 0;
   assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => {
     positiveReads++;

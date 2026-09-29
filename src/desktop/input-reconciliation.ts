@@ -51,16 +51,19 @@ export async function scanTerminalQueuedInputTurn(
     previous.seenCursors.some(value => typeof value !== "string" || !value) ||
     new Set(previous.seenCursors).size !== previous.seenCursors.length ||
     previous.seenCursors.at(-1) !== previous.cursor ||
-    !Number.isSafeInteger(previous.pages) || previous.pages < 1 || previous.pages > 1_000))
+    !Number.isSafeInteger(previous.pages) || previous.pages < 1 || previous.pages > 5_000))
     throw new DesktopUnavailableError("Курсор истории очереди повреждён.");
   type Page = IpcObject & { data: unknown[]; nextCursor: string | null };
   const fingerprint = (page: Page): string => createHash("sha256")
     .update(JSON.stringify([page.data, page.nextCursor])).digest("hex");
   const read = async (cursor?: string): Promise<Page> => {
-    const page = await list({ threadId, limit: 20, sortDirection: "desc", itemsView: "full",
+    // Historical turns may contain very large transcripts. A 20-turn page
+    // exceeded MetadataRpc's 64 MiB guard on real tasks; one turn per page
+    // keeps the bounded scan usable without raising that memory ceiling.
+    const page = await list({ threadId, limit: 1, sortDirection: "desc", itemsView: "full",
       ...(cursor ? { cursor } : {}) });
     if (page.threadId !== undefined && page.threadId !== threadId ||
-      !Array.isArray(page.data) || page.data.length > 20 ||
+      !Array.isArray(page.data) || page.data.length > 1 ||
       !(page.nextCursor === null || typeof page.nextCursor === "string"))
       throw new DesktopUnavailableError("Codex вернул неполную историю очереди.");
     return page as Page;
@@ -103,7 +106,7 @@ export async function scanTerminalQueuedInputTurn(
     if (matched) return { done: true, turnId: matched };
   }
   while (cursor !== null && calls < 20) {
-    if (pages >= 1_000) throw new DesktopUnavailableError("История очереди превысила предел чтения.");
+    if (pages >= 5_000) throw new DesktopUnavailableError("История очереди превысила предел чтения.");
     const page = await read(cursor);
     calls++;
     const matched = consume(page);
