@@ -29,6 +29,9 @@ interface FileJob {
   operationId: string;
   generation: number;
   directory: string;
+  /** Original task identity survives a verified transfer of this file job. */
+  threadId?: string;
+  sourceId?: string;
   /** Existing jobs retain their original key derivation across an upgrade. */
   keyFormat?: "relative-path-v2";
   state: "prepared" | "accepted" | "rejected" | "uncertain";
@@ -366,6 +369,9 @@ export class TaskFiles {
     // A transfer may advance the job's routing generation; the receipt keeps
     // the generation at capture time as provenance for its immutable bytes.
     if (receipt.bindingId !== bindingId || receipt.operationId !== job.operationId
+      || (job.threadId !== undefined &&
+        (receipt.threadId !== job.threadId ||
+          (receipt.sourceId ?? "") !== (job.sourceId ?? "")))
       || !receipt.threadId || !Number.isSafeInteger(receipt.stagedAt)
       || (receipt.turnId !== undefined && receipt.turnId !== job.turnId)
       || typeof receipt.relativePath !== "string" || !receipt.relativePath
@@ -495,7 +501,9 @@ export class TaskFiles {
     }
     await this.check(binding, generation);
     this.completed.delete(binding.id);
-    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, keyFormat: "relative-path-v2", state: "prepared", done: false, completed: false }]);
+    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory,
+      threadId: binding.threadId, ...(binding.sourceId ? { sourceId: binding.sourceId } : {}),
+      keyFormat: "relative-path-v2", state: "prepared", done: false, completed: false }]);
     return { inputFiles, outboxDir };
   }
   finish(bindingId: string, operationId: string, state: "accepted" | "rejected" | "uncertain", turnId?: string): void {

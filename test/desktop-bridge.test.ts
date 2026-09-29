@@ -3464,32 +3464,53 @@ test("malformed legacy stage receipts fail closed for new stage admission", asyn
 });
 
 test("a staged version survives source mutation and restart before upload", async t => {
-  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-restart-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-restart-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const store = new BridgeStore(filename); const chat = new Chat();
+  const bindingId = store.ensureBinding(task).id;
+  store.setChat(bindingId, peerId, 17);
+  const binding = store.getBinding(bindingId)!;
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store), undefined, true);
   const prepared = await files.prepare(binding, "staged-restart", []);
   files.finish(binding.id, "staged-restart", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
   await writeFile(source, "first version");
-  const setValue = s.store.setValue.bind(s.store);
-  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+  const setValue = store.setValue.bind(store);
+  const crash = t.mock.method(store, "setValue", (key: string, value: unknown) => {
     if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
     return setValue(key, value);
   });
   await assert.rejects(files.collect(binding, true), /executor lost/u);
   crash.mock.restore();
-  const staged = s.store.getValue<Record<string, { path: string; sha256: string; relativePath: string; threadId: string; operationId: string; generation: number; stagedAt: number }>>("file-stage-index:" + binding.id + ":staged-restart");
+  const staged = store.getValue<Record<string, { path: string; sha256: string; relativePath: string; threadId: string; operationId: string; generation: number; stagedAt: number }>>("file-stage-index:" + binding.id + ":staged-restart");
   assert.ok(staged);
   const receipt = Object.values(staged)[0]!;
   assert.equal(receipt.relativePath, "result.txt");
   assert.equal(receipt.threadId, binding.threadId);
   assert.equal(receipt.operationId, "staged-restart");
-  assert.equal(receipt.generation, s.store.streamGeneration(binding.id));
+  assert.equal(receipt.generation, store.streamGeneration(binding.id));
   assert.ok(Number.isSafeInteger(receipt.stagedAt));
   assert.equal(await readFile(receipt.path, "utf8"), "first version");
   await writeFile(source, "second version");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
-  await restored.collect(binding, true);
-  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
+  store.close();
+  const recovered = new BridgeStore(filename);
+  t.after(() => recovered.close());
+  const recoveredBinding = recovered.getBinding(binding.id)!;
+  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered));
+  const receiptKey = Object.keys(staged)[0]!;
+  recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, {
+    ...staged, [receiptKey]: { ...receipt, threadId: "another-source-task" },
+  });
+  await assert.rejects(restored.collect(recoveredBinding, true), /Квитанция staged-файла повреждена/u);
+  assert.equal(chat.binaryUploads.length, 0);
+  recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, {
+    ...staged, [receiptKey]: { ...receipt, sourceId: "another-source" },
+  });
+  await assert.rejects(restored.collect(recoveredBinding, true), /Квитанция staged-файла повреждена/u);
+  assert.equal(chat.binaryUploads.length, 0);
+  recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, staged);
+  await restored.collect(recoveredBinding, true);
+  assert.equal(chat.binaryUploads[0]!.contents.toString(), "first version");
   assert.equal(await readFile(receipt.path, "utf8"), "first version");
 });
 
