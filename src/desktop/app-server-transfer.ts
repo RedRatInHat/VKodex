@@ -485,6 +485,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       const lastTurnId = request.checkpoint?.lastTurnId ?? await this.lastTerminalTurn(sourceHome, request.task.threadId);
       if (request.checkpoint) await this.verifySource(request.task, request.checkpoint);
       const staged = await this.stage(request.task.rolloutPath, sourceHome, targetHome, request.operationId, lastTurnId);
+      let uncertainFork = false;
       try {
         if (request.checkpoint) await this.verifySource(request.task, request.checkpoint);
         if (request.checkpoint && contextChanged(request.checkpoint, staged)) {
@@ -519,11 +520,14 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
         }
       } catch (error) {
         if (!(error instanceof UncertainActionError)) throw error;
+        uncertainFork = true;
         if (request.checkpoint && !target) throw new TransferConflictError("Codex не подтвердил ID созданной копии. Источник сохранён; автоматическое создание второй копии запрещено.");
         target ??= await this.waitForReconciliation(request);
         if (!target) throw error;
       } finally {
-        await staged.cleanup();
+        // The native process may still be reading the staged path after an
+        // uncertain reply. Keep it until a target is confirmed by recovery.
+        if (!uncertainFork || target) await staged.cleanup();
       }
     }
     request.onForkCreated?.(target);

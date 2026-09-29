@@ -2702,6 +2702,7 @@ test("App Server transfer forks a fixed completed boundary into the target profi
   let target: DesktopTask = { hostId: "local", threadId: "target-thread", sourceId: "work", sourceLabel: ".codex-work",
     title: "Initial prompt", workspace: path.resolve("fixture-project"), projectId: "target-project", rolloutPath: rollout, updatedAt: 2 };
   const calls: { method: string; params: IpcObject }[] = []; const metadata: string[] = [];
+  let cleanups = 0;
   const transfer = new AppServerTaskTransfer({
     sourceHome: () => targetHome,
     listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }],
@@ -2716,7 +2717,7 @@ test("App Server transfer forks a fixed completed boundary into the target profi
     if (method === "thread/list") return { data: [] };
     return { thread: { id: target.threadId, cwd: target.workspace, path: rollout, updatedAt: 2, name: null } };
   } }), async () => ({ path: path.join(targetHome, ".vkodex-transfer-staging", "transfer-op", "source.jsonl"),
-    model: "model-a", effort: "high", cwd: path.resolve("fixture-project"), cleanup: async () => {} }));
+    model: "model-a", effort: "high", cwd: path.resolve("fixture-project"), cleanup: async () => { cleanups++; } }));
   const result = await transfer.fork({ operationId: "transfer-op", startedAt: 1_000, task: {
     hostId: "local", threadId: "source-thread", title: "Moved task", rolloutPath: path.resolve("source.jsonl"),
   }, targetSourceId: "work", projectId: "target-project" });
@@ -2726,11 +2727,13 @@ test("App Server transfer forks a fixed completed boundary into the target profi
     lastTurnId: "completed-turn", model: "model-a", cwd: path.resolve("fixture-project"), config: { model_reasoning_effort: "high" },
     threadSource: "user", excludeTurns: true, deferGoalContinuation: true });
   assert.deepEqual(metadata, ["name:Moved task", "project:target-project"]);
+  assert.equal(cleanups, 1);
 });
 
 test("a definite native fork rejection clears the durable submission marker after empty reconciliation", async () => {
   const home = path.resolve("fixture-target-home");
   const markers: string[] = [];
+  let cleanups = 0;
   const transfer = new AppServerTaskTransfer({
     sourceHome: () => home,
     listSources: () => [{ id: "work", label: ".codex-work" }],
@@ -2739,13 +2742,47 @@ test("a definite native fork rejection clears the durable submission marker afte
   () => ({ call: async method => method === "thread/turns/list"
     ? { data: [{ id: "boundary", status: "completed" }] }
     : Promise.reject(new ActionRejectedError("Native fork rejected the staged history.")) }),
-  async () => ({ path: path.join(home, "source.jsonl"), cleanup: async () => {} }));
+  async () => ({ path: path.join(home, "source.jsonl"), cleanup: async () => { cleanups++; } }));
   await assert.rejects(transfer.fork({ operationId: "rejected-fork", startedAt: 1, task: {
     hostId: "local", threadId: "source", title: "Source", rolloutPath: path.resolve("source.jsonl"),
   }, targetSourceId: "work", projectId: null,
   onForkSubmitted: () => markers.push("submitted"), onForkRejected: () => markers.push("rejected") }),
   ActionRejectedError);
   assert.deepEqual(markers, ["submitted", "rejected"]);
+  assert.equal(cleanups, 1);
+});
+
+test("an unresolved native fork retains its staged rollout and cannot submit a second fork", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-uncertain-fork-stage-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const sourcePath = path.join(sourceHome, "sessions", "source.jsonl");
+  await mkdir(path.dirname(sourcePath), { recursive: true }); await mkdir(targetHome);
+  await writeFile(sourcePath, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  const stagedPath = path.join(targetHome, ".vkodex-transfer-staging", "uncertain-op", "source.jsonl");
+  let forkCalls = 0; let recycleCalls = 0; let forkSubmitted = false; const markers: string[] = [];
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: task => task.sourceId === "work" ? sourceHome : targetHome,
+    listSources: () => [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }],
+    listTasks: async () => [], listProjects: async () => [],
+  }, { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {} },
+  () => ({ call: async method => {
+    if (method === "thread/turns/list") return { data: [{ id: "boundary", status: "completed" }] };
+    if (method === "thread/fork") { forkCalls++; throw new UncertainActionError(); }
+    throw new Error(`unexpected RPC: ${method}`);
+  } }),
+  (source, sourceRoot, targetRoot, operation, turn) => stageTransferRollout(source, sourceRoot, targetRoot, operation, turn,
+    async directory => { recycleCalls++; await rename(directory, path.join(root, "recycled-stage")); }));
+  const request: TransferTaskRequest = { operationId: "uncertain-op", startedAt: Date.now(), task: {
+    hostId: "local", threadId: "source", sourceId: "work", title: "Source", rolloutPath: sourcePath,
+  }, targetSourceId: "", projectId: null,
+  onForkSubmitted: () => { markers.push("submitted"); forkSubmitted = true; }, onForkRejected: () => markers.push("rejected") };
+  await assert.rejects(transfer.fork(request), UncertainActionError);
+  assert.equal(JSON.parse(await readFile(stagedPath, "utf8")).payload.id, "source");
+  assert.equal(recycleCalls, 0);
+  await assert.rejects(transfer.fork({ ...request, forkSubmitted }), TransferConflictError);
+  assert.equal(JSON.parse(await readFile(stagedPath, "utf8")).payload.id, "source");
+  assert.equal(forkCalls, 1);
+  assert.deepEqual(markers, ["submitted"]);
 });
 
 test("transfer staging materializes a paginated fork's inherited and resumed rollout prefix", async () => {
