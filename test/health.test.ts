@@ -61,11 +61,42 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "stage_storage", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("stage storage health distinguishes normal retention from stale pending recycle and never exposes paths", async t => {
+  const s = setup(t);
+  let clock = 1_000;
+  t.mock.method(Date, "now", () => clock);
+  const secretPath = "C:/private/retained-customer-file.txt";
+  assert.equal(s.store.reserveStage("stage-health", "binding", "operation", 5, secretPath), "reserved");
+  s.store.markStageReady("stage-health", secretPath);
+  let check = (await s.monitor.check()).checks.find(item => item.name === "stage_storage")!;
+  assert.equal(check.state, "ok");
+  assert.match(check.detail, /1, 5 байт/u);
+  assert.doesNotMatch(check.detail, /private|retained-customer-file/u);
+  clock = 100_000;
+  assert.equal(s.store.markStageRecyclePending("stage-health", secretPath), true);
+  s.advance(10 * 60_000 + 1);
+  check = (await s.monitor.check()).checks.find(item => item.name === "stage_storage")!;
+  assert.equal(check.state, "degraded");
+  assert.match(check.detail, /подтвержд/u);
+  assert.doesNotMatch(check.detail, /private|retained-customer-file/u);
+  s.store.markStageRecycled("stage-health", secretPath);
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "stage_storage")?.state, "ok");
+});
+
+test("stage storage health reports admission quota exhaustion even when maintenance is healthy", async t => {
+  const s = setup(t);
+  for (let i = 0; i < 10; i++) assert.equal(s.store.reserveStage(`full-${i}`, "binding", `operation-${i}`, 200 * 1024 * 1024, `C:/stage-${i}`), "reserved");
+  assert.equal(s.store.reserveStage("full-10", "binding", "operation-10", 48 * 1024 * 1024, "C:/stage-10"), "reserved");
+  const check = (await s.monitor.check()).checks.find(item => item.name === "stage_storage")!;
+  assert.equal(check.state, "degraded");
+  assert.match(check.detail, /квот/u);
 });
 
 test("health detects commentary stuck before the VK queue and clears after mirror recovery", async t => {

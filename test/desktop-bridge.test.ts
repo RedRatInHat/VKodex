@@ -3740,6 +3740,31 @@ test("a pending recycle remains charged across database restart", async () => {
   again.close();
 });
 
+test("stage storage inventory uses the admission ledger and excludes only confirmed recycling", () => {
+  const store = new BridgeStore();
+  try {
+    assert.equal(store.reserveStage("stage-reserved", "binding", "operation", 2, "C:/stage-reserved"), "reserved");
+    assert.equal(store.reserveStage("stage-ready", "binding", "operation", 3, "C:/stage-ready"), "reserved");
+    assert.equal(store.reserveStage("stage-pending", "binding", "operation", 5, "C:/stage-pending"), "reserved");
+    assert.equal(store.reserveStage("stage-recycled", "binding", "operation", 7, "C:/stage-recycled"), "reserved");
+    assert.equal(store.reserveStage("stage-zero", "binding", "operation", 0, "C:/stage-zero"), "reserved");
+    for (const key of ["stage-ready", "stage-pending", "stage-recycled"])
+      store.markStageReady(key, `C:/${key}`);
+    for (const key of ["stage-pending", "stage-recycled"])
+      assert.equal(store.markStageRecyclePending(key, `C:/${key}`), true);
+    store.markStageRecycled("stage-recycled", "C:/stage-recycled");
+    const stats = store.stageStorageStats();
+    assert.equal(stats.chargedBytes, 10);
+    assert.equal(stats.chargedCount, 4);
+    assert.equal(stats.pendingBytes, 5);
+    assert.equal(stats.pendingCount, 1);
+    assert.equal(typeof stats.oldestPendingAt, "number");
+    assert.equal(stats.legacyUnaccounted, false);
+    assert.equal(stats.chargedBytes, store.stageReservedBytes());
+    assert.equal(stats.chargedCount, store.stageReservedCount());
+  } finally { store.close(); }
+});
+
 test("stage recycle pages advance past blocked old rows, survive restart, and wrap", async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-page-test-"));
   const filename = path.join(root, "bridge.sqlite");
@@ -3841,6 +3866,8 @@ test("an older JSON stage receipt is counted by the additive admission table aft
   original.close();
   const restored = new BridgeStore(filename);
   assert.equal(restored.stageReservedBytes("binding", "operation"), 13);
+  assert.deepEqual({ count: restored.stageStorageStats().chargedCount, bytes: restored.stageStorageStats().chargedBytes,
+    legacyUnaccounted: restored.stageStorageStats().legacyUnaccounted }, { count: 1, bytes: 13, legacyUnaccounted: false });
   assert.equal(restored.reserveStage("file:binding:operation:old", "binding", "operation", 13, path.join(root, "another.bin")), "existing");
   assert.equal(restored.stageReservedBytes(), 13);
   restored.close();
@@ -3855,6 +3882,7 @@ test("malformed legacy stage receipts fail closed for new stage admission", asyn
   const restored = new BridgeStore(filename);
   assert.equal(restored.reserveStage("new-file", "binding", "operation", 1, path.join(root, "new-stage.bin")), "limit");
   assert.equal(restored.stageReservedCount(), 0);
+  assert.equal(restored.stageStorageStats().legacyUnaccounted, true);
   restored.close();
 });
 

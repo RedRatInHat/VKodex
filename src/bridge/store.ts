@@ -973,6 +973,23 @@ export class BridgeStore {
     return row.count;
   }
 
+  /** Read-only capacity inventory. Only a confirmed recycle removes a charge;
+   * pending moves and incomplete reservations remain in the same total used
+   * by admission. No paths or file keys leave this method. */
+  stageStorageStats(): { chargedBytes: number; chargedCount: number; pendingBytes: number;
+    pendingCount: number; oldestPendingAt: number | null; legacyUnaccounted: boolean } {
+    const row = this.db.prepare(`SELECT COALESCE(SUM(r.bytes), 0) AS chargedBytes,
+      COUNT(*) AS chargedCount,
+      COALESCE(SUM(CASE WHEN c.state = 'pending' THEN r.bytes ELSE 0 END), 0) AS pendingBytes,
+      COALESCE(SUM(CASE WHEN c.state = 'pending' THEN 1 ELSE 0 END), 0) AS pendingCount,
+      MIN(CASE WHEN c.state = 'pending' THEN c.updated_at END) AS oldestPendingAt
+      FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key
+      WHERE c.state IS NULL OR c.state <> 'recycled'`).get() as {
+      chargedBytes: number; chargedCount: number; pendingBytes: number; pendingCount: number; oldestPendingAt: number | null;
+    };
+    return { ...row, legacyUnaccounted: this.stageLegacyUnaccounted };
+  }
+
   markStageReady(fileKey: string, stagedPath: string): void {
     const result = this.db.prepare("UPDATE bridge_stage_reservations SET state = 'ready' WHERE file_key = ? AND path = ? AND state = 'reserved'").run(fileKey, stagedPath);
     if (result.changes !== 1) throw new Error("Missing staged file reservation");

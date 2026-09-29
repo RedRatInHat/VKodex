@@ -161,6 +161,17 @@ export class BridgeHealthMonitor {
                 : "Ограниченная сверка staged-файлов запланирована; первая попытка ещё не запускалась." });
     }
 
+    const stageStorage = this.store.stageStorageStats();
+    const pendingAge = stageStorage.oldestPendingAt === null ? 0 : Math.max(0, checkedAt - stageStorage.oldestPendingAt);
+    const atStageQuota = stageStorage.chargedBytes >= 2 * 1024 * 1024 * 1024 || stageStorage.chargedCount >= 2_048;
+    const stageState: HealthState = stageStorage.legacyUnaccounted || atStageQuota || pendingAge > 10 * 60_000 ? "degraded" : "ok";
+    checks.push({ name: "stage_storage", state: stageState,
+      detail: `Учтено staged-файлов: ${stageStorage.chargedCount}, ${stageStorage.chargedBytes} байт; `
+        + `неподтверждённых переносов: ${stageStorage.pendingCount}, ${stageStorage.pendingBytes} байт`
+        + (stageStorage.pendingCount ? `, старейший ожидает ${Math.round(pendingAge / 1_000)} с` : "")
+        + (atStageQuota ? "; квота staging исчерпана" : "")
+        + (stageStorage.legacyUnaccounted ? "; есть неучтённые legacy-записи, объёмы — нижняя граница" : "") + "." });
+
     const delivery = this.store.deliveryHealth(checkedAt);
     if (delivery.criticalPending === 0) {
       this.criticalPendingId = null; this.criticalPendingSince = null;
