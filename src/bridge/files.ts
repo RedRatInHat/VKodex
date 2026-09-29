@@ -568,6 +568,7 @@ export class TaskFiles {
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
     const uploadFile = this.chat.uploadFile.bind(this.chat);
     let count = 0; let unknownFiles = 0; let retryableFailure: OutputFilesError | null = null;
+    let quotaFailure: ActionRejectedError | null = null;
     const completedTurns = this.terminalTurns(binding.id);
     const eligible = this.jobs(binding.id).filter(job => {
       if (job.generation !== generation || job.state !== "accepted" || job.queued) return false;
@@ -585,6 +586,18 @@ export class TaskFiles {
       const pending: { name: string; key: string; attachment: string; bytes: number }[] = [];
       const processed = new Set<string>();
       let pendingBytes = 0;
+      const quotaBlocked = (key: string, name: string, message: string): void => {
+        this.store.atomic(() => {
+          this.store.setValue(`${key}:upload-state`, null);
+          this.store.setValue(`${key}:quota-blocked`, true);
+          this.store.enqueue(`${key}:quota-error`, binding.peerId!, {
+            text: `Файл «${name}» не отправлен. ${message} Остальные файлы этой выдачи продолжают отправляться. Повтори /files после освобождения места.`,
+            silent: true,
+          }, binding.id);
+        });
+        processed.add(key);
+        quotaFailure ??= new ActionRejectedError(message);
+      };
       const flushPending = async (): Promise<void> => {
         if (!pending.length) return;
         await this.check(binding, generation);
@@ -622,6 +635,7 @@ export class TaskFiles {
           }
           if (this.store.getValue<boolean>(`${key}:queued`)) return;
           if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) return;
+          if (!manual && this.store.getValue<boolean>(`${key}:quota-blocked`)) return;
           await this.check(binding, generation);
           let attachment = this.store.getValue<string>(`${key}:uploaded`);
           if (!attachment) {
@@ -642,11 +656,23 @@ export class TaskFiles {
               catch (error) {
                 if (error instanceof FileUploadStorageFullError) {
                   this.store.setValue(`${key}:upload-state`, null);
-                  if (cleanupAttempted) throw error;
+                  if (cleanupAttempted) {
+                    quotaBlocked(key, file.name, "VK снова сообщил о заполненном хранилище документов после очистки.");
+                    attachment = null;
+                    break;
+                  }
                   cleanupAttempted = true;
                   const cleanup = await this.cleanupDocuments([]);
-                  if (cleanup === "no-candidate") throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено, но нет безопасных документов для автоматической очистки. Файл не отправлен; освободи место в VK и повтори /files.");
-                  if (cleanup !== "removed") throw new ActionRejectedError("VK не принял файл: хранилище документов заполнено, а очистка не подтвердила удаление. Файл не отправлен; проверь доступ к документам VK или освободи место вручную, затем повтори /files.");
+                  if (cleanup === "no-candidate") {
+                    quotaBlocked(key, file.name, "VK не принял файл: хранилище документов заполнено, но нет безопасных документов для автоматической очистки.");
+                    attachment = null;
+                    break;
+                  }
+                  if (cleanup !== "removed") {
+                    quotaBlocked(key, file.name, "VK не принял файл: хранилище документов заполнено, а очистка не подтвердила удаление.");
+                    attachment = null;
+                    break;
+                  }
                   continue;
                 }
                 if (!(error instanceof FileUploadRejectedError)) {
@@ -669,6 +695,7 @@ export class TaskFiles {
               if (document) this.rememberDocument({ attachment: uploadedAttachment, ownerId: Number(document[1]), documentId: Number(document[2]), name: file.name, uploadedAt: Date.now(), fileKey: key });
               this.store.setValue(`${key}:uploaded`, uploadedAttachment);
               this.store.setValue(`${key}:upload-state`, "uploaded");
+              this.store.setValue(`${key}:quota-blocked`, null);
             });
           }
           if (pending.length && (pending.length >= FILE_LIMITS.maxFiles || pendingBytes + file.contents.length > FILE_LIMITS.maxTotalBytes)) await flushPending();
@@ -688,6 +715,7 @@ export class TaskFiles {
             continue;
           }
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:rejected`)) continue;
+          if (!manual && this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)) continue;
           const contents = await this.stagedContents(receipt, job, binding.id);
           await processFile({ name: receipt.name, contents, kind: receipt.kind }, receipt.relativePath, receipt.fingerprint, receipt);
         }
@@ -706,7 +734,8 @@ export class TaskFiles {
               this.store.enqueue(`${known.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
               return true;
             }
-            return !manual && !!this.store.getValue<boolean>(`${known.key}:rejected`);
+            return !manual && (!!this.store.getValue<boolean>(`${known.key}:rejected`)
+              || !!this.store.getValue<boolean>(`${known.key}:quota-blocked`));
           },
           onFile: processFile,
         });
@@ -732,6 +761,7 @@ export class TaskFiles {
     }
     if (retryableFailure && !manual) throw retryableFailure;
     if (!count && unknownFiles) throw new ActionRejectedError("Есть файл с неизвестным результатом загрузки в VK. Повтор остановлен, чтобы не создать дубль; проверь документы VK перед новой попыткой.");
+    if (!count && quotaFailure) throw quotaFailure;
     return count;
   }
   tick(): Promise<void> {

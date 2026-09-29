@@ -4520,6 +4520,36 @@ test("document quota cleanup excludes history-only, legacy, undelivered, young a
   assert.deepEqual(s.store.getValue<VkDocumentRecord[]>("vk-document-registry"), records);
 });
 
+test("a quota-blocked document does not starve a deliverable sibling image", async t => {
+  const s = setup(t); const binding = s.attach();
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-quota-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "quota-sibling", []);
+  files.finish(binding.id, "quota-sibling", "accepted");
+  await writeFile(path.join(prepared.outboxDir, "a.txt"), "document");
+  await writeFile(path.join(prepared.outboxDir, "b.png"), "image");
+  const attempted: string[] = [];
+  let storageFull = true;
+  t.mock.method(s.chat, "uploadFile", async (_peer: number, name: string) => {
+    attempted.push(name);
+    if (name === "a.txt" && storageFull) throw new FileUploadStorageFullError("storage full");
+    return name === "a.txt" ? "doc-202_2" : "photo-202_1";
+  });
+  files.observe(binding.id, "idle");
+  assert.equal(await files.collect(binding), 1);
+  await s.worker.flush();
+  assert.deepEqual(attempted, ["a.txt", "b.png"]);
+  assert.deepEqual(s.chat.cleanupCalls, []);
+  assert.ok(s.chat.sent.some(message => message.view.attachments?.includes("photo-202_1")));
+  assert.ok(s.chat.sent.some(message => /a\.txt.*хранилище документов заполнено/u.test(message.view.text)));
+  const restarted = new TaskFiles(root, s.store, s.chat, s.gate);
+  assert.equal(await restarted.collect(binding), 0);
+  assert.deepEqual(attempted, ["a.txt", "b.png"], "automatic rescan must not retry a blocked document");
+  storageFull = false;
+  assert.equal(await restarted.collect(binding, true), 1);
+  assert.deepEqual(attempted, ["a.txt", "b.png", "a.txt"], "manual /files may retry after quota is freed");
+});
+
 test("document quota cleanup keeps sibling uploads while removing only old delivered owned documents", async t => {
   const s = setup(t); const binding = s.attach();
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-document-cleanup-sibling-"));
