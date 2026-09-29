@@ -104,6 +104,51 @@ test('one source subscription fans full initial and ordered changes to authentic
   assert.equal(f.detached, 1);
 });
 
+test('new observer gets the completed turn after its predecessor disconnects mid-turn', async t => {
+  const f = fixture();
+  const server = new ManagedWorkerTaskStateServer({ epoch, taskId, backendGeneration: generation,
+    token, source: f.source, heartbeatMs: 1000 });
+  t.after(() => server.close());
+  const endpoint = await server.listen();
+  const first = await client(endpoint.port);
+  t.after(() => first.socket.destroy());
+  first.socket.write(JSON.stringify({ token }) + '\n');
+  assert.deepEqual(await first.reader.next(), { ok: true });
+  subscribe(first.socket);
+  assert.equal((await first.reader.next() as Record<string, unknown>).seq, 0);
+
+  const user = { id: 'user-1', type: 'userMessage', clientId: 'accepted-client',
+    content: [{ type: 'text', text: 'hello' }] };
+  const started = applyNotification(native(), { method: 'turn/started', params: { threadId: taskId,
+    turn: { id: 'turn-1', status: 'inProgress', startedAt: 12, items: [user] } } });
+  f.emit(started);
+  assert.equal((await first.reader.next() as Record<string, unknown>).seq, 1);
+  first.socket.destroy();
+
+  const completed = applyNotification(started, { method: 'turn/completed', params: { threadId: taskId,
+    turn: { id: 'turn-1', status: 'completed', startedAt: 12, completedAt: 13, items: [user,
+      { id: 'assistant-1', type: 'agentMessage', text: 'done' }] } } });
+  f.emit(completed);
+  assert.equal(f.detached, 0, 'frontend EOF must not detach the worker state source');
+
+  const second = await client(endpoint.port);
+  t.after(() => second.socket.destroy());
+  second.socket.write(JSON.stringify({ token }) + '\n');
+  assert.deepEqual(await second.reader.next(), { ok: true });
+  subscribe(second.socket);
+  const snapshot = await second.reader.next() as Record<string, unknown>;
+  assert.equal(snapshot.kind, 'snapshot');
+  assert.equal(snapshot.seq, 2);
+  assert.equal(snapshot.historyComplete, true);
+  const turns = (snapshot.state as { turns: Array<{ id: string; status: string;
+    items: Array<{ clientId?: string }> }> }).turns;
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.id, 'turn-1');
+  assert.equal(turns[0]?.status, 'completed');
+  assert.equal(turns[0]?.items[0]?.clientId, 'accepted-client');
+  assert.equal(f.subscribed, 1, 'reconnect must use the original worker subscription');
+});
+
 test('wrong token/scope do not expose state; owner loss closes stream without backend action', async t => {
   const f = fixture();
   const server = new ManagedWorkerTaskStateServer({ epoch, taskId, backendGeneration: generation,

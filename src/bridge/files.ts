@@ -450,9 +450,18 @@ export class TaskFiles {
         || !this.store.hasConfirmedFileDelivery(receipt.deliveryKey, row.bindingId, receipt.peerId!, receipt.attachment)) continue;
       const job = this.jobs(row.bindingId).find(item => item.operationId === row.operationId);
       if (!job) continue;
+      const verified = await lstat(row.path).catch(() => null);
+      if (!verified) continue;
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       if (!this.store.markStageRecyclePending(row.key, row.path)) continue;
+      // Recheck after journaling: an accidental path replacement during that
+      // interval must not recycle another file or release this reservation.
+      // A same-user actor can still race a pathname-based Recycle Bin move.
+      try { await this.stagedContents(receipt, job, row.bindingId); }
+      catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
+      const current = await lstat(row.path).catch(() => null);
+      if (!current || current.dev !== verified.dev || current.ino !== verified.ino) continue;
       // A failed or interrupted move leaves the reservation charged. Missing
       // files on a later run are not interpreted as successful recycling.
       await this.recycleStage(row.path);

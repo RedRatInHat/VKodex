@@ -13,6 +13,7 @@ import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
@@ -3311,6 +3312,31 @@ test("stage retention fails closed for unknown upload, incomplete reserve, and c
   assert.equal(await files.reconcileStagedArtifacts(), 0);
   assert.deepEqual(recycled, []);
   assert.equal(s.store.stageReservedBytes(binding.id, "guards"), "good bytes".length + 9);
+});
+
+for (const replacement of ["other", "bytes"] as const) test(`stage retention does not recycle a path replaced after the pending journal write (${replacement === "bytes" ? "same bytes" : "changed bytes"})`, async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-replaced-path-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "replaced-path", []);
+  files.finish(binding.id, "replaced-path", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:replaced-path`) ?? {})[0]!;
+  const originalMark = s.store.markStageRecyclePending.bind(s.store);
+  t.mock.method(s.store, "markStageRecyclePending", (key: string, stagedPath: string) => {
+    const pending = originalMark(key, stagedPath);
+    if (pending) {
+      renameSync(receipt.path, `${receipt.path}.original`);
+      writeFileSync(receipt.path, replacement); // The replacement has the same size, and may even have the same bytes.
+    }
+    return pending;
+  });
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.deepEqual(recycled, []);
+  assert.equal(s.store.stageReservedBytes(binding.id, "replaced-path"), 5);
 });
 
 test("failed recycling keeps the reservation charged and a retry can complete", async t => {
