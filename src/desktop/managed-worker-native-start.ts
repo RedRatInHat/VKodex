@@ -20,7 +20,8 @@ export interface NativeStartAuthority {
   readonly composer?: { readonly snapshot: IpcObject; readonly defaults: IpcObject | null } | null;
 }
 interface Options {
-  readonly host: Pick<ManagedWorkerFrontendHost, 'metadata' | 'executeCommandWithResponse'>;
+  readonly host: Pick<ManagedWorkerFrontendHost, 'metadata' | 'executeCommandWithResponse'> &
+    Partial<Pick<ManagedWorkerFrontendHost, 'commandStatusForIntent'>>;
   readonly controlKey: object;
   readonly taskId: string;
   readonly ownerEpoch: string;
@@ -32,6 +33,10 @@ interface Options {
   /** Qualifies current policy on the same already-loaded worker. Only its
    * fenced ID-only resume/read is allowed; never create or replace a worker. */
   readonly qualifyContinuation?: (authority: NativeStartAuthority) => Promise<QualifiedContinuationEvidence>;
+  /** Synchronous first Composer turn fence. The dispatcher invokes beforeWrite
+   * before journal reservation and again at the actual RPC write boundary. */
+  readonly qualifyFirstTurn?: (request: Readonly<IpcIncomingRequest>, authority: NativeStartAuthority,
+    command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write') => void;
   /** Refresh local projection only after validating an actual accepted receipt. */
   readonly onAccepted?: () => void;
 }
@@ -58,7 +63,10 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         typeof options.authority !== 'function' || typeof options.authorizeFollower !== 'function' ||
         typeof options.host?.executeCommandWithResponse !== 'function' ||
         options.onAccepted !== undefined && typeof options.onAccepted !== 'function' ||
-        options.qualifyContinuation !== undefined && typeof options.qualifyContinuation !== 'function') throw refused();
+        options.qualifyContinuation !== undefined && typeof options.qualifyContinuation !== 'function' ||
+        options.qualifyFirstTurn !== undefined &&
+          (typeof options.qualifyFirstTurn !== 'function' ||
+            typeof options.host.commandStatusForIntent !== 'function')) throw refused();
     if (options.intentStore && (options.intentStore.owner.ownerEpoch !== options.ownerEpoch ||
         options.intentStore.owner.threadId !== options.taskId ||
         options.intentStore.owner.backendGeneration !== options.host.metadata.backendGeneration)) throw refused();
@@ -167,6 +175,11 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         uiParams: compiled?.uiParams ?? null, localMetadata: compiled?.localMetadata ?? null };
     }
     const command = intent.command;
+    const storedAdmission = intent.admission as unknown as NativeStartAuthority;
+    const firstComposer = intent.uiParams !== null &&
+      Array.isArray(storedAdmission.composer?.snapshot.turns) &&
+      storedAdmission.composer.snapshot.turns.length === 0;
+    let firstTurnFenceCalls = 0;
     const commandBytes = Buffer.byteLength(JSON.stringify(command));
     if (commandBytes > 32 * 1024 * 1024) throw refused();
     const bytes = Buffer.byteLength(JSON.stringify(intent));
@@ -189,7 +202,13 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
       }
     }
     const outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
-      () => this.#sameAuthority(request, intent.admission as unknown as NativeStartAuthority));
+      () => {
+        this.#sameAuthority(request, storedAdmission);
+        if (!firstComposer || !this.#options.qualifyFirstTurn) return;
+        if (++firstTurnFenceCalls > 2) throw refused();
+        this.#options.qualifyFirstTurn(request, storedAdmission, command,
+          firstTurnFenceCalls === 1 ? 'before-reservation' : 'before-write');
+      });
     // This signal only gates delivery. Never interrupt an accepted model turn.
     if (signal.aborted) throw new Error('Native response delivery disconnected; worker outcome retained');
     const current = this.#capture(request);

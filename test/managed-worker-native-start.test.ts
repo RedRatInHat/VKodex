@@ -256,6 +256,55 @@ test('native disconnect suppresses response delivery but preserves accepted work
   } finally { await f.host.stop('test-cleanup'); }
 });
 
+test('opt-in first Composer fence runs before reservation and again for the exact dispatching operation', async () => {
+  const f = await fixture();
+  const { request } = continuationFixture(f);
+  (f.authority.composer!.snapshot.turns as unknown[]).length = 0;
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-first-fence-'));
+  const store = new NativeStartIntentStore({ filePath: path.join(directory, 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
+    encryptionKey: randomBytes(32) });
+  const phases: string[] = [];
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store,
+    qualifyFirstTurn: (_request, _authority, command, phase) => {
+      phases.push(phase);
+      const operation = f.host.commandStatusForIntent(f.controlKey, command);
+      assert.equal(operation?.state ?? null, phase === 'before-reservation' ? null : 'dispatching');
+    } });
+  try {
+    const running = handler.handle(request, new AbortController().signal);
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    f.child.reply(wire.id, { turn: { id: 'fenced-first-turn', status: 'inProgress' } });
+    await running;
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('opt-in first Composer fence refusal at actual write never reaches backend', async () => {
+  const f = await fixture();
+  const { request } = continuationFixture(f);
+  (f.authority.composer!.snapshot.turns as unknown[]).length = 0;
+  const directory = mkdtempSync(path.join(tmpdir(), 'vkodex-first-fence-refuse-'));
+  const store = new NativeStartIntentStore({ filePath: path.join(directory, 'intent.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
+    encryptionKey: randomBytes(32) });
+  const phases: string[] = [];
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store,
+    qualifyFirstTurn: (_request, _authority, _command, phase) => {
+      phases.push(phase);
+      if (phase === 'before-write') throw new Error('fence-changed');
+    } });
+  try {
+    await assert.rejects(handler.handle(request, new AbortController().signal));
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('unqualified native scope, lease, context and version cannot dispatch', async () => {
   const f = await fixture();
   try {

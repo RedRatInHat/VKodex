@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ManagedWorkerFrontendHost, ManagedWorkerNotification } from '../codex/managed-worker-frontend-host.js';
 import type { RequestFrame } from '../codex/app-server-request-inbox.js';
 import { compileNativeRequestResponse } from '../codex/native-request-response.js';
-import type { NativeStartIntentRecord, NativeStartIntentStore } from '../codex/native-start-intent-store.js';
+import type { NativeStartIntent, NativeStartIntentRecord, NativeStartIntentStore } from '../codex/native-start-intent-store.js';
 import { projectNativeStartIntents } from '../codex/native-start-intent-projection.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import { applyNotification, projectNativeServerRequest } from '../codex/managed-native-projection.js';
@@ -16,7 +16,8 @@ import type { NativeStockQueueQuiescence } from '../codex/native-stock-queue-jou
 
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
   'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
-  Partial<Pick<ManagedWorkerFrontendHost, 'commandQuiescence' | 'requestQuiescence' | 'acceptedCommandReceipts'>>;
+  Partial<Pick<ManagedWorkerFrontendHost, 'commandQuiescence' | 'requestQuiescence' |
+    'acceptedCommandReceipts' | 'acceptedQueueInputs'>>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
 type StartupStage = 'not-started' | 'observing' | 'reading-initial' | 'validating-initial' |
   'checking-boundary' | 'connecting' | 'ready';
@@ -104,6 +105,13 @@ export interface ManagedWorkerNativeOwnerOptions {
   readonly composerDefaults?: () => IpcObject | null;
   /** Opt-in same-worker current-policy read. Must fence every awaited RPC. */
   readonly qualifyContinuation?: (fence: () => ContinuationOwnerFence) => Promise<QualifiedContinuationEvidence>;
+  /** Additional opt-in admission for a first read-only Composer turn. This is
+   * evaluated synchronously at both worker journal reservation and RPC write. */
+  readonly qualifyFirstTurn?: (scope: Readonly<{
+    request: IpcIncomingRequest; authority: NativeStartAuthority;
+    command: NativeStartIntent['command'];
+    phase: 'before-reservation' | 'before-write';
+  }>) => boolean;
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
   /** Explicit previously qualified native queue adapter; never enabled by default. */
   readonly queueAdapterFactory?: (context: Readonly<ManagedNativeStockQueueContext>) => ManagedNativeStockQueueAdapter;
@@ -203,6 +211,12 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         typeof options.readInitialState !== 'function' ||
         options.composerDefaults !== undefined &&
           (typeof options.composerDefaults !== 'function' || !options.intentStore) ||
+        options.qualifyFirstTurn !== undefined &&
+          (typeof options.qualifyFirstTurn !== 'function' || !options.composerDefaults ||
+            !options.intentStore || typeof options.host.commandQuiescence !== 'function' ||
+            typeof options.host.requestQuiescence !== 'function' ||
+            typeof options.host.acceptedCommandReceipts !== 'function' ||
+            typeof options.host.acceptedQueueInputs !== 'function') ||
         options.qualifyContinuation !== undefined &&
           (typeof options.qualifyContinuation !== 'function' || !options.composerDefaults ||
             typeof options.host.commandQuiescence !== 'function' ||
@@ -596,6 +610,11 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         ...(this.#options.qualifyContinuation ? {
           qualifyContinuation: (authority: NativeStartAuthority) => this.#qualifyContinuation(authority),
         } : {}),
+        ...(this.#options.qualifyFirstTurn ? {
+          qualifyFirstTurn: (request: IpcIncomingRequest, authority: NativeStartAuthority,
+            command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write') =>
+            this.#qualifyFirstTurn(request, authority, command, phase),
+        } : {}),
         authorizeFollower: request => {
           const grant = this.#grants.get(request.requestId);
           return grant?.sourceClientId === request.sourceClientId && this.#ownerCurrent() &&
@@ -682,8 +701,59 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     }
     return { ownerEpoch: this.#options.ownerEpoch, backendGeneration: this.#generation,
       authorityRevision: this.#authorityRevision, snapshot: copy(this.#authoritySnapshot),
-      ...(this.#options.qualifyContinuation ? { semanticRevision: this.#semanticRevision } : {}),
+      ...(this.#options.qualifyContinuation || this.#options.qualifyFirstTurn
+        ? { semanticRevision: this.#semanticRevision } : {}),
       ...(composer === undefined ? {} : { composer }) };
+  }
+
+  #qualifyFirstTurn(request: IpcIncomingRequest, authority: NativeStartAuthority,
+    command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write'): void {
+    const assertCurrent = (): void => {
+      const projection = this.#projection, host = this.#options.host;
+      const turnStart = object(request.params.turnStart) ? request.params.turnStart : null;
+      const startRequest = object(turnStart?.request) ? turnStart.request : null;
+      if (!this.#options.qualifyFirstTurn || !projection || !this.#ownerCurrent() ||
+          !['connected', 'disconnected'].includes(this.#state) || this.#pendingEvents !== 0 ||
+          this.#queueAdapter || this.#queueGrants.size !== 0 || this.#grants.size !== 1 ||
+          this.#grants.get(request.requestId)?.sourceClientId !== request.sourceClientId ||
+          this.#generation === null || authority.ownerEpoch !== this.#options.ownerEpoch ||
+          authority.backendGeneration !== this.#generation ||
+          authority.authorityRevision !== this.#authorityRevision ||
+          !isDeepStrictEqual(this.#authority(), authority) ||
+          projection.id !== this.#options.taskId || projection.turns.length !== 0 ||
+          !object(projection.turnsPagination) ||
+          projection.turnsPagination.hasLoadedOldest !== true ||
+          projection.turnsPagination.olderCursor !== null ||
+          projection.threadRuntimeStatus.type !== 'idle' ||
+          projection.requests.length !== 0 ||
+          projection.nativeQueue !== undefined &&
+            (!Array.isArray(projection.nativeQueue) || projection.nativeQueue.length !== 0) ||
+          projection.queuedFollowUps !== undefined &&
+            (!Array.isArray(projection.queuedFollowUps) || projection.queuedFollowUps.length !== 0) ||
+          host.metadata.state !== 'running' || host.metadata.taskId !== this.#options.taskId ||
+          host.metadata.backendGeneration !== this.#generation ||
+          command.method !== 'turn/start' || command.params.threadId !== this.#options.taskId ||
+          command.params.clientUserMessageId !== startRequest?.clientUserMessageId)
+        throw refuse();
+      const pending = host.requestQuiescence!(this.#options.controlKey);
+      const commands = host.commandQuiescence!(this.#options.controlKey);
+      const operation = host.commandStatusForIntent(this.#options.controlKey, command);
+      if (pending.generation !== this.#generation || pending.unresolved !== 0 ||
+          host.acceptedCommandReceipts!(this.#options.controlKey).length !== 0 ||
+          host.acceptedQueueInputs!(this.#options.controlKey).length !== 0 ||
+          phase === 'before-reservation' &&
+            (operation !== null || commands.inFlight !== 0 || commands.unconfirmed) ||
+          phase === 'before-write' &&
+            (operation?.state !== 'dispatching' || operation.ownerEpoch !== this.#options.ownerEpoch ||
+              operation.backendGeneration !== this.#generation ||
+              operation.threadId !== this.#options.taskId ||
+              operation.operationId !== command.operationId ||
+              commands.inFlight > 1 || commands.unconfirmed !== true)) throw refuse();
+    };
+    assertCurrent();
+    if (this.#options.qualifyFirstTurn!(freezeTree(copy({ request, authority, command, phase }))) !== true)
+      throw refuse();
+    assertCurrent();
   }
 
   async #qualifyContinuation(authority: NativeStartAuthority): Promise<QualifiedContinuationEvidence> {

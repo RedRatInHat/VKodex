@@ -13,7 +13,7 @@ import type { AppServerServerRequest } from '../src/codex/app-server-connection.
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import type { IpcObject } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerNativeOwner } from '../src/desktop/managed-worker-native-owner.js';
-import type { ManagedNativeStockQueueContext } from '../src/desktop/managed-worker-native-owner.js';
+import type { ManagedNativeStockQueueContext, ManagedWorkerNativeOwnerOptions } from '../src/desktop/managed-worker-native-owner.js';
 import { ManagedNativeStockQueueAdapter } from '../src/desktop/managed-native-stock-queue-adapter.js';
 import type { NativeProjectionState } from '../src/codex/managed-native-projection.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from '../src/desktop/managed-worker-bootstrap.js';
@@ -211,7 +211,8 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   isOwnerCurrent: () => boolean = () => true,
   stock = false,
   stockHooks: { confirmOwner?: (qualified: boolean) => boolean | Promise<boolean>;
-    baseline?: () => boolean | Promise<boolean> } = {}) {
+    baseline?: () => boolean | Promise<boolean> } = {},
+  qualifyFirstTurn?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -255,6 +256,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     } } : {}),
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     ...(qualifyContinuation ? { qualifyContinuation } : {}),
+    ...(qualifyFirstTurn ? { qualifyFirstTurn } : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
       return broker;
@@ -275,6 +277,22 @@ function composerState(): NativeProjectionState {
       summary: null, personality: 'pragmatic', activePermissionProfile: profile, sandboxPolicy: sandbox },
     currentPermissions: { activePermissionProfile: profile, sandboxPolicy: sandbox,
       approvalPolicy: 'never', approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/own'] } };
+}
+
+function firstComposerRequest(clientId: string, requestId = 'fenced-first'): IpcObject {
+  return { type: 'request', requestId, sourceClientId: 'follower', hostId: 'local',
+    targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+    params: { conversationId: taskId, turnStart: {
+      request: { threadId: taskId, clientUserMessageId: clientId,
+        input: [{ type: 'text', text: 'one', text_elements: [] }],
+        cwd: 'C:/own', model: null, effort: null, serviceTier: null,
+        collaborationMode: composerState().latestCollaborationMode,
+        permissions: ':read-only', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+        turnTrigger: 'composer', multiAgentMode: 'explicitRequestOnly',
+        responsesapiClientMetadata: { source: 'codex', client_type: 'desktop_app' } },
+      context: { inheritThreadSettings: true, writingBlockContextPrepared: true,
+        localTurnMetadata: { fileAttachmentCount: 0 }, attachments: [], commentAttachments: [],
+        responseItems: [], useAppServerPermissionDefault: false, usePermissionSelection: false } } } };
 }
 
 function continuationState(): NativeProjectionState {
@@ -1072,6 +1090,81 @@ test('Composer intent overlays only its accepted observed turn and retries after
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     assert.equal(f.owner.metadata.state, 'connected');
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+});
+
+test('opt-in first Composer owner fence observes zero work before reservation and only its dispatch at write', async () => {
+  const phases: string[] = [];
+  let f: Awaited<ReturnType<typeof fixture>>;
+  f = await fixture(async () => composerState(), undefined, undefined, true,
+    undefined, () => true, false, {}, scope => {
+      phases.push(scope.phase);
+      const operation = f.host.commandStatusForIntent(f.controlKey, scope.command);
+      assert.equal(operation?.state ?? null,
+        scope.phase === 'before-reservation' ? null : 'dispatching');
+      return true;
+    });
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.broker.send(firstComposerRequest(randomUUID()));
+    const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    f.child.reply(wire.id, { turn: { id: 'fenced-turn', status: 'inProgress' } });
+    const response = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'fenced-first');
+    assert.equal(response.resultType, 'success');
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('opt-in first Composer owner fence rejects owner drift at write without backend request', async () => {
+  let live = true;
+  const phases: string[] = [];
+  const f = await fixture(async () => composerState(), undefined, undefined, true,
+    undefined, () => live, false, {}, scope => {
+      phases.push(scope.phase);
+      if (scope.phase === 'before-write') live = false;
+      return true;
+    });
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.broker.send(firstComposerRequest(randomUUID()));
+    await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'fenced-first');
+    assert.deepEqual(phases, ['before-reservation', 'before-write']);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('opt-in first Composer owner fence refuses pending requests and competing journal work', async () => {
+  for (const blocked of ['pending-request', 'in-flight-command'] as const) {
+    const f = await fixture(async () => composerState(), undefined, undefined, true,
+      undefined, () => true, false, {}, () => true);
+    const requests = f.host.requestQuiescence.bind(f.host);
+    const commands = f.host.commandQuiescence.bind(f.host);
+    try {
+      await f.owner.start();
+      f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+        sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+      await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+      if (blocked === 'pending-request')
+        f.host.requestQuiescence = key => ({ ...requests(key), unresolved: 1 });
+      else f.host.commandQuiescence = key => ({ ...commands(key), inFlight: 1 });
+      f.broker.send(firstComposerRequest(randomUUID()));
+      const response = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+        frame.requestId === 'fenced-first');
+      assert.equal(response.resultType, 'error');
+      assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    } finally {
+      f.host.requestQuiescence = requests;
+      f.host.commandQuiescence = commands;
+      f.owner.close(); await f.host.stop('test-cleanup');
+    }
+  }
 });
 
 test('qualified second Composer send uses one actual wire and accepted duplicate skips fresh qualification', async () => {
