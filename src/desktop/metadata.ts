@@ -13,7 +13,8 @@ import { closeAppServer } from "./app-server-process.js";
 import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
-import { findAcceptedInputTurn } from "./input-reconciliation.js";
+import { findAcceptedInputTurn, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
+import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from "../core/codex-tasks.js";
 import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
 import { nativeCodexPath } from "../codex/native-cli.js";
@@ -339,6 +340,13 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
     const rpc = new MetadataRpc(this.sourceHome(task), undefined, 10_000);
     return findAcceptedInputTurn(task.threadId, operationId, params => rpc.call("thread/turns/list", params));
+  }
+  scanTerminalQueuedInput(task: TaskRef, clientId: string,
+    cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
+    if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("История доступна только для локальной задачи.");
+    const rpc = new MetadataRpc(this.sourceHome(task), undefined, 30_000);
+    return scanTerminalQueuedInputTurn(task.threadId, clientId,
+      params => rpc.call("thread/turns/list", params), cursor);
   }
   async queue(request: SubmitTaskRequest, input: readonly IpcObject[]): Promise<string> {
     const metadata = this.createMetadata(this.sourceHome(request.task));

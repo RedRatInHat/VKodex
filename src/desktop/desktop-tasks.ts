@@ -540,6 +540,11 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
     return this.metadata?.findAcceptedInput?.(task, operationId) ?? Promise.resolve(null);
   }
+  scanTerminalQueuedInput(task: TaskRef, clientId: string,
+    cursor: import("../core/codex-tasks.js").QueuedInputHistoryCursor | null) {
+    return this.metadata?.scanTerminalQueuedInput?.(task, clientId, cursor) ??
+      Promise.resolve({ done: true as const, turnId: null });
+  }
 
   async queue(request: SubmitTaskRequest): Promise<string> {
     if (!this.metadata?.queue) throw new ActionRejectedError("Штатная очередь недоступна в этом подключении Codex.");

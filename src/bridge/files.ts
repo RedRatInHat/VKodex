@@ -552,13 +552,19 @@ export class TaskFiles {
   pendingQueuedOperations(bindingId: string): ReadonlySet<string> {
     return new Set(this.jobs(bindingId).filter(job => job.queued && !job.turnId).map(job => job.operationId));
   }
-  associateTurn(bindingId: string, operationId: string, turnId: string): void {
+  associateTurn(bindingId: string, operationId: string, turnId: string, terminalConfirmed = false): void {
     if (!this.jobs(bindingId).some(job => job.operationId === operationId && !job.turnId)) return;
-    const terminal = this.terminalTurns(bindingId).has(turnId);
-    this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId && !job.turnId
-      ? { ...job, turnId, done: false, queued: false, completed: terminal,
-        autoScanUntil: terminal ? Date.now() + LATE_SCAN_WINDOW_MS : undefined, nextScanAt: terminal ? 0 : undefined }
-      : job));
+    const terminal = terminalConfirmed || this.terminalTurns(bindingId).has(turnId);
+    this.store.atomic(() => {
+      if (terminalConfirmed) {
+        const known = this.terminalTurns(bindingId);
+        if (!known.has(turnId)) this.store.setValue(`file-terminal-turns:${bindingId}`, [...known, turnId].slice(-128));
+      }
+      this.save(bindingId, this.jobs(bindingId).map(job => job.operationId === operationId && !job.turnId
+        ? { ...job, turnId, done: false, queued: false, completed: terminal,
+          autoScanUntil: terminal ? Date.now() + LATE_SCAN_WINDOW_MS : undefined, nextScanAt: terminal ? 0 : undefined }
+        : job));
+    });
   }
   observe(bindingId: string, status: TaskDetails["status"], turnId?: string | null): void {
     if (["idle", "failed", "interrupted"].includes(status)) {

@@ -6,7 +6,7 @@ import { AccessGate, DeliveryWorker } from "./delivery.js";
 import { TaskManager, type TaskInputScope } from "./manager.js";
 import { TaskMirror } from "./mirror.js";
 import { BridgeStore } from "./store.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type QueuedInputHistoryCursor, type TaskCreationUpdate, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type RuntimeHealthState } from "./health.js";
@@ -51,6 +51,9 @@ export class BridgeRuntime {
   private lastHealthAt = 0;
   private operationReconciliation: Promise<void> | null = null;
   private lastOperationReconciliationAt = 0;
+  private queueReconciliation: Promise<void> | null = null;
+  private lastQueueReconciliationAt = 0;
+  private queueReconciliationCursor = 0;
   /** Tasks released after a terminal turn stay detached until VK needs them. */
   private readonly releasedIdle = new Set<string>();
   /** A new VK request asks the next update to acquire that task again. */
@@ -163,6 +166,7 @@ export class BridgeRuntime {
       void this.files?.tick().catch(() => {});
       try { this.manager.replaySavedInputs(); } catch { /* Health reports a broken journal. */ }
       this.reconcileUncertainOperation();
+      this.reconcileHistoricalQueuedInput();
       void this.tick(false).catch(() => {});
     }, 1_000);
     // Establish subscriptions before the first report so a healthy restart does
@@ -245,6 +249,53 @@ export class BridgeRuntime {
       });
     })().catch(() => {}).finally(() => { if (this.operationReconciliation === work) this.operationReconciliation = null; });
     this.operationReconciliation = work;
+  }
+
+  private reconcileHistoricalQueuedInput(): void {
+    if (this.stopped || !this.desktop.scanTerminalQueuedInput || this.queueReconciliation ||
+      this.now() - this.lastQueueReconciliationAt < 30_000) return;
+    const pending = this.store.bindings().filter(candidate => candidate.attached && candidate.peerId !== null)
+      .flatMap(candidate => this.store.queuedInputs(candidate.id).map(operation => {
+        const key = `queue-history:${candidate.id}:${operation.operationId}`;
+        const saved = this.store.getValue<{ taskKey: string; cursor: QueuedInputHistoryCursor | null;
+          nextAt: number }>(key);
+        return { binding: candidate, operation, checkpointKey: key,
+          checkpoint: saved?.taskKey === taskKey(candidate) ? saved : null };
+      })).filter(item => !item.checkpoint || item.checkpoint.nextAt <= this.now());
+    if (!pending.length) return;
+    const { binding, operation, checkpointKey, checkpoint } = pending[this.queueReconciliationCursor % pending.length]!;
+    this.queueReconciliationCursor++;
+    const key = taskKey(binding), generation = this.store.streamGeneration(binding.id);
+    this.lastQueueReconciliationAt = this.now();
+    const work = this.desktop.scanTerminalQueuedInput(binding, operation.operationId, checkpoint?.cursor ?? null).then(result => {
+      if (this.stopped) return;
+      const current = this.store.getBinding(binding.id);
+      if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== key ||
+        this.store.streamGeneration(binding.id) !== generation ||
+        !this.store.queuedInputs(binding.id).some(item => item.operationId === operation.operationId)) return;
+      this.store.atomic(() => {
+        if (!result.done) {
+          this.store.setValue(checkpointKey, { taskKey: key, cursor: result.cursor,
+            nextAt: this.now() + 5 * 60_000 });
+        } else if (result.turnId) {
+          this.store.settleQueuedInput(binding.id, operation.operationId);
+          this.store.setValue(checkpointKey, null);
+          this.files?.associateTurn(binding.id, operation.operationId, result.turnId, true);
+        } else {
+          this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
+            nextAt: this.now() + 60 * 60_000 });
+        }
+      });
+    }).catch(() => {
+      // A changed or incomplete native history invalidates the cursor. Keep the ACK.
+      const current = this.store.getBinding(binding.id);
+      if (current?.attached && current.peerId === binding.peerId && taskKey(current) === key &&
+        this.store.streamGeneration(binding.id) === generation)
+        this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
+          nextAt: this.now() + 60 * 60_000 });
+    })
+      .finally(() => { if (this.queueReconciliation === work) this.queueReconciliation = null; });
+    this.queueReconciliation = work;
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -740,6 +791,7 @@ export class BridgeRuntime {
                 }
                 if (pendingQueue.has(operationId)) {
                   this.store.settleQueuedInput(binding.id, operationId);
+                  this.store.setValue(`queue-history:${binding.id}:${operationId}`, null);
                   this.store.rememberAcceptedTurn(binding.id, input.turnId, operationId);
                 }
               }

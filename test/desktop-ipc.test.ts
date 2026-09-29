@@ -13,7 +13,7 @@ import { withVkResponseFormat } from "../src/core/task-input.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
-import { findAcceptedInputTurn } from "../src/desktop/input-reconciliation.js";
+import { findAcceptedInputTurn, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
@@ -670,6 +670,60 @@ test("runtime follows a native queued request into its actual Codex turn", async
 
   assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
   assert.deepEqual(s.store.acceptedTurns(s.binding.id), [{ turnId: "fixture-turn", operationId }]);
+});
+
+test("runtime settles a historical queue ACK only after exact terminal native proof", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "historical-queue-operation";
+  s.store.recordOperation(operationId, s.binding, "historical-queue-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "native-queue-id");
+  const desktop = s.desktop as import("../src/core/codex-tasks.js").CodexTasks;
+  const reconcile = () => (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  let calls = 0;
+  desktop.scanTerminalQueuedInput = async (task, id) => {
+    calls++;
+    assert.equal(task.threadId, s.binding.threadId);
+    assert.equal(id, operationId);
+    if (calls === 1) throw new DesktopUnavailableError("incomplete page");
+    return { done: true, turnId: "old-terminal-turn" };
+  };
+  reconcile();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+  s.advance(60 * 60_000 + 1);
+  (s.runtime as unknown as { lastQueueReconciliationAt: number }).lastQueueReconciliationAt = 0;
+  reconcile();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
+  assert.equal(calls, 2);
+});
+
+test("historical queue scan persists partial progress without settling its ACK", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "deep-queue-operation";
+  s.store.recordOperation(operationId, s.binding, "deep-queue-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "deep-queue-id");
+  const desktop = s.desktop as import("../src/core/codex-tasks.js").CodexTasks;
+  const cursor = { headDigest: "a".repeat(64), cursor: "next-page", seenCursors: ["next-page"],
+    pages: 1 };
+  let observedCursor: typeof cursor | null = null;
+  desktop.scanTerminalQueuedInput = async (_task, id, previous) => {
+    assert.equal(id, operationId);
+    observedCursor = previous as typeof cursor | null;
+    return previous ? { done: true, turnId: "deep-terminal-turn" } : { done: false, cursor };
+  };
+  const reconcile = () => (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  reconcile();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), [operationId]);
+  assert.equal(observedCursor, null);
+  s.advance(5 * 60_000 + 1);
+  reconcile();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(observedCursor, cursor);
+  assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
 });
 
 test("bridge core consumes task state through a transport without Desktop IPC", async t => {
@@ -2634,6 +2688,58 @@ test("accepted input reconciliation finds the native client ID across paginated 
   assert.equal(await findAcceptedInputTurn("thread", "vk-operation", list), "accepted-turn");
   assert.equal(await findAcceptedInputTurn("thread", "missing", list), null);
   await assert.rejects(findAcceptedInputTurn("thread", "missing", async () => ({ data: [], nextCursor: "loop" })), DesktopUnavailableError);
+});
+
+test("terminal queue reconciliation searches beyond the recent turn window and refuses incomplete history", async () => {
+  const calls: IpcObject[] = [];
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    const index = Number(params.cursor ?? 0);
+    return { data: [{ id: `turn-${index}`, status: "completed", itemsView: "full",
+      items: [{ type: "userMessage", clientId: index === 125 ? "old-queue-id" : `other-${index}` }] }],
+      nextCursor: index === 125 ? null : String(index + 1) };
+  };
+  let cursor: import("../src/core/codex-tasks.js").QueuedInputHistoryCursor | null = null;
+  let turnId: string | null = null;
+  for (let scanNumber = 0; scanNumber < 10; scanNumber++) {
+    const before = calls.length;
+    const result = await scanTerminalQueuedInputTurn("thread", "old-queue-id", list, cursor);
+    assert.ok(calls.length - before <= 20, "one scan must have a bounded native RPC budget");
+    if (result.done) { turnId = result.turnId; break; }
+    cursor = result.cursor;
+  }
+  assert.equal(turnId, "turn-125");
+  assert.ok(calls.length > 126);
+  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 20));
+  let positiveReads = 0;
+  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => {
+    positiveReads++;
+    return { data: [{ id: "exact-terminal", status: "completed", itemsView: "full",
+      items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: "older" };
+  }), { done: true, turnId: "exact-terminal" });
+  assert.equal(positiveReads, 1, "positive page proof needs no speculative older-page read");
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
+    data: [{ id: "incomplete", status: "completed", itemsView: "full",
+      items: [{ type: "userMessage", clientId: "old-queue-id" }, null] }], nextCursor: null,
+  })), DesktopUnavailableError);
+  const first = await scanTerminalQueuedInputTurn("thread", "old-queue-id", list);
+  assert.equal(first.done, false);
+  if (!first.done) {
+    await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async params =>
+      params.cursor ? list(params) : { data: [{ id: "new-head", status: "completed", itemsView: "full", items: [] }],
+        nextCursor: "different" }, first.cursor), DesktopUnavailableError);
+  }
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
+    data: [{ id: "active", status: "inProgress", itemsView: "full",
+      items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
+  })), DesktopUnavailableError);
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
+    data: [], nextCursor: "missing-page",
+  })), DesktopUnavailableError);
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
+    threadId: "different-thread", data: [{ id: "wrong", status: "completed", itemsView: "full",
+      items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
+  })), DesktopUnavailableError);
 });
 
 test("semantic transfer checkpoints ignore harmless file metadata changes but retain legacy checks", async () => {

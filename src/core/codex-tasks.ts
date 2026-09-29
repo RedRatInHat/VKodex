@@ -7,6 +7,16 @@ export interface TaskRef {
   readonly rolloutPath?: string;
 }
 
+export interface QueuedInputHistoryCursor {
+  readonly headDigest: string;
+  readonly cursor: string;
+  readonly seenCursors: readonly string[];
+  readonly pages: number;
+}
+
+export type QueuedInputHistoryScan = Readonly<
+  { done: true; turnId: string | null } | { done: false; cursor: QueuedInputHistoryCursor }>;
+
 export interface DesktopTask extends TaskRef {
   readonly sourceLabel?: string;
   /** null means no project; undefined means project membership could not be read. */
@@ -193,6 +203,9 @@ export interface AccountUsageProvider {
 export interface DesktopMetadata {
   queue?(request: SubmitTaskRequest, input: readonly Record<string, unknown>[]): Promise<string>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
+  /** Bounded read-only native history scan; only done with a turn ID is terminal proof. */
+  scanTerminalQueuedInput?(task: TaskRef, clientId: string,
+    cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan>;
   /** Durable stock queue acceptance, distinct from a started turn ID. */
   findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
   findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
@@ -295,6 +308,8 @@ export interface CodexTasks {
   /** Submit only through an owner that is already connected; never launch UI. */
   submitConnectedWithReceipt?(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
+  scanTerminalQueuedInput?(task: TaskRef, clientId: string,
+    cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan>;
   findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
   findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;

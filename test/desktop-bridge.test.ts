@@ -3194,6 +3194,24 @@ test("default file delivery does not reserve staged storage", async t => {
   assert.equal(s.store.stageReservedCount(), 0);
 });
 
+test("terminal history proof completes only its matching queued file job", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-history-file-job-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  await files.prepare(binding, "old-queued-operation", []);
+  await files.prepare(binding, "new-active-operation", []);
+  files.finish(binding.id, "old-queued-operation", "accepted");
+  files.finish(binding.id, "new-active-operation", "accepted");
+
+  files.associateTurn(binding.id, "old-queued-operation", "old-terminal-turn", true);
+
+  const jobs = s.store.getValue<{ operationId: string; turnId?: string; completed?: boolean }[]>(`file-jobs:${binding.id}`)!;
+  assert.deepEqual(jobs.map(job => [job.operationId, job.turnId, job.completed]), [
+    ["old-queued-operation", "old-terminal-turn", true],
+    ["new-active-operation", undefined, false],
+  ]);
+  assert.deepEqual(s.store.getValue<string[]>(`file-terminal-turns:${binding.id}`), ["old-terminal-turn"]);
+});
+
 test("opt-in file delivery stages immutable bytes before VK upload and recovers after source mutation", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-default-stage-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);

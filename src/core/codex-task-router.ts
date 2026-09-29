@@ -28,6 +28,9 @@ export interface CodexTaskOwner {
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void>;
   findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null>;
+  scanTerminalQueuedInput?(task: TaskRef, clientId: string,
+    cursor: import("./codex-tasks.js").QueuedInputHistoryCursor | null):
+    Promise<import("./codex-tasks.js").QueuedInputHistoryScan>;
   findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
   findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
@@ -78,6 +81,14 @@ export class RoutedCodexTasks implements CodexTasks {
       }
     }
     return this.base.findAcceptedInput?.(task, operationId) ?? null;
+  }
+  async scanTerminalQueuedInput(task: TaskRef, clientId: string,
+    cursor: import("./codex-tasks.js").QueuedInputHistoryCursor | null):
+    Promise<import("./codex-tasks.js").QueuedInputHistoryScan> {
+    const owner = this.owner(task);
+    if (owner?.routingPolicy === "exclusive") return { done: true, turnId: null };
+    if (owner?.scanTerminalQueuedInput) return owner.scanTerminalQueuedInput(task, clientId, cursor);
+    return this.base.scanTerminalQueuedInput?.(task, clientId, cursor) ?? { done: true, turnId: null };
   }
   async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
     const owner = this.owner(task);
