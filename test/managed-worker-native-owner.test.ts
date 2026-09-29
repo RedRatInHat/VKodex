@@ -62,7 +62,7 @@ test('native CLI auto-start absence refuses stock queue and continuation capabil
   }
 });
 
-test('native CLI auto-start absence refuses pending host requests and commands', async () => {
+test('native CLI auto-start absence fences pending requests while command ledger is checked separately', async () => {
   const f = await fixture();
   const requests = f.host.requestQuiescence.bind(f.host);
   const commands = f.host.commandQuiescence.bind(f.host);
@@ -75,7 +75,8 @@ test('native CLI auto-start absence refuses pending host requests and commands',
     assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
     f.host.requestQuiescence = requests;
     f.host.commandQuiescence = key => ({ ...commands(key), inFlight: 1 });
-    assert.equal(f.owner.noPendingNativeCliAutoStart(), false);
+    assert.equal(f.owner.noPendingNativeCliAutoStart(), true,
+      'an admitted CLI dispatch must not revoke its own source fence');
     f.host.commandQuiescence = commands;
     assert.equal(f.owner.noPendingNativeCliAutoStart(), true);
     f.host.acceptedCommandReceipts = () => [{ method: 'turn/start', receiptId: 'accepted' }];

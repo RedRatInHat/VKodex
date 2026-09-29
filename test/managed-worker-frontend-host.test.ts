@@ -305,6 +305,37 @@ test('WebSocket restart retains backend PID and rejects old bearer on the new li
   } finally { await fixture.stop('test-cleanup'); }
 });
 
+test('owner revocation cannot resurrect a WebSocket bearer racing frontend restart', async () => {
+  const child = new Child(), adapterKey = {}, controlKey = {};
+  const policy: WorkerCommandPolicy = { controlKey, ownerEpoch: randomUUID(),
+    journalPath: path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-frontend-revoke-')), 'operations.sqlite'),
+    fingerprintKey: randomBytes(32), isOwnerCurrent: () => true, authorize: () => false };
+  const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
+    initializeRequest: init, adapterKey, frontendProtocol: 'websocket',
+    backendTimeoutMs: 500, bootstrapReadMethods: [], commandPolicy: policy,
+    allowRequest: () => false, allowAnswer: () => false,
+    launch: () => child.asChild() });
+  await managed.start();
+  try {
+    const bearer = managed.frontendWebSocketCapability(adapterKey);
+    const client = await websocketClient(bearer);
+    try {
+      client.send({ id: 'init', method: 'initialize', params: init });
+      assert.equal((await client.next()).id, 'init');
+      await assert.rejects(managed.revokeFrontend({}), /Unauthorized/);
+      const closed = once(client.socket, 'close');
+      const restarting = managed.restartFrontend();
+      await managed.revokeFrontend(controlKey);
+      await assert.rejects(restarting, /superseded|unavailable/i);
+      await closed;
+      await assert.rejects(websocketClient(bearer));
+      await assert.rejects(managed.restartFrontend(), /unavailable/i);
+      assert.equal(child.stdin.writableEnded, false);
+      assert.equal(managed.metadata.state, 'frontend-unavailable');
+    } finally { client.close(); }
+  } finally { await managed.stop('test-cleanup'); }
+});
+
 test('default JSONL host does not expose a WebSocket capability and rejects invalid protocol', async () => {
   const child = new Child(), key = {}, fixture = host(child, key);
   assert.throws(() => new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own', initializeRequest: init,

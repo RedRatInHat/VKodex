@@ -604,6 +604,8 @@ Unsubscribing an observer does not discard a pending Codex question: the task ca
 
 The IPC client also accepts an explicitly supplied inbound native request handler for Gateway testing. By default it declines discovery and does not claim task ownership. This interface alone neither enables managed workers nor proves native UI compatibility.
 
+The experimental CLI Gateway requires an explicit isolated managed-worker opt-in; the production bridge does not enable it. It uses a `127.0.0.1` WebSocket with an in-memory bearer and admits a plain-text `turn/start` only after proving the same backend, current owner, empty queue and goal, no competing automatic start, and exact `gpt-5.6-sol` / `low` / read-only settings. Acceptance is returned only after a durable receipt; an uncertain outcome is never blindly replayed. Idle checks read the backend through a private owner channel without displacing the CLI session; owner loss revokes the WebSocket and bearer without stopping the backend. Ordinary frontend detachment leaves the turn with the worker. Passing isolated integration tests does not yet qualify the real CLI, Desktop, or VS Code.
+
 Incoming IPC broadcasts are accepted when addressed to this client or when no recipient list is supplied: native clients use the latter to announce observation when opening a task. Foreign, empty, and malformed recipient lists are ignored; state handlers additionally validate the owner, source directory, and task.
 
 Observers of the same native task within one IPC transport also share one subscription. Only the last observer closes the upstream follow; each receives its own state copy. Conflicting copies of one task from different source directories are not combined.

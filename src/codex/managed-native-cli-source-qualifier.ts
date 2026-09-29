@@ -70,7 +70,14 @@ export class ManagedNativeCliSourceQualifier {
               event.generation !== this.#generation) this.#faulted = true;
           changed();
         }, () => { this.#faulted = true; changed(); });
-      this.#check();
+      // Attaching the read-only observer must remain possible while a goal,
+      // queue item, or external scheduler is busy. Only a later write
+      // qualification requires those sources to be empty and stable.
+      const current = this.#options.host.metadata;
+      if (this.#faulted || current.taskId !== this.#options.taskId ||
+          current.state !== 'running' || current.backendGeneration !== this.#generation ||
+          this.#options.assertOwnerCurrent() !== true)
+        fail('owner or worker changed');
     } catch (error) { this.close(); throw error; }
   }
 

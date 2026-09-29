@@ -5,6 +5,8 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ManagedWorkerRegistry, type ProcessIdentity, type BackendIdentity, type WorkerAttempt } from '../codex/managed-worker-registry.js';
 import { ManagedWorkerFrontendHost } from '../codex/managed-worker-frontend-host.js';
+import { ManagedNativeCliSourceQualifier } from '../codex/managed-native-cli-source-qualifier.js';
+import { ManagedNativeCliStartAdmission } from '../codex/managed-native-cli-start-admission.js';
 import type { WorkerCommandScope, WorkerCommand } from '../codex/managed-worker-command-dispatcher.js';
 import { NativeStartIntentStore } from '../codex/native-start-intent-store.js';
 import { compileNativeRequestResponse } from '../codex/native-request-response.js';
@@ -79,6 +81,13 @@ export interface ManagedWorkerDaemonOptions {
   }>;
   /** Explicit private native projection listener. It adds no writer capability. */
   readonly nativeTaskState?: true;
+  /** Isolated read-only CLI WebSocket route. The external callback must prove
+   * that no independent goal/scheduler can auto-start a turn; the owner-local
+   * projection alone cannot establish that. No bearer is written to disk. */
+  readonly nativeCliWebSocket?: Readonly<{
+    capability: object;
+    noPendingExternalAutoStart: () => boolean;
+  }>;
   /** Explicit isolated first-turn route. The callback must validate its own
    * one-shot challenge; the private intent store caps distinct starts at one. */
   readonly oneShotFirstComposer?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>;
@@ -138,6 +147,9 @@ export class ManagedWorkerDaemon {
   #bootstrap: ManagedWorkerBootstrap | null = null;
   #control: ManagedWorkerControlServer | null = null;
   #taskStateServer: ManagedWorkerTaskStateServer | null = null;
+  #cliQualifier: ManagedNativeCliSourceQualifier | null = null;
+  #cliAdapterKey: object | null = null;
+  #cliControlKey: object | null = null;
   #registry: ManagedWorkerRegistry | null = null;
   #attempt: WorkerAttempt | null = null;
   #self: ProcessIdentity | null = null;
@@ -163,6 +175,14 @@ export class ManagedWorkerDaemon {
       typeof options.verifyFamilyQuiescent !== 'function')
       throw new TypeError('Daemon requires explicit local follower, IPC, and family policies');
     const stock = options.nativeStockQueue;
+    const cli = options.nativeCliWebSocket;
+    if (cli !== undefined && (!object(cli) ||
+      !isDeepStrictEqual(Object.keys(cli).sort(),
+        ['capability', 'noPendingExternalAutoStart'].sort()) || !cli.capability ||
+      typeof cli.capability !== 'object' ||
+      typeof cli.noPendingExternalAutoStart !== 'function' ||
+      stock !== undefined || options.oneShotFirstComposer !== undefined))
+      throw new TypeError('Native CLI WebSocket requires an isolated scheduler proof');
     if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
       throw new TypeError('Managed native task-state listener requires explicit opt-in');
     if (options.oneShotFirstComposer !== undefined &&
@@ -186,6 +206,7 @@ export class ManagedWorkerDaemon {
         stock.headlessVk.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(stock.headlessVk.sourceId))))
       throw new TypeError('Explicit managed native stock queue policy invalid');
     this.#options = Object.freeze({ ...options,
+      ...(cli ? { nativeCliWebSocket: Object.freeze({ ...cli }) } : {}),
       ...(stock ? { nativeStockQueue: Object.freeze({ ...stock,
         ...(stock.headlessVk ? { headlessVk: Object.freeze({ ...stock.headlessVk }) } : {}) }) } : {}) });
   }
@@ -203,6 +224,20 @@ export class ManagedWorkerDaemon {
         bootstrapPendingRequests: owner.bootstrapPendingRequests,
         bootstrapBoundary: owner.bootstrapBoundary,
         ...(owner.lastRequestFailure ? { lastRequestFailure: owner.lastRequestFailure } : {}) }) : null });
+  }
+
+  /** In-process capability only. The native CLI bearer is never included in
+   * the private control endpoint, persisted locator, or diagnostic metadata. */
+  nativeCliWebSocketCapability(capability: object): Readonly<{
+    protocol: 'websocket'; host: string; port: number; token: string;
+  }> {
+    if (!this.#options.nativeCliWebSocket ||
+        capability !== this.#options.nativeCliWebSocket.capability ||
+        this.#state !== 'ready' || !this.#admissionOpen || this.#ingressRevoked ||
+        !this.#host || !this.#cliQualifier || !this.#cliAdapterKey ||
+        this.#currentOwner?.() !== true)
+      throw new Error('Native CLI frontend unavailable');
+    return this.#host.frontendWebSocketCapability(this.#cliAdapterKey);
   }
 
   /** Capability-bound queue ingress, also exposed only by opt-in private control. */
@@ -349,6 +384,16 @@ export class ManagedWorkerDaemon {
           throw new Error('Managed stock policy unavailable');
         }
       }
+      if (this.#options.nativeCliWebSocket) {
+        const approved = manifest.approvedTaskPolicy;
+        if (!approved || approved.model !== 'gpt-5.6-sol' || approved.effort !== 'low' ||
+            approved.approvalPolicy !== 'never' ||
+            approved.activePermissionProfile.id !== ':read-only' ||
+            approved.activePermissionProfile.extends !== null ||
+            approved.sandbox.type !== 'readOnly' || approved.sandbox.networkAccess !== false ||
+            !['default', null].includes(approved.serviceTier))
+          throw new Error('Native CLI read-only policy unavailable');
+      }
       this.#registry = new ManagedWorkerRegistry(manifest.registryPath);
       const reserved = this.#registry.get(manifest.home, manifest.familyRoot);
       if (!reserved || reserved.epoch !== manifest.epoch || reserved.state !== 'reserved')
@@ -440,6 +485,13 @@ export class ManagedWorkerDaemon {
       });
       this.#startupPhase = 'control-listening';
       const oneShotGate = this.#options.oneShotFirstComposer ? new OneShotComposerCommandGate() : null;
+      const cliAdmission = this.#options.nativeCliWebSocket ? new ManagedNativeCliStartAdmission({
+        taskId: manifest.taskId, ownerEpoch: manifest.epoch, controlKey,
+        qualify: resume => {
+          if (!this.#cliQualifier) throw new Error('Native CLI source unavailable');
+          return this.#cliQualifier.qualify(resume);
+        },
+      }) : null;
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
         if (this.#ingressRevoked || !ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
@@ -477,13 +529,20 @@ export class ManagedWorkerDaemon {
           isDeepStrictEqual(p.runtimeWorkspaceRoots, [manifest.cwd]) && p.environments === undefined;
         const composerLocation = inheritedEnvironment && p.cwd === null &&
           p.runtimeWorkspaceRoots === null && isDeepStrictEqual(p.environments, environment);
+        // Only the separately admitted CLI frame uses explicit null environments.
+        // The durable policy still independently checks the effective read-only tuple.
+        const cliLocation = cliAdmission !== null && p.cwd === manifest.cwd &&
+          isDeepStrictEqual(p.runtimeWorkspaceRoots, [manifest.cwd]) && p.environments === null;
         const inheritedModel = p.model === null && p.effort === null &&
           isDeepStrictEqual(p.collaborationMode, { mode: 'default', settings: {
             model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } });
         const directModel = p.model === 'gpt-5.6-sol' && p.effort === 'low';
-        if (p.threadId !== manifest.taskId || !(ordinaryLocation || composerLocation) ||
-          p.permissions !== ':read-only' || !(inheritedModel || directModel) ||
-          p.approvalPolicy !== 'never' && p.approvalPolicy !== 'on-request' ||
+        const admittedLocation = cliAdmission ? cliLocation : ordinaryLocation || composerLocation;
+        const admittedModel = cliAdmission ? directModel : inheritedModel || directModel;
+        const admittedApproval = cliAdmission ? p.approvalPolicy === 'never' :
+          p.approvalPolicy === 'never' || p.approvalPolicy === 'on-request';
+        if (p.threadId !== manifest.taskId || !admittedLocation ||
+          p.permissions !== ':read-only' || !admittedModel || !admittedApproval ||
           p.sandboxPolicy !== undefined && p.sandboxPolicy !== null) return false;
         if (oneShotGate && !oneShotGate.authorize(this.#intentStore, scope)) return false;
         // A journal-reserved dispatch may finish after new admission closes.
@@ -513,6 +572,8 @@ export class ManagedWorkerDaemon {
       };
       this.#host = new ManagedWorkerFrontendHost({
         taskId: manifest.taskId, ownCwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
+        ...(cliAdmission ? { frontendProtocol: 'websocket' as const,
+          frontendStartAdmission: cliAdmission } : {}),
         ...(this.#options.dependencies?.backendTimeoutMs ?
           { backendTimeoutMs: this.#options.dependencies.backendTimeoutMs } : {}),
         bootstrapReadMethods: this.#options.nativeStockQueue ?
@@ -543,6 +604,7 @@ export class ManagedWorkerDaemon {
             },
           } : {}) },
       });
+      this.#cliControlKey = cliAdmission ? controlKey : null;
       await this.#host.start();
       const meta = this.#host.metadata;
       if (!launched.child?.pid || !meta.backendGeneration) throw new Error('Backend identity unavailable');
@@ -555,6 +617,8 @@ export class ManagedWorkerDaemon {
       launched.child.once('exit', () => this.#backendExited());
       this.#startupPhase = 'bootstrapping';
       this.#bootstrap = await bootstrapManagedWorker({ host: this.#host, adapterKey,
+        ...(cliAdmission ? { frontendProtocol: 'websocket' as const,
+          ownerReadControlKey: controlKey } : {}),
         taskId: manifest.taskId, cwd: manifest.cwd, initializeRequest: manifest.initializeRequest,
         resumeParams: manifest.resumeParams,
         ...(manifest.approvedTaskPolicy ? { approvedTaskPolicy: manifest.approvedTaskPolicy } : {}) });
@@ -628,6 +692,20 @@ export class ManagedWorkerDaemon {
         // projection, or authority failure remains fatal.
         if (native.state !== 'disconnected' || native.startupStage !== 'connecting' ||
           native.failure !== null) throw new Error('Native owner unavailable');
+      }
+      if (this.#options.nativeCliWebSocket) {
+        this.#cliAdapterKey = adapterKey;
+        this.#cliQualifier = new ManagedNativeCliSourceQualifier({
+          host: this.#host, adapterKey, controlKey,
+          taskId: manifest.taskId, ownerEpoch: manifest.epoch,
+          assertOwnerCurrent: ownerCurrent,
+          noPendingAutoStart: () =>
+            (this.#state === 'starting' || this.#state === 'ready' && this.#admissionOpen) &&
+            !this.#ingressRevoked && this.#headlessPending === 0 &&
+            this.#owner?.noPendingNativeCliAutoStart() === true &&
+            this.#options.nativeCliWebSocket?.noPendingExternalAutoStart() === true,
+        });
+        this.#cliQualifier.start();
       }
       this.#stockInitializer?.close();
       this.#stockInitializer = null;
@@ -730,6 +808,7 @@ export class ManagedWorkerDaemon {
       this.#stockInitializer?.close(); this.#stockInitializer = null;
       await this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
       this.#state = 'failed'; this.#failure = 'startup-unavailable'; this.#admissionOpen = false;
+      this.#cliQualifier?.close();
       // A native owner may already be connected when ready publication fails.
       // Retire only that gateway; the owned backend and diagnostic control stay available.
       if (launchAttempted) {
@@ -743,6 +822,7 @@ export class ManagedWorkerDaemon {
   }
 
   #backendExited(): void {
+    this.#cliQualifier?.close();
     this.#stockInitializer?.close(); this.#stockInitializer = null;
     if (this.#state === 'stopping' || this.#state === 'stopped' || !this.#registry ||
       !this.#attempt || !this.#self || !this.#backend) return;
@@ -763,6 +843,13 @@ export class ManagedWorkerDaemon {
     this.#reconnectTimer = null;
   }
 
+  #revokeCliFrontend(): void {
+    this.#cliQualifier?.close();
+    const host = this.#host, key = this.#cliControlKey;
+    if (this.#options.nativeCliWebSocket && host && key)
+      void host.revokeFrontend(key).catch(() => {});
+  }
+
   /** Rejoins only the native transport. Never launches or resumes a backend. */
   #scheduleReconnect(): void {
     this.#clearReconnect();
@@ -774,6 +861,7 @@ export class ManagedWorkerDaemon {
       try { current = this.#currentOwner?.() === true; } catch { /* authority query failed closed */ }
       if (!current) {
         this.#admissionOpen = false; this.#state = 'failed'; this.#failure = 'owner-unconfirmed';
+        this.#revokeCliFrontend();
         this.#owner.close(); this.#clearReconnect();
         void this.#control?.close().catch(() => {});
         return;
@@ -784,6 +872,7 @@ export class ManagedWorkerDaemon {
         // unavailable; retain authenticated diagnosis and never relaunch it.
         this.#admissionOpen = false; this.#state = 'failed';
         this.#failure = 'native-owner-unavailable';
+        this.#revokeCliFrontend();
         this.#clearReconnect();
         return;
       }
@@ -881,6 +970,7 @@ export class ManagedWorkerDaemon {
       this.#stockInitializer?.close(); this.#stockInitializer = null;
       this.#clearReconnect();
       await this.#taskStateServer?.close().catch(() => {}); this.#taskStateServer = null;
+      this.#cliQualifier?.close();
       owner.close(); stopIssued = true;
       await host.stop('owner-request');
       if (same(observe(this.#backend.pid), this.#backend))
@@ -894,7 +984,10 @@ export class ManagedWorkerDaemon {
     } catch (error) {
       if (!stopIssued && error instanceof ManagedWorkerStopRefusedError)
         this.#admissionOpen = !this.#ingressRevoked;
-      else { this.#state = 'failed'; this.#failure = 'stop-unconfirmed'; }
+      else {
+        this.#state = 'failed'; this.#failure = 'stop-unconfirmed';
+        this.#revokeCliFrontend();
+      }
       throw error;
     }
   }

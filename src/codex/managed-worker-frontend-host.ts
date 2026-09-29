@@ -139,6 +139,7 @@ export class ManagedWorkerFrontendHost {
   #state: HostState = 'new';
   #launched = false;
   #stopRequested = false;
+  #frontendRevoked = false;
   #backendGeneration: number | null = null;
   #sessions: PersistentFrontendSessions | null = null;
   #transport: FrontendTransport | null = null;
@@ -452,6 +453,21 @@ export class ManagedWorkerFrontendHost {
       token: this.#transport.authToken() });
   }
 
+  /** Owner-only frontend revocation. Terminates its bearer and attachments,
+   * while the App Server backend remains alive for explicit recovery. */
+  revokeFrontend(controlKey: object): Promise<void> {
+    if (!this.#commandPolicy || controlKey !== this.#commandPolicy.controlKey)
+      return Promise.reject(new TypeError('Unauthorized frontend revocation'));
+    if (this.#state !== 'running' && this.#state !== 'restarting' &&
+        this.#state !== 'frontend-unavailable')
+      return Promise.reject(new Error('Frontend revocation unavailable'));
+    this.#frontendRevoked = true;
+    this.#state = 'frontend-unavailable';
+    const transport = this.#transport;
+    this.#transport = null;
+    return transport?.close() ?? Promise.resolve();
+  }
+
   start(): Promise<void> {
     if (this.#stopRequested) return Promise.reject(new Error('Host is stopping'));
     if (this.#state === 'running') return Promise.resolve();
@@ -508,7 +524,7 @@ export class ManagedWorkerFrontendHost {
 
   async #listenFrontend(): Promise<void> {
     const sessions = this.#sessions;
-    if (!sessions || this.#stopRequested || this.#isLost())
+    if (!sessions || this.#stopRequested || this.#frontendRevoked || this.#isLost())
       throw new Error('Frontend listener superseded');
     const transport = this.#frontendProtocol === 'websocket'
       ? new PersistentFrontendWebSocketTransport({ sessions, host: '127.0.0.1', port: this.#frontendPort })
@@ -516,7 +532,7 @@ export class ManagedWorkerFrontendHost {
     this.#transport = transport;
     try {
       await transport.listen();
-      if (this.#stopRequested || this.#isLost() ||
+      if (this.#stopRequested || this.#frontendRevoked || this.#isLost() ||
         this.#backendGeneration === null || !this.#rpc.isSessionCurrent(this.#backendGeneration))
         throw new Error('Frontend listener superseded');
       this.#state = 'running';
@@ -530,7 +546,7 @@ export class ManagedWorkerFrontendHost {
   restartFrontend(): Promise<void> {
     if (this.#restartPromise) return this.#restartPromise;
     if ((this.#state !== 'running' && this.#state !== 'frontend-unavailable') ||
-      this.#stopRequested || !this.#startPromise || !this.#sessions ||
+      this.#stopRequested || this.#frontendRevoked || !this.#startPromise || !this.#sessions ||
       this.#backendGeneration === null || !this.#rpc.isSessionCurrent(this.#backendGeneration))
       return Promise.reject(new Error('Frontend restart unavailable'));
     const work = this.#restartOnce();
@@ -546,7 +562,8 @@ export class ManagedWorkerFrontendHost {
     this.#transport = null;
     try {
       await previous?.close();
-      if (this.#stopRequested || this.#isLost()) throw new Error('Frontend restart superseded');
+      if (this.#stopRequested || this.#frontendRevoked || this.#isLost())
+        throw new Error('Frontend restart superseded');
       await this.#listenFrontend();
     } catch (error) {
       if (!this.#stopRequested && !this.#isLost()) this.#state = 'frontend-unavailable';

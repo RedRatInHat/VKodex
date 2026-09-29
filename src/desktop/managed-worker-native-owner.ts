@@ -274,12 +274,13 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
           !host.commandQuiescence || !host.requestQuiescence ||
           !host.acceptedCommandReceipts || !host.acceptedQueueInputs) return false;
       const requests = host.requestQuiescence(this.#options.controlKey);
-      const commands = host.commandQuiescence(this.#options.controlKey);
       const terminalTurnIds = new Set(projection.turns.filter(turn =>
         ['completed', 'interrupted', 'failed'].includes(turn.status)).map(turn => turn.turnId));
       const receipts = host.acceptedCommandReceipts(this.#options.controlKey);
       return requests.generation === this.#generation && requests.unresolved === 0 &&
-        commands.inFlight === 0 && commands.unconfirmed === false &&
+        // Command-ledger quiescence is checked separately by the CLI source
+        // qualifier before reservation. Rechecking it here would reject that
+        // same CLI command at the dispatcher's before-write fence.
         receipts.every(receipt => receipt.method === 'turn/start' &&
           terminalTurnIds.has(receipt.receiptId)) &&
         host.acceptedQueueInputs(this.#options.controlKey).length === 0 &&

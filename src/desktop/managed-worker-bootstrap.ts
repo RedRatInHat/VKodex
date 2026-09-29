@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
+import WebSocket from 'ws';
 import { createProjection } from '../codex/managed-native-projection.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import type { ManagedWorkerFrontendHost } from '../codex/managed-worker-frontend-host.js';
@@ -20,7 +21,14 @@ const MAX_PAGES = 100;
 const terminalStatuses = new Set(['completed', 'failed', 'interrupted']);
 
 export interface ManagedWorkerBootstrapOptions {
-  readonly host: Pick<ManagedWorkerFrontendHost, 'metadata' | 'frontendCapability'>;
+  readonly host: Pick<ManagedWorkerFrontendHost,
+    'metadata' | 'frontendCapability'> &
+    Partial<Pick<ManagedWorkerFrontendHost,
+      'frontendWebSocketCapability' | 'ownerRead'>>;
+  /** Defaults to the established local JSONL bootstrap. */
+  readonly frontendProtocol?: 'jsonl' | 'websocket';
+  /** Private owner key for non-displacing WebSocket idle reads. Never sent to a frontend. */
+  readonly ownerReadControlKey?: object;
   readonly adapterKey: object;
   readonly taskId: string;
   readonly cwd: string;
@@ -149,7 +157,10 @@ function scope(options: ManagedWorkerBootstrapOptions): { generation: number; re
   policy: ApprovedTaskPolicy | undefined } {
   if (!options || !options.host || !options.adapterKey || typeof options.adapterKey !== 'object' ||
     typeof options.taskId !== 'string' || !options.taskId || typeof options.cwd !== 'string' || !options.cwd ||
-    !object(options.resumeParams) || !object(options.initializeRequest)) fail('invalid-options');
+    !object(options.resumeParams) || !object(options.initializeRequest) ||
+    options.frontendProtocol !== undefined &&
+      options.frontendProtocol !== 'jsonl' && options.frontendProtocol !== 'websocket')
+    fail('invalid-options');
   const resume = jsonCopy(options.resumeParams), initialize = jsonCopy(options.initializeRequest);
   const policy = Object.hasOwn(options, 'approvedTaskPolicy')
     ? approveTaskPolicy(options.approvedTaskPolicy) : undefined;
@@ -176,7 +187,7 @@ function current(host: ManagedWorkerBootstrapOptions['host'], taskId: string, ge
 
 /** One authenticated attachment; close detaches only this socket, never the worker. */
 class FrontendReader {
-  readonly #socket: Socket;
+  readonly #socket: Socket | WebSocket;
   readonly #decoder = new StringDecoder('utf8');
   #buffer = '';
   #frames: Row[] = [];
@@ -184,36 +195,58 @@ class FrontendReader {
   #failure: Error | null = null;
   #nextId = 1;
   readonly #guard: () => void;
-  private constructor(socket: Socket, guard: () => void) {
+  private constructor(socket: Socket | WebSocket, guard: () => void) {
     this.#socket = socket;
     this.#guard = guard;
-    socket.on('data', chunk => this.#receive(chunk));
+    if (socket instanceof WebSocket) {
+      socket.on('message', (data, isBinary) => {
+        if (isBinary) { this.#fail(new Error('frontend-frame-malformed')); this.close(); return; }
+        const raw = data.toString();
+        if (Buffer.byteLength(raw, 'utf8') > MAX_FRAME_BYTES) {
+          this.#fail(new Error('frontend-frame-overflow')); this.close(); return;
+        }
+        try {
+          const frame: unknown = JSON.parse(raw);
+          if (!object(frame)) throw new Error('frontend-frame-malformed');
+          this.#push(frame);
+        } catch { this.#fail(new Error('frontend-frame-malformed')); this.close(); }
+      });
+    } else socket.on('data', chunk => this.#receive(chunk));
     socket.on('error', () => this.#fail(new Error('frontend-socket-error')));
     socket.on('close', () => this.#fail(new Error('frontend-eof')));
   }
-  static async open(capability: Readonly<{ host: string; port: number; token: string }>,
+  static async open(capability: Readonly<{ protocol?: 'websocket'; host: string; port: number; token: string }>,
     initialize: Row, guard: () => void): Promise<FrontendReader> {
     if (capability.host !== '127.0.0.1' || !Number.isSafeInteger(capability.port) ||
       capability.port < 1 || capability.port > 65535 || typeof capability.token !== 'string' ||
       capability.token.length < 32) fail('invalid-frontend-capability');
-    const socket = connect({ host: capability.host, port: capability.port });
+    const websocket = capability.protocol === 'websocket';
+    const socket = websocket ? new WebSocket(`ws://${capability.host}:${capability.port}/`, {
+      headers: { Authorization: `Bearer ${capability.token}` },
+      perMessageDeflate: false, maxPayload: MAX_FRAME_BYTES,
+    }) : connect({ host: capability.host, port: capability.port });
     const reader = new FrontendReader(socket, guard);
     try {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('frontend-connect-timeout')), RPC_TIMEOUT_MS);
-        socket.once('connect', () => { clearTimeout(timer); resolve(); });
+        socket.once(websocket ? 'open' : 'connect', () => { clearTimeout(timer); resolve(); });
         socket.once('error', () => { clearTimeout(timer); reject(new Error('frontend-connect-failed')); });
       });
       guard();
-      reader.#send({ token: capability.token });
-      const auth = await reader.#next();
-      if (auth.ok !== true) fail('frontend-auth-failed');
-      guard();
+      if (!websocket) {
+        reader.#send({ token: capability.token });
+        const auth = await reader.#next();
+        if (auth.ok !== true) fail('frontend-auth-failed');
+        guard();
+      }
       await reader.request('initialize', initialize);
       return reader;
     } catch (error) { reader.close(); throw error; }
   }
-  close(): void { this.#socket.destroy(); }
+  close(): void {
+    if (this.#socket instanceof WebSocket) this.#socket.terminate();
+    else this.#socket.destroy();
+  }
   #fail(error: Error): void {
     if (this.#failure) return;
     this.#failure = error;
@@ -230,19 +263,27 @@ class FrontendReader {
         if (Buffer.byteLength(line, 'utf8') > MAX_FRAME_BYTES) throw new Error('frontend-frame-overflow');
         const frame: unknown = JSON.parse(line);
         if (!object(frame)) throw new Error('frontend-frame-malformed');
-        if (this.#waiting) { const waiting = this.#waiting; this.#waiting = null; waiting.resolve(frame); }
-        else {
-          if (this.#frames.length >= 32) throw new Error('frontend-frame-backlog');
-          this.#frames.push(frame);
-        }
+        this.#push(frame);
       } catch { this.#fail(new Error('frontend-frame-malformed')); this.close(); return; }
     }
   }
+  #push(frame: Row): void {
+    if (this.#failure) return;
+    if (this.#waiting) { const waiting = this.#waiting; this.#waiting = null; waiting.resolve(frame); }
+    else {
+      if (this.#frames.length >= 32) throw new Error('frontend-frame-backlog');
+      this.#frames.push(frame);
+    }
+  }
   #send(frame: Row): void {
-    if (this.#failure || this.#socket.destroyed) throw new Error('frontend-eof');
-    const line = JSON.stringify(frame) + '\n';
-    if (Buffer.byteLength(line, 'utf8') > MAX_FRAME_BYTES) fail('outbound-frame-overflow');
-    this.#socket.write(line);
+    if (this.#failure || this.#socket instanceof WebSocket &&
+      this.#socket.readyState !== WebSocket.OPEN ||
+      this.#socket instanceof WebSocket === false && this.#socket.destroyed)
+      throw new Error('frontend-eof');
+    const encoded = JSON.stringify(frame);
+    if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) fail('outbound-frame-overflow');
+    if (this.#socket instanceof WebSocket) this.#socket.send(encoded);
+    else this.#socket.write(encoded + '\n');
   }
   #next(deadline = Date.now() + RPC_TIMEOUT_MS): Promise<Row> {
     if (Date.now() >= deadline) return Promise.reject(new Error('frontend-response-timeout'));
@@ -282,6 +323,8 @@ class FrontendReader {
   }
 }
 
+type ReadClient = Pick<FrontendReader, 'request'>;
+
 function threadOf(result: Row, taskId: string, cwd: string, statuses: readonly string[]): Row {
   if (!object(result.thread) || result.thread.id !== taskId ||
     !object(result.thread.status) || !statuses.includes(result.thread.status.type as string) ||
@@ -290,7 +333,7 @@ function threadOf(result: Row, taskId: string, cwd: string, statuses: readonly s
     fail('thread-read-unqualified');
   return result.thread;
 }
-async function fullHistory(client: FrontendReader, taskId: string): Promise<Row[]> {
+async function fullHistory(client: ReadClient, taskId: string): Promise<Row[]> {
   const turns: Row[] = [], ids = new Set<string>(), cursors = new Set<string>();
   let cursor: string | undefined;
   for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber++) {
@@ -309,7 +352,7 @@ async function fullHistory(client: FrontendReader, taskId: string): Promise<Row[
   }
   fail('history-page-limit');
 }
-async function noGoalOrQueue(client: FrontendReader, taskId: string): Promise<void> {
+async function noGoalOrQueue(client: ReadClient, taskId: string): Promise<void> {
   const goal = await client.request('thread/goal/get', { threadId: taskId });
   const queue = await client.request('thread/queue/list', { threadId: taskId, limit: PAGE_LIMIT });
   if (goal.goal !== null || !Array.isArray(queue.data) || queue.data.length !== 0 || queue.nextCursor !== null)
@@ -478,9 +521,32 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
     extraGuard: () => void = () => {}): Promise<T> => {
     const check = () => { guard(); extraGuard(); };
     check();
-    const reader = await FrontendReader.open(host.frontendCapability(adapterKey), initialize, check);
+    const capability = options.frontendProtocol === 'websocket'
+      ? (typeof host.frontendWebSocketCapability === 'function'
+        ? host.frontendWebSocketCapability(adapterKey)
+        : fail('websocket-frontend-unavailable'))
+      : host.frontendCapability(adapterKey);
+    const reader = await FrontendReader.open(capability, initialize, check);
     try { check(); const result = await work(reader); check(); return result; }
     finally { reader.close(); }
+  };
+  const withIdleReader = async <T>(work: (reader: ReadClient) => Promise<T>): Promise<T> => {
+    if (options.frontendProtocol !== 'websocket') return withReader(work);
+    const key = options.ownerReadControlKey;
+    if (!key || typeof key !== 'object' || typeof host.ownerRead !== 'function')
+      return fail('owner-read-unavailable');
+    guard();
+    const reader: ReadClient = { request: async (method, params) => {
+      guard();
+      if (method === 'initialize' || method === 'thread/resume')
+        return fail('owner-read-mutation-refused');
+      const result = await host.ownerRead!(key, generation, method, params);
+      guard();
+      return result;
+    } };
+    const result = await work(reader);
+    guard();
+    return result;
   };
   const qualified = await withReader(async reader => {
     const before = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
@@ -519,7 +585,7 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
     const queueClients = jsonCopy(expectedQueueClientIds);
     if (!Array.isArray(queueClients) || queueClients.some(id => typeof id !== 'string' || !id) ||
         new Set(queueClients).size !== queueClients.length) fail('invalid-expected-queue-clients');
-    return withReader(async reader => {
+    return withIdleReader(async reader => {
       const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
       const turns = await fullHistory(reader, taskId);

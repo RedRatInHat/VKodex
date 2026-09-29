@@ -275,7 +275,7 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   const controlKey = {}, adapterKey = {};
   let notify: ((event: ManagedWorkerNotification) => void) | null = null;
   let failObserver: ((reason: WorkerObserverFailure) => void) | null = null;
-  let ownerCurrent = true, noPendingAutoStart = true, unresolved = 0;
+  let ownerCurrent = true, noPendingAutoStart = false, unresolved = 0;
   let inFlight = 0, unconfirmed = false;
   let acceptedQueue = false, acceptedReceipt = false, notificationsDuringRead = 0;
   const thread = { ...resumeResult().thread, updatedAt: 5 };
@@ -314,6 +314,9 @@ test('CLI source qualifier fences live worker changes around complete idle reads
     adapterKey, controlKey, assertOwnerCurrent: () => ownerCurrent,
     noPendingAutoStart: () => noPendingAutoStart });
   qualifier.start();
+  await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
+    /auto|pending/i, 'a busy scheduler must not prevent a read-only observer from starting');
+  noPendingAutoStart = true;
   const proof = await qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId));
   assert.equal(proof.idle, true);
   assert.equal(proof.nativeQueueEmpty, true);

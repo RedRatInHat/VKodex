@@ -8,6 +8,7 @@ import { Duplex, PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import WebSocket from 'ws';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-operation-journal.js';
 import Database from 'better-sqlite3';
@@ -113,6 +114,180 @@ test('native task-state endpoint remains absent without the explicit daemon opt-
     await (own.control as ManagedWorkerControlServer | null)?.close();
   }
 });
+
+test('native CLI WebSocket is opt-in and requires an isolated read-only policy', async () => {
+  const ordinary = await readyFixture();
+  try {
+    assert.throws(() => ordinary.daemon.nativeCliWebSocketCapability({}), /unavailable/i);
+    const endpoint = JSON.parse(await readFile(path.join(ordinary.privateDirectory,
+      'endpoint.v1.json'), 'utf8')) as Record<string, unknown>;
+    assert.doesNotMatch(JSON.stringify(endpoint), /websocket|bearer|token/iu);
+  } finally {
+    await controlStop(ordinary.privateDirectory, ordinary.reserved.epoch, 'ordinary-stop');
+  }
+  const capability = {}, cli = { capability, noPendingExternalAutoStart: () => true };
+  await assert.rejects(readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined, cli, false),
+  /startup unavailable/);
+  const common = { baseDirectory: path.join(os.tmpdir(), 'vkodex-private-test'),
+    epoch: randomUUID(), allowFollower: () => true, clientFactory: () => { throw new Error('unused'); },
+    verifyFamilyQuiescent: async () => true, nativeCliWebSocket: cli };
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    nativeStockQueue: {} as never }), /Native CLI WebSocket requires/);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    oneShotFirstComposer: () => true }), /Native CLI WebSocket requires/);
+});
+
+test('native CLI WebSocket admits one qualified plain-text turn through the same durable worker', async () => {
+  const capability = {}; let externalIdle = false;
+  const cli = { capability, noPendingExternalAutoStart: () => externalIdle };
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined, cli);
+  let client: Awaited<ReturnType<typeof nativeCliClient>> | null = null;
+  try {
+    assert.throws(() => own.daemon.nativeCliWebSocketCapability({}), /unavailable/i);
+    const bearer = own.daemon.nativeCliWebSocketCapability(capability);
+    assert.equal(bearer.protocol, 'websocket');
+    assert.equal(bearer.host, '127.0.0.1');
+    assert.doesNotMatch(JSON.stringify(own.daemon.metadata), /websocket|bearer|token/iu);
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'endpoint.v1.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal(JSON.stringify(endpoint).includes(bearer.token), false);
+    client = await nativeCliClient(bearer);
+    assert.equal((await client.request('initialize', 'initialize',
+      { clientInfo: { name: 'fixture' }, capabilities: {} })).id, 'initialize');
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    const params = { threadId: own.taskId, clientUserMessageId: randomUUID(),
+      input: [{ type: 'text', text: 'one CLI turn' }], turnTrigger: null, toolOutput: null,
+      responsesapiClientMetadata: null, additionalContext: null, environments: null,
+      cwd: own.home, runtimeWorkspaceRoots: [own.home], approvalPolicy: 'never',
+      approvalsReviewer: 'user', sandboxPolicy: null, permissions: ':read-only',
+      model: 'gpt-5.6-sol', serviceTier: null, serviceTierForTurn: null, effort: 'low',
+      summary: null, personality: null, outputSchema: null,
+      collaborationMode: { mode: 'default', settings: { model: 'gpt-5.6-sol',
+        reasoning_effort: 'low', developer_instructions: null } },
+      multiAgentMode: null, cyberAccessProgram: null };
+    const denied = async (id: string) => {
+      const reply = await client!.request(id, 'turn/start', params);
+      assert.equal((reply.error as { code: number }).code, -32602);
+      assert.equal(own.backend.writes, 0);
+    };
+    await denied('before-resume');
+    const resumed = await client.request('resume', 'thread/resume', { threadId: own.taskId });
+    assert.equal((resumed.result as { thread: { id: string } }).thread.id, own.taskId);
+    await denied('external-scheduler'); externalIdle = true;
+    own.backend.queueEntries = [{ id: 'pending-queue' }];
+    await denied('queued'); own.backend.queueEntries = [];
+    own.backend.goalOverride = { id: 'pending-goal' };
+    await denied('goal'); own.backend.goalOverride = null;
+    own.backend.readStatusOverride = 'active';
+    await denied('active'); own.backend.readStatusOverride = null;
+    const accepted = await client.request('accepted', 'turn/start', params);
+    assert.deepEqual(accepted.result, { turn: { id: 'accepted-composer-turn',
+      status: 'inProgress', extra: true } });
+    assert.equal(own.backend.writes, 1);
+    assert.equal(own.launches, 1);
+    assert.equal(own.backend.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.deepEqual(own.backend.frames.find(frame => frame.method === 'turn/start')?.params, params);
+    const journal = new Database(path.join(own.privateDirectory, 'operations.sqlite'), { readonly: true });
+    try {
+      assert.equal((journal.prepare("SELECT count(*) AS n FROM managed_worker_operations WHERE state = 'accepted'")
+        .get() as { n: number }).n, 1);
+    } finally { journal.close(); }
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-stop')).result,
+      { stopped: true });
+    assert.throws(() => own.daemon.nativeCliWebSocketCapability(capability), /unavailable/i);
+    await waitFor(() => client!.socket.readyState === WebSocket.CLOSED);
+  } finally {
+    client?.socket.terminate();
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('refused stop during an active CLI turn preserves the attached WebSocket', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true });
+  const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
+  try {
+    await client.request('initialize', 'initialize', { clientInfo: { name: 'fixture' }, capabilities: {} });
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    await client.request('resume', 'thread/resume', { threadId: own.taskId });
+    const params = { threadId: own.taskId, clientUserMessageId: randomUUID(),
+      input: [{ type: 'text', text: 'active CLI turn' }], turnTrigger: null, toolOutput: null,
+      responsesapiClientMetadata: null, additionalContext: null, environments: null,
+      cwd: own.home, runtimeWorkspaceRoots: [own.home], approvalPolicy: 'never',
+      approvalsReviewer: 'user', sandboxPolicy: null, permissions: ':read-only',
+      model: 'gpt-5.6-sol', serviceTier: null, serviceTierForTurn: null, effort: 'low',
+      summary: null, personality: null, outputSchema: null,
+      collaborationMode: { mode: 'default', settings: { model: 'gpt-5.6-sol',
+        reasoning_effort: 'low', developer_instructions: null } },
+      multiAgentMode: null, cyberAccessProgram: null };
+    assert.ok((await client.request('start', 'turn/start', params)).result);
+    own.backend.readStatusOverride = 'active';
+    assert.equal((await controlStop(own.privateDirectory, own.reserved.epoch, 'active-cli-stop')).error,
+      'stop-refused');
+    assert.equal(own.daemon.metadata.state, 'ready');
+    assert.equal(own.backend.exitCode, null);
+    assert.equal(client.socket.readyState, WebSocket.OPEN,
+      'a read-only stop proof must not retire the attached CLI session');
+    assert.ok((await client.request('after-refusal', 'thread/read',
+      { threadId: own.taskId, includeTurns: true })).result);
+    own.backend.readStatusOverride = null;
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'drained-cli-stop')).result,
+      { stopped: true });
+  } finally {
+    client.socket.terminate();
+    if (own.backend.exitCode === null) own.backend.stdin.end();
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+for (const failure of ['owner-unconfirmed', 'native-owner-unavailable'] as const)
+  test(`native CLI bearer is revoked after ${failure} while its backend remains alive`, async () => {
+    const capability = {};
+    const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+      'normal', false, null, undefined, undefined, false, undefined, undefined,
+      { capability, noPendingExternalAutoStart: () => true });
+    const bearer = own.daemon.nativeCliWebSocketCapability(capability);
+    const client = await nativeCliClient(bearer);
+    try {
+      await client.request('initialize', 'initialize', { clientInfo: { name: 'fixture' }, capabilities: {} });
+      client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+      if (failure === 'owner-unconfirmed') {
+        const registry = new ManagedWorkerRegistry(own.registryPath);
+        try {
+          const ready = registry.get(own.home, 'own-family');
+          assert.ok(ready?.host && ready.backend);
+          registry.markLost(ready, ready.host, ready.backend, 'backend_unavailable');
+        } finally { registry.close(); }
+      } else own.backend.stdout.write(JSON.stringify({ method: 'thread/unsupported',
+        params: { threadId: own.taskId } }) + '\n');
+      await waitFor(() => own.daemon.metadata.failure === failure, 3500);
+      assert.equal(own.backend.exitCode, null);
+      assert.throws(() => own.daemon.nativeCliWebSocketCapability(capability), /unavailable/i);
+      await waitFor(() => client.socket.readyState === WebSocket.CLOSED, 1500);
+      const probe = new WebSocket(`ws://${bearer.host}:${bearer.port}/`, {
+        headers: { Authorization: `Bearer ${bearer.token}` }, perMessageDeflate: false });
+      probe.on('error', () => {});
+      try {
+        const outcome = await Promise.race([
+          new Promise<'open' | 'rejected'>(resolve => {
+            probe.once('open', () => resolve('open'));
+            probe.once('error', () => resolve('rejected'));
+          }),
+          new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), 1500)),
+        ]);
+        assert.equal(outcome, 'rejected', 'a previously issued bearer must not restore read access');
+      } finally { probe.terminate(); }
+    } finally {
+      client.socket.terminate();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+    }
+  });
 
 test('stock daemon confirms one settings write on its own backend before readiness', async () => {
   const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal', true);
@@ -738,6 +913,7 @@ class Backend extends EventEmitter {
   stockCompletedClients: string[] = [];
   queueEntries: Record<string, unknown>[] = [];
   readStatusOverride: string | null = null;
+  goalOverride: unknown = null;
   holdIdOnlyResume = false;
   heldIdOnlyResume: unknown = null;
   readonly taskId: string; readonly cwd: string;
@@ -800,14 +976,14 @@ class Backend extends EventEmitter {
       { ...thread(), status: { type: 'inProgress' } } : thread() };
     if (method === 'thread/turns/list') return { data: this.terminalTurns().map(turn =>
       ({ ...turn, itemsView: 'full' })), nextCursor: null };
-    if (method === 'thread/goal/get') return { goal: null };
+    if (method === 'thread/goal/get') return { goal: this.goalOverride };
     if (method === 'thread/queue/list') return { data: this.queueEntries, nextCursor: null };
     if (method === 'thread/resume') {
       this.resumed = true;
       return { thread: thread(), cwd: this.cwd, model: 'gpt-5.6-sol', modelProvider: 'openai',
         reasoningEffort: this.stock ? 'medium' : 'low',
         approvalPolicy: 'never', activePermissionProfile: this.stock ?
-          { id: ':danger-full-access', extends: null } : { id: ':read-only' },
+          { id: ':danger-full-access', extends: null } : { id: ':read-only', extends: null },
         sandbox: this.stock ? { type: 'dangerFullAccess' } :
           { type: 'readOnly', networkAccess: false }, runtimeWorkspaceRoots: [this.cwd],
         serviceTier: this.resumeServiceTier, approvalsReviewer: 'user', disabledPluginIds: [],
@@ -929,7 +1105,9 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | 'policy' | null = null,
   headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number,
   nativeTaskState = false, handoffCapability?: object,
-  oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>) {
+  oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>,
+  nativeCliWebSocket?: NonNullable<ManagedWorkerDaemonOptions['nativeCliWebSocket']>,
+  cliApprovedPolicy = true) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -939,7 +1117,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   await writeFile(cliPath, 'pinned-code');
   const registry = new ManagedWorkerRegistry(registryPath);
   const reserved = registry.reserve(home, 'own-family'); registry.close();
-  const taskId = stock ? randomUUID() : 'own-zero-turn';
+  const taskId = stock || nativeCliWebSocket ? randomUUID() : 'own-zero-turn';
   const backend = new Backend(taskId, home), brokers: Broker[] = [], probeBrokers: Broker[] = [],
     handlerErrors: string[] = [];
   const ownerId = stock ? randomUUID() : 'local-owner';
@@ -952,6 +1130,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
     ...(oneShotFirstComposer ? { oneShotFirstComposer } : {}),
+    ...(nativeCliWebSocket ? { nativeCliWebSocket } : {}),
     ...(nativeTaskState ? { nativeTaskState: true as const } : {}),
     ...(stock ? { nativeStockQueue: { sourceGeneration: 'qualified-stock-v1',
       assertControlledNativeBaseline: () => stockFailure !== 'baseline',
@@ -998,12 +1177,13 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         resumeParams: { threadId: taskId, cwd: home, model: 'gpt-5.6-sol',
           permissions: stock && stockFailure !== 'policy' ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
           runtimeWorkspaceRoots: [home], config: { model_reasoning_effort: stock ? 'medium' : 'low' } },
-        ...(stock ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
-          model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'medium', cwd: home,
-          runtimeWorkspaceRoots: [home], environments: [], approvalPolicy: 'never',
-          approvalsReviewer: 'user', activePermissionProfile: { id: stockFailure === 'policy' ?
+        ...(stock || nativeCliWebSocket && cliApprovedPolicy ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
+          model: 'gpt-5.6-sol', modelProvider: 'openai', effort: stock ? 'medium' : 'low', cwd: home,
+          runtimeWorkspaceRoots: [home], environments: stock ? [] :
+            [{ environmentId: 'local', cwd: home, runtimeWorkspaceRoots: [home] }], approvalPolicy: 'never',
+          approvalsReviewer: 'user', activePermissionProfile: { id: !stock || stockFailure === 'policy' ?
             ':read-only' : ':danger-full-access', extends: null },
-          sandbox: stockFailure === 'policy' ? { type: 'readOnly', networkAccess: false } :
+          sandbox: !stock || stockFailure === 'policy' ? { type: 'readOnly', networkAccess: false } :
             { type: 'dangerFullAccess' }, serviceTier: null }) } : {}), registryPath,
       }, keys: { fingerprintKey: Buffer.alloc(32, 1).toString('base64'),
         intentKey: Buffer.alloc(32, 2).toString('base64'),
@@ -1013,6 +1193,9 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
       launch: () => { launches++; return backend as unknown as ChildProcessWithoutNullStreams; },
     },
   });
+  if (nativeCliWebSocket)
+    assert.throws(() => daemon.nativeCliWebSocketCapability(nativeCliWebSocket.capability),
+      /Native CLI frontend unavailable/);
   if (stockFailure === 'discovery' || stockFailure === 'notice' || stockFailure === 'policy') {
     try {
       await daemon.start();
@@ -1027,7 +1210,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   else if (startup === 'normal') {
     try { await daemon.start(); }
     catch (error) {
-      if (stock) { await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end(); }
+      await (control as ManagedWorkerControlServer | null)?.close(); backend.stdin.end();
       throw error;
     }
   }
@@ -1109,6 +1292,22 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
     await new Promise(resolve => setTimeout(resolve, 5));
   }
   throw new Error('fixture observation timeout');
+}
+
+async function nativeCliClient(capability: Readonly<{ host: string; port: number; token: string }>) {
+  const socket = new WebSocket(`ws://${capability.host}:${capability.port}/`, {
+    headers: { Authorization: `Bearer ${capability.token}` }, perMessageDeflate: false });
+  const frames: Record<string, unknown>[] = [];
+  socket.on('message', data => frames.push(JSON.parse(data.toString()) as Record<string, unknown>));
+  socket.on('error', () => {});
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', resolve); socket.once('error', reject);
+  });
+  return { socket, async request(id: string, method: string, params: Record<string, unknown>) {
+    socket.send(JSON.stringify({ id, method, params }));
+    await waitFor(() => frames.some(frame => frame.id === id));
+    return frames.splice(frames.findIndex(frame => frame.id === id), 1)[0]!;
+  } };
 }
 
 async function observeNativeTaskState(endpoint: { host: string; port: number }, epoch: string,
