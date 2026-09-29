@@ -38,7 +38,10 @@ const nonempty = (value: unknown): value is string => typeof value === 'string' 
 const clone = <T>(value: T): T => structuredClone(value);
 function fail(message: string): never { throw new TypeError('native projection: ' + message); }
 const ms = (value: unknown): number | null => value == null ? null : typeof value === 'number' && Number.isFinite(value) ? value * 1000 : fail('invalid seconds timestamp');
-const unsupportedItems = new Set(['imageGeneration', 'collabAgentToolCall']);
+// Collaboration calls are native transcript items: the generic clone retains
+// their fields and status without granting any local command authority.
+// Rejecting them would retire observation during inter-agent turns.
+const unsupportedItems = new Set(['imageGeneration']);
 
 const serverRequestMethods = new Set(['item/tool/requestUserInput', 'item/permissions/requestApproval',
   'item/commandExecution/requestApproval', 'item/fileChange/requestApproval']);

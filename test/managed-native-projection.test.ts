@@ -80,6 +80,21 @@ assert.equal(ended.turns[1]!.items[0]!.text,'Working done');
 assert.equal(ended.turns[1]!.status,'completed');
 assert.equal(item.turns[1]!.items[0]!.text,'');
 assert.equal(state.turns.length,1);
+// A native collaboration tool call is transcript data. It must not retire the
+// observer when another agent starts or completes a turn in the same task.
+const collabStarted={id:'collab-2',type:'collabAgentToolCall',tool:'spawn_agent',status:'inProgress',
+  senderThreadId:id,receiverThreadIds:['child-1'],details:{task:'inspect'}};
+const collabHistory=createProjection(start,{thread:{...read.thread,turns:[{...read.thread.turns[0]!,
+  items:[...read.thread.turns[0]!.items,collabStarted]}]}},{hostId:'local',workspaceKind:'projectless'});
+assert.deepEqual(findTurn(collabHistory,'turn-1').items.at(-1),collabStarted);
+const collabLive=applyNotification(started,{method:'item/started',params:{threadId:id,turnId:'turn-2',item:collabStarted}});
+assert.deepEqual(findTurn(collabLive,'turn-2').items[0],collabStarted);
+const collabCompleted={...collabStarted,status:'completed'};
+const collabDone=applyNotification(collabLive,{method:'item/completed',params:{threadId:id,turnId:'turn-2',item:collabCompleted}});
+assert.deepEqual(findTurn(collabDone,'turn-2').items[0],collabCompleted);
+assert.deepEqual(findTurn(collabLive,'turn-2').items[0],collabStarted);
+collabDone.turns[1]!.items[0]!.details={task:'mutated'};
+assert.deepEqual(collabStarted.details,{task:'inspect'});
 assert.throws(()=>createProjection(start,{thread:{...read.thread,turns:[{...read.thread.turns[0]!,items:[{id:'bad',type:'imageGeneration',result:'x'}]}]}},{hostId:'local',workspaceKind:'projectless'}),/special item mapping/);
 assert.equal(applyNotification(state,{method:'item/agentMessage/delta',params:{threadId:'wrong',turnId:'turn-1',itemId:'agent-1',delta:'x'}}),state);
 assert.equal(applyNotification(state,{method:'mcpServer/startupStatus/updated',params:{threadId:id,name:'test',status:'ready'}}),state);
