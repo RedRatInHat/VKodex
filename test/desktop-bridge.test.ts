@@ -3632,7 +3632,7 @@ test("a lost recycle acknowledgement remains charged when the staged path cannot
   assert.equal(s.store.stageReservedBytes(binding.id, "uncertain-recycle"), 5);
 });
 
-test("a pending recycle with a missing staged path recovers the lost acknowledgement", async t => {
+test("a pending recycle with a missing staged path retains charge after a lost acknowledgement", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-lost-ack-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
@@ -3650,10 +3650,31 @@ test("a pending recycle with a missing staged path recovers the lost acknowledge
   await assert.rejects(files.reconcileStagedArtifacts(), /acknowledgement lost after move/u);
   assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, "pending");
   assert.equal(s.store.stageReservedBytes(binding.id, "lost-ack"), 5);
-  assert.equal(await files.reconcileStagedArtifacts(), 1);
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
   assert.equal(moves, 1);
-  assert.equal(s.store.stageReservedBytes(binding.id, "lost-ack"), 0);
+  assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, "pending");
+  assert.equal(s.store.stageReservedBytes(binding.id, "lost-ack"), 5);
   assert.equal(await readFile(`${receipt.path}.recycled-fixture`, "utf8"), "bytes");
+});
+
+test("a staged path disappearing after the pending journal write is not proof of recycling", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-pending-disappeared-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  let moves = 0;
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const prepared = await files.prepare(binding, "pending-disappeared", []);
+  files.finish(binding.id, "pending-disappeared", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; path: string }>>(`file-stage-index:${binding.id}:pending-disappeared`) ?? {})[0]!;
+  assert.equal(s.store.markStageRecyclePending(receipt.key, receipt.path), true);
+  await rename(receipt.path, `${receipt.path}.not-recycled`);
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.equal(moves, 0);
+  assert.equal(s.store.stageRecycleCandidates()[0]?.recycling, "pending");
+  assert.equal(s.store.stageReservedBytes(binding.id, "pending-disappeared"), 5);
+  assert.equal(await readFile(`${receipt.path}.not-recycled`, "utf8"), "bytes");
 });
 
 test("a ready reservation with a missing staged path remains charged", async t => {
