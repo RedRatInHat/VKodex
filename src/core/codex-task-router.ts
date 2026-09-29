@@ -70,8 +70,12 @@ export class RoutedCodexTasks implements CodexTasks {
   async findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
     const owner = this.owner(task);
     if (owner) {
-      const accepted = await owner.findAcceptedInput(task, operationId);
-      if (owner.routingPolicy === "exclusive" || accepted) return accepted;
+      try {
+        const accepted = await owner.findAcceptedInput(task, operationId);
+        if (owner.routingPolicy === "exclusive" || accepted) return accepted;
+      } catch (error) {
+        if (owner.routingPolicy === "exclusive") throw error;
+      }
     }
     return this.base.findAcceptedInput?.(task, operationId) ?? null;
   }

@@ -225,6 +225,31 @@ test("exclusive queue reconciliation never treats the legacy writer as proof of 
   assert.equal(baseReads, 0);
 });
 
+test("accepted-input reconciliation falls back to the exact profile task after a nonexclusive owner read error", async () => {
+  const f = fixture(); const sourceTask = { ...work, rolloutPath: "C:/codex/sessions/exact.jsonl" };
+  let baseTask: TaskRef | undefined; let baseOperationId: string | undefined;
+  const base = { ...f.base, findAcceptedInput: async (task: TaskRef, operationId: string) => {
+    baseTask = task; baseOperationId = operationId; return "profile-turn";
+  } } satisfies CodexTasks;
+  const owner = { ...f.owner, findAcceptedInput: async () => { throw new Error("profile owner read failed"); } };
+  const routed = new RoutedCodexTasks(base, [owner]);
+
+  assert.equal(await routed.findAcceptedInput!(sourceTask, "operation-1"), "profile-turn");
+  assert.deepEqual(baseTask, sourceTask);
+  assert.equal(baseOperationId, "operation-1");
+});
+
+test("accepted-input reconciliation keeps an exclusive owner fail-closed after a read error", async () => {
+  const f = fixture(); let baseReads = 0;
+  const base = { ...f.base, findAcceptedInput: async () => { baseReads++; return "profile-turn"; } } satisfies CodexTasks;
+  const exclusive = { ...f.owner, routingPolicy: "exclusive" as const,
+    findAcceptedInput: async () => { throw new Error("exclusive owner read failed"); } };
+  const routed = new RoutedCodexTasks(base, [exclusive]);
+
+  await assert.rejects(routed.findAcceptedInput!(work, "operation-2"), /exclusive owner read failed/u);
+  assert.equal(baseReads, 0);
+});
+
 test("exclusive task refuses unsupported edit, transfer, reveal and export before base", async () => {
   const f = fixture(); let touched = 0;
   const base = { ...f.base,
