@@ -28,7 +28,8 @@ test('daemon requires explicit follower and IPC policy before private state is r
 });
 
 test('one-shot first Composer cannot be enabled without a callback or alongside stock queue', () => {
-  const common = { baseDirectory: 'C:\\private', epoch: '11111111-1111-4111-8111-111111111111',
+  const common = { baseDirectory: path.join(os.tmpdir(), 'vkodex-private-test'),
+    epoch: '11111111-1111-4111-8111-111111111111',
     allowFollower: () => true, clientFactory: () => { throw new Error('unused'); },
     verifyFamilyQuiescent: async () => true };
   assert.throws(() => new ManagedWorkerDaemon({ ...common, oneShotFirstComposer: true as never }),
