@@ -46,6 +46,7 @@ interface FileJob {
   /** The Codex turn that must finish before its outbox is collected. */
   turnId?: string;
 }
+interface StageIdentity { readonly dev: number; readonly ino: number; readonly birthtimeMs: number }
 interface StagedFile {
   readonly key: string;
   /** Exact VK message batch containing this version, persisted with :queued. */
@@ -59,6 +60,8 @@ interface StagedFile {
   readonly fingerprint: string;
   readonly sha256: string;
   readonly bytes: number;
+  /** Filesystem object captured from the open staged file. Legacy receipts omit this and are not recyclable. */
+  readonly identity?: StageIdentity;
   readonly bindingId: string;
   readonly threadId: string;
   readonly sourceId?: string;
@@ -71,6 +74,12 @@ class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
 }
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
+const validStageIdentity = (value: unknown): value is StageIdentity =>
+  typeof value === "object" && value !== null && Number.isSafeInteger((value as StageIdentity).dev)
+    && Number.isSafeInteger((value as StageIdentity).ino) && (value as StageIdentity).ino > 0
+    && Number.isFinite((value as StageIdentity).birthtimeMs) && (value as StageIdentity).birthtimeMs > 0;
+const sameStageIdentity = (stat: { dev: number; ino: number; birthtimeMs: number }, identity: StageIdentity): boolean =>
+  stat.dev === identity.dev && stat.ino === identity.ino && stat.birthtimeMs === identity.birthtimeMs;
 const fileFingerprint = (stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }): string =>
   `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
@@ -84,8 +93,8 @@ const LATE_SCAN_WINDOW_MS = 48 * 60 * 60_000;
 const STAGE_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const MIN_STAGE_FREE_BYTES = 512 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
-/** Windows-only single-file Recycle Bin move. Isolated same-session canary
- * passed; automatic retention still requires a stronger object-identity fence. */
+/** Windows-only single-file Recycle Bin move. The caller verifies its durable
+ * identity first; pathname replacement during the move remains a race. */
 export async function recycleStageOnWindows(target: string): Promise<void> {
   if (process.platform !== "win32") throw new ActionRejectedError("Корзина Windows недоступна на этой платформе.");
   if (!path.isAbsolute(target)) throw new ActionRejectedError("Для Корзины требуется абсолютный путь к файлу.");
@@ -379,7 +388,8 @@ export class TaskFiles {
       || receipt.kind !== (imageName(path.basename(receipt.relativePath)) ? "image" : "file")
       || !/^[0-9a-f-]+\.bin$/u.test(path.basename(receipt.path))
       || path.dirname(path.resolve(receipt.path)) !== folder || receipt.bytes > FILE_LIMITS.maxFileBytes || receipt.bytes < 0
-      || !/^[0-9a-f]{64}$/u.test(receipt.sha256)) throw new ActionRejectedError("Квитанция staged-файла повреждена; загрузка остановлена.");
+      || !/^[0-9a-f]{64}$/u.test(receipt.sha256)
+      || (receipt.identity !== undefined && !validStageIdentity(receipt.identity))) throw new ActionRejectedError("Квитанция staged-файла повреждена; загрузка остановлена.");
     let handle: Awaited<ReturnType<typeof open>> | null = null;
     try {
       const before = await lstat(receipt.path);
@@ -387,6 +397,8 @@ export class TaskFiles {
       handle = await open(receipt.path, "r");
       const opened = await handle.stat();
       if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new Error("changed stage file");
+      if (receipt.identity && (!sameStageIdentity(before, receipt.identity) || !sameStageIdentity(opened, receipt.identity)))
+        throw new Error("replaced stage file");
       const contents = reuse ?? Buffer.allocUnsafe(receipt.bytes);
       if (contents.length !== receipt.bytes) throw new Error("incorrect stage buffer");
       let size = 0;
@@ -397,7 +409,8 @@ export class TaskFiles {
       }
       const extra = await handle.read(Buffer.alloc(1), 0, 1, null);
       const after = await handle.stat();
-      if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || digest(contents) !== receipt.sha256) throw new Error("corrupt stage file");
+      if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || digest(contents) !== receipt.sha256
+        || (receipt.identity && !sameStageIdentity(after, receipt.identity))) throw new Error("corrupt stage file");
       return contents;
     } catch {
       throw new ActionRejectedError(`Staged-версия файла «${receipt.name}» отсутствует или повреждена; загрузка остановлена. Исходный файл не будет использован вместо неё.`);
@@ -415,10 +428,17 @@ export class TaskFiles {
     if (reservation === "limit") throw new ActionRejectedError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
     if (reservation === "existing") throw new ActionRejectedError("Обнаружена незавершённая staged-версия файла. Загрузка остановлена до сверки сохранённых данных; повтор не создаст другую версию автоматически.");
     const handle = await open(target, "wx", 0o600);
-    try { await handle.writeFile(file.contents); await handle.sync(); }
+    let identity: StageIdentity;
+    try {
+      await handle.writeFile(file.contents); await handle.sync();
+      const staged = await handle.stat();
+      identity = { dev: staged.dev, ino: staged.ino, birthtimeMs: staged.birthtimeMs };
+      if (!validStageIdentity(identity) || !staged.isFile() || staged.nlink !== 1 || staged.size !== file.contents.length)
+        throw new ActionRejectedError("Не удалось подтвердить идентичность staged-файла; загрузка остановлена.");
+    }
     finally { await handle.close(); }
     const receipt: StagedFile = { key, path: target, relativePath, name: file.name, kind: file.kind, fingerprint,
-      sha256: digest(file.contents), bytes: file.contents.length, bindingId: binding.id, threadId: binding.threadId,
+      sha256: digest(file.contents), bytes: file.contents.length, identity, bindingId: binding.id, threadId: binding.threadId,
       ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), operationId: job.operationId,
       generation: job.generation, stagedAt: Date.now(), ...(job.turnId ? { turnId: job.turnId } : {}) };
     this.store.atomic(() => {
@@ -441,6 +461,7 @@ export class TaskFiles {
     for (const row of this.store.stageRecycleCandidates()) {
       const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key];
       if (!receipt || receipt.path !== row.path || receipt.bytes !== row.bytes || receipt.key !== row.key
+        || !validStageIdentity(receipt.identity)
         || !receipt.deliveryKey?.startsWith(`files:${row.bindingId}:${row.operationId}:`)
         || !receipt.attachment || !Number.isSafeInteger(receipt.peerId) || receipt.peerId! <= 0
         || !Number.isSafeInteger(receipt.stagedAt) || receipt.stagedAt <= 0 || receipt.stagedAt > now - STAGE_RETENTION_MS
@@ -461,7 +482,8 @@ export class TaskFiles {
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       const current = await lstat(row.path).catch(() => null);
-      if (!current || current.dev !== verified.dev || current.ino !== verified.ino) continue;
+      if (!current || current.dev !== verified.dev || current.ino !== verified.ino
+        || !sameStageIdentity(current, receipt.identity)) continue;
       // A failed or interrupted move leaves the reservation charged. Missing
       // files on a later run are not interpreted as successful recycling.
       await this.recycleStage(row.path);

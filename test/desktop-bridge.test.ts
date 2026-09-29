@@ -3366,6 +3366,46 @@ for (const replacement of ["other", "bytes"] as const) test(`stage retention doe
   assert.equal(s.store.stageReservedBytes(binding.id, "replaced-path"), 5);
 });
 
+test("pending recycle does not accept a same-byte path replacement on a later reconciliation", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-pending-replaced-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "pending-replaced", []);
+  files.finish(binding.id, "pending-replaced", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string; path: string }>>(`file-stage-index:${binding.id}:pending-replaced`) ?? {})[0]!;
+  assert.equal(s.store.markStageRecyclePending(receipt.key, receipt.path), true);
+  renameSync(receipt.path, `${receipt.path}.original`);
+  writeFileSync(receipt.path, "bytes");
+  now += 8 * 24 * 60 * 60_000;
+  const recovered = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  assert.equal(await recovered.reconcileStagedArtifacts(), 0);
+  assert.deepEqual(recycled, []);
+  assert.equal(s.store.stageReservedBytes(binding.id, "pending-replaced"), 5);
+});
+
+test("legacy staged receipts without file identity remain charged during retention", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-legacy-retention-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "legacy-retention", []);
+  files.finish(binding.id, "legacy-retention", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const indexKey = `file-stage-index:${binding.id}:legacy-retention`;
+  const index = s.store.getValue<Record<string, { identity?: unknown }>>(indexKey)!;
+  const key = Object.keys(index)[0]!;
+  const { identity: _identity, ...legacy } = index[key]!;
+  s.store.setValue(indexKey, { ...index, [key]: legacy });
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 0);
+  assert.deepEqual(recycled, []);
+  assert.equal(s.store.stageReservedBytes(binding.id, "legacy-retention"), 5);
+});
+
 test("failed recycling keeps the reservation charged and a retry can complete", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-retry-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
@@ -3561,7 +3601,8 @@ test("a staged version survives source mutation and restart before upload", asyn
   });
   await assert.rejects(restored.collect(recoveredBinding, true), /Квитанция staged-файла повреждена/u);
   assert.equal(chat.binaryUploads.length, 0);
-  recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, staged);
+  const { identity: _identity, ...legacyReceipt } = receipt as typeof receipt & { identity?: unknown };
+  recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, { ...staged, [receiptKey]: legacyReceipt });
   await restored.collect(recoveredBinding, true);
   assert.equal(chat.binaryUploads[0]!.contents.toString(), "first version");
   assert.equal(await readFile(receipt.path, "utf8"), "first version");
