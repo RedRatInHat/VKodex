@@ -6,6 +6,13 @@ import { qualifyNativeCliResumePolicy } from './native-cli-resume-policy.js';
 import type { NativeCliResumePolicy } from './native-cli-resume-policy.js';
 
 type JsonObject = Record<string, unknown>;
+/** No native command was handed to the durable dispatcher. Never includes source or request data. */
+export class NativeCliStartNotSubmittedError extends Error {
+  constructor() {
+    super('Native CLI start not submitted');
+    this.name = 'NativeCliStartNotSubmittedError';
+  }
+}
 interface Host {
   readonly metadata: Readonly<{ taskId: string; state: string; backendGeneration: number | null }>;
   executeCommandWithResponse(controlKey: object, command: WorkerCommand,
@@ -97,53 +104,67 @@ export class ManagedNativeCliStartAdmission {
 
   async run({ taskId, generation, params }: Readonly<{ taskId: string;
     generation: number; params: JsonObject }>): Promise<WorkerCommandResponse> {
-    if (this.#qualifying || taskId !== this.#options.taskId ||
-        !Number.isSafeInteger(generation) || generation < 1)
-      throw new Error('Native CLI start scope unavailable');
-    const host = this.#boundHost;
-    if (!host) throw new Error('Native CLI admission not attached to a worker');
-    const exactHost = () => {
-      const meta = host.metadata;
-      if (!meta || meta.state !== 'running' || meta.taskId !== taskId ||
-          meta.backendGeneration !== generation)
-        throw new Error('Native CLI worker generation changed');
-    };
-    exactHost();
-    const resume = this.#resume;
-    if (!resume || resume.generation !== generation)
-      throw new Error('Native CLI resume evidence unavailable');
-    const exactResume = () => {
-      if (this.#resume !== resume || this.#resumeRevision !== resume.revision)
-        throw new Error('Native CLI resume evidence changed');
-    };
-    this.#qualifying = true;
-    let proof: NativeCliStartProof;
-    try { proof = await this.#options.qualify(resume.policy); }
-    finally { this.#qualifying = false; }
-    exactHost(); exactResume();
-    if (!proof || proof.taskId !== taskId || proof.ownerEpoch !== this.ownerEpoch ||
-        proof.backendGeneration !== generation ||
-        !Number.isSafeInteger(proof.semanticRevision) || proof.semanticRevision < 0 ||
-        proof.idle !== true || proof.nativeQueueEmpty !== true ||
-        proof.noPendingAutoStart !== true || typeof proof.assertCurrent !== 'function')
-      throw new Error('Native CLI queue or owner proof unavailable');
-    assertSync(proof);
-    const quiescence = host.commandQuiescence(this.#options.controlKey);
-    if (quiescence.inFlight !== 0 || quiescence.unconfirmed !== false)
-      throw new Error('Native CLI command ledger unsettled');
-    const command = prepareNativeCliTurnStart(params, { taskId,
-      ownerEpoch: this.ownerEpoch, effectiveSettings: proof.effectiveSettings });
-    const effective = proof.effectiveSettings;
-    for (const key of ['cwd', 'runtimeWorkspaceRoots', 'approvalPolicy',
-      'approvalsReviewer', 'permissions', 'sandboxPolicy', 'model',
-      'serviceTier', 'effort'] as const)
-      if (!isDeepStrictEqual(effective[key], resume.policy[key]))
-        throw new Error('Native CLI resume and current settings disagree');
-    exactHost(); exactResume(); assertSync(proof);
-    // No await between this final semantic fence and the command dispatcher's
-    // own synchronous before-write callback and generation/owner checks.
-    return host.executeCommandWithResponse(this.#options.controlKey, command, () => {
+    let dispatch!: () => Promise<WorkerCommandResponse>;
+    try {
+      if (this.#qualifying || taskId !== this.#options.taskId ||
+          !Number.isSafeInteger(generation) || generation < 1)
+        throw new Error('Native CLI start scope unavailable');
+      const host = this.#boundHost;
+      if (!host) throw new Error('Native CLI admission not attached to a worker');
+      const exactHost = () => {
+        const meta = host.metadata;
+        if (!meta || meta.state !== 'running' || meta.taskId !== taskId ||
+            meta.backendGeneration !== generation)
+          throw new Error('Native CLI worker generation changed');
+      };
+      exactHost();
+      const resume = this.#resume;
+      if (!resume || resume.generation !== generation)
+        throw new Error('Native CLI resume evidence unavailable');
+      const exactResume = () => {
+        if (this.#resume !== resume || this.#resumeRevision !== resume.revision)
+          throw new Error('Native CLI resume evidence changed');
+      };
+      this.#qualifying = true;
+      let proof: NativeCliStartProof;
+      try { proof = await this.#options.qualify(resume.policy); }
+      finally { this.#qualifying = false; }
+      exactHost(); exactResume();
+      if (!proof || proof.taskId !== taskId || proof.ownerEpoch !== this.ownerEpoch ||
+          proof.backendGeneration !== generation ||
+          !Number.isSafeInteger(proof.semanticRevision) || proof.semanticRevision < 0 ||
+          proof.idle !== true || proof.nativeQueueEmpty !== true ||
+          proof.noPendingAutoStart !== true || typeof proof.assertCurrent !== 'function')
+        throw new Error('Native CLI queue or owner proof unavailable');
+      assertSync(proof);
+      const quiescence = host.commandQuiescence(this.#options.controlKey);
+      if (quiescence.inFlight !== 0 || quiescence.unconfirmed !== false)
+        throw new Error('Native CLI command ledger unsettled');
+      const command = prepareNativeCliTurnStart(params, { taskId,
+        ownerEpoch: this.ownerEpoch, effectiveSettings: proof.effectiveSettings });
+      const effective = proof.effectiveSettings;
+      for (const key of ['cwd', 'runtimeWorkspaceRoots', 'approvalPolicy',
+        'approvalsReviewer', 'permissions', 'sandboxPolicy', 'model',
+        'serviceTier', 'effort'] as const)
+        if (!isDeepStrictEqual(effective[key], resume.policy[key]))
+          throw new Error('Native CLI resume and current settings disagree');
       exactHost(); exactResume(); assertSync(proof);
-    });
+      // No await between this final semantic fence and the command dispatcher's
+      // own synchronous before-write callback and generation/owner checks.
+      dispatch = () => host.executeCommandWithResponse(this.#options.controlKey, command, () => {
+        exactHost(); exactResume(); assertSync(proof);
+      });
+    } catch {
+      throw new NativeCliStartNotSubmittedError();
+    }
+    try {
+      return await dispatch();
+    } catch (failure) {
+      // A dispatcher failure has an unknown write outcome, even if it happens
+      // to throw the same class used by the earlier admission phase.
+      if (failure instanceof NativeCliStartNotSubmittedError)
+        throw new Error('Native CLI dispatch outcome unknown');
+      throw failure;
+    }
   }
 }

@@ -154,10 +154,14 @@ export class ManagedNativeCliSourceQualifier {
     return Object.freeze({ taskId: this.#options.taskId,
       ownerEpoch: this.#options.ownerEpoch, backendGeneration: generation,
       semanticRevision: revision,
-      // These three fields are no-override CLI request semantics, not claims
-      // about unexposed per-thread settings in the native resume response.
+      // The default mode echoes the model and effort independently proved by
+      // native resume. It must carry no developer-instruction override. This
+      // canonical tuple is an allowed CLI request, not a claim that resume
+      // exposes the full per-thread collaboration settings.
       effectiveSettings: Object.freeze({ ...resume, summary: null,
-        personality: null, collaborationMode: Object.freeze({ mode: 'default', settings: null }) }),
+        personality: null, collaborationMode: Object.freeze({ mode: 'default',
+          settings: Object.freeze({ model: resume.model,
+            reasoning_effort: resume.effort, developer_instructions: null }) }) }),
       idle: true, nativeQueueEmpty: true, noPendingAutoStart: true,
       assertCurrent: current });
   }

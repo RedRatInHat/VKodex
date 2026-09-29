@@ -154,7 +154,8 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
     approvalPolicy: 'never', approvalsReviewer: 'user', permissions: ':read-only',
     sandboxPolicy: { type: 'readOnly', networkAccess: false }, model: 'gpt-5.6-sol', serviceTier: 'default',
     effort: 'low', summary: null, personality: null,
-    collaborationMode: { mode: 'default', settings: null } };
+    collaborationMode: { mode: 'default', settings: { model: 'gpt-5.6-sol',
+      reasoning_effort: 'low', developer_instructions: null } } };
   const params = { threadId: taskId, clientUserMessageId: clientId,
     input: [{ type: 'text', text: 'isolated host turn' }], turnTrigger: null,
     toolOutput: null, responsesapiClientMetadata: null, additionalContext: null,
@@ -224,7 +225,7 @@ test('opt-in CLI start crosses the WebSocket only through the durable same-worke
       child.send({ id: activeWire.id, result: activeResume });
       assert.deepEqual((await client.next()).result, activeResume);
       client.send({ id: 4, method: 'turn/start', params });
-      assert.equal(((await client.next()).error as { code: number }).code, -32001);
+      assert.equal(((await client.next()).error as { code: number }).code, -32602);
       assert.equal(child.messages.filter(frame => frame.method === 'turn/start').length, 1);
     } finally { client.close(); }
   } finally { await managed.stop('test-cleanup'); }

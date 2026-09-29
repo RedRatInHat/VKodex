@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { AppServerRequestOptions, AppServerInitializedSession,
   AppServerResponseEnvelope } from './app-server-connection.js';
 import type { WorkerCommandResponse } from './managed-worker-command-dispatcher.js';
+import { NativeCliStartNotSubmittedError } from './managed-native-cli-start-admission.js';
 
 type JsonObject = Record<string, unknown>;
 type Frame = JsonObject;
@@ -532,7 +533,11 @@ export class PersistentFrontendSessions {
             }
             safeSend(error(id, -32001, 'Native start outcome unknown; do not replay blindly'));
             return 'start-unknown';
-          } catch {
+          } catch (failure) {
+            if (failure instanceof NativeCliStartNotSubmittedError) {
+              safeSend(error(id, -32602, 'Native start not submitted'));
+              return 'start-not-submitted';
+            }
             safeSend(error(id, -32001, 'Native start outcome unknown; do not replay blindly'));
             return 'start-unknown';
           } finally {

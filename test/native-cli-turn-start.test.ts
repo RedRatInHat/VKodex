@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
-import { ManagedNativeCliStartAdmission } from '../src/codex/managed-native-cli-start-admission.js';
+import { ManagedNativeCliStartAdmission, NativeCliStartNotSubmittedError } from
+  '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
 import { qualifyNativeCliResumePolicy } from '../src/codex/native-cli-resume-policy.js';
 import { ManagedNativeCliSourceQualifier } from '../src/codex/managed-native-cli-source-qualifier.js';
@@ -15,7 +16,8 @@ const settings = {
   cwd: 'D:\\GitStorageG\\VKodex', runtimeWorkspaceRoots: ['D:\\GitStorageG\\VKodex'],
   approvalPolicy: 'never', approvalsReviewer: 'user', permissions: ':read-only',
   sandboxPolicy: { type: 'readOnly', networkAccess: false }, model: 'gpt-5.6-sol', serviceTier: 'default',
-  effort: 'low', summary: null, collaborationMode: { mode: 'default', settings: null },
+  effort: 'low', summary: null, collaborationMode: { mode: 'default', settings: {
+    model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } },
   personality: null,
 };
 function start(overrides: Record<string, unknown> = {}) {
@@ -72,6 +74,9 @@ test('native CLI start rejects source, settings, context, and input drift', () =
     start({ input: [{ type: 'image', url: 'local' }] }),
     start({ input: [{ type: 'text', text: ' ' }] }),
     start({ input: [{ type: 'text', text: 'isolated test', text_elements: ['unsupported'] }] }),
+    start({ collaborationMode: { mode: 'plan', settings: settings.collaborationMode.settings } }),
+    start({ collaborationMode: { mode: 'default', settings: {
+      ...settings.collaborationMode.settings, developer_instructions: 'unapproved' } } }),
     start({ extra: true }),
   ]) assert.throws(() => prepareNativeCliTurnStart(request,
     { taskId, ownerEpoch, effectiveSettings: settings }));
@@ -108,16 +113,20 @@ test('CLI admission rechecks same-worker queue proof before durable host write',
     } });
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
   assert.throws(() => admission.bindHost(host, taskId, { ownerEpoch, controlKey }), /mismatch/);
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /resume/i);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
+  assert.equal(writes, 0);
   admission.recordResume(host, 7, resumeResult());
   const accepted = await admission.run({ taskId, generation: 7, params: start() });
   assert.equal(accepted.operation.receiptId, 'native-turn');
   assert.equal(writes, 1);
   current = false;
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /stale/);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
   assert.equal(writes, 1);
   current = true; host.metadata.backendGeneration = 8;
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /generation/);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
   assert.equal(writes, 1);
 });
 
@@ -134,9 +143,11 @@ test('CLI admission refuses an occupied queue and unsettled command ledger', asy
     }) });
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
   admission.recordResume(host, 7, resumeResult());
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /proof/);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
   queued = false; unsettled = true;
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /unsettled/);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
   assert.equal(writes, 0);
 });
 
@@ -157,10 +168,11 @@ test('CLI admission invalidates an in-flight proof when native resume changes', 
   const pending = admission.run({ taskId, generation: 7, params: start() });
   admission.recordResume(host, 7, resumeResult());
   release();
-  await assert.rejects(pending, /resume evidence changed/i);
+  await assert.rejects(pending, NativeCliStartNotSubmittedError);
   assert.equal(writes, 0);
   admission.recordResume(host, 7, { bad: true });
-  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }), /resume evidence unavailable/i);
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    NativeCliStartNotSubmittedError);
 });
 
 test('CLI admission rejects a proof whose permissions differ from native resume', async () => {
@@ -177,8 +189,29 @@ test('CLI admission rejects a proof whose permissions differ from native resume'
   admission.bindHost(host, taskId, { ownerEpoch, controlKey });
   admission.recordResume(host, 7, resumeResult());
   await assert.rejects(admission.run({ taskId, generation: 7,
-    params: start({ serviceTier: null }) }), /resume and current settings disagree/i);
+    params: start({ serviceTier: null }) }), NativeCliStartNotSubmittedError);
   assert.equal(writes, 0);
+});
+
+test('CLI admission never labels a dispatcher failure as not submitted', async () => {
+  const controlKey = {}; let dispatches = 0;
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence: () => ({ inFlight: 0, unconfirmed: false }),
+    executeCommandWithResponse: async () => {
+      dispatches++;
+      throw new NativeCliStartNotSubmittedError();
+    } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch,
+    controlKey, qualify: async () => ({ taskId, ownerEpoch, backendGeneration: 7,
+      semanticRevision: 1, effectiveSettings: settings, idle: true,
+      nativeQueueEmpty: true, noPendingAutoStart: true, assertCurrent: () => {} }) });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  admission.recordResume(host, 7, resumeResult());
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start() }),
+    error => error instanceof Error &&
+      !(error instanceof NativeCliStartNotSubmittedError) &&
+      /outcome unknown/u.test(error.message));
+  assert.equal(dispatches, 1);
 });
 
 test('CLI source reader requires stable terminal history, empty native queue and null goal', async () => {
@@ -285,6 +318,7 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   assert.equal(proof.idle, true);
   assert.equal(proof.nativeQueueEmpty, true);
   assert.equal(proof.effectiveSettings.permissions, ':read-only');
+  assert.deepEqual(proof.effectiveSettings.collaborationMode, settings.collaborationMode);
   proof.assertCurrent();
   inFlight = 1;
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),

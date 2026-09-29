@@ -6,6 +6,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AppServerInitializedSession, AppServerRequestOptions,
   AppServerResponseEnvelope } from '../src/codex/app-server-connection.js';
 import { PersistentFrontendSessions } from '../src/codex/persistent-frontend-session.js';
+import { NativeCliStartNotSubmittedError } from '../src/codex/managed-native-cli-start-admission.js';
 import { AppServerRequestInbox } from '../src/codex/app-server-request-inbox.js';
 
 type JsonObject = Record<string, unknown>;
@@ -1010,6 +1011,29 @@ test('native CLI start refuses a foreign receipt even when callback claims accep
     threadId: taskId, clientUserMessageId, input: [{ type: 'text', text: 'test' }],
   } }), 'start-unknown');
   assert.equal(frames[1]!.error!.code, -32001);
+  assert.equal(backend.requests.length, 0);
+});
+
+test('native CLI start exposes only typed pre-dispatch failure as safe not-submitted', async () => {
+  const backend = fakeBackend();
+  const ownerEpoch = 'd2a53334-a43f-4765-a3c8-a818ed68fe0f';
+  let preDispatch = true;
+  const sessions = createSessions(backend, { frontendStart: { ownerEpoch, observeResume: () => {},
+    run: async () => {
+      if (preDispatch) throw new NativeCliStartNotSubmittedError();
+      throw new Error('private dispatcher outcome');
+    } } });
+  const { frames, frontend } = attach(sessions); await initialize(frontend);
+  const params = { threadId: taskId,
+    clientUserMessageId: '1d9a5c7c-1c7f-4f72-a315-c6607930d10c',
+    input: [{ type: 'text', text: 'private prompt' }] };
+  assert.equal(await frontend.receive({ id: 2, method: 'turn/start', params }), 'start-not-submitted');
+  assert.equal(frames[1]!.error!.code, -32602);
+  assert.equal(JSON.stringify(frames[1]).includes('private'), false);
+  preDispatch = false;
+  assert.equal(await frontend.receive({ id: 3, method: 'turn/start', params }), 'start-unknown');
+  assert.equal(frames[2]!.error!.code, -32001);
+  assert.equal(JSON.stringify(frames[2]).includes('private'), false);
   assert.equal(backend.requests.length, 0);
 });
 
