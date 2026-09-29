@@ -161,7 +161,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   streamTransport?: TaskStateTransport,
   inspectExternalOwner?: (task: import("../src/core/codex-tasks.js").TaskRef) => Promise<"idle" | "active" | "systemError" | null>,
   goals?: import("../src/desktop/contracts.js").DesktopGoals,
-  history?: TaskHistoryRecovery) {
+  history?: TaskHistoryRecovery, fileRoot?: string) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -184,7 +184,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const runtime = new DesktopBridgeRuntime(access, desktop, chat, store,
     { ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
       ...(inspectExternalOwner ? { inspectExternalOwner } : {}) },
-    () => now, undefined, undefined, 60_000, healthCheckOverride);
+    () => now, fileRoot, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
@@ -841,6 +841,43 @@ test("a rejected scheduled health report cannot terminate the runtime", async t 
   await s.runtime.tick();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.ok(checks > initialChecks);
+});
+
+test("runtime schedules bounded staged maintenance every five minutes without enabling new staging", async t => {
+  const fileRoot = await mkdtemp(path.join(os.tmpdir(), "vkodex-runtime-stage-maintenance-"));
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, fileRoot);
+  type RuntimeInternals = {
+    files: {
+      stageNewUploads: boolean;
+      reconcileAbandonedStageReservations(limit?: number): Promise<number>;
+      reconcileStagedArtifactsBatch(now?: number, limit?: number): Promise<number>;
+    };
+  };
+  const files = (s.runtime as unknown as RuntimeInternals).files;
+  assert.equal(files.stageNewUploads, false);
+  const abandonedLimits: number[] = [];
+  const recycleCalls: Array<[number | undefined, number | undefined]> = [];
+  t.mock.method(files, "reconcileAbandonedStageReservations", async (limit?: number) => { abandonedLimits.push(limit ?? 64); return 0; });
+  t.mock.method(files, "reconcileStagedArtifactsBatch", async (now?: number, limit?: number) => { recycleCalls.push([now, limit]); return 0; });
+  const intervals: Array<{ callback: () => void; delay: number }> = [];
+  t.mock.method(global, "setInterval", ((callback: () => void, delay?: number) => {
+    intervals.push({ callback, delay: Number(delay) });
+    return 0 as unknown as ReturnType<typeof setInterval>;
+  }) as typeof setInterval);
+
+  s.runtime.start();
+  const tick = intervals.find(interval => interval.delay === 1_000);
+  assert.ok(tick, "start keeps maintenance on the existing one-second runtime tick");
+  s.advance(5 * 60_000 - 1);
+  tick.callback();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(abandonedLimits, []);
+  assert.deepEqual(recycleCalls, []);
+  s.advance(1);
+  tick.callback();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(abandonedLimits, [8]);
+  assert.deepEqual(recycleCalls, [[400_000, 4]]);
 });
 
 test("health keeps checking while the initial task subscription is still pending", async t => {

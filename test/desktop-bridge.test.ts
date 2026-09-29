@@ -3335,6 +3335,56 @@ test("stage retention waits seven days and an exact confirmed send before recycl
   assert.equal(await readFile(receipt.path, "utf8"), "retained bytes"); // injected recycler never deletes fixture bytes
 });
 
+test("bounded staged reconciliation recycles four eligible files before a later pass", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-batch-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "bounded-recycle", []);
+  files.finish(binding.id, "bounded-recycle", "accepted", "finished-turn");
+  for (let index = 0; index < 5; index++) await writeFile(path.join(prepared.outboxDir, `${index}.txt`), `file-${index}`);
+  assert.equal(await files.collect(binding, true), 5);
+  await s.worker.flush();
+
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifactsBatch(now), 4);
+  assert.equal(recycled.length, 4);
+  assert.equal(await files.reconcileStagedArtifactsBatch(now), 1);
+  assert.equal(recycled.length, 5);
+});
+
+test("stopping staged maintenance waits for its in-flight recycle without starting the next file", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-stop-recycle-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  let releaseRecycle!: () => void;
+  const recycleBlocked = new Promise<void>(resolve => { releaseRecycle = resolve; });
+  let firstRecycleStarted!: () => void;
+  const firstStarted = new Promise<void>(resolve => { firstRecycleStarted = resolve; });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => {
+    recycled.push(target);
+    if (recycled.length === 1) { firstRecycleStarted(); await recycleBlocked; }
+  });
+  const prepared = await files.prepare(binding, "stop-recycle", []);
+  files.finish(binding.id, "stop-recycle", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "one.txt"), "one");
+  await writeFile(path.join(prepared.outboxDir, "two.txt"), "two");
+  assert.equal(await files.collect(binding, true), 2);
+  await s.worker.flush();
+
+  now += 8 * 24 * 60 * 60_000;
+  const reconciliation = files.reconcileStagedArtifactsBatch(now, 2);
+  await firstStarted;
+  let stopped = false;
+  const stopping = files.stop().then(() => { stopped = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(stopped, false, "stop waits for the Recycle Bin call already in flight");
+  releaseRecycle();
+  await stopping;
+  assert.equal(await reconciliation, 1);
+  assert.equal(recycled.length, 1, "shutdown does not start another recycle after the first settles");
+});
+
 test("staging refuses low physical free space even when logical quota is available", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-free-space-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {}, async () => 0n);
@@ -3667,6 +3717,32 @@ test("a pending recycle remains charged across database restart", async () => {
   assert.equal(again.stageRecycleCandidates().length, 0);
   assert.equal(again.stageReservedBytes(), 0);
   again.close();
+});
+
+test("stage recycle pages advance past blocked old rows, survive restart, and wrap", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-page-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  let store = new BridgeStore(filename);
+  t.after(() => store.close());
+  for (let index = 0; index < 5; index++) {
+    const key = `stage-${index}`; const stagedPath = path.join(root, `${key}.bin`);
+    assert.equal(store.reserveStage(key, "binding", "operation", 0, stagedPath), "reserved");
+    store.markStageReady(key, stagedPath);
+  }
+  assert.deepEqual(store.nextStageRecycleCandidates(2).map(row => row.key), ["stage-0", "stage-1"]);
+  // One old path stays blocked while another becomes ineligible after selection.
+  const recycledPath = path.join(root, "stage-1.bin");
+  assert.equal(store.markStageRecyclePending("stage-1", recycledPath), true);
+  store.markStageRecycled("stage-1", recycledPath);
+  assert.deepEqual(store.nextStageRecycleCandidates(2).map(row => row.key), ["stage-2", "stage-3"]);
+  store.close();
+  store = new BridgeStore(filename);
+  assert.deepEqual(store.nextStageRecycleCandidates(2).map(row => row.key), ["stage-4"]);
+  assert.deepEqual(store.nextStageRecycleCandidates(2).map(row => row.key), ["stage-0", "stage-2"]);
+  assert.deepEqual(store.stageRecycleCandidates().map(row => row.key),
+    ["stage-0", "stage-2", "stage-3", "stage-4"]);
+  assert.throws(() => store.nextStageRecycleCandidates(0), RangeError);
+  assert.throws(() => store.nextStageRecycleCandidates(2_049), RangeError);
 });
 
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {

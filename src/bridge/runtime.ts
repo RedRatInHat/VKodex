@@ -54,6 +54,11 @@ export class BridgeRuntime {
   private queueReconciliation: Promise<void> | null = null;
   private lastQueueReconciliationAt = 0;
   private queueReconciliationCursor = 0;
+  private stageMaintenance: Promise<void> | null = null;
+  private lastStageMaintenanceAt = 0;
+  private stageMaintenanceLastAttemptAt = 0;
+  private stageMaintenanceStartedAt: number | null = null;
+  private stageMaintenanceFailed = false;
   /** Tasks released after a terminal turn stay detached until VK needs them. */
   private readonly releasedIdle = new Set<string>();
   /** A new VK request asks the next update to acquire that task again. */
@@ -157,6 +162,8 @@ export class BridgeRuntime {
     this.store.recover();
     this.manager.recoverInputs();
     this.lastHealthAt = this.now();
+    // Give native subscriptions time to reconnect before the first file pass.
+    this.lastStageMaintenanceAt = this.now();
     this.timer = setInterval(() => {
       this.lastTickAt = this.now();
       try { this.mirror.tick(); } catch { /* Health reports an overdue mirror buffer. */ }
@@ -195,6 +202,8 @@ export class BridgeRuntime {
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
       maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
+      ...(this.files ? { stageMaintenance: { startedAt: this.stageMaintenanceStartedAt, lastAttemptAt: this.stageMaintenanceLastAttemptAt,
+        failed: this.stageMaintenanceFailed } } : {}),
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
       failedBindings: bindings.filter(actionableFailure).length, bindings };
   }
@@ -599,6 +608,7 @@ export class BridgeRuntime {
     try { this.update(); }
     catch (error) { return Promise.reject(error); }
     finally { this.updateStartedAt = null; }
+    this.scheduleStageMaintenance();
     // Production ticks only schedule single-flight jobs. Explicit diagnostic
     // batches may wait for this snapshot without holding subsequent ticks.
     const jobs = [...this.maintenance.values()].filter(job => !bindingId || job.bindingId === bindingId);
@@ -607,6 +617,28 @@ export class BridgeRuntime {
       await Promise.allSettled(bindingId ? connection ? [connection] : [] : this.connecting.values());
       void this.delivery.flush().catch(() => {});
     }) : Promise.resolve();
+  }
+
+  /** A separate, infrequent pass keeps file retention independent of the
+   * one-second delivery loop. Staging new uploads stays disabled in runtime. */
+  private scheduleStageMaintenance(): void {
+    if (this.stopped || !this.files || this.stageMaintenance
+      || this.now() - this.lastStageMaintenanceAt < 5 * 60_000) return;
+    this.lastStageMaintenanceAt = this.now();
+    this.stageMaintenanceStartedAt = this.now();
+    this.stageMaintenanceLastAttemptAt = this.now();
+    const work = (async () => {
+      await this.files!.reconcileAbandonedStageReservations(8);
+      if (!this.stopped) await this.files!.reconcileStagedArtifactsBatch(this.now(), 4);
+    })();
+    this.stageMaintenance = work;
+    void work.then(
+      () => { this.stageMaintenanceFailed = false; },
+      () => { this.stageMaintenanceFailed = true; },
+    ).then(() => {
+      if (this.stageMaintenance === work) this.stageMaintenance = null;
+      this.stageMaintenanceStartedAt = null;
+    });
   }
 
   private background(key: string, phase: string, work: (setPhase: (phase: string) => void) => Promise<void>, bindingId?: string): void {
@@ -877,6 +909,7 @@ export class BridgeRuntime {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.files?.haltStagedMaintenance();
     const transfersStopped = this.manager.panels.transfers.stop();
     this.activity.stop();
     if (this.timer) clearInterval(this.timer);
@@ -888,6 +921,7 @@ export class BridgeRuntime {
     await Promise.allSettled(this.connecting.values());
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
     await Promise.allSettled([...this.maintenance.values()].map(job => job.work));
+    await this.stageMaintenance?.catch(() => {});
     await this.manager.idle();
     await transfersStopped;
     await this.files?.stop();

@@ -10,7 +10,7 @@ import type { Binding, BridgeChat } from "./contracts.js";
 import { FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
-import { readWindowsProcessIdentity } from "../desktop/windows-process-identity.js";
+import { readWindowsProcessIdentity, readWindowsProcessIdentityAsync } from "../desktop/windows-process-identity.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 30_000 };
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
@@ -372,6 +372,7 @@ export class TaskFiles {
   private reconciliation: Promise<number> | null = null;
   private stageWriterIdentity: ReturnType<typeof readWindowsProcessIdentity> = null;
   private stopped = false;
+  private maintenanceStopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
     /** Opt-in pilot: stage new output versions before upload; default delivery uses source bytes. */
@@ -381,7 +382,9 @@ export class TaskFiles {
       const free = await statfs(folder);
       return BigInt(free.bavail) * BigInt(free.bsize);
     },
-    private readonly observeStageWriter: typeof readWindowsProcessIdentity = readWindowsProcessIdentity) {}
+    private readonly observeStageWriter: typeof readWindowsProcessIdentity = readWindowsProcessIdentity,
+    private readonly observeAbandonedStageWriter: (pid: number) => Promise<ReturnType<typeof readWindowsProcessIdentity>> =
+      observeStageWriter === readWindowsProcessIdentity ? readWindowsProcessIdentityAsync : async pid => observeStageWriter(pid)) {}
   private jobs(bindingId: string): FileJob[] { return this.store.getValue<FileJob[]>(`file-jobs:${bindingId}`) ?? []; }
   private save(bindingId: string, jobs: FileJob[]): void { this.store.setValue(`file-jobs:${bindingId}`, jobs); }
   private terminalTurns(bindingId: string): ReadonlySet<string> {
@@ -499,8 +502,20 @@ export class TaskFiles {
   /** Explicit maintenance entry point. Never runs from tick and never touches
    * incomplete reservations, unknown uploads, or undelivered VK batches. */
   reconcileStagedArtifacts(now = Date.now()): Promise<number> {
+    if (this.stopped || this.maintenanceStopped) return Promise.resolve(0);
     if (this.reconciliation) return this.reconciliation;
     const work = this.reconcileStagedArtifactsNow(now).finally(() => { this.reconciliation = null; });
+    this.reconciliation = work;
+    return work;
+  }
+  /** Bounded maintenance pass. Its persisted candidate cursor advances even
+   * when an old row is ineligible, so that row cannot starve later copies. */
+  reconcileStagedArtifactsBatch(now = Date.now(), limit = 4): Promise<number> {
+    if (this.stopped || this.maintenanceStopped) return Promise.resolve(0);
+    if (this.reconciliation) return this.reconciliation;
+    if (!Number.isSafeInteger(now) || now < STAGE_RETENTION_MS) return Promise.reject(new RangeError("Invalid stage reconciliation time"));
+    const work = this.reconcileStagedArtifactsNow(now, this.store.nextStageRecycleCandidates(limit))
+      .finally(() => { this.reconciliation = null; });
     this.reconciliation = work;
     return work;
   }
@@ -509,8 +524,9 @@ export class TaskFiles {
   async reconcileAbandonedStageReservations(limit = 64): Promise<number> {
     let abandoned = 0;
     for (const candidate of this.store.abandonedStageCandidates(limit)) {
+      if (this.stopped || this.maintenanceStopped) break;
       let observed;
-      try { observed = this.observeStageWriter(candidate.writer.pid); }
+      try { observed = await this.observeAbandonedStageWriter(candidate.writer.pid); }
       catch { continue; }
       if (observed !== null && (!observed || observed.pid !== candidate.writer.pid
         || !/^[1-9]\d{0,23}$/u.test(observed.birthTicks) || observed.birthTicks === candidate.writer.birthTicks)) continue;
@@ -522,10 +538,12 @@ export class TaskFiles {
     }
     return abandoned;
   }
-  private async reconcileStagedArtifactsNow(now: number): Promise<number> {
+  private async reconcileStagedArtifactsNow(now: number,
+    candidates = this.store.stageRecycleCandidates()): Promise<number> {
     if (!Number.isSafeInteger(now) || now < STAGE_RETENTION_MS) throw new RangeError("Invalid stage reconciliation time");
     let recycled = 0;
-    for (const row of this.store.stageRecycleCandidates()) {
+    for (const row of candidates) {
+      if (this.stopped || this.maintenanceStopped) break;
       const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key];
       if (!receipt || receipt.path !== row.path || receipt.bytes !== row.bytes || receipt.key !== row.key
         || !validStageIdentity(receipt.identity)
@@ -552,7 +570,7 @@ export class TaskFiles {
       }
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
-      if (!this.store.markStageRecyclePending(row.key, row.path)) continue;
+      if (this.stopped || this.maintenanceStopped || !this.store.markStageRecyclePending(row.key, row.path)) continue;
       // Recheck after journaling: an accidental path replacement during that
       // interval must not recycle another file or release this reservation.
       // A same-user actor can still race a pathname-based Recycle Bin move.
@@ -560,7 +578,7 @@ export class TaskFiles {
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       const current = await lstat(row.path, { bigint: true }).catch(() => null);
       const legacyCurrent = current && !("version" in receipt.identity) ? await lstat(row.path).catch(() => null) : undefined;
-      if (!current || current.dev !== verified.dev || current.ino !== verified.ino
+      if (this.stopped || this.maintenanceStopped || !current || current.dev !== verified.dev || current.ino !== verified.ino
         || current.birthtimeNs !== verified.birthtimeNs || !sameStageIdentity(current, receipt.identity, legacyCurrent ?? undefined)) continue;
       // A failed or interrupted move leaves the reservation charged while
       // its pathname exists. A later ENOENT is reconciled above.
@@ -902,5 +920,14 @@ export class TaskFiles {
       }
     }
   }
-  async stop(): Promise<void> { this.stopped = true; this.completed.clear(); await this.working; await Promise.allSettled(this.collections.values()); }
+  async stop(): Promise<void> {
+    this.haltStagedMaintenance();
+    this.stopped = true;
+    this.completed.clear();
+    await this.working;
+    await Promise.allSettled(this.collections.values());
+    await this.reconciliation?.catch(() => {});
+  }
+  /** Stop scheduling another candidate while a running Recycle Bin call settles. */
+  haltStagedMaintenance(): void { this.maintenanceStopped = true; }
 }

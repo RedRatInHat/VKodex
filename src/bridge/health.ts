@@ -21,6 +21,7 @@ export interface RuntimeHealthState {
   readonly lastTickAt: number;
   readonly updateStartedAt: number | null;
   readonly maintenance?: readonly { readonly phase: string; readonly bindingId?: string; readonly startedAt: number }[];
+  readonly stageMaintenance?: { readonly startedAt: number | null; readonly lastAttemptAt: number; readonly failed: boolean };
   readonly stopped: boolean;
   readonly activeBindings: number;
   readonly connectedBindings: number;
@@ -148,6 +149,16 @@ export class BridgeHealthMonitor {
         detail: age > 15_000 && oldest
           ? `Ожидает фоновый этап ${oldest.phase}${oldest.bindingId ? ` задачи ${oldest.bindingId}` : ""}: ${Math.round(age / 1_000)} с. Проверь доступность источника этого этапа; независимые задачи продолжают обслуживаться, повторная операция не запускается.`
           : `Фоновые этапы без просроченных ожиданий; выполняется ${pending.length}.` });
+    }
+    if (runtime.stageMaintenance) {
+      const stage = runtime.stageMaintenance;
+      const age = stage.startedAt === null ? 0 : Math.max(0, checkedAt - stage.startedAt);
+      checks.push({ name: "stage_maintenance", state: age > 5 * 60_000 || stage.failed ? "degraded" : "ok",
+        detail: age > 5 * 60_000 ? `Сверка staged-файлов выполняется ${Math.round(age / 1_000)} с; новые версии не создаются автоматически.`
+          : stage.failed ? "Последняя сверка staged-файлов завершилась ошибкой; незавершённые записи сохраняют свою квоту, повтор будет позже."
+            : stage.startedAt !== null ? "Идёт ограниченная сверка staged-файлов."
+              : stage.lastAttemptAt > 0 ? `Ограниченная сверка staged-файлов запланирована; последняя попытка ${new Date(stage.lastAttemptAt).toISOString()}.`
+                : "Ограниченная сверка staged-файлов запланирована; первая попытка ещё не запускалась." });
     }
 
     const delivery = this.store.deliveryHealth(checkedAt);
