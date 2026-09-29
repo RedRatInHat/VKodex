@@ -347,8 +347,8 @@ export class TaskFiles {
   private stopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
-    /** New output versions are staged before upload; false is for legacy compatibility. */
-    private readonly stageNewUploads = true,
+    /** Opt-in pilot: stage new output versions before upload; default delivery uses source bytes. */
+    private readonly stageNewUploads = false,
     private readonly recycleStage: (target: string) => Promise<void> = recycleStageOnWindows,
     private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
       const free = await statfs(folder);

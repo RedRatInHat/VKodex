@@ -3182,20 +3182,21 @@ test("different relative paths with the same display name and bytes are distinct
   assert.equal(await files.collect(binding, true), 0);
 });
 
-test("legacy staging opt-out leaves output on the original path", async t => {
+test("default file delivery does not reserve staged storage", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-disabled-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
   const prepared = await files.prepare(binding, "stage-disabled", []);
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
   files.finish(binding.id, "stage-disabled", "accepted", "finished-turn");
   files.observe(binding.id, "idle", "finished-turn");
   assert.equal(await files.collect(binding), 1);
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-disabled`), null);
+  assert.equal(s.store.stageReservedCount(), 0);
 });
 
-test("default file delivery stages immutable bytes before VK upload and recovers after source mutation", async t => {
+test("opt-in file delivery stages immutable bytes before VK upload and recovers after source mutation", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-default-stage-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   const prepared = await files.prepare(binding, "default-stage", []);
   files.finish(binding.id, "default-stage", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
@@ -3216,7 +3217,7 @@ test("default file delivery stages immutable bytes before VK upload and recovers
   assert.equal(await readFile(staged.path, "utf8"), "first version");
 
   await writeFile(source, "second version");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   assert.equal(await restored.collect(binding, true), 2);
   assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["first version", "second version"]);
 });
@@ -3547,7 +3548,7 @@ test("a pending recycle remains charged across database restart", async () => {
 
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   const prepared = await files.prepare(binding, "stage-cap", []);
   files.finish(binding.id, "stage-cap", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "new bytes");
@@ -3670,7 +3671,7 @@ test("a staged version survives source mutation and restart before upload", asyn
   const recovered = new BridgeStore(filename);
   t.after(() => recovered.close());
   const recoveredBinding = recovered.getBinding(binding.id)!;
-  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered));
+  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered), undefined, true);
   const receiptKey = Object.keys(staged)[0]!;
   recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, {
     ...staged, [receiptKey]: { ...receipt, threadId: "another-source-task" },
@@ -3703,7 +3704,7 @@ test("a staged version remains recoverable when the native turn ID arrives after
   await assert.rejects(files.collect(binding, true), /executor lost/u);
   crash.mock.restore();
   files.associateTurn(binding.id, "staged-late-turn", "native-turn-later");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   assert.equal(await restored.collect(binding, true), 1);
   assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
 });
@@ -3761,7 +3762,7 @@ test("a corrupt durable stage fails closed even when the source is still availab
   crash.mock.restore();
   const receipt = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:corrupt-stage`)!)[0]!;
   await writeFile(receipt.path, "corrupt bytes");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   await assert.rejects(restored.collect(binding, true), /отсутствует или повреждена/u);
   assert.equal(s.chat.binaryUploads.length, 0);
 });
@@ -3782,7 +3783,7 @@ test("a staged receipt cannot change the uploaded filename or file kind", async 
   const indexKey = `file-stage-index:${binding.id}:metadata-integrity`;
   const index = s.store.getValue<Record<string, { name: string; kind: "image" | "file" }>>(indexKey)!;
   const [key, receipt] = Object.entries(index)[0]!;
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
   s.store.setValue(indexKey, { ...index, [key]: { ...receipt, name: "other.txt" } });
   await assert.rejects(restored.collect(binding, true), /Квитанция staged-файла повреждена/u);
   s.store.setValue(indexKey, { ...index, [key]: { ...receipt, kind: "image" } });
