@@ -346,8 +346,8 @@ export class TaskFiles {
   private stopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
-    /** Kept off in production until recycle identity and end-to-end acceptance are proven. */
-    private readonly stageNewUploads = false,
+    /** New output versions are staged before upload; false is for legacy compatibility. */
+    private readonly stageNewUploads = true,
     private readonly recycleStage: (target: string) => Promise<void> = recycleStageOnWindows,
     private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
       const free = await statfs(folder);
@@ -437,9 +437,10 @@ export class TaskFiles {
         throw new ActionRejectedError("Не удалось подтвердить идентичность staged-файла; загрузка остановлена.");
     }
     finally { await handle.close(); }
+    const sourceId = job.threadId === undefined ? binding.sourceId : job.sourceId;
     const receipt: StagedFile = { key, path: target, relativePath, name: file.name, kind: file.kind, fingerprint,
-      sha256: digest(file.contents), bytes: file.contents.length, identity, bindingId: binding.id, threadId: binding.threadId,
-      ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), operationId: job.operationId,
+      sha256: digest(file.contents), bytes: file.contents.length, identity, bindingId: binding.id, threadId: job.threadId ?? binding.threadId,
+      ...(sourceId ? { sourceId } : {}), operationId: job.operationId,
       generation: job.generation, stagedAt: Date.now(), ...(job.turnId ? { turnId: job.turnId } : {}) };
     this.store.atomic(() => {
       this.store.setValue(this.stageIndexKey(binding.id, job.operationId), { ...this.stageIndex(binding.id, job.operationId), [key]: receipt });

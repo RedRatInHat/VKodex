@@ -3182,15 +3182,43 @@ test("different relative paths with the same display name and bytes are distinct
   assert.equal(await files.collect(binding, true), 0);
 });
 
-test("new staging stays disabled until disk retention is qualified", async t => {
+test("legacy staging opt-out leaves output on the original path", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-disabled-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false);
   const prepared = await files.prepare(binding, "stage-disabled", []);
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
   files.finish(binding.id, "stage-disabled", "accepted", "finished-turn");
   files.observe(binding.id, "idle", "finished-turn");
   assert.equal(await files.collect(binding), 1);
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-disabled`), null);
+});
+
+test("default file delivery stages immutable bytes before VK upload and recovers after source mutation", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-default-stage-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "default-stage", []);
+  files.finish(binding.id, "default-stage", "accepted", "finished-turn");
+  const source = path.join(prepared.outboxDir, "result.txt");
+  await writeFile(source, "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  let stagedAtUploadIntent = false;
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") {
+      stagedAtUploadIntent = Object.keys(s.store.getValue<Record<string, unknown>>(`file-stage-index:${binding.id}:default-stage`) ?? {}).length === 1;
+      throw new Error("crash before VK upload");
+    }
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /crash before VK upload/u);
+  crash.mock.restore();
+  assert.equal(stagedAtUploadIntent, true);
+  const staged = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:default-stage`) ?? {})[0]!;
+  assert.equal(await readFile(staged.path, "utf8"), "first version");
+
+  await writeFile(source, "second version");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  assert.equal(await restored.collect(binding, true), 2);
+  assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["first version", "second version"]);
 });
 
 test("a queued staged file records its exact delivery key and attachment atomically", async t => {
@@ -3470,7 +3498,7 @@ test("a pending recycle remains charged across database restart", async () => {
 
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
   const prepared = await files.prepare(binding, "stage-cap", []);
   files.finish(binding.id, "stage-cap", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "new bytes");
