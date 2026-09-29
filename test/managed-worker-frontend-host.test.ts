@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import WebSocket from 'ws';
 import { AppServerConnection } from '../src/codex/app-server-connection.js';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
 import type { ManagedWorkerNotification } from '../src/codex/managed-worker-frontend-host.js';
@@ -25,7 +26,7 @@ const init: Frame = { clientInfo: { name: 'fixture', version: '1' }, capabilitie
 class Child extends EventEmitter {
   readonly stdin = new PassThrough(); readonly stdout = new PassThrough(); readonly stderr = new PassThrough();
   readonly messages: Frame[] = [];
-  exitCode: number | null = null; signalCode: NodeJS.Signals | null = null; pid = undefined;
+  exitCode: number | null = null; signalCode: NodeJS.Signals | null = null; pid: number | undefined = undefined;
   autoInitialize = true;
   constructor() {
     super(); let buffer = '';
@@ -81,6 +82,33 @@ async function client(capability: Readonly<{ host: string; port: number; token: 
   assert.equal((await connected.next()).ok, true);
   return connected;
 }
+class WebSocketClient {
+  readonly frames: Frame[] = [];
+  private readonly waiting: Array<(frame: Frame) => void> = [];
+  constructor(readonly socket: WebSocket) {
+    socket.on('message', data => {
+      const frame = JSON.parse(data.toString()) as Frame;
+      const waiter = this.waiting.shift();
+      if (waiter) waiter(frame); else this.frames.push(frame);
+    });
+    socket.on('error', () => {});
+  }
+  send(frame: Frame): void { this.socket.send(JSON.stringify(frame)); }
+  next(): Promise<Frame> {
+    const existing = this.frames.shift();
+    if (existing) return Promise.resolve(existing);
+    return Promise.race([new Promise<Frame>(resolve => this.waiting.push(resolve)),
+      new Promise<Frame>((_, reject) => setTimeout(() => reject(new Error('websocket-frame-timeout')), 1000))]);
+  }
+  close(): void { this.socket.terminate(); }
+}
+async function websocketClient(capability: Readonly<{ host: string; port: number; token: string }>): Promise<WebSocketClient> {
+  const socket = new WebSocket(`ws://${capability.host}:${capability.port}/`, {
+    headers: { Authorization: `Bearer ${capability.token}` }, perMessageDeflate: false,
+  });
+  await once(socket, 'open');
+  return new WebSocketClient(socket);
+}
 function host(child: Child, adapterKey: object, port = 0) {
   let launches = 0;
   const managed = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
@@ -92,6 +120,77 @@ function host(child: Child, adapterKey: object, port = 0) {
     launch: () => { launches++; return child.asChild(); } });
   return { managed, get launches() { return launches; } };
 }
+
+test('opt-in WebSocket host accepts native initialize/read without a JSONL auth frame', async () => {
+  const child = new Child(), key = {};
+  const fixture = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own', initializeRequest: init,
+    adapterKey: key, frontendProtocol: 'websocket', backendTimeoutMs: 500, bootstrapReadMethods: [],
+    allowRequest: () => false, allowAnswer: () => false, launch: () => child.asChild() });
+  await fixture.start();
+  try {
+    assert.throws(() => fixture.frontendCapability(key), /JSONL|protocol/i);
+    assert.throws(() => fixture.frontendWebSocketCapability({}), TypeError);
+    const cap = fixture.frontendWebSocketCapability(key);
+    assert.equal(cap.host, '127.0.0.1');
+    assert.equal(cap.protocol, 'websocket');
+    await assert.rejects(websocketClient({ ...cap, token: 'wrong' }));
+    const client = await websocketClient(cap);
+    try {
+      assert.deepEqual(client.frames, []);
+      client.send({ id: 'native-init', method: 'initialize', params: init });
+      assert.equal((await client.next()).id, 'native-init');
+      client.send({ id: 'native-read', method: 'thread/read', params: { threadId: taskId } });
+      assert.deepEqual((await client.next()).result, { thread: { id: taskId } });
+    } finally { client.close(); }
+  } finally { await fixture.stop('test-cleanup'); }
+});
+
+test('WebSocket restart retains backend PID and rejects old bearer on the new listener', async () => {
+  const child = new Child(), key = {}; child.pid = 42_424; let launches = 0;
+  const fixture = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own', initializeRequest: init,
+    adapterKey: key, frontendProtocol: 'websocket', backendTimeoutMs: 500, bootstrapReadMethods: [],
+    allowRequest: () => false, allowAnswer: () => false,
+    launch: () => { launches++; return child.asChild(); } });
+  await fixture.start();
+  try {
+    const oldCap = fixture.frontendWebSocketCapability(key);
+    const old = await websocketClient(oldCap);
+    old.send({ id: 'before', method: 'initialize', params: init });
+    assert.equal((await old.next()).id, 'before');
+    const oldPid = child.pid;
+    const closed = once(old.socket, 'close');
+    await fixture.restartFrontend();
+    await closed;
+    const newCap = fixture.frontendWebSocketCapability(key);
+    assert.notEqual(newCap.token, oldCap.token);
+    assert.equal(oldPid, 42_424);
+    assert.equal(child.pid, oldPid);
+    assert.equal(launches, 1);
+    assert.equal(child.stdin.writableEnded, false);
+    await assert.rejects(websocketClient({ ...newCap, token: oldCap.token }));
+    const fresh = await websocketClient(newCap);
+    try {
+      fresh.send({ id: 'after', method: 'initialize', params: init });
+      assert.equal((await fresh.next()).id, 'after');
+      fresh.send({ id: 'read-after', method: 'thread/read', params: { threadId: taskId } });
+      assert.deepEqual((await fresh.next()).result, { thread: { id: taskId } });
+    } finally { fresh.close(); old.close(); }
+  } finally { await fixture.stop('test-cleanup'); }
+});
+
+test('default JSONL host does not expose a WebSocket capability and rejects invalid protocol', async () => {
+  const child = new Child(), key = {}, fixture = host(child, key);
+  assert.throws(() => new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own', initializeRequest: init,
+    adapterKey: key, frontendProtocol: 'http' as 'websocket', bootstrapReadMethods: [],
+    allowRequest: () => false, allowAnswer: () => false, launch: () => child.asChild() }), TypeError);
+  await fixture.managed.start();
+  try {
+    assert.throws(() => fixture.managed.frontendWebSocketCapability(key), /WebSocket|protocol/i);
+    assert.throws(() => fixture.managed.frontendWebSocketCapability({}), TypeError);
+    const frontend = await client(fixture.managed.frontendCapability(key));
+    frontend.close();
+  } finally { await fixture.managed.stop('test-cleanup'); }
+});
 
 test('scoped notification observers survive frontend detach without owning worker lifetime', async () => {
   const child = new Child(), key = {}, fixture = host(child, key);

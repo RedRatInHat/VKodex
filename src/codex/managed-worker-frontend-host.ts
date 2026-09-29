@@ -7,6 +7,7 @@ import type { PendingRequestResponder, RequestFrame, RequestInboxOptions } from 
 import { PersistentFrontendSessions } from './persistent-frontend-session.js';
 import { PersistentFrontendLocalTransport } from './frontend-local-transport.js';
 import type { FrontendTransportMetadata } from './frontend-local-transport.js';
+import { PersistentFrontendWebSocketTransport } from './frontend-websocket-transport.js';
 import { ManagedWorkerCommandDispatcher, captureWorkerCommandPolicy } from './managed-worker-command-dispatcher.js';
 import type { WorkerCommand, WorkerCommandPolicy, WorkerCommandResponse, WorkerCommandQuiescence,
   SettingsCommand } from './managed-worker-command-dispatcher.js';
@@ -18,6 +19,8 @@ type HostState = 'new' | 'starting' | 'running' | 'restarting' |
   'frontend-unavailable' | 'failed' | 'lost' | 'stopping' | 'stopped';
 type ResumeAuthority = NonNullable<ConstructorParameters<typeof PersistentFrontendSessions>[0]['resumeAuthority']>;
 type RequestPolicy = Pick<RequestInboxOptions, 'allowRequest' | 'allowAnswer' | 'allowError'>;
+type FrontendProtocol = 'jsonl' | 'websocket';
+type FrontendTransport = PersistentFrontendLocalTransport | PersistentFrontendWebSocketTransport;
 
 export interface ManagedWorkerFrontendHostOptions extends RequestPolicy {
   /** Routing scope only; this is not proof of native writer or family ownership. */
@@ -29,6 +32,8 @@ export interface ManagedWorkerFrontendHostOptions extends RequestPolicy {
   /** In-process object identity held by the authorized frontend adapter. */
   readonly adapterKey: object;
   readonly frontendPort?: number;
+  /** Explicit opt-in; omitted means the existing JSONL transport. */
+  readonly frontendProtocol?: FrontendProtocol;
   readonly backendTimeoutMs?: number;
   readonly trustedLocalFrontend?: boolean;
   readonly resumeAuthority?: ResumeAuthority;
@@ -92,6 +97,7 @@ export class ManagedWorkerFrontendHost {
   readonly #bootstrapReadMethods: readonly string[];
   readonly #adapterKey: object;
   readonly #frontendPort: number;
+  readonly #frontendProtocol: FrontendProtocol;
   readonly #trustedLocalFrontend: boolean;
   readonly #resumeAuthority: ResumeAuthority | null;
   readonly #requestPolicy: RequestPolicy;
@@ -104,7 +110,7 @@ export class ManagedWorkerFrontendHost {
   #stopRequested = false;
   #backendGeneration: number | null = null;
   #sessions: PersistentFrontendSessions | null = null;
-  #transport: PersistentFrontendLocalTransport | null = null;
+  #transport: FrontendTransport | null = null;
   #startPromise: Promise<void> | null = null;
   #restartPromise: Promise<void> | null = null;
   #lossClosePromise: Promise<unknown> | null = null;
@@ -125,6 +131,8 @@ export class ManagedWorkerFrontendHost {
       typeof options.allowAnswer !== 'function' ||
       (options.allowError !== undefined && typeof options.allowError !== 'function') ||
       (options.resumeAuthority !== undefined && typeof options.resumeAuthority !== 'function') ||
+      (options.frontendProtocol !== undefined && options.frontendProtocol !== 'jsonl' &&
+        options.frontendProtocol !== 'websocket') ||
       (options.trustedLocalFrontend !== undefined && typeof options.trustedLocalFrontend !== 'boolean'))
       throw new TypeError('Explicit worker/frontend host policy is required');
     const port = options.frontendPort ?? 0;
@@ -138,6 +146,7 @@ export class ManagedWorkerFrontendHost {
     this.#bootstrapReadMethods = Object.freeze([...options.bootstrapReadMethods]);
     this.#adapterKey = options.adapterKey;
     this.#frontendPort = port;
+    this.#frontendProtocol = options.frontendProtocol ?? 'jsonl';
     this.#trustedLocalFrontend = options.trustedLocalFrontend ?? false;
     this.#resumeAuthority = options.resumeAuthority ?? null;
     this.#requestPolicy = Object.freeze({ allowRequest: options.allowRequest,
@@ -347,10 +356,24 @@ export class ManagedWorkerFrontendHost {
   /** The token is available only to the caller holding the constructor's key. */
   frontendCapability(adapterKey: object): Readonly<{ host: string; port: number; token: string }> {
     if (adapterKey !== this.#adapterKey) throw new TypeError('Unauthorized frontend adapter');
+    if (this.#frontendProtocol !== 'jsonl') throw new Error('JSONL frontend protocol unavailable');
     if (this.#state !== 'running' || !this.#transport?.address)
       throw new Error('Frontend listener unavailable');
     const address = this.#transport.address;
     return Object.freeze({ host: address.address, port: address.port,
+      token: this.#transport.authToken() });
+  }
+
+  /** Native CLI WebSocket bearer, never returned by the JSONL capability API. */
+  frontendWebSocketCapability(adapterKey: object): Readonly<{
+    protocol: 'websocket'; host: string; port: number; token: string;
+  }> {
+    if (adapterKey !== this.#adapterKey) throw new TypeError('Unauthorized frontend adapter');
+    if (this.#frontendProtocol !== 'websocket') throw new Error('WebSocket frontend protocol unavailable');
+    if (this.#state !== 'running' || !this.#transport?.address)
+      throw new Error('Frontend listener unavailable');
+    const address = this.#transport.address;
+    return Object.freeze({ protocol: 'websocket', host: address.address, port: address.port,
       token: this.#transport.authToken() });
   }
 
@@ -405,8 +428,9 @@ export class ManagedWorkerFrontendHost {
     const sessions = this.#sessions;
     if (!sessions || this.#stopRequested || this.#isLost())
       throw new Error('Frontend listener superseded');
-    const transport = new PersistentFrontendLocalTransport({ sessions,
-      host: '127.0.0.1', port: this.#frontendPort });
+    const transport = this.#frontendProtocol === 'websocket'
+      ? new PersistentFrontendWebSocketTransport({ sessions, host: '127.0.0.1', port: this.#frontendPort })
+      : new PersistentFrontendLocalTransport({ sessions, host: '127.0.0.1', port: this.#frontendPort });
     this.#transport = transport;
     try {
       await transport.listen();
