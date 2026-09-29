@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { Duplex, PassThrough } from "node:stream";
 import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
@@ -2748,9 +2748,8 @@ test("a definite native fork rejection clears the durable submission marker afte
   assert.deepEqual(markers, ["submitted", "rejected"]);
 });
 
-test("transfer staging materializes a paginated fork's inherited and resumed rollout prefix", async t => {
+test("transfer staging materializes a paginated fork's inherited and resumed rollout prefix", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-segments-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
   const sessions = path.join(sourceHome, "sessions");
   await mkdir(sessions, { recursive: true }); await mkdir(targetHome, { recursive: true });
@@ -2767,25 +2766,90 @@ test("transfer staging materializes a paginated fork's inherited and resumed rol
     record(5, "event_msg", { type: "item_completed", item: { type: "AgentMessage", content: [{ type: "Text", text: "Done" }] } })].join("\n") + "\n");
   await writeFile(leaf, [record(6, "session_meta", { id: "child", forked_from_id: "parent", history_mode: "paginated" }),
     record(7, "event_msg", { type: "thread_settings_applied" })].join("\n") + "\n");
-  const staged = await stageTransferRollout(leaf, sourceHome, targetHome, "segmented", "boundary");
+  const recycled: string[] = [];
+  const staged = await stageTransferRollout(leaf, sourceHome, targetHome, "segmented", "boundary",
+    async directory => { recycled.push(directory); await rename(directory, path.join(root, "recycled-stage")); });
   const rows = (await readFile(staged.path, "utf8")).trim().split("\n").map(line => JSON.parse(line) as IpcObject);
   assert.deepEqual(rows.map(row => row.ordinal), [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.equal(rows[3]!.type, "session_meta"); // Replaced stale writer row.
   assert.equal((rows[5]!.payload as IpcObject).type, "agent_message");
   assert.equal(staged.model, "model-b");
   await staged.cleanup();
+  assert.deepEqual(recycled, [path.join(targetHome, ".vkodex-transfer-staging", "segmented")]);
 });
 
-test("transfer staging rejects a missing inherited segment before submitting a fork", async t => {
+test("transfer staging rejects a missing inherited segment before submitting a fork", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-segments-gap-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
   const sessions = path.join(sourceHome, "sessions");
   await mkdir(sessions, { recursive: true }); await mkdir(targetHome, { recursive: true });
   const leaf = path.join(sessions, "rollout-child.jsonl");
   await writeFile(leaf, `${JSON.stringify({ ordinal: 5, type: "session_meta", payload: {
     id: "child", forked_from_id: "missing", history_mode: "paginated" } })}\n`);
-  await assert.rejects(stageTransferRollout(leaf, sourceHome, targetHome, "missing-parent", "boundary"), TransferConflictError);
+  const recycled: string[] = [];
+  await assert.rejects(stageTransferRollout(leaf, sourceHome, targetHome, "missing-parent", "boundary",
+    async directory => { recycled.push(directory); await rename(directory, path.join(root, "recycled-failed-stage")); }), TransferConflictError);
+  assert.deepEqual(recycled, [path.join(targetHome, ".vkodex-transfer-staging", "missing-parent")]);
+});
+
+test("transfer staging refuses an existing operation directory without replacing its file", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-existing-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const source = path.join(sourceHome, "sessions", "rollout.jsonl");
+  const directory = path.join(targetHome, ".vkodex-transfer-staging", "existing-op");
+  const destination = path.join(directory, "source.jsonl");
+  await mkdir(path.dirname(source), { recursive: true });
+  await mkdir(directory, { recursive: true });
+  await writeFile(source, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  await writeFile(destination, "prior stage must survive");
+  await assert.rejects(stageTransferRollout(source, sourceHome, targetHome, "existing-op", "boundary"));
+  assert.equal(await readFile(destination, "utf8"), "prior stage must survive");
+});
+
+test("transfer staging preserves its directory when recycling is unconfirmed", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-failed-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const source = path.join(sourceHome, "sessions", "rollout.jsonl");
+  await mkdir(path.dirname(source), { recursive: true }); await mkdir(targetHome);
+  await writeFile(source, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  const staged = await stageTransferRollout(source, sourceHome, targetHome, "recycle-failed", "boundary",
+    async () => { throw new Error("fake recycler unavailable"); });
+  await assert.rejects(staged.cleanup(), /fake recycler unavailable/u);
+  assert.equal((await readFile(staged.path, "utf8")).includes("session_meta"), true);
+});
+
+test("transfer staging does not recycle a directory with an unexpected entry", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-foreign-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const source = path.join(sourceHome, "sessions", "rollout.jsonl");
+  await mkdir(path.dirname(source), { recursive: true }); await mkdir(targetHome);
+  await writeFile(source, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  let calls = 0;
+  const staged = await stageTransferRollout(source, sourceHome, targetHome, "foreign-entry", "boundary",
+    async () => { calls++; });
+  const foreign = path.join(path.dirname(staged.path), "foreign.txt");
+  await writeFile(foreign, "keep me");
+  await assert.rejects(staged.cleanup(), TransferConflictError);
+  assert.equal(calls, 0);
+  assert.equal(await readFile(foreign, "utf8"), "keep me");
+});
+
+test("transfer staging does not recycle a replacement operation directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-swapped-"));
+  const sourceHome = path.join(root, "source"); const targetHome = path.join(root, "target");
+  const source = path.join(sourceHome, "sessions", "rollout.jsonl");
+  await mkdir(path.dirname(source), { recursive: true }); await mkdir(targetHome);
+  await writeFile(source, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  let calls = 0;
+  const staged = await stageTransferRollout(source, sourceHome, targetHome, "swapped", "boundary",
+    async () => { calls++; });
+  const directory = path.dirname(staged.path);
+  await rename(directory, path.join(root, "original-stage"));
+  await mkdir(directory);
+  await writeFile(path.join(directory, "source.jsonl"), "replacement must survive");
+  await assert.rejects(staged.cleanup(), TransferConflictError);
+  assert.equal(calls, 0);
+  assert.equal(await readFile(path.join(directory, "source.jsonl"), "utf8"), "replacement must survive");
 });
 
 test("transfer compatibility keeps Responses history and exposes paginated user and agent items to the target app", () => {

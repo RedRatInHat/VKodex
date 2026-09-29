@@ -1,11 +1,12 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstat, mkdir, readdir, realpath, rename, stat } from "node:fs/promises";
 import { once } from "node:events";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { finished } from "node:stream/promises";
+import { promisify } from "node:util";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
 import { ActionRejectedError, DesktopUnavailableError, TransferPageTooLargeError, UncertainActionError, ProjectAssignmentUnconfirmedError, TransferConflictError, sameTask,
   type DesktopMetadata, type DesktopTask, type DesktopTaskTransfer, type TransferTaskRequest, type TaskRef, type TransferCheckpoint } from "./contracts.js";
@@ -25,6 +26,59 @@ interface StagedRollout {
   readonly effort?: string;
   readonly cwd?: string;
   cleanup(): Promise<void>;
+}
+
+const execFileAsync = promisify(execFile);
+const transferStageName = ".vkodex-transfer-staging";
+type DirectoryIdentity = Pick<Stats, "dev" | "ino" | "birthtimeMs">;
+
+function sameDirectoryIdentity(actual: DirectoryIdentity, created: DirectoryIdentity): boolean {
+  return actual.dev === created.dev && actual.ino === created.ino &&
+    actual.birthtimeMs === created.birthtimeMs;
+}
+
+/** An unexpected entry, link, or changed ancestor is evidence to preserve. */
+async function assertTransferStageDirectory(directory: string): Promise<void> {
+  if (!path.isAbsolute(directory) || path.basename(path.dirname(directory)) !== transferStageName ||
+    !/^[A-Za-z0-9_-]{1,100}$/u.test(path.basename(directory))) {
+    throw new TransferConflictError("Путь staged-истории не подтверждён; очистка остановлена.");
+  }
+  const root = path.dirname(directory);
+  const [rootInfo, directoryInfo] = await Promise.all([lstat(root), lstat(directory)]);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() ||
+    !directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() ||
+    path.dirname(await realpath(directory)) !== await realpath(root)) {
+    throw new TransferConflictError("Staged-каталог изменился; очистка остановлена.");
+  }
+  const entries = await readdir(directory);
+  if (entries.length > 1 || entries.some(name => name !== "source.jsonl" &&
+    name !== `source.${process.pid}.tmp`)) {
+    throw new TransferConflictError("В staged-каталоге появились посторонние файлы; очистка остановлена.");
+  }
+  if (entries.length === 1) {
+    const file = await lstat(path.join(directory, entries[0]!));
+    if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) {
+      throw new TransferConflictError("Staged-файл изменился; очистка остановлена.");
+    }
+  }
+}
+
+/** Windows-only Recycle Bin move, with a bounded hidden helper and no path in
+ * its command line or output. A lost acknowledgement leaves the directory. */
+async function recycleTransferStageOnWindows(directory: string): Promise<void> {
+  if (process.platform !== "win32") throw new TransferConflictError("Корзина Windows недоступна; staged-история сохранена.");
+  await assertTransferStageDirectory(directory);
+  const command = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:VKODEX_TRANSFER_RECYCLE_TARGET, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)";
+  try {
+    await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+      Buffer.from(command, "utf16le").toString("base64")], {
+      env: { ...process.env, VKODEX_TRANSFER_RECYCLE_TARGET: directory },
+      windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024,
+    });
+  } catch { throw new TransferConflictError("Не удалось переместить staged-историю в Корзину; каталог сохранён."); }
+  try { await lstat(directory); }
+  catch (error) { if (error instanceof Error && "code" in error && error.code === "ENOENT") return; throw error; }
+  throw new TransferConflictError("Результат перемещения staged-истории в Корзину не подтверждён.");
 }
 
 interface TransferContext {
@@ -243,16 +297,54 @@ async function rolloutHistoryMode(rolloutPath: string): Promise<string | null> {
 }
 
 export async function stageTransferRollout(sourcePath: string, sourceHome: string, targetHome: string,
-  operationId: string, lastTurnId: string): Promise<StagedRollout> {
+  operationId: string, lastTurnId: string,
+  recycleDirectory: (directory: string) => Promise<void> = recycleTransferStageOnWindows): Promise<StagedRollout> {
   if (!path.isAbsolute(sourcePath) || !inside(sourceHome, sourcePath)) {
     throw new ActionRejectedError("Путь истории исходной задачи не принадлежит выбранному каталогу Codex.");
   }
   if (!/^[A-Za-z0-9_-]{1,100}$/u.test(operationId)) throw new ActionRejectedError("Некорректный идентификатор операции переноса.");
-  const directory = path.join(targetHome, ".vkodex-transfer-staging", operationId);
+  const stageRoot = path.join(targetHome, transferStageName);
+  const directory = path.join(stageRoot, operationId);
   const destination = path.join(directory, "source.jsonl");
   const temporary = path.join(directory, `source.${process.pid}.tmp`);
-  await mkdir(directory, { recursive: true });
-  await rm(temporary, { force: true });
+  const targetInfo = await lstat(targetHome);
+  if (!targetInfo.isDirectory() || targetInfo.isSymbolicLink()) {
+    throw new TransferConflictError("Целевой каталог переноса не подтверждён.");
+  }
+  try { await mkdir(stageRoot); }
+  catch (error) { if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error; }
+  const stageInfo = await lstat(stageRoot);
+  if (!stageInfo.isDirectory() || stageInfo.isSymbolicLink() ||
+    path.dirname(await realpath(stageRoot)) !== await realpath(targetHome)) {
+    throw new TransferConflictError("Корень staged-истории изменился; перенос остановлен.");
+  }
+  // An existing operation may contain an earlier uncertain fork. Never clear
+  // its destination or temporary file and silently retry that same operation.
+  try { await mkdir(directory); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new TransferConflictError("Staged-история этой операции уже существует; нужна сверка перед повтором.");
+    }
+    throw error;
+  }
+  const ownedDirectoryInfo = await lstat(directory);
+  const recycleOwned = async (): Promise<void> => {
+    await assertTransferStageDirectory(directory);
+    const [currentHome, currentRoot, currentDirectory] = await Promise.all([
+      lstat(targetHome), lstat(stageRoot), lstat(directory),
+    ]);
+    if (!currentHome.isDirectory() || currentHome.isSymbolicLink() ||
+      !sameDirectoryIdentity(currentHome, targetInfo) ||
+      !sameDirectoryIdentity(currentRoot, stageInfo) ||
+      !sameDirectoryIdentity(currentDirectory, ownedDirectoryInfo) ||
+      path.dirname(await realpath(stageRoot)) !== await realpath(targetHome)) {
+      throw new TransferConflictError("Staged-каталог или его родитель был заменён; очистка остановлена.");
+    }
+    await recycleDirectory(directory);
+    try { await lstat(directory); }
+    catch (error) { if (error instanceof Error && "code" in error && error.code === "ENOENT") return; throw error; }
+    throw new TransferConflictError("Корзина не подтвердила перемещение staged-истории; каталог сохранён.");
+  };
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(), 10 * 60_000);
   const writer = createWriteStream(temporary, { encoding: "utf8", flags: "wx", signal: controller.signal });
@@ -294,10 +386,13 @@ export async function stageTransferRollout(sourcePath: string, sourceHome: strin
       throw new TransferConflictError("Завершённый ход отсутствует в собранной истории. Копия не создана.");
     }
     writer.end(); await written;
-    await rm(destination, { force: true }); await rename(temporary, destination);
+    try { await lstat(destination); throw new TransferConflictError("Staged-файл назначения уже существует; перенос остановлен."); }
+    catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
+    await rename(temporary, destination);
   } catch (error) {
     writer.destroy(); await written.catch(() => {});
-    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    try { await recycleOwned(); }
+    catch { throw new TransferConflictError("Staged-история не перемещена в Корзину; каталог сохранён для проверки."); }
     if (controller.signal.aborted) throw new DesktopUnavailableError("Копирование истории не завершилось за 10 минут. Источник не изменён.");
     throw error;
   } finally { clearTimeout(deadline); }
@@ -306,7 +401,7 @@ export async function stageTransferRollout(sourcePath: string, sourceHome: strin
   return {
     path: destination,
     ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(cwd ? { cwd } : {}),
-    cleanup: async () => { await rm(directory, { recursive: true, force: true }); },
+    cleanup: recycleOwned,
   };
 }
 
@@ -428,7 +523,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
         target ??= await this.waitForReconciliation(request);
         if (!target) throw error;
       } finally {
-        await staged.cleanup().catch(() => {});
+        await staged.cleanup();
       }
     }
     request.onForkCreated?.(target);
