@@ -4246,6 +4246,35 @@ test("a lost Codex acknowledgment is confirmed from native history without resub
   assert.match(s.chat.sent.at(-1)!.view.text, /Codex принял запрос/u);
 });
 
+test("accepted turn reconciliation retains more than sixteen unresolved operations", t => {
+  const s = setup(t); const binding = s.attach();
+  for (let index = 0; index < 20; index++) {
+    const operationId = `accepted-operation-${index}`;
+    s.store.recordOperation(operationId, binding, `inbox-${index}`, binding.id);
+    s.store.finishOperation(operationId, "accepted");
+    s.store.rememberAcceptedTurn(binding.id, `turn-${index}`, operationId);
+  }
+  assert.equal(s.store.acceptedTurns(binding.id).length, 20);
+  s.store.recover();
+  assert.deepEqual(s.store.acceptedTurns(binding.id).map(turn => turn.turnId),
+    Array.from({ length: 20 }, (_, index) => `turn-${index}`));
+  s.store.settleAcceptedTurn(binding.id, "turn-0");
+  assert.equal(s.store.acceptedTurns(binding.id).length, 19);
+});
+
+test("multiple accepted steering operations in one turn remain distinct until terminal settlement", t => {
+  const s = setup(t); const binding = s.attach();
+  for (let index = 0; index < 20; index++) {
+    const operationId = `steering-operation-${index}`;
+    s.store.recordOperation(operationId, binding, `steering-inbox-${index}`, binding.id);
+    s.store.finishOperation(operationId, "accepted");
+    s.store.rememberAcceptedTurn(binding.id, "shared-turn", operationId);
+  }
+  assert.equal(s.store.acceptedTurns(binding.id).length, 20);
+  s.store.settleAcceptedTurn(binding.id, "shared-turn");
+  assert.deepEqual(s.store.acceptedTurns(binding.id), []);
+});
+
 test("managed queue acceptance is recorded as a queue submission, never as an active turn", async t => {
   const s = setup(t); const binding = s.attach();
   const prior = { messageId: 123, senderId: 42, operationId: "prior-operation",

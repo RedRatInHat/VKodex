@@ -1047,8 +1047,11 @@ export class BridgeStore {
   }
   isOwnOperation(id: string, task: TaskRef): boolean { return Boolean(this.db.prepare("SELECT 1 FROM bridge_operations WHERE id = ? AND task_key = ?").get(id, taskKey(task))); }
   rememberAcceptedTurn(bindingId: string, turnId: string, operationId: string): void {
-    const turns = this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId);
-    this.setValue(`accepted-turns:${bindingId}`, [...turns, { turnId, operationId }].slice(-16));
+    // Steering can accept several independent VK operations into one turn.
+    // Keep each operation until that turn's terminal event is observed; a
+    // fixed tail cap silently loses reconciliation evidence during backlogs.
+    const turns = this.acceptedTurns(bindingId).filter(turn => turn.operationId !== operationId);
+    this.setValue(`accepted-turns:${bindingId}`, [...turns, { turnId, operationId }]);
   }
   acceptedTurns(bindingId: string): readonly AcceptedTaskTurn[] {
     const value = this.getValue<unknown>(`accepted-turns:${bindingId}`);
