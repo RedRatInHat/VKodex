@@ -779,7 +779,7 @@ export class TaskPanels {
       this.markGoalContinuation(binding, { ...attempt, receipt }, "accepted", goal);
       return receipt.mode === "started"
         ? "Цель возобновлена. Новый ход запущен."
-        : "Цель возобновлена. Уже выполняется подтверждённый ход.";
+        : "Цель активна. В задаче уже выполняется ход; новый ход не запускался.";
     } catch (error) {
       if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
         this.markGoalContinuation(binding, attempt, "rejected", goal);

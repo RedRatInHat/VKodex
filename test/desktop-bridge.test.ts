@@ -580,6 +580,18 @@ test("goal resume durably records the confirmed continuation turn", async t => {
   assert.match(panelView(s).text, /Новый ход запущен/u);
 });
 
+test("goal resume reports an already-running turn without claiming a new start", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.continueGoal = async () => ({ mode: "alreadyRunning" as const, turnId: "active-turn" });
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  const marker = s.store.getValue<{ receipt: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`);
+  assert.deepEqual(marker?.receipt, { mode: "alreadyRunning", turnId: "active-turn" });
+  assert.match(panelView(s).text, /новый ход не запускался/u);
+});
+
 test("lost goal activation acknowledgment preserves intent and blocks another start", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
