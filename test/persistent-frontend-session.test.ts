@@ -499,6 +499,26 @@ test('bootstrap cwd reads accept the same absolute Windows directory across casi
   assert.equal(backend.requests.length, 2);
 });
 
+test('bootstrap cwd reads accept the same absolute POSIX directory without folding case', async () => {
+  const backend = fakeBackend();
+  const { frontend } = attach(createSessions(backend, {
+    bootstrapReadMethods: ['config/read', 'permissionProfile/list', 'hooks/list', 'skills/list'],
+    ownCwd: '/tmp/VKodex-source' }));
+  await initialize(frontend);
+  for (const [method, params] of ([
+    ['config/read', { cwd: '/tmp/VKodex-source/' }],
+    ['permissionProfile/list', { cwd: '/tmp/VKodex-source/.' }],
+    ['hooks/list', { cwds: ['/tmp/VKodex-source'] }],
+    ['skills/list', { cwds: ['/tmp/VKodex-source/'], forceReload: true }],
+  ] as Array<[string, JsonObject]>)) await frontend.receive({ id: method, method, params });
+  assert.deepEqual(backend.requests.map(request => request.method),
+    ['config/read', 'permissionProfile/list', 'hooks/list', 'skills/list']);
+  for (const cwd of ['/tmp/vkodex-source', 'tmp/VKodex-source',
+    '//tmp/VKodex-source', '\\tmp\\VKodex-source', '/tmp/Other'])
+    await frontend.receive({ id: `bad-${cwd}`, method: 'config/read', params: { cwd } });
+  assert.equal(backend.requests.length, 4);
+});
+
 test('native CLI catalogs stay on the pinned task and Windows workspace', async () => {
   const backend = fakeBackend();
   const { frontend } = attach(createSessions(backend, {

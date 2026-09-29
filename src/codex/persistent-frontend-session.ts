@@ -71,11 +71,19 @@ const oneOf = (value: unknown, choices: readonly string[]): boolean =>
   nullable(value, item => typeof item === 'string' && choices.includes(item));
 const stringArray = (value: unknown): boolean => nullable(value, items => Array.isArray(items) &&
   items.every(textValue));
-const cwdValue = (value: unknown, ownCwd: string | null): boolean => nullable(value, cwd =>
-  typeof ownCwd === 'string' && typeof cwd === 'string' &&
-  path.win32.isAbsolute(ownCwd) && path.win32.isAbsolute(cwd) &&
-  path.win32.parse(ownCwd).root.length > 1 && path.win32.parse(cwd).root.length > 1 &&
-  path.win32.resolve(cwd).toLowerCase() === path.win32.resolve(ownCwd).toLowerCase());
+const cwdValue = (value: unknown, ownCwd: string | null): boolean => nullable(value, cwd => {
+  if (typeof ownCwd !== 'string' || typeof cwd !== 'string') return false;
+  // The gateway can run on either host OS. Windows roots are case-insensitive;
+  // POSIX roots are not. A root-relative Windows path or a foreign path must
+  // never be treated as evidence of the worker's own workspace.
+  const windowsOwn = path.win32.isAbsolute(ownCwd) && path.win32.parse(ownCwd).root.length > 1;
+  if (windowsOwn) return path.win32.isAbsolute(cwd) && path.win32.parse(cwd).root.length > 1 &&
+    path.win32.resolve(cwd).toLowerCase() === path.win32.resolve(ownCwd).toLowerCase();
+  const posixAbsolute = (value: string): boolean => path.posix.isAbsolute(value) &&
+    !value.startsWith('//') && !/[\\\u0000-\u001f\u007f]/u.test(value);
+  return posixAbsolute(ownCwd) && posixAbsolute(cwd) &&
+    path.posix.resolve(cwd) === path.posix.resolve(ownCwd);
+});
 const ownCwds = (value: unknown, ownCwd: string | null): boolean =>
   Array.isArray(value) && value.length === 1 && typeof value[0] === 'string' &&
   cwdValue(value[0], ownCwd);
