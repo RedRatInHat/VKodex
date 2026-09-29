@@ -24,7 +24,7 @@ import { assertManagedStockSettingsPolicy, createManagedStockSettingsInitializer
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
-import { oneShotComposerCommandAuthorized } from './one-shot-composer-command.js';
+import { OneShotComposerCommandGate } from './one-shot-composer-command.js';
 import { ManagedStockVkSubmitter, managedVkStockCommandId,
   type ManagedStockVkLease } from './managed-stock-vk-submit.js';
 import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server.js';
@@ -439,6 +439,7 @@ export class ManagedWorkerDaemon {
         control: { host: controlEndpoint.host, port: controlEndpoint.port },
       });
       this.#startupPhase = 'control-listening';
+      const oneShotGate = this.#options.oneShotFirstComposer ? new OneShotComposerCommandGate() : null;
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
         if (this.#ingressRevoked || !ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
@@ -484,8 +485,7 @@ export class ManagedWorkerDaemon {
           p.permissions !== ':read-only' || !(inheritedModel || directModel) ||
           p.approvalPolicy !== 'never' && p.approvalPolicy !== 'on-request' ||
           p.sandboxPolicy !== undefined && p.sandboxPolicy !== null) return false;
-        if (this.#options.oneShotFirstComposer &&
-            !oneShotComposerCommandAuthorized(this.#intentStore, scope)) return false;
+        if (oneShotGate && !oneShotGate.authorize(this.#intentStore, scope)) return false;
         // A journal-reserved dispatch may finish after new admission closes.
         if (!this.#admissionOpen) {
           const admitted = this.#host?.commandStatusForIntent(controlKey, {
@@ -605,7 +605,11 @@ export class ManagedWorkerDaemon {
         allowFollower: this.#options.allowFollower,
         readInitialState: initialized ? initialized.readInitialState : this.#bootstrap.readInitialState,
         intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
-        ...(this.#options.oneShotFirstComposer ? { qualifyFirstTurn: this.#options.oneShotFirstComposer } : {}),
+        ...(this.#options.oneShotFirstComposer ? { qualifyFirstTurn: this.#options.oneShotFirstComposer,
+          onFirstTurnQualification: (command: WorkerCommand,
+            phase: 'before-reservation' | 'before-write', passed: boolean) =>
+            oneShotGate!.note(command, phase, passed),
+          onFirstTurnAttemptSettled: (command: WorkerCommand) => oneShotGate!.settle(command) } : {}),
         ...(queueAdapterFactory ? { queueAdapterFactory } : {}),
         ...(manifest.approvedTaskPolicy ? {} : {
           qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),

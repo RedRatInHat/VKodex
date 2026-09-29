@@ -265,7 +265,15 @@ test('opt-in first Composer fence runs before reservation and again for the exac
     ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
     encryptionKey: randomBytes(32) });
   const phases: string[] = [];
-  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+  const host = {
+    get metadata() { return f.host.metadata; },
+    commandStatusForIntent: f.host.commandStatusForIntent.bind(f.host),
+    executeCommandWithResponse: (...args: Parameters<typeof f.host.executeCommandWithResponse>) => {
+      assert.deepEqual(phases, ['before-reservation']);
+      return f.host.executeCommandWithResponse(...args);
+    },
+  };
+  const handler = new ManagedWorkerNativeStartHandler({ host, controlKey: f.controlKey,
     taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
     authorizeFollower: () => true, intentStore: store,
     qualifyFirstTurn: (_request, _authority, command, phase) => {

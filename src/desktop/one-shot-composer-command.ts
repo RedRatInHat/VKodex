@@ -29,3 +29,28 @@ export function oneShotComposerCommandAuthorized(store: IntentReader | null, sco
     return Array.isArray(turns) && turns.length === 0;
   } catch { return false; }
 }
+
+/** Ephemeral proof that the native owner completed the first qualification
+ * phase. A persisted intent by itself is not a write capability. */
+export class OneShotComposerCommandGate {
+  #qualifiedOperationId: string | null = null;
+
+  note(command: Readonly<WorkerCommand>, phase: 'before-reservation' | 'before-write', passed: boolean): void {
+    if (phase === 'before-write' || !passed) {
+      if (this.#qualifiedOperationId === command.operationId) this.#qualifiedOperationId = null;
+      return;
+    }
+    if (this.#qualifiedOperationId !== null && this.#qualifiedOperationId !== command.operationId)
+      throw new Error('One-shot Composer qualification already active');
+    this.#qualifiedOperationId = command.operationId;
+  }
+
+  settle(command: Readonly<WorkerCommand>): void {
+    if (this.#qualifiedOperationId === command.operationId) this.#qualifiedOperationId = null;
+  }
+
+  authorize(store: IntentReader | null, scope: Command): boolean {
+    return this.#qualifiedOperationId === scope.operationId &&
+      oneShotComposerCommandAuthorized(store, scope);
+  }
+}

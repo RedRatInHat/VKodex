@@ -13,7 +13,7 @@ import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-opera
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
 import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
-import { oneShotComposerCommandAuthorized } from '../src/desktop/one-shot-composer-command.js';
+import { OneShotComposerCommandGate, oneShotComposerCommandAuthorized } from '../src/desktop/one-shot-composer-command.js';
 import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { ManagedWorkerControlClient } from '../src/desktop/managed-worker-control-client.js';
@@ -61,6 +61,15 @@ test('one-shot command policy admits only the exact persisted first Composer int
     intent: { ...record.intent, admission: { ...record.intent.admission,
       composer: { snapshot: { turns: [{ id: 'older' }] } } } } }) }, scope), false);
   assert.equal(oneShotComposerCommandAuthorized({ get: () => { throw new Error('bad seal'); } }, scope), false);
+  const gate = new OneShotComposerCommandGate();
+  assert.equal(gate.authorize(store, scope), false, 'persisted intent alone cannot bypass the first qualifier');
+  gate.note(scope, 'before-reservation', true);
+  assert.equal(gate.authorize(store, scope), true);
+  gate.note(scope, 'before-write', false);
+  assert.equal(gate.authorize(store, scope), false, 'a failed final qualifier clears the temporary grant');
+  gate.note(scope, 'before-reservation', true);
+  gate.settle(scope);
+  assert.equal(gate.authorize(store, scope), false, 'settled admission cannot leave an open command gate');
 });
 
 test('opt-in native task-state listener publishes initial and changed state without another backend request', async () => {

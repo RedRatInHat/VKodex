@@ -112,6 +112,10 @@ export interface ManagedWorkerNativeOwnerOptions {
     command: NativeStartIntent['command'];
     phase: 'before-reservation' | 'before-write';
   }>) => boolean;
+  /** Private daemon gate: records only an owner-verified qualification phase. */
+  readonly onFirstTurnQualification?: (command: NativeStartIntent['command'],
+    phase: 'before-reservation' | 'before-write', passed: boolean) => void;
+  readonly onFirstTurnAttemptSettled?: (command: NativeStartIntent['command']) => void;
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
   /** Explicit previously qualified native queue adapter; never enabled by default. */
   readonly queueAdapterFactory?: (context: Readonly<ManagedNativeStockQueueContext>) => ManagedNativeStockQueueAdapter;
@@ -217,6 +221,10 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
             typeof options.host.requestQuiescence !== 'function' ||
             typeof options.host.acceptedCommandReceipts !== 'function' ||
             typeof options.host.acceptedQueueInputs !== 'function') ||
+        options.onFirstTurnQualification !== undefined &&
+          (typeof options.onFirstTurnQualification !== 'function' || !options.qualifyFirstTurn) ||
+        options.onFirstTurnAttemptSettled !== undefined &&
+          (typeof options.onFirstTurnAttemptSettled !== 'function' || !options.qualifyFirstTurn) ||
         options.qualifyContinuation !== undefined &&
           (typeof options.qualifyContinuation !== 'function' || !options.composerDefaults ||
             typeof options.host.commandQuiescence !== 'function' ||
@@ -612,8 +620,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         } : {}),
         ...(this.#options.qualifyFirstTurn ? {
           qualifyFirstTurn: (request: IpcIncomingRequest, authority: NativeStartAuthority,
-            command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write') =>
-            this.#qualifyFirstTurn(request, authority, command, phase),
+            command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write') => {
+            let passed = false;
+            try { this.#qualifyFirstTurn(request, authority, command, phase); passed = true; }
+            finally { this.#options.onFirstTurnQualification?.(command, phase, passed); }
+          },
+          ...(this.#options.onFirstTurnAttemptSettled ? {
+            onFirstTurnAttemptSettled: this.#options.onFirstTurnAttemptSettled,
+          } : {}),
         } : {}),
         authorizeFollower: request => {
           const grant = this.#grants.get(request.requestId);

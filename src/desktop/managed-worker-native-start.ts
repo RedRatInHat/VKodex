@@ -33,10 +33,12 @@ interface Options {
   /** Qualifies current policy on the same already-loaded worker. Only its
    * fenced ID-only resume/read is allowed; never create or replace a worker. */
   readonly qualifyContinuation?: (authority: NativeStartAuthority) => Promise<QualifiedContinuationEvidence>;
-  /** Synchronous first Composer turn fence. The dispatcher invokes beforeWrite
-   * before journal reservation and again at the actual RPC write boundary. */
+  /** Synchronous first Composer turn fence. For a new command the first phase
+   * runs before entering the dispatcher; the second runs at the RPC write. */
   readonly qualifyFirstTurn?: (request: Readonly<IpcIncomingRequest>, authority: NativeStartAuthority,
     command: NativeStartIntent['command'], phase: 'before-reservation' | 'before-write') => void;
+  /** Retires a temporary first-phase command grant after the original attempt. */
+  readonly onFirstTurnAttemptSettled?: (command: NativeStartIntent['command']) => void;
   /** Refresh local projection only after validating an actual accepted receipt. */
   readonly onAccepted?: () => void;
 }
@@ -66,7 +68,9 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         options.qualifyContinuation !== undefined && typeof options.qualifyContinuation !== 'function' ||
         options.qualifyFirstTurn !== undefined &&
           (typeof options.qualifyFirstTurn !== 'function' ||
-            typeof options.host.commandStatusForIntent !== 'function')) throw refused();
+            typeof options.host.commandStatusForIntent !== 'function') ||
+        options.onFirstTurnAttemptSettled !== undefined &&
+          (typeof options.onFirstTurnAttemptSettled !== 'function' || !options.qualifyFirstTurn)) throw refused();
     if (options.intentStore && (options.intentStore.owner.ownerEpoch !== options.ownerEpoch ||
         options.intentStore.owner.threadId !== options.taskId ||
         options.intentStore.owner.backendGeneration !== options.host.metadata.backendGeneration)) throw refused();
@@ -204,14 +208,29 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         this.#commands.delete(oldest);
       }
     }
-    const outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
-      () => {
-        this.#sameAuthority(request, storedAdmission);
-        if (!firstComposer || !this.#options.qualifyFirstTurn) return;
-        if (++firstTurnFenceCalls > 2) throw refused();
-        this.#options.qualifyFirstTurn(request, storedAdmission, command,
-          firstTurnFenceCalls === 1 ? 'before-reservation' : 'before-write');
-      });
+    let prequalified = false;
+    if (firstComposer && this.#options.qualifyFirstTurn &&
+        !this.#options.host.commandStatusForIntent!(this.#options.controlKey, command)) {
+      this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-reservation');
+      firstTurnFenceCalls = 1;
+      prequalified = true;
+    }
+    let outcome: Awaited<ReturnType<ManagedWorkerFrontendHost['executeCommandWithResponse']>>;
+    try {
+      outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
+        () => {
+          this.#sameAuthority(request, storedAdmission);
+          if (!firstComposer || !this.#options.qualifyFirstTurn) return;
+          // The dispatcher invokes this callback once before its journal
+          // reservation and once at the actual RPC write. Phase one already
+          // ran before entering it, so only the latter is a new qualification.
+          if (++firstTurnFenceCalls === 2) return;
+          if (firstTurnFenceCalls !== 3) throw refused();
+          this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-write');
+        });
+    } finally {
+      if (prequalified) this.#options.onFirstTurnAttemptSettled?.(command);
+    }
     // This signal only gates delivery. Never interrupt an accepted model turn.
     if (signal.aborted) throw new Error('Native response delivery disconnected; worker outcome retained');
     const current = this.#capture(request);
