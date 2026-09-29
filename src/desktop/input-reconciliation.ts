@@ -45,13 +45,16 @@ export async function scanTerminalQueuedInputTurn(
   previous: QueuedInputHistoryCursor | null = null,
 ): Promise<QueuedInputHistoryScan> {
   if (!threadId || !clientId) throw new DesktopUnavailableError("Не задана задача или операция очереди.");
-  if (previous && (typeof previous.headDigest !== "string" || !/^[0-9a-f]{64}$/u.test(previous.headDigest) ||
-    typeof previous.cursor !== "string" || !previous.cursor ||
-    !Array.isArray(previous.seenCursors) || previous.seenCursors.length !== previous.pages ||
-    previous.seenCursors.some(value => typeof value !== "string" || !value) ||
-    new Set(previous.seenCursors).size !== previous.seenCursors.length ||
-    previous.seenCursors.at(-1) !== previous.cursor ||
-    !Number.isSafeInteger(previous.pages) || previous.pages < 1 || previous.pages > 5_000))
+  // Old checkpoints have no scan version and may point into descending history.
+  // Restarting a read-only scan is safe; resuming an incompatible cursor is not.
+  const resume = previous?.scanVersion === 2 ? previous : null;
+  if (resume && (typeof resume.headDigest !== "string" || !/^[0-9a-f]{64}$/u.test(resume.headDigest) ||
+    typeof resume.cursor !== "string" || !resume.cursor ||
+    !Array.isArray(resume.seenCursors) || resume.seenCursors.length !== resume.pages ||
+    resume.seenCursors.some(value => typeof value !== "string" || !value) ||
+    new Set(resume.seenCursors).size !== resume.seenCursors.length ||
+    resume.seenCursors.at(-1) !== resume.cursor ||
+    !Number.isSafeInteger(resume.pages) || resume.pages < 1 || resume.pages > 5_000))
     throw new DesktopUnavailableError("Курсор истории очереди повреждён.");
   type Page = IpcObject & { data: unknown[]; nextCursor: string | null };
   const fingerprint = (page: Page): string => createHash("sha256")
@@ -72,11 +75,11 @@ export async function scanTerminalQueuedInputTurn(
   // appended. Keep the existing cursor field name for persisted checkpoints.
   const oldest = await read();
   const headDigest = fingerprint(oldest);
-  if (previous && headDigest !== previous.headDigest)
+  if (resume && headDigest !== resume.headDigest)
     throw new DesktopUnavailableError("История очереди изменилась во время проверки.");
-  const cursors = new Set(previous?.seenCursors ?? []);
-  let cursor: string | null = previous?.cursor ?? null;
-  let pages = previous?.pages ?? 0;
+  const cursors = new Set(resume?.seenCursors ?? []);
+  let cursor: string | null = resume?.cursor ?? null;
+  let pages = resume?.pages ?? 0;
   let calls = 1;
   const consume = (page: Page): string | null => {
     const turns = new Set<string>();
@@ -103,7 +106,7 @@ export async function scanTerminalQueuedInputTurn(
     if (cursor) cursors.add(cursor);
     return matched;
   };
-  if (!previous) {
+  if (!resume) {
     const matched = consume(oldest);
     if (matched) return { done: true, turnId: matched };
   }
@@ -114,7 +117,7 @@ export async function scanTerminalQueuedInputTurn(
     const matched = consume(page);
     if (matched) return { done: true, turnId: matched };
   }
-  if (cursor !== null) return { done: false, cursor: { headDigest, cursor,
+  if (cursor !== null) return { done: false, cursor: { scanVersion: 2, headDigest, cursor,
     seenCursors: [...cursors], pages } };
   return { done: true, turnId: null };
 }

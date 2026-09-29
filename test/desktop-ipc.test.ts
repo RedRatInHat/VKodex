@@ -713,7 +713,7 @@ test("historical queue scan persists partial progress without settling its ACK",
   s.store.finishOperation(operationId, "accepted");
   s.store.rememberQueuedInput(s.binding.id, operationId, "deep-queue-id");
   const desktop = s.desktop as import("../src/core/codex-tasks.js").CodexTasks;
-  const cursor = { headDigest: "a".repeat(64), cursor: "next-page", seenCursors: ["next-page"],
+  const cursor = { scanVersion: 2 as const, headDigest: "a".repeat(64), cursor: "next-page", seenCursors: ["next-page"],
     pages: 1 };
   let observedCursor: typeof cursor | null = null;
   desktop.scanTerminalQueuedInput = async (_task, id, previous) => {
@@ -2843,6 +2843,21 @@ test("terminal queue reconciliation survives appended turns but rejects a change
   turns[0] = { id: "turn-0", status: "completed", itemsView: "full",
     items: [{ type: "userMessage", clientId: "edited-prefix" }] };
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", list, prefix.cursor), DesktopUnavailableError);
+});
+
+test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {
+  const legacy = { headDigest: "a".repeat(64), cursor: "old-descending-page",
+    seenCursors: ["old-descending-page"], pages: 1 } as unknown as
+    import("../src/core/codex-tasks.js").QueuedInputHistoryCursor;
+  const calls: IpcObject[] = [];
+  const result = await scanTerminalQueuedInputTurn("thread", "queued-id", async params => {
+    calls.push(params);
+    assert.equal(params.cursor, undefined, "a legacy checkpoint must not skip the oldest page");
+    return { data: [{ id: "terminal", status: "completed", itemsView: "full",
+      items: [{ type: "userMessage", clientId: "queued-id" }] }], nextCursor: null };
+  }, legacy);
+  assert.deepEqual(result, { done: true, turnId: "terminal" });
+  assert.equal(calls.length, 1);
 });
 
 test("semantic transfer checkpoints ignore harmless file metadata changes but retain legacy checks", async () => {
