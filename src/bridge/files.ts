@@ -73,6 +73,7 @@ interface StagedFile {
 class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
 }
+class StageQuotaError extends ActionRejectedError {}
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const validStageIdentity = (value: unknown): value is StageIdentity =>
   typeof value === "object" && value !== null && Number.isSafeInteger((value as StageIdentity).dev)
@@ -422,10 +423,10 @@ export class TaskFiles {
     const folder = await this.stageDirectory(job, binding.id);
     const observedFree = await this.stageFreeBytes(folder);
     if (observedFree < BigInt(MIN_STAGE_FREE_BYTES + file.contents.length))
-      throw new ActionRejectedError("Недостаточно свободного места для staged-файла и резерва диска. Загрузка в VK остановлена.");
+      throw new StageQuotaError("Недостаточно свободного места для staged-файла и резерва диска. Загрузка в VK остановлена.");
     const target = path.join(folder, `${randomUUID()}.bin`);
     const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target, observedFree);
-    if (reservation === "limit") throw new ActionRejectedError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
+    if (reservation === "limit") throw new StageQuotaError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
     if (reservation === "existing") throw new ActionRejectedError("Обнаружена незавершённая staged-версия файла. Загрузка остановлена до сверки сохранённых данных; повтор не создаст другую версию автоматически.");
     const handle = await open(target, "wx", 0o600);
     let identity: StageIdentity;
@@ -669,7 +670,15 @@ export class TaskFiles {
               this.store.enqueue(`${key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${file.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
               return;
             }
-            const receipt = staged ?? (this.stageNewUploads ? await this.stageFile(file, relativePath, fingerprint, key, job, binding) : undefined);
+            let receipt = staged;
+            if (!receipt && this.stageNewUploads) {
+              try { receipt = await this.stageFile(file, relativePath, fingerprint, key, job, binding); }
+              catch (error) {
+                if (!(error instanceof StageQuotaError)) throw error;
+                quotaBlocked(key, file.name, error.message);
+                return;
+              }
+            }
             // When staging is enabled, VK receives verified staged bytes using
             // the existing bounded buffer. Old jobs continue the old path.
             const uploadBytes = staged || !receipt ? file.contents : await this.stagedContents(receipt, job, binding.id, file.contents);

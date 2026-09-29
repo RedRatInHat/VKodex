@@ -3348,6 +3348,53 @@ test("stageFile submits its free-space snapshot to transactional admission", asy
   assert.equal(s.store.stageReservedBytes(), 200 * 1024 * 1024);
 });
 
+test("a staging quota failure does not strand uploaded siblings in one batch", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "stage-quota-sibling", []);
+  files.finish(binding.id, "stage-quota-sibling", "accepted", "finished-turn");
+  for (const name of ["a-good.txt", "b-blocked.txt", "c-good.txt"]) await writeFile(path.join(prepared.outboxDir, name), name);
+  files.observe(binding.id, "idle", "finished-turn");
+  const reserveStage = s.store.reserveStage.bind(s.store);
+  let admissions = 0;
+  const admission = t.mock.method(s.store, "reserveStage", (...args: Parameters<typeof reserveStage>) => ++admissions === 2 ? "limit" : reserveStage(...args));
+
+  assert.equal(await files.collect(binding), 2);
+  assert.deepEqual(s.chat.binaryUploads.map(item => item.name), ["a-good.txt", "c-good.txt"]);
+  const batch = s.store.pendingDeliveries().find(delivery => delivery.key.startsWith(`files:${binding.id}:stage-quota-sibling:`));
+  assert.deepEqual(batch?.view.attachments, ["doc-202_1", "doc-202_2"]);
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.join(",") === "doc-202_1,doc-202_2"));
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  assert.equal(await restored.collect(binding), 0);
+  assert.equal(s.chat.binaryUploads.length, 2);
+  admission.mock.restore();
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.deepEqual(s.chat.binaryUploads.map(item => item.name), ["a-good.txt", "c-good.txt", "b-blocked.txt"]);
+});
+
+test("a staging quota failure after a full batch preserves that batch and a newer job", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-boundary-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const first = await files.prepare(binding, "stage-quota-boundary", []);
+  files.finish(binding.id, "stage-quota-boundary", "accepted");
+  for (let index = 0; index < 11; index++) await writeFile(path.join(first.outboxDir, `${String(index).padStart(2, "0")}.txt`), "fixture");
+  const newer = await files.prepare(binding, "newer-job", []);
+  files.finish(binding.id, "newer-job", "accepted");
+  await writeFile(path.join(newer.outboxDir, "result.txt"), "new result");
+  files.observe(binding.id, "idle");
+  const reserveStage = s.store.reserveStage.bind(s.store);
+  let admissions = 0;
+  t.mock.method(s.store, "reserveStage", (...args: Parameters<typeof reserveStage>) => ++admissions === 11 ? "limit" : reserveStage(...args));
+
+  await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 11);
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.length === 10));
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.length === 1 && item.view.text === "result.txt"));
+  await files.tick(); await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 11);
+});
+
 test("stage retention fails closed for unknown upload, incomplete reserve, and corrupt bytes", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-retention-guard-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
@@ -3543,8 +3590,12 @@ test("stage admission counts prior versions and the global budget", async t => {
     assert.equal(s.store.reserveStage(`almost-full-${index}`, binding.id, "versions", bytes * 1024 * 1024 - (index === 2 ? 6 : 0), `private-other-${index}`), "reserved");
   await writeFile(source, "four");
   const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
-  await assert.rejects(restored.collect(binding, true), /лимит.*staged/u);
+  assert.equal(await restored.collect(binding, true), 1);
   assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["one"]);
+  const blockedKey = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:versions`)!["result.txt"]!.key;
+  assert.equal(s.store.getValue(`${blockedKey}:quota-blocked`), true);
+  assert.equal(s.store.getValue(`${blockedKey}:uploaded`), null);
+  assert.equal(s.store.getValue(`${blockedKey}:queued`), null);
   assert.equal(s.store.stageReservedBytes(binding.id, "versions"), 512 * 1024 * 1024 - 3);
   let remaining = 2 * 1024 * 1024 * 1024 - (512 * 1024 * 1024 - 3);
   for (let index = 0; remaining; index++) {
