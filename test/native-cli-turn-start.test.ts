@@ -277,8 +277,10 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   let failObserver: ((reason: WorkerObserverFailure) => void) | null = null;
   let ownerCurrent = true, noPendingAutoStart = false, unresolved = 0;
   let inFlight = 0, unconfirmed = false;
-  let acceptedQueue = false, acceptedReceipt = false, notificationsDuringRead = 0;
+  let acceptedQueue = false, acceptedReceipt = false, terminalReceipt = false,
+    notificationsDuringRead = 0;
   const thread = { ...resumeResult().thread, updatedAt: 5 };
+  const priorTurn = { id: 'completed-prior', status: 'completed', items: [] };
   const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
     observeNotifications(key: object, listener: (event: ManagedWorkerNotification) => void,
       onFailure: (reason: WorkerObserverFailure) => void) {
@@ -296,9 +298,11 @@ test('CLI source qualifier fences live worker changes around complete idle reads
           notify?.({ taskId, generation: 7,
             notification: { method: 'thread/settings/updated', params: { threadId: taskId } } });
         }
-        return { thread };
+        return { thread: terminalReceipt ? { ...thread, updatedAt: 6,
+          turns: [priorTurn] } : thread };
       }
-      if (method === 'thread/turns/list') return { data: [], nextCursor: null };
+      if (method === 'thread/turns/list') return { data: terminalReceipt ?
+        [{ ...priorTurn, itemsView: 'full' }] : [], nextCursor: null };
       if (method === 'thread/goal/get') return { goal: null };
       if (method === 'thread/queue/list') return { data: [], nextCursor: null };
       throw new Error('unexpected read');
@@ -306,7 +310,8 @@ test('CLI source qualifier fences live worker changes around complete idle reads
     commandQuiescence: () => ({ inFlight, unconfirmed }),
     requestQuiescence: () => ({ generation: 7, unresolved }),
     acceptedCommandReceipts: () => acceptedReceipt ?
-      [{ method: 'turn/start' as const, receiptId: 'not-terminal' }] : [],
+      [{ method: 'turn/start' as const, receiptId: terminalReceipt ?
+        priorTurn.id : 'not-terminal' }] : [],
     acceptedQueueInputs: () => acceptedQueue ?
       [{ clientUserMessageId: clientId, submissionId: 'queued' }] : [],
   };
@@ -335,7 +340,11 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   acceptedQueue = false; acceptedReceipt = true;
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
     /history|incomplete/i);
+  terminalReceipt = true;
+  const repeat = await qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId));
+  repeat.assertCurrent();
   acceptedReceipt = false;
+  terminalReceipt = false;
   unresolved = 1;
   assert.throws(proof.assertCurrent, /pending|request/i);
   unresolved = 0; noPendingAutoStart = false;
