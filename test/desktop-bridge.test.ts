@@ -3726,6 +3726,33 @@ test("an ambiguous VK upload is not retried by automatic scan or /files after re
   assert.equal(upload.mock.callCount(), 1);
 });
 
+test("an unknown staged upload does not strand earlier or later independent files", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-unknown-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "unknown-sibling", []);
+  files.finish(binding.id, "unknown-sibling", "accepted", "completed-turn");
+  for (const name of ["a-good.txt", "b-unknown.txt", "c-good.txt"]) await writeFile(path.join(prepared.outboxDir, name), name);
+  files.observe(binding.id, "idle", "completed-turn");
+  const upload = t.mock.method(s.chat, "uploadFile", async (_peer: number, name: string) => {
+    if (name === "b-unknown.txt") throw new Error("response lost");
+    return name === "a-good.txt" ? "doc-202_11" : "doc-202_12";
+  });
+
+  assert.equal(await files.collect(binding), 2);
+  assert.deepEqual(upload.mock.calls.map(call => call.arguments[1]), ["a-good.txt", "b-unknown.txt", "c-good.txt"]);
+  const batch = s.store.pendingDeliveries().find(delivery => delivery.key.startsWith(`files:${binding.id}:unknown-sibling:`));
+  assert.deepEqual(batch?.view.attachments, ["doc-202_11", "doc-202_12"]);
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.join(",") === "doc-202_11,doc-202_12"));
+
+  const staged = s.store.getValue<Record<string, { name: string; key: string }>>(`file-stage-index:${binding.id}:unknown-sibling`)!;
+  const unknown = Object.values(staged).find(receipt => receipt.name === "b-unknown.txt")!;
+  assert.equal(s.store.getValue(`${unknown.key}:upload-state`), "unknown");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  await assert.rejects(restored.collect(binding, true), /неизвестным результатом загрузки/u);
+  assert.equal(upload.mock.callCount(), 3);
+});
+
 test("late reconciliation skips unchanged queued bytes but reads a new file and changed version", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-late-scan-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);

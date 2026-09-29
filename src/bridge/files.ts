@@ -591,6 +591,7 @@ export class TaskFiles {
     const uploadFile = this.chat.uploadFile.bind(this.chat);
     let count = 0; let unknownFiles = 0; let retryableFailure: OutputFilesError | null = null;
     let quotaFailure: ActionRejectedError | null = null;
+    let unknownFailure: ActionRejectedError | null = null;
     const completedTurns = this.terminalTurns(binding.id);
     const eligible = this.jobs(binding.id).filter(job => {
       if (job.generation !== generation || job.state !== "accepted" || job.queued) return false;
@@ -699,7 +700,10 @@ export class TaskFiles {
                 }
                 if (!(error instanceof FileUploadRejectedError)) {
                   this.store.setValue(`${key}:upload-state`, "unknown");
-                  throw new ActionRejectedError(`Результат загрузки файла «${file.name}» в VK неизвестен. Повтор остановлен, чтобы не создать дубль. Проверь документ в VK перед новой попыткой.`);
+                  unknownFiles++;
+                  unknownFailure ??= new ActionRejectedError(`Результат загрузки файла «${file.name}» в VK неизвестен. Повтор остановлен, чтобы не создать дубль. Проверь документ в VK перед новой попыткой.`);
+                  this.store.enqueue(`${key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${file.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
+                  return;
                 }
                 this.store.setValue(`${key}:upload-state`, null);
                 await this.check(binding, generation);
@@ -782,7 +786,7 @@ export class TaskFiles {
           scanDelayMs: Math.min((item.scanDelayMs ?? INITIAL_LATE_SCAN_MS) * 2, MAX_LATE_SCAN_MS) } : item));
     }
     if (retryableFailure && !manual) throw retryableFailure;
-    if (!count && unknownFiles) throw new ActionRejectedError("Есть файл с неизвестным результатом загрузки в VK. Повтор остановлен, чтобы не создать дубль; проверь документы VK перед новой попыткой.");
+    if (!count && unknownFiles) throw unknownFailure ?? new ActionRejectedError("Есть файл с неизвестным результатом загрузки в VK. Повтор остановлен, чтобы не создать дубль; проверь документы VK перед новой попыткой.");
     if (!count && quotaFailure) throw quotaFailure;
     return count;
   }
