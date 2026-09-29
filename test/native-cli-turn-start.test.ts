@@ -151,6 +151,37 @@ test('CLI admission refuses an occupied queue and unsettled command ledger', asy
   assert.equal(writes, 0);
 });
 
+test('single-start CLI canary refuses a second distinct accepted turn', async () => {
+  const controlKey = {}; let writes = 0;
+  const accepted: Array<{ method: 'turn/start'; receiptId: string }> = [];
+  const host = { metadata: { taskId, state: 'running', backendGeneration: 7 },
+    commandQuiescence: () => ({ inFlight: 0, unconfirmed: false }),
+    acceptedCommandReceipts: (key: object) => { assert.equal(key, controlKey); return accepted; },
+    async executeCommandWithResponse(_key: object, command: ReturnType<typeof prepareNativeCliTurnStart>,
+      beforeWrite?: () => void) {
+      beforeWrite?.(); writes++;
+      accepted.push({ method: 'turn/start', receiptId: `native-${writes}` });
+      return { operation: { ownerEpoch, backendGeneration: 7, threadId: taskId,
+        operationId: command.operationId, clientUserMessageId: command.params.clientUserMessageId as string,
+        method: 'turn/start' as const, fingerprint: 'a'.repeat(64), revision: writes,
+        state: 'accepted' as const, receiptId: `native-${writes}`, rejectionCode: null },
+      response: { turn: { id: `native-${writes}` } } };
+    } };
+  const admission = new ManagedNativeCliStartAdmission({ taskId, ownerEpoch, controlKey,
+    singleAcceptedStart: true,
+    qualify: async () => ({ taskId, ownerEpoch, backendGeneration: 7,
+      semanticRevision: 4, effectiveSettings: settings, idle: true,
+      nativeQueueEmpty: true, noPendingAutoStart: true, assertCurrent: () => {},
+    }) });
+  admission.bindHost(host, taskId, { ownerEpoch, controlKey });
+  admission.recordResume(host, 7, resumeResult());
+  await admission.run({ taskId, generation: 7, params: start() });
+  await assert.rejects(admission.run({ taskId, generation: 7, params: start({
+    clientUserMessageId: '76c8caee-85da-4125-8bb6-7b602239783b',
+  }) }), NativeCliStartNotSubmittedError);
+  assert.equal(writes, 1);
+});
+
 test('CLI admission invalidates an in-flight proof when native resume changes', async () => {
   const controlKey = {}; let release!: () => void; let writes = 0;
   const gate = new Promise<void>(resolve => { release = resolve; });

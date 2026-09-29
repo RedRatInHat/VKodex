@@ -140,7 +140,8 @@ test('native CLI WebSocket is opt-in and requires an isolated read-only policy',
 
 test('native CLI WebSocket admits one qualified plain-text turn through the same durable worker', async () => {
   const capability = {}; let externalIdle = false;
-  const cli = { capability, noPendingExternalAutoStart: () => externalIdle };
+  const cli = { capability, noPendingExternalAutoStart: () => externalIdle,
+    singleAcceptedStart: true as const };
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
     'normal', false, null, undefined, undefined, false, undefined, undefined, cli);
   let client: Awaited<ReturnType<typeof nativeCliClient>> | null = null;

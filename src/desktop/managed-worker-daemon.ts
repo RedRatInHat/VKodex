@@ -87,6 +87,8 @@ export interface ManagedWorkerDaemonOptions {
   readonly nativeCliWebSocket?: Readonly<{
     capability: object;
     noPendingExternalAutoStart: () => boolean;
+    /** Optional isolated acceptance budget; never inferred for production. */
+    singleAcceptedStart?: true;
   }>;
   /** Explicit isolated first-turn route. The callback must validate its own
    * one-shot challenge; the private intent store caps distinct starts at one. */
@@ -178,9 +180,11 @@ export class ManagedWorkerDaemon {
     const cli = options.nativeCliWebSocket;
     if (cli !== undefined && (!object(cli) ||
       !isDeepStrictEqual(Object.keys(cli).sort(),
-        ['capability', 'noPendingExternalAutoStart'].sort()) || !cli.capability ||
+        ['capability', 'noPendingExternalAutoStart',
+          ...(cli.singleAcceptedStart === undefined ? [] : ['singleAcceptedStart'])].sort()) || !cli.capability ||
       typeof cli.capability !== 'object' ||
       typeof cli.noPendingExternalAutoStart !== 'function' ||
+      cli.singleAcceptedStart !== undefined && cli.singleAcceptedStart !== true ||
       stock !== undefined || options.oneShotFirstComposer !== undefined))
       throw new TypeError('Native CLI WebSocket requires an isolated scheduler proof');
     if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
@@ -487,6 +491,7 @@ export class ManagedWorkerDaemon {
       const oneShotGate = this.#options.oneShotFirstComposer ? new OneShotComposerCommandGate() : null;
       const cliAdmission = this.#options.nativeCliWebSocket ? new ManagedNativeCliStartAdmission({
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, controlKey,
+        ...(this.#options.nativeCliWebSocket.singleAcceptedStart ? { singleAcceptedStart: true as const } : {}),
         qualify: resume => {
           if (!this.#cliQualifier) throw new Error('Native CLI source unavailable');
           return this.#cliQualifier.qualify(resume);

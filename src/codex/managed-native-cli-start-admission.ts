@@ -18,6 +18,8 @@ interface Host {
   executeCommandWithResponse(controlKey: object, command: WorkerCommand,
     beforeWrite?: () => void): Promise<WorkerCommandResponse>;
   commandQuiescence(controlKey: object): Readonly<{ inFlight: number; unconfirmed: boolean }>;
+  acceptedCommandReceipts?(controlKey: object): ReadonlyArray<Readonly<{
+    method: WorkerCommand['method']; receiptId: string }>>;
 }
 export interface NativeCliStartProof {
   readonly taskId: string;
@@ -38,6 +40,9 @@ export interface ManagedNativeCliStartAdmissionOptions {
   readonly controlKey: object;
   /** Must independently prove source, native queue, active turn and goal state. */
   readonly qualify: (resume: NativeCliResumePolicy) => Promise<NativeCliStartProof>;
+  /** Canary-only budget: once one native turn/start is durably accepted, refuse
+   * further starts. This is not an automatic retry or a production scheduler. */
+  readonly singleAcceptedStart?: true;
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 function assertSync(proof: NativeCliStartProof): void {
@@ -64,7 +69,9 @@ export class ManagedNativeCliStartAdmission {
     if (!options || typeof options.taskId !== 'string' || !options.taskId ||
         !uuid.test(options.ownerEpoch) || !options.controlKey ||
         typeof options.controlKey !== 'object' ||
-        typeof options.qualify !== 'function') throw new TypeError('Native CLI start admission unavailable');
+        typeof options.qualify !== 'function' ||
+        options.singleAcceptedStart !== undefined && options.singleAcceptedStart !== true)
+      throw new TypeError('Native CLI start admission unavailable');
     this.ownerEpoch = options.ownerEpoch;
     this.#options = Object.freeze({ ...options });
   }
@@ -111,6 +118,13 @@ export class ManagedNativeCliStartAdmission {
         throw new Error('Native CLI start scope unavailable');
       const host = this.#boundHost;
       if (!host) throw new Error('Native CLI admission not attached to a worker');
+      const assertStartBudget = () => {
+        if (!this.#options.singleAcceptedStart) return;
+        const accepted = host.acceptedCommandReceipts?.(this.#options.controlKey);
+        if (!accepted || accepted.some(item => item.method === 'turn/start'))
+          throw new Error('Native CLI one-start budget exhausted');
+      };
+      assertStartBudget();
       const exactHost = () => {
         const meta = host.metadata;
         if (!meta || meta.state !== 'running' || meta.taskId !== taskId ||
@@ -148,11 +162,11 @@ export class ManagedNativeCliStartAdmission {
         'serviceTier', 'effort'] as const)
         if (!isDeepStrictEqual(effective[key], resume.policy[key]))
           throw new Error('Native CLI resume and current settings disagree');
-      exactHost(); exactResume(); assertSync(proof);
+      exactHost(); exactResume(); assertSync(proof); assertStartBudget();
       // No await between this final semantic fence and the command dispatcher's
       // own synchronous before-write callback and generation/owner checks.
       dispatch = () => host.executeCommandWithResponse(this.#options.controlKey, command, () => {
-        exactHost(); exactResume(); assertSync(proof);
+        exactHost(); exactResume(); assertSync(proof); assertStartBudget();
       });
     } catch {
       throw new NativeCliStartNotSubmittedError();
