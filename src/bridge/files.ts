@@ -47,7 +47,10 @@ interface FileJob {
   /** The Codex turn that must finish before its outbox is collected. */
   turnId?: string;
 }
-interface StageIdentity { readonly dev: number; readonly ino: number; readonly birthtimeMs: number }
+interface LegacyStageIdentity { readonly dev: number; readonly ino: number; readonly birthtimeMs: number }
+interface ExactStageIdentity { readonly version: 2; readonly dev: string; readonly ino: string; readonly birthtimeNs: string }
+type StageIdentity = LegacyStageIdentity | ExactStageIdentity;
+type StageBigIntStat = { readonly dev: bigint; readonly ino: bigint; readonly birthtimeNs: bigint };
 interface StagedFile {
   readonly key: string;
   /** Exact VK message batch containing this version, persisted with :queued. */
@@ -76,12 +79,34 @@ class OutputFilesError extends ActionRejectedError {
 }
 class StageQuotaError extends ActionRejectedError {}
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
-const validStageIdentity = (value: unknown): value is StageIdentity =>
-  typeof value === "object" && value !== null && Number.isSafeInteger((value as StageIdentity).dev)
-    && Number.isSafeInteger((value as StageIdentity).ino) && (value as StageIdentity).ino > 0
-    && Number.isFinite((value as StageIdentity).birthtimeMs) && (value as StageIdentity).birthtimeMs > 0;
-const sameStageIdentity = (stat: { dev: number; ino: number; birthtimeMs: number }, identity: StageIdentity): boolean =>
-  stat.dev === identity.dev && stat.ino === identity.ino && stat.birthtimeMs === identity.birthtimeMs;
+const positiveDecimal = (value: unknown): value is string => typeof value === "string" && /^[1-9]\d*$/u.test(value);
+const validStageIdentity = (value: unknown): value is StageIdentity => {
+  if (typeof value !== "object" || value === null) return false;
+  if ("version" in value) {
+    const identity = value as ExactStageIdentity;
+    return identity.version === 2 && positiveDecimal(identity.dev) && positiveDecimal(identity.ino)
+      && positiveDecimal(identity.birthtimeNs);
+  }
+  const identity = value as LegacyStageIdentity;
+  return Number.isSafeInteger(identity.dev) && identity.dev > 0
+    && Number.isSafeInteger(identity.ino) && identity.ino > 0
+    && Number.isFinite(identity.birthtimeMs) && identity.birthtimeMs > 0;
+};
+export const captureStageIdentity = (stat: StageBigIntStat): ExactStageIdentity => ({
+  version: 2, dev: stat.dev.toString(), ino: stat.ino.toString(), birthtimeNs: stat.birthtimeNs.toString(),
+});
+export const sameStageIdentity = (
+  stat: StageBigIntStat, identity: StageIdentity,
+  legacyStat?: { readonly dev: number; readonly ino: number; readonly birthtimeMs: number },
+): boolean => {
+  if (!validStageIdentity(identity) || stat.dev <= 0n || stat.ino <= 0n || stat.birthtimeNs <= 0n) return false;
+  if ("version" in identity) return stat.dev.toString() === identity.dev && stat.ino.toString() === identity.ino
+    && stat.birthtimeNs.toString() === identity.birthtimeNs;
+  return !!legacyStat && Number.isSafeInteger(legacyStat.dev) && Number.isSafeInteger(legacyStat.ino)
+    && BigInt(legacyStat.dev) === stat.dev && BigInt(legacyStat.ino) === stat.ino
+    && legacyStat.dev === identity.dev && legacyStat.ino === identity.ino
+    && legacyStat.birthtimeMs === identity.birthtimeMs;
+};
 const fileFingerprint = (stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }): string =>
   `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 const imageName = (name: string): boolean => /\.(?:png|jpe?g|webp|gif)$/iu.test(name);
@@ -396,12 +421,16 @@ export class TaskFiles {
       || (receipt.identity !== undefined && !validStageIdentity(receipt.identity))) throw new ActionRejectedError("Квитанция staged-файла повреждена; загрузка остановлена.");
     let handle: Awaited<ReturnType<typeof open>> | null = null;
     try {
-      const before = await lstat(receipt.path);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size !== receipt.bytes) throw new Error("invalid stage file");
+      const before = await lstat(receipt.path, { bigint: true });
+      const legacyBefore = receipt.identity && !("version" in receipt.identity) ? await lstat(receipt.path) : undefined;
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size !== BigInt(receipt.bytes)) throw new Error("invalid stage file");
       handle = await open(receipt.path, "r");
-      const opened = await handle.stat();
-      if (opened.ino !== before.ino || opened.dev !== before.dev || opened.nlink !== 1) throw new Error("changed stage file");
-      if (receipt.identity && (!sameStageIdentity(before, receipt.identity) || !sameStageIdentity(opened, receipt.identity)))
+      const opened = await handle.stat({ bigint: true });
+      const legacyOpened = receipt.identity && !("version" in receipt.identity) ? await handle.stat() : undefined;
+      if (opened.ino !== before.ino || opened.dev !== before.dev || opened.birthtimeNs !== before.birthtimeNs
+        || opened.nlink !== 1n || opened.size !== BigInt(receipt.bytes)) throw new Error("changed stage file");
+      if (receipt.identity && (!sameStageIdentity(before, receipt.identity, legacyBefore)
+        || !sameStageIdentity(opened, receipt.identity, legacyOpened)))
         throw new Error("replaced stage file");
       const contents = reuse ?? Buffer.allocUnsafe(receipt.bytes);
       if (contents.length !== receipt.bytes) throw new Error("incorrect stage buffer");
@@ -412,9 +441,12 @@ export class TaskFiles {
         size += read.bytesRead;
       }
       const extra = await handle.read(Buffer.alloc(1), 0, 1, null);
-      const after = await handle.stat();
-      if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || digest(contents) !== receipt.sha256
-        || (receipt.identity && !sameStageIdentity(after, receipt.identity))) throw new Error("corrupt stage file");
+      const after = await handle.stat({ bigint: true });
+      const legacyAfter = receipt.identity && !("version" in receipt.identity) ? await handle.stat() : undefined;
+      if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || after.nlink !== 1n
+        || after.dev !== before.dev || after.ino !== before.ino || after.birthtimeNs !== before.birthtimeNs
+        || digest(contents) !== receipt.sha256 || (receipt.identity && !sameStageIdentity(after, receipt.identity, legacyAfter)))
+        throw new Error("corrupt stage file");
       return contents;
     } catch {
       throw new ActionRejectedError(`Staged-версия файла «${receipt.name}» отсутствует или повреждена; загрузка остановлена. Исходный файл не будет использован вместо неё.`);
@@ -447,9 +479,9 @@ export class TaskFiles {
     let identity: StageIdentity;
     try {
       await handle.writeFile(file.contents); await handle.sync();
-      const staged = await handle.stat();
-      identity = { dev: staged.dev, ino: staged.ino, birthtimeMs: staged.birthtimeMs };
-      if (!validStageIdentity(identity) || !staged.isFile() || staged.nlink !== 1 || staged.size !== file.contents.length)
+      const staged = await handle.stat({ bigint: true });
+      identity = captureStageIdentity(staged);
+      if (!validStageIdentity(identity) || !staged.isFile() || staged.nlink !== 1n || staged.size !== BigInt(file.contents.length))
         throw new ActionRejectedError("Не удалось подтвердить идентичность staged-файла; загрузка остановлена.");
     }
     finally { await handle.close(); }
@@ -506,7 +538,7 @@ export class TaskFiles {
         || !this.store.hasConfirmedFileDelivery(receipt.deliveryKey, row.bindingId, receipt.peerId!, receipt.attachment)) continue;
       const job = this.jobs(row.bindingId).find(item => item.operationId === row.operationId);
       if (!job) continue;
-      const verified = await lstat(row.path).catch(() => null);
+      const verified = await lstat(row.path, { bigint: true }).catch(() => null);
       if (!verified) continue;
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
@@ -516,9 +548,10 @@ export class TaskFiles {
       // A same-user actor can still race a pathname-based Recycle Bin move.
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
-      const current = await lstat(row.path).catch(() => null);
+      const current = await lstat(row.path, { bigint: true }).catch(() => null);
+      const legacyCurrent = current && !("version" in receipt.identity) ? await lstat(row.path).catch(() => null) : undefined;
       if (!current || current.dev !== verified.dev || current.ino !== verified.ino
-        || !sameStageIdentity(current, receipt.identity)) continue;
+        || current.birthtimeNs !== verified.birthtimeNs || !sameStageIdentity(current, receipt.identity, legacyCurrent ?? undefined)) continue;
       // A failed or interrupted move leaves the reservation charged. Missing
       // files on a later run are not interpreted as successful recycling.
       await this.recycleStage(row.path);

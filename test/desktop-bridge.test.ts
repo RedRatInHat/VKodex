@@ -11,9 +11,9 @@ import { ArchiveOwnerRequiredError, DesktopUnavailableError, TransferConflictErr
 import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
-import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
+import { TaskFiles, captureStageIdentity, sameStageIdentity, downloadVkFileToPath } from "../src/bridge/files.js";
 import type { ProcessIdentity } from "../src/codex/managed-worker-registry.js";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -3481,6 +3481,43 @@ test("pending recycle does not accept a same-byte path replacement on a later re
   assert.equal(await recovered.reconcileStagedArtifacts(), 0);
   assert.deepEqual(recycled, []);
   assert.equal(s.store.stageReservedBytes(binding.id, "pending-replaced"), 5);
+});
+
+test("v2 staged identity preserves dev and ino above Number.MAX_SAFE_INTEGER", () => {
+  const stat = { dev: 9_007_199_254_740_993n, ino: 9_007_199_254_740_995n, birthtimeNs: 1_700_000_000_000_000_001n };
+  const identity = captureStageIdentity(stat);
+  assert.deepEqual(identity, { version: 2, dev: "9007199254740993", ino: "9007199254740995", birthtimeNs: "1700000000000000001" });
+  assert.equal(sameStageIdentity(stat, identity), true);
+  assert.equal(sameStageIdentity({ ...stat, ino: stat.ino + 1n }, identity), false);
+  assert.equal(sameStageIdentity({ ...stat, birthtimeNs: stat.birthtimeNs + 1n }, identity), false);
+});
+
+test("legacy staged identity requires safe exact numeric dev and ino", () => {
+  const stat = { dev: 12n, ino: 34n, birthtimeNs: 1_700_000_000_123_000_000n };
+  const legacy = { dev: 12, ino: 34, birthtimeMs: 1_700_000_000_123 };
+  assert.equal(sameStageIdentity(stat, legacy, { ...legacy }), true);
+  assert.equal(sameStageIdentity(stat, { ...legacy, ino: Number.MAX_SAFE_INTEGER + 1 }, { ...legacy }), false);
+  assert.equal(sameStageIdentity({ ...stat, ino: 35n }, legacy, { ...legacy }), false);
+});
+
+test("a safe numeric v1 receipt remains readable and recyclable", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-v1-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const prepared = await files.prepare(binding, "v1-receipt", []);
+  files.finish(binding.id, "v1-receipt", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  await files.collect(binding, true); await s.worker.flush();
+  const indexKey = `file-stage-index:${binding.id}:v1-receipt`;
+  const index = s.store.getValue<Record<string, { path: string; identity: unknown }>>(indexKey)!;
+  const key = Object.keys(index)[0]!;
+  const stat = await lstat(index[key]!.path);
+  if (!Number.isSafeInteger(stat.dev) || !Number.isSafeInteger(stat.ino)) { t.skip("filesystem does not expose a safe v1 numeric identity"); return; }
+  s.store.setValue(indexKey, { ...index, [key]: { ...index[key], identity: { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs } } });
+  now += 8 * 24 * 60 * 60_000;
+  assert.equal(await files.reconcileStagedArtifacts(), 1);
+  assert.deepEqual(recycled, [index[key]!.path]);
 });
 
 test("legacy staged receipts without file identity remain charged during retention", async t => {
