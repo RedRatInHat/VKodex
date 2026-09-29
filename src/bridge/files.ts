@@ -367,6 +367,9 @@ export class TaskFiles {
     if (existing) return existing;
     const folder = await this.stageDirectory(job, binding.id);
     const target = path.join(folder, `${randomUUID()}.bin`);
+    const reservation = this.store.reserveStage(key, binding.id, job.operationId, file.contents.length, target);
+    if (reservation === "limit") throw new ActionRejectedError("Превышен лимит staged-файлов для запроса или всего хранилища. Загрузка в VK остановлена; освободи место после проверки сохранённых версий и повтори /files.");
+    if (reservation === "existing") throw new ActionRejectedError("Обнаружена незавершённая staged-версия файла. Загрузка остановлена до сверки сохранённых данных; повтор не создаст другую версию автоматически.");
     const handle = await open(target, "wx", 0o600);
     try { await handle.writeFile(file.contents); await handle.sync(); }
     finally { await handle.close(); }
@@ -374,7 +377,10 @@ export class TaskFiles {
       sha256: digest(file.contents), bytes: file.contents.length, bindingId: binding.id, threadId: binding.threadId,
       ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), operationId: job.operationId,
       generation: job.generation, stagedAt: Date.now(), ...(job.turnId ? { turnId: job.turnId } : {}) };
-    this.store.setValue(this.stageIndexKey(binding.id, job.operationId), { ...this.stageIndex(binding.id, job.operationId), [key]: receipt });
+    this.store.atomic(() => {
+      this.store.setValue(this.stageIndexKey(binding.id, job.operationId), { ...this.stageIndex(binding.id, job.operationId), [key]: receipt });
+      this.store.markStageReady(key, target);
+    });
     return receipt;
   }
   private async cleanupDocuments(except: readonly string[]): Promise<"removed" | "no-candidate" | "not-removed"> {

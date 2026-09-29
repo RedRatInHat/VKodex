@@ -3165,6 +3165,94 @@ test("new staging stays disabled until disk retention is qualified", async t => 
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-disabled`), null);
 });
 
+test("stage admission denies an operation at 512 MiB before VK upload", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "stage-cap", []);
+  files.finish(binding.id, "stage-cap", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "new bytes");
+  for (const [index, bytes] of [200, 200, 112].entries())
+    assert.equal(s.store.reserveStage(`prior-version-${index}`, binding.id, "stage-cap", bytes * 1024 * 1024, `private-prior-${index}`), "reserved");
+  await assert.rejects(files.collect(binding, true), /лимит.*staged/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
+  assert.equal(s.store.getValue(`file-stage-index:${binding.id}:stage-cap`), null);
+  assert.equal(s.store.stageReservedBytes(binding.id, "stage-cap"), 512 * 1024 * 1024);
+});
+
+test("zero-byte staged versions still consume per-operation and global file slots", t => {
+  const s = setup(t);
+  for (let index = 0; index < 256; index++)
+    assert.equal(s.store.reserveStage(`empty-first-${index}`, "first", "operation", 0, `private-first-${index}`), "reserved");
+  assert.equal(s.store.reserveStage("empty-first-over", "first", "operation", 0, "private-first-over"), "limit");
+  for (let operation = 1; operation < 8; operation++) {
+    for (let index = 0; index < 256; index++)
+      assert.equal(s.store.reserveStage(`empty-${operation}-${index}`, "other", `operation-${operation}`, 0, `private-${operation}-${index}`), "reserved");
+  }
+  assert.equal(s.store.stageReservedBytes(), 0);
+  assert.equal(s.store.stageReservedCount(), 2_048);
+  assert.equal(s.store.reserveStage("empty-global-over", "other", "operation-8", 0, "private-global-over"), "limit");
+});
+
+test("stage admission counts prior versions and the global budget", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-versions-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "versions", []);
+  files.finish(binding.id, "versions", "accepted", "finished-turn");
+  const source = path.join(prepared.outboxDir, "result.txt");
+  await writeFile(source, "one");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("preupload crash");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /preupload crash/u);
+  crash.mock.restore();
+  assert.equal(s.store.stageReservedBytes(binding.id, "versions"), 3);
+  for (const [index, bytes] of [200, 200, 112].entries())
+    assert.equal(s.store.reserveStage(`almost-full-${index}`, binding.id, "versions", bytes * 1024 * 1024 - (index === 2 ? 6 : 0), `private-other-${index}`), "reserved");
+  await writeFile(source, "four");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  await assert.rejects(restored.collect(binding, true), /лимит.*staged/u);
+  assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["one"]);
+  assert.equal(s.store.stageReservedBytes(binding.id, "versions"), 512 * 1024 * 1024 - 3);
+  let remaining = 2 * 1024 * 1024 * 1024 - (512 * 1024 * 1024 - 3);
+  for (let index = 0; remaining; index++) {
+    const bytes = Math.min(remaining, 200 * 1024 * 1024);
+    assert.equal(s.store.reserveStage(`global-${index}`, "other-binding", `other-op-${Math.floor(index / 2)}`, bytes, `private-global-${index}`), "reserved");
+    remaining -= bytes;
+  }
+  assert.equal(s.store.reserveStage("global-two", "other-binding", "other-op", 1, "private-over"), "limit");
+});
+
+test("an older JSON stage receipt is counted by the additive admission table after restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-migration-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const original = new BridgeStore(filename);
+  original.setValue("file-stage-index:binding:operation", { old: {
+    key: "file:binding:operation:old", bindingId: "binding", operationId: "operation",
+    bytes: 13, path: path.join(root, "old-stage.bin"), stagedAt: 123,
+  } });
+  original.setValue("file-stage-index:retired:operation", null);
+  original.close();
+  const restored = new BridgeStore(filename);
+  assert.equal(restored.stageReservedBytes("binding", "operation"), 13);
+  assert.equal(restored.reserveStage("file:binding:operation:old", "binding", "operation", 13, path.join(root, "another.bin")), "existing");
+  assert.equal(restored.stageReservedBytes(), 13);
+  restored.close();
+});
+
+test("malformed legacy stage receipts fail closed for new stage admission", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-unsafe-migration-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const original = new BridgeStore(filename);
+  original.setValue("file-stage-index:binding:operation", { broken: { bytes: 12 } });
+  original.close();
+  const restored = new BridgeStore(filename);
+  assert.equal(restored.reserveStage("new-file", "binding", "operation", 1, path.join(root, "new-stage.bin")), "limit");
+  assert.equal(restored.stageReservedCount(), 0);
+  restored.close();
+});
+
 test("a staged version survives source mutation and restart before upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-restart-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
@@ -3229,9 +3317,27 @@ test("an incomplete stage cannot be treated as a durable upload version", async 
   crash.mock.restore();
   assert.equal(s.chat.binaryUploads.length, 0);
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:incomplete-stage`), null);
+  assert.equal(s.store.stageReservedBytes(binding.id, "incomplete-stage"), "first version".length);
   const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
-  assert.equal(await restored.collect(binding, true), 1);
-  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
+  await assert.rejects(restored.collect(binding, true), /незавершённая staged/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
+  assert.equal(s.store.stageReservedBytes(binding.id, "incomplete-stage"), "first version".length);
+});
+
+test("a receipt transaction crash preserves its reservation and blocks a second write", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-receipt-crash-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const prepared = await files.prepare(binding, "receipt-crash", []);
+  files.finish(binding.id, "receipt-crash", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
+  const crash = t.mock.method(s.store, "markStageReady", () => { throw new Error("receipt transaction lost"); });
+  await assert.rejects(files.collect(binding, true), /receipt transaction lost/u);
+  crash.mock.restore();
+  assert.equal(s.store.getValue(`file-stage-index:${binding.id}:receipt-crash`), null);
+  assert.equal(s.store.stageReservedBytes(binding.id, "receipt-crash"), 5);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  await assert.rejects(restored.collect(binding, true), /незавершённая staged/u);
+  assert.equal(s.chat.binaryUploads.length, 0);
 });
 
 test("a corrupt durable stage fails closed even when the source is still available", async t => {

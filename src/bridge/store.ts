@@ -214,6 +214,9 @@ function managedBinding(row: ManagedOwnerBindingRow): ManagedOwnerBinding {
 
 export class BridgeStore {
   private readonly db: Database;
+  private stageLegacyUnaccounted = false;
+  private static readonly MAX_STAGE_FILES_PER_OPERATION = 256;
+  private static readonly MAX_STAGE_FILES_GLOBAL = 2_048;
 
   constructor(filename = ":memory:") {
     this.db = new DatabaseConstructor(filename);
@@ -231,6 +234,11 @@ export class BridgeStore {
       );
       CREATE TABLE IF NOT EXISTS bridge_actions (id TEXT PRIMARY KEY, payload TEXT NOT NULL, expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_values (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS bridge_stage_reservations (
+        file_key TEXT PRIMARY KEY, binding_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+        bytes INTEGER NOT NULL CHECK(bytes >= 0), path TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'ready')), created_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
         operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id),
@@ -271,6 +279,32 @@ export class BridgeStore {
     const deliveryColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_delivery)").all() as { name: string }[]).map(column => column.name));
     if (!deliveryColumns.has("priority_revision")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN priority_revision INTEGER NOT NULL DEFAULT 0");
     if (!deliveryColumns.has("turn_id")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN turn_id TEXT");
+    // Existing JSON stage receipts remain authoritative for recovery. Mirror
+    // them into the additive admission ledger so upgrades count their bytes.
+    this.atomic(() => {
+      const indexes = this.db.prepare("SELECT value FROM bridge_values WHERE key LIKE 'file-stage-index:%' AND value <> 'null'").all() as { value: string }[];
+      for (const index of indexes) {
+        try {
+          const receipts = JSON.parse(index.value) as Record<string, unknown>;
+          if (!receipts || typeof receipts !== "object" || Array.isArray(receipts)) throw new Error("Invalid stage index");
+          for (const candidate of Object.values(receipts)) {
+            const item = candidate as Record<string, unknown>;
+            if (!item || typeof item.key !== "string" || typeof item.bindingId !== "string" || typeof item.operationId !== "string"
+              || typeof item.path !== "string" || !item.path || typeof item.bytes !== "number"
+              || !Number.isSafeInteger(item.bytes) || item.bytes < 0 || item.bytes > 200 * 1024 * 1024) throw new Error("Invalid stage receipt");
+            const result = this.db.prepare("INSERT OR IGNORE INTO bridge_stage_reservations(file_key, binding_id, operation_id, bytes, path, state, created_at) VALUES (?, ?, ?, ?, ?, 'ready', ?)")
+              .run(item.key, item.bindingId, item.operationId, item.bytes, item.path,
+                typeof item.stagedAt === "number" && Number.isSafeInteger(item.stagedAt) ? item.stagedAt : Date.now());
+            if (!result.changes) {
+              const known = this.db.prepare("SELECT binding_id, operation_id, bytes, path FROM bridge_stage_reservations WHERE file_key = ?").get(item.key) as
+                { binding_id: string; operation_id: string; bytes: number; path: string } | undefined;
+              if (!known || known.binding_id !== item.bindingId || known.operation_id !== item.operationId || known.bytes !== item.bytes || known.path !== item.path)
+                throw new Error("Conflicting stage receipt");
+            }
+          }
+        } catch { this.stageLegacyUnaccounted = true; }
+      }
+    });
   }
 
   close(): void { this.db.close(); }
@@ -813,6 +847,52 @@ export class BridgeStore {
   }
   setValue(key: string, value: unknown): void {
     this.db.prepare("INSERT INTO bridge_values(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
+  }
+
+  /** Reservations stay charged after a crash until a separate reconciler safely
+   * resolves them. Existing keys never get a new path or byte count. */
+  reserveStage(fileKey: string, bindingId: string, operationId: string, bytes: number, stagedPath: string): "reserved" | "existing" | "limit" {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 200 * 1024 * 1024 || !stagedPath) throw new RangeError("Invalid staged file reservation");
+    if (this.stageLegacyUnaccounted) return "limit";
+    return this.atomic(() => {
+      const existing = this.db.prepare("SELECT binding_id, operation_id, bytes, path FROM bridge_stage_reservations WHERE file_key = ?")
+        .get(fileKey) as { binding_id: string; operation_id: string; bytes: number; path: string } | undefined;
+      if (existing) {
+        if (existing.binding_id !== bindingId || existing.operation_id !== operationId || existing.bytes !== bytes) throw new Error("Conflicting staged file reservation");
+        return "existing";
+      }
+      const operationBytes = this.stageReservedBytes(bindingId, operationId);
+      const globalBytes = this.stageReservedBytes();
+      if (operationBytes + bytes > 512 * 1024 * 1024 || globalBytes + bytes > 2 * 1024 * 1024 * 1024
+        || this.stageReservedCount(bindingId, operationId) >= BridgeStore.MAX_STAGE_FILES_PER_OPERATION
+        || this.stageReservedCount() >= BridgeStore.MAX_STAGE_FILES_GLOBAL) return "limit";
+      this.db.prepare("INSERT INTO bridge_stage_reservations(file_key, binding_id, operation_id, bytes, path, state, created_at) VALUES (?, ?, ?, ?, ?, 'reserved', ?)")
+        .run(fileKey, bindingId, operationId, bytes, stagedPath, Date.now());
+      return "reserved";
+    });
+  }
+
+  stageReservedBytes(bindingId?: string, operationId?: string): number {
+    if ((bindingId === undefined) !== (operationId === undefined)) throw new RangeError("Both stage owner fields are required");
+    const row = bindingId === undefined
+      ? this.db.prepare("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM bridge_stage_reservations").get() as { bytes: number }
+      : this.db.prepare("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM bridge_stage_reservations WHERE binding_id = ? AND operation_id = ?")
+        .get(bindingId, operationId) as { bytes: number };
+    return row.bytes;
+  }
+
+  stageReservedCount(bindingId?: string, operationId?: string): number {
+    if ((bindingId === undefined) !== (operationId === undefined)) throw new RangeError("Both stage owner fields are required");
+    const row = bindingId === undefined
+      ? this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations").get() as { count: number }
+      : this.db.prepare("SELECT COUNT(*) AS count FROM bridge_stage_reservations WHERE binding_id = ? AND operation_id = ?")
+        .get(bindingId, operationId) as { count: number };
+    return row.count;
+  }
+
+  markStageReady(fileKey: string, stagedPath: string): void {
+    const result = this.db.prepare("UPDATE bridge_stage_reservations SET state = 'ready' WHERE file_key = ? AND path = ? AND state = 'reserved'").run(fileKey, stagedPath);
+    if (result.changes !== 1) throw new Error("Missing staged file reservation");
   }
 
   claimInitialHandoff(bindingId: string, task: TaskRef, now = Date.now()): boolean {
