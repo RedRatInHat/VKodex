@@ -132,6 +132,8 @@ test('Composer intent survives adapter recreation and first-turn eligibility los
   const profile = { id: ':read-only' };
   const full = { ...structuredClone(f.authority.snapshot), hostId: 'local', resumeState: 'resumed',
     workspaceKind: 'projectless', turns: [], environments: [], latestCollaborationMode: mode,
+    turnsPagination: { hasLoadedOldest: true, olderCursor: null }, threadRuntimeStatus: { type: 'idle' },
+    requests: [], nativeQueue: [], queuedFollowUps: [],
     currentPermissions: { activePermissionProfile: profile, sandboxPolicy, approvalPolicy: 'never',
       approvalsReviewer: 'user', runtimeWorkspaceRoots: ['C:/native-test'] },
     latestThreadSettings: { cwd: 'C:/native-test', model: 'gpt-fixture', effort: 'low', serviceTier: null,

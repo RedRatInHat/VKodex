@@ -7,6 +7,8 @@ type Row = Record<string, unknown>;
 function snapshot(): Row {
   return { id: "thread-1", cwd: "C:/isolated", latestModel: "gpt-6-luna", latestReasoningEffort: "low",
     hostId: "local", resumeState: "resumed", workspaceKind: "projectless", turns: [], environments: [],
+    turnsPagination: { hasLoadedOldest: true, olderCursor: null }, threadRuntimeStatus: { type: "idle" },
+    requests: [], nativeQueue: [], queuedFollowUps: [],
     latestThreadSettings: { cwd: "C:/isolated", model: "gpt-6-luna", effort: "low", serviceTier: "default", summary: null,
       personality: "pragmatic", activePermissionProfile: { id: ":read-only" }, sandboxPolicy: { type: "readOnly", networkAccess: false } },
     latestCollaborationMode: { mode: "default", settings: { model: "gpt-6-luna", reasoning_effort: "low", developer_instructions: null } },
@@ -114,6 +116,24 @@ test("requires first turn, exact workspace/snapshot settings and known defaults"
   const actual = compileNativeReadOnlyComposerStart(s, f, defaults);
   assert.equal(actual.request.personality, "friendly");
   assert.throws(() => compileNativeReadOnlyComposerStart(s, f, { ...defaults, taskId: "other" }));
+});
+
+test("first turn rejects incomplete history, active runtime and pending work", () => {
+  const cases: [string, (s: Row) => void][] = [
+    ["missing pagination", s => { delete s.turnsPagination; }],
+    ["partial history", s => { (s.turnsPagination as Row).hasLoadedOldest = false; }],
+    ["older cursor", s => { (s.turnsPagination as Row).olderCursor = "opaque"; }],
+    ["missing runtime", s => { delete s.threadRuntimeStatus; }],
+    ["active runtime", s => { s.threadRuntimeStatus = { type: "inProgress" }; }],
+    ["missing requests", s => { delete s.requests; }],
+    ["pending request", s => { s.requests = [{ id: "pending" }]; }],
+    ["native queue", s => { s.nativeQueue = [{ id: "queued" }]; }],
+    ["follow-up queue", s => { s.queuedFollowUps = [{ id: "queued" }]; }],
+  ];
+  for (const [label, change] of cases) {
+    const s = snapshot(), f = envelope(s); change(s);
+    assert.throws(() => compileNativeReadOnlyComposerStart(s, f), { name: "TypeError" }, label);
+  }
 });
 
 test("environment roots and tier requirements preserve wire/UI differences", () => {

@@ -26,6 +26,15 @@ function checkedProfile(value: Row): void {
   }
   only(sandbox, ["type", "networkAccess"], "sandboxPolicy");
 }
+function fullyLoadedAndIdle(snapshot: Row): boolean {
+  return object(snapshot.turnsPagination) && snapshot.turnsPagination.hasLoadedOldest === true &&
+    snapshot.turnsPagination.olderCursor === null &&
+    object(snapshot.threadRuntimeStatus) && snapshot.threadRuntimeStatus.type === 'idle' &&
+    Array.isArray(snapshot.requests) && snapshot.requests.length === 0 &&
+    (snapshot.nativeQueue === undefined || Array.isArray(snapshot.nativeQueue) && snapshot.nativeQueue.length === 0) &&
+    (snapshot.queuedFollowUps === undefined ||
+      Array.isArray(snapshot.queuedFollowUps) && snapshot.queuedFollowUps.length === 0);
+}
 
 /**
  * Pure first-turn local :read-only Composer canary compiler. It is not general
@@ -33,8 +42,8 @@ function checkedProfile(value: Row): void {
  * Caller must fence the same live worker generation before dispatch.
  */
 export function compileNativeReadOnlyComposerStart(snapshot: unknown, follower: unknown, defaults: unknown = null): NativeComposerStartResult {
-  if (!object(snapshot) || !Array.isArray(snapshot.turns) || snapshot.turns.length !== 0)
-    fail('first turn requires empty history');
+  if (!object(snapshot) || !Array.isArray(snapshot.turns) || snapshot.turns.length !== 0 ||
+      !fullyLoadedAndIdle(snapshot)) fail('first turn requires fully loaded idle empty history');
   return compileQualifiedComposerStart(snapshot, follower, defaults);
 }
 
@@ -44,13 +53,7 @@ export function compileNativeReadOnlyContinuationComposerStart(snapshot: unknown
   evidence: QualifiedContinuationEvidence): NativeComposerStartResult {
   if (!object(snapshot) || !object(evidence) || !object(evidence.owner) || !object(evidence.effective) ||
       !Array.isArray(snapshot.turns) || snapshot.turns.length === 0 ||
-      !object(snapshot.turnsPagination) || snapshot.turnsPagination.hasLoadedOldest !== true ||
-      snapshot.turnsPagination.olderCursor !== null ||
-      !object(snapshot.threadRuntimeStatus) || snapshot.threadRuntimeStatus.type !== 'idle' ||
-      !Array.isArray(snapshot.requests) || snapshot.requests.length !== 0 ||
-      snapshot.nativeQueue !== undefined && (!Array.isArray(snapshot.nativeQueue) || snapshot.nativeQueue.length !== 0) ||
-      snapshot.queuedFollowUps !== undefined &&
-        (!Array.isArray(snapshot.queuedFollowUps) || snapshot.queuedFollowUps.length !== 0))
+      !fullyLoadedAndIdle(snapshot))
     fail('continuation is not fully loaded and idle');
   const seen = new Set<string>();
   for (const turn of snapshot.turns) {
