@@ -3,6 +3,7 @@ import test from "node:test";
 import { BridgeHealthMonitor } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
+import { taskKey } from "../src/core/codex-tasks.js";
 import type { BridgeChat, HealthCheckResult, MessageHandle, View } from "../src/bridge/contracts.js";
 import type { CreateTaskRequest, DesktopCompatibility, DesktopModel, DesktopProject, DesktopTask, DesktopTasks, SubmitTaskRequest, TaskDetails, TaskGoalUpdate, TaskRef, TaskRenameResult } from "../src/desktop/contracts.js";
 
@@ -387,6 +388,46 @@ test("health detects native queued VK input stranded behind an idle task", async
   assert.doesNotMatch(stranded.detail, /остаются в штатной очереди/u);
   store.settleQueuedInput(binding.id, "queued-op");
   assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);
+});
+
+test("health exposes bounded per-operation queue scan progress without native history content", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const binding = store.ensureBinding((await new HealthDesktop().listTasks())[0]!);
+  store.setChat(binding.id, 2_000_000_001, 1);
+  store.setAttached(binding.id, true);
+  store.recordOperation("queued-op", binding, "queue-scan-inbox", binding.id, 100_000);
+  store.finishOperation("queued-op", "accepted");
+  store.rememberQueuedInput(binding.id, "queued-op", "secret native queue item", 100_000);
+  store.setValue(`queue-history:${binding.id}:queued-op`, {
+    taskKey: taskKey(binding), cursor: { cursor: "secret cursor", headDigest: "secret digest", pages: 3 },
+    pages: 3, lastAttemptAt: 190_000, lastFailure: "history_unavailable", nextAt: 3_790_000,
+  });
+  const now = 200_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1,
+    connectedBindings: 1, requiredBindings: 0, connectedRequiredBindings: 0,
+    bindings: [{ id: binding.id, title: binding.title, source: ".codex", status: "idle", connected: true,
+      lastConfirmedAt: now, failure: null }],
+  }), undefined, () => now, undefined, () => true);
+  const report = await monitor.check(true);
+  const progress = report.checks.find(check => check.name === `codex_queue_scan:${binding.id}:1`)!;
+  assert.equal(progress.state, "ok");
+  assert.match(progress.detail, /3.*1970-01-01T00:03:10\.000Z.*history_unavailable.*1970-01-01T01:03:10\.000Z/u);
+  assert.doesNotMatch(JSON.stringify(report), /secret/u);
+  assert.equal(report.state, "ok", JSON.stringify(report.checks.filter(check => check.state !== "ok")));
+  for (let index = 2; index <= 5; index++) {
+    const id = `queued-op-${index}`;
+    store.recordOperation(id, binding, `queue-scan-inbox-${index}`, binding.id, 100_000);
+    store.finishOperation(id, "accepted");
+    store.rememberQueuedInput(binding.id, id, `native-queue-${index}`, 100_000);
+  }
+  const bounded = await monitor.check(true);
+  assert.equal(bounded.checks.filter(check => check.name.startsWith(`codex_queue_scan:${binding.id}:`)).length, 4);
+  assert.match(bounded.checks.find(check => check.name === `codex_queue_scan_more:${binding.id}`)?.detail ?? "", /Ещё 1 ACK/u);
+  store.setValue(`queue-history:${binding.id}:queued-op`, "malformed legacy checkpoint");
+  const malformed = await monitor.check(true);
+  assert.equal(malformed.checks.find(check => check.name === `codex_queue_scan:${binding.id}:1`)?.state, "ok");
+  assert.doesNotMatch(JSON.stringify(malformed), /malformed legacy checkpoint/u);
 });
 
 test("health detects stuck and legacy transfers even when streams and the database are healthy", async t => {

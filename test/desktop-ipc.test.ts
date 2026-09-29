@@ -10,6 +10,7 @@ import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, ProjectAssignmentUnconfirmedError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
 import { withVkResponseFormat } from "../src/core/task-input.js";
+import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
@@ -691,6 +692,12 @@ test("runtime settles a historical queue ACK only after exact terminal native pr
   reconcile();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+  const failed = s.store.getValue<Record<string, unknown>>(`queue-history:${s.binding.id}:${operationId}`)!;
+  assert.equal(failed.pages, 0);
+  assert.equal(failed.lastAttemptAt, 100_000);
+  assert.equal(failed.lastFailure, "history_unavailable");
+  assert.equal(failed.nextAt, 100_000 + 60 * 60_000);
+  assert.doesNotMatch(JSON.stringify(failed), /incomplete page/u);
   s.advance(60 * 60_000 + 1);
   (s.runtime as unknown as { lastQueueReconciliationAt: number }).lastQueueReconciliationAt = 0;
   reconcile();
@@ -719,11 +726,39 @@ test("historical queue scan persists partial progress without settling its ACK",
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), [operationId]);
   assert.equal(observedCursor, null);
+  const progress = s.store.getValue<Record<string, unknown>>(`queue-history:${s.binding.id}:${operationId}`)!;
+  assert.equal(progress.pages, 1);
+  assert.equal(progress.lastAttemptAt, 100_000);
+  assert.equal(progress.lastFailure, null);
+  assert.equal(progress.nextAt, 100_000 + 5 * 60_000);
   s.advance(5 * 60_000 + 1);
   reconcile();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(observedCursor, cursor);
   assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
+});
+
+test("historical queue scan restarts read-only verification after a malformed checkpoint", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "malformed-history-checkpoint";
+  s.store.recordOperation(operationId, s.binding, "malformed-history-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "native-queue-id");
+  s.store.setValue(`queue-history:${s.binding.id}:${operationId}`, {
+    taskKey: taskKey(s.binding), cursor: null, nextAt: "invalid",
+  });
+  const desktop = s.desktop as import("../src/core/codex-tasks.js").CodexTasks;
+  let calls = 0;
+  desktop.scanTerminalQueuedInput = async (_task, id, previous) => {
+    assert.equal(id, operationId);
+    assert.equal(previous, null);
+    calls++;
+    return { done: true, turnId: null };
+  };
+  (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "a negative scan does not settle the ACK");
 });
 
 test("bridge core consumes task state through a transport without Desktop IPC", async t => {

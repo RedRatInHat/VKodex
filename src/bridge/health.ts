@@ -1,9 +1,20 @@
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { sameTask, type DesktopCompatibility, type CodexTasks } from "../core/codex-tasks.js";
+import { sameTask, taskKey, type DesktopCompatibility, type CodexTasks } from "../core/codex-tasks.js";
 import type { TaskStateRouteDiagnostic } from "../core/task-state.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
+import type { QueuedInputHistoryCursor } from "../core/codex-tasks.js";
+
+/** Only scanner metadata is surfaced; native cursors and exception text stay private. */
+export interface QueueHistoryProgress {
+  readonly taskKey: string;
+  readonly cursor: QueuedInputHistoryCursor | null;
+  readonly pages: number;
+  readonly lastAttemptAt: number;
+  readonly lastFailure: "history_unavailable" | "scan_error" | null;
+  readonly nextAt: number;
+}
 
 export interface RuntimeHealthState {
   readonly startedAt: number;
@@ -245,6 +256,27 @@ export class BridgeHealthMonitor {
       }
       const queued = this.store.queuedInputs(binding.id);
       const queuedAge = queued.length ? Math.max(0, checkedAt - Math.min(...queued.map(item => item.acceptedAt))) : 0;
+      // /health is sent through VK as one message; keep this diagnostic bounded.
+      for (const [index, operation] of queued.slice(0, 4).entries()) {
+        let current: QueueHistoryProgress | null = null;
+        try {
+          const progress = this.store.getValue<QueueHistoryProgress>(`queue-history:${binding.id}:${operation.operationId}`);
+          const storedBinding = this.store.getBinding(binding.id);
+          if (storedBinding && progress && typeof progress === "object" && progress.taskKey === taskKey(storedBinding))
+            current = progress;
+        } catch { /* Invalid optional diagnostics must not break the health report. */ }
+        const pages = current && Number.isSafeInteger(current.pages) ? Math.min(5_000, Math.max(0, current.pages)) : 0;
+        const failure = current?.lastFailure === "history_unavailable" || current?.lastFailure === "scan_error"
+          ? current.lastFailure : null;
+        const attempt = current && Number.isSafeInteger(current.lastAttemptAt) && current.lastAttemptAt >= 0 && current.lastAttemptAt <= 8.64e15
+          ? new Date(current.lastAttemptAt).toISOString() : "ещё не было";
+        const nextAt = current && Number.isSafeInteger(current.nextAt) && current.nextAt >= 0 && current.nextAt <= 8.64e15
+          ? new Date(current.nextAt).toISOString() : "не назначена";
+        checks.push({ name: `codex_queue_scan:${binding.id}:${index + 1}`, state: "ok",
+          detail: `Сверка ACK ${index + 1}/${queued.length}: страниц не менее ${pages}; последняя попытка ${attempt}; ошибка ${failure ?? "нет"}; следующая попытка ${nextAt}.` });
+      }
+      if (queued.length > 4) checks.push({ name: `codex_queue_scan_more:${binding.id}`, state: "ok",
+        detail: `Ещё ${queued.length - 4} ACK ожидают сверки; подробности ограничены первыми 4.` });
       if (queued.length && queuedAge > 2 * 60_000 && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
         checks.push({ name: `codex_native_queue:${binding.id}`, state: binding.status === "unavailable" ? "degraded" : "failed",
           detail: `«${binding.title.slice(0, 120)}» (${binding.source}): для ${queued.length} VK-запрос(а) сохранены локальные подтверждения thread/queue/add; переход в ход не подтверждён в течение ${Math.round(queuedAge / 1_000)} с (состояние «${binding.status}»). Текущее наличие в очереди Codex не проверено. VKodex не запускает и не повторяет их самостоятельно.` });
