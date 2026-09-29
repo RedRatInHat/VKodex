@@ -12,7 +12,7 @@ import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, downloadVkFileToPath } from "../src/bridge/files.js";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
@@ -3123,6 +3123,31 @@ test("an automatic tick delivers a file added after a completed turn's empty out
   assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "late result");
   await restored.tick(); await s.worker.flush();
   assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("idle observations without file jobs do not write a file journal", t => {
+  const s = setup(t); const binding = s.attach();
+  const files = new TaskFiles("unused", s.store, s.chat, s.gate);
+  files.observe(binding.id, "idle", "ordinary-turn");
+  files.observe(binding.id, "idle", "ordinary-turn");
+  assert.equal(s.store.getValue(`file-jobs:${binding.id}`), null);
+});
+
+test("different relative paths with the same display name and bytes are distinct file versions", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-path-key-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "path-key", []);
+  await mkdir(path.join(prepared.outboxDir, "a"));
+  await writeFile(path.join(prepared.outboxDir, "a", "b.txt"), "same bytes");
+  await writeFile(path.join(prepared.outboxDir, "a_b.txt"), "same bytes");
+  files.finish(binding.id, "path-key", "accepted", "path-turn");
+  files.observe(binding.id, "idle", "path-turn");
+
+  assert.equal(await files.collect(binding), 2);
+  assert.equal(s.chat.binaryUploads.length, 2);
+  assert.equal(s.chat.binaryUploads[0]!.name, "a_b.txt");
+  assert.equal(s.chat.binaryUploads[1]!.name, "a_b.txt");
+  assert.equal(await files.collect(binding, true), 0);
 });
 
 test("an ambiguous VK upload is not retried by automatic scan or /files after restart", async t => {

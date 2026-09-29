@@ -27,6 +27,8 @@ interface FileJob {
   operationId: string;
   generation: number;
   directory: string;
+  /** Existing jobs retain their original key derivation across an upgrade. */
+  keyFormat?: "relative-path-v2";
   state: "prepared" | "accepted" | "rejected" | "uncertain";
   done: boolean;
   /** Completion is persisted so late output remains eligible after restart. */
@@ -282,7 +284,6 @@ export function batchOutputFiles(files: readonly OutputFile[], limits = FILE_LIM
 
 export class TaskFiles {
   private readonly completed = new Set<string>();
-  private readonly completedTurns = new Map<string, Set<string>>();
   private readonly retries = new Map<string, number>();
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
@@ -341,7 +342,7 @@ export class TaskFiles {
     }
     await this.check(binding, generation);
     this.completed.delete(binding.id);
-    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, state: "prepared", done: false, completed: false }]);
+    this.save(binding.id, [...this.jobs(binding.id), { operationId, generation, directory: jobDirectory, keyFormat: "relative-path-v2", state: "prepared", done: false, completed: false }]);
     return { inputFiles, outboxDir };
   }
   finish(bindingId: string, operationId: string, state: "accepted" | "rejected" | "uncertain", turnId?: string): void {
@@ -368,17 +369,24 @@ export class TaskFiles {
   observe(bindingId: string, status: TaskDetails["status"], turnId?: string | null): void {
     if (["idle", "failed", "interrupted"].includes(status)) {
       this.completed.add(bindingId);
-      this.save(bindingId, this.jobs(bindingId).map(job => job.state === "accepted" && (job.turnId ? job.turnId === turnId : true)
-        ? { ...job, completed: true,
+      const jobs = this.jobs(bindingId);
+      let changed = false;
+      const observed = jobs.map(job => {
+        if (job.state !== "accepted" || (job.turnId && job.turnId !== turnId)
+          || (job.completed === true && job.autoScanUntil !== undefined)) return job;
+        changed = true;
+        return { ...job, completed: true,
           autoScanUntil: job.autoScanUntil ?? (job.completed === undefined && job.done ? Date.now() : Date.now() + LATE_SCAN_WINDOW_MS),
-          nextScanAt: job.completed === false ? 0 : job.nextScanAt } : job));
+          nextScanAt: job.completed === false ? 0 : job.nextScanAt };
+      });
+      if (changed) this.save(bindingId, observed);
       if (turnId) {
-        const turns = this.completedTurns.get(bindingId) ?? new Set<string>();
-        turns.add(turnId); this.completedTurns.set(bindingId, turns);
-        const persisted = this.terminalTurns(bindingId);
-        if (!persisted.has(turnId)) this.store.setValue(`file-terminal-turns:${bindingId}`, [...persisted, turnId].slice(-128));
+        if (jobs.some(job => job.completed !== true && (!job.turnId || job.turnId === turnId))) {
+          const persisted = this.terminalTurns(bindingId);
+          if (!persisted.has(turnId)) this.store.setValue(`file-terminal-turns:${bindingId}`, [...persisted, turnId].slice(-128));
+        }
       }
-    } else if (!this.completedTurns.get(bindingId)?.size) this.completed.delete(bindingId);
+    } else this.completed.delete(bindingId);
   }
   collect(binding: Binding, manual = false): Promise<number> {
     const existing = this.collections.get(binding.id); if (existing) return existing;
@@ -390,7 +398,7 @@ export class TaskFiles {
     if (!this.chat.uploadFile) throw new ActionRejectedError("Загрузка файлов в VK недоступна.");
     const uploadFile = this.chat.uploadFile.bind(this.chat);
     let count = 0; let unknownFiles = 0; let retryableFailure: OutputFilesError | null = null;
-    const completedTurns = new Set([...(this.completedTurns.get(binding.id) ?? []), ...this.terminalTurns(binding.id)]);
+    const completedTurns = this.terminalTurns(binding.id);
     const eligible = this.jobs(binding.id).filter(job => {
       if (job.generation !== generation || job.state !== "accepted" || job.queued) return false;
       if (manual) return true;
@@ -420,7 +428,11 @@ export class TaskFiles {
       const processFile = async (file: OutputFile, relativePath: string, fingerprint: string): Promise<void> => {
           // Store only the metadata of a stable read. A crash during upload must
           // not cause another full read or an ambiguous second upload.
-          const key = `file:${binding.id}:${job.operationId}:${digest(file.name + ":" + digest(file.contents))}`;
+          const contentHash = digest(file.contents);
+          const identity = job.keyFormat === "relative-path-v2"
+            ? JSON.stringify([relativePath.replaceAll(path.sep, "/"), contentHash])
+            : file.name + ":" + contentHash;
+          const key = `file:${binding.id}:${job.operationId}:${digest(identity)}`;
           scanned[relativePath] = { fingerprint, key };
           this.store.setValue(metadataKey, scanned);
           if (this.store.getValue<boolean>(`${key}:queued`)) return;
