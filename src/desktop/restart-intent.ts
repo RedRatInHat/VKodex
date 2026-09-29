@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import DatabaseConstructor from "better-sqlite3";
 import type { TaskRef } from "../core/codex-tasks.js";
 import type { BridgeStore } from "../bridge/store.js";
 
@@ -61,8 +62,22 @@ export async function readRestartIntent(dataDir: string): Promise<RestartIntent 
   }
 }
 
-export async function captureRestartIntent(store: BridgeStore, dataDir: string, sourcePid: number, now = Date.now()): Promise<RestartIntent> {
+async function writeRestartIntent(tasks: readonly RestartTaskSnapshot[], dataDir: string, sourcePid: number, now: number): Promise<RestartIntent> {
   const id = randomUUID();
+  const intent = parseRestartIntent({ version: 1, id, createdAt: now, sourcePid, tasks });
+  const destination = restartIntentPath(dataDir);
+  const temporary = path.join(path.dirname(destination), `restart-intent.${id}.pending`);
+  await writeFile(temporary, `${JSON.stringify(intent, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  try { await rename(temporary, destination); }
+  catch (error) {
+    // Preserve the complete snapshot under its unique pending name for manual
+    // inspection; never overwrite an earlier unconsumed restart request.
+    throw error;
+  }
+  return intent;
+}
+
+export async function captureRestartIntent(store: BridgeStore, dataDir: string, sourcePid: number, now = Date.now()): Promise<RestartIntent> {
   const tasks = store.bindings().flatMap(binding => {
     const details = store.getValue<{ status?: string }>(`task-details:${binding.id}`);
     if (!binding.attached || binding.peerId === null || details?.status !== "running") return [];
@@ -77,17 +92,51 @@ export async function captureRestartIntent(store: BridgeStore, dataDir: string, 
       ...(binding.sourceId ? { sourceId: binding.sourceId } : {}),
     } satisfies RestartTaskSnapshot];
   });
-  const intent: RestartIntent = { version: 1, id, createdAt: now, sourcePid, tasks };
-  const destination = restartIntentPath(dataDir);
-  const temporary = path.join(path.dirname(destination), `restart-intent.${id}.pending`);
-  await writeFile(temporary, `${JSON.stringify(intent, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  try { await rename(temporary, destination); }
-  catch (error) {
-    // Preserve the complete snapshot under its unique pending name for manual
-    // inspection; never overwrite an earlier unconsumed restart request.
-    throw error;
-  }
-  return intent;
+  return writeRestartIntent(tasks, dataDir, sourcePid, now);
+}
+
+interface RestartSnapshotRow {
+  id: string;
+  host_id: string;
+  thread_id: string;
+  title: string;
+  source_id: string;
+  details: string | null;
+  activity: string | null;
+  generation: string | null;
+}
+
+/** Read one committed SQLite snapshot without opening BridgeStore or running migrations. */
+export async function captureRestartIntentFromDatabase(filename: string, dataDir: string, sourcePid: number, now = Date.now()): Promise<RestartIntent> {
+  const db = new DatabaseConstructor(filename, { readonly: true, fileMustExist: true, timeout: 5_000 });
+  let tasks: RestartTaskSnapshot[];
+  try {
+    tasks = db.transaction(() => {
+      const rows = db.prepare(`SELECT b.id, b.host_id, b.thread_id, b.title, b.source_id,
+          details.value AS details, activity.value AS activity, generation.value AS generation
+        FROM bridge_bindings AS b
+        LEFT JOIN bridge_values AS details ON details.key = 'task-details:' || b.id
+        LEFT JOIN bridge_values AS activity ON activity.key = 'activity:' || b.id
+        LEFT JOIN bridge_values AS generation ON generation.key = 'stream-generation:' || b.id
+        WHERE b.attached = 1 AND b.peer_id IS NOT NULL ORDER BY b.id`).all() as RestartSnapshotRow[];
+      return rows.flatMap(row => {
+        const details = row.details === null ? null : JSON.parse(row.details) as { status?: string } | null;
+        if (details?.status !== "running") return [];
+        const activity = row.activity === null ? null : JSON.parse(row.activity) as { turnId?: string | null } | null;
+        const generation = row.generation === null ? null : JSON.parse(row.generation) as number | null;
+        return [{
+          bindingId: row.id,
+          hostId: row.host_id,
+          threadId: row.thread_id,
+          title: row.title,
+          generation: generation ?? 0,
+          activeTurnId: typeof activity?.turnId === "string" && activity.turnId ? activity.turnId : null,
+          ...(row.source_id ? { sourceId: row.source_id } : {}),
+        } satisfies RestartTaskSnapshot];
+      });
+    }).deferred();
+  } finally { db.close(); }
+  return writeRestartIntent(tasks, dataDir, sourcePid, now);
 }
 
 export async function archiveRestartIntent(dataDir: string, intent: RestartIntent): Promise<string> {

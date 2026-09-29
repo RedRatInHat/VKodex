@@ -1,8 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { loadDesktopBridgeConfig } from "../bridge/config.js";
-import { BridgeStore } from "../bridge/store.js";
-import { captureRestartIntent, restartIntentPath } from "./restart-intent.js";
+import { captureRestartIntentFromDatabase, restartIntentPath } from "./restart-intent.js";
 
 interface RuntimeState { readonly status?: string; readonly pid?: number; readonly startedAt?: number }
 
@@ -22,10 +21,7 @@ async function main(): Promise<void> {
     throw new Error("VKodex bridge is not running; no controlled restart was attempted.");
   }
   const oldPid: number = pid;
-  const store = new BridgeStore(`${config.dataDir.replace(/[\\/]$/u, "")}/vkodex.sqlite`);
-  let intent;
-  try { intent = await captureRestartIntent(store, config.dataDir, oldPid); }
-  finally { store.close(); }
+  const intent = await captureRestartIntentFromDatabase(`${config.dataDir.replace(/[\\/]$/u, "")}/vkodex.sqlite`, config.dataDir, oldPid);
   process.stdout.write(`Captured ${intent.tasks.length} active task(s) in ${restartIntentPath(config.dataDir)}.\n`);
   process.kill(oldPid, "SIGTERM");
   const deadline = Date.now() + 120_000;
