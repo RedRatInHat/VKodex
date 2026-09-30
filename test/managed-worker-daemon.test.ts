@@ -202,6 +202,24 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
   }
 });
 
+test('controlled native CLI canary evidence permits only one outstanding history read', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  try {
+    own.backend.holdEvidenceRead = true;
+    const first = own.daemon.nativeCliCanaryEvidence(capability);
+    await waitFor(() => own.backend.heldEvidenceRead !== null, 1500);
+    await assert.rejects(own.daemon.nativeCliCanaryEvidence(capability), /unavailable/i);
+    own.backend.answerHeldEvidenceRead();
+    assert.equal((await first).turnsPageComplete, true);
+    assert.equal((await own.daemon.nativeCliCanaryEvidence(capability)).turnsPageComplete, true);
+  } finally {
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'canary-singleflight-stop');
+  }
+});
+
 test('native CLI WebSocket admits one qualified plain-text turn through the same durable worker', async () => {
   const capability = {}; let externalIdle = false;
   const cli = { capability, noPendingExternalAutoStart: () => externalIdle,
@@ -1060,6 +1078,7 @@ class Backend extends EventEmitter {
   queueEntries: Record<string, unknown>[] = [];
   readStatusOverride: string | null = null;
   goalOverride: unknown = null;
+  holdEvidenceRead = false; heldEvidenceRead: Record<string, unknown> | null = null;
   holdIdOnlyResume = false;
   heldIdOnlyResume: unknown = null;
   readonly taskId: string; readonly cwd: string;
@@ -1097,6 +1116,10 @@ class Backend extends EventEmitter {
             result: { queuedSubmission: { id: `submission-${this.queueWrites}`,
               clientUserMessageId: params.clientUserMessageId, input: params.input } } }) + '\n'));
           continue;
+        }
+        if (method === 'thread/read' && this.holdEvidenceRead &&
+            (frame.params as Record<string, unknown> | undefined)?.includeTurns === false) {
+          this.heldEvidenceRead = frame; continue;
         }
         if (method === 'thread/resume' && this.holdIdOnlyResume &&
             Object.keys(frame.params as Record<string, unknown>).length === 1) {
@@ -1141,6 +1164,12 @@ class Backend extends EventEmitter {
     throw new Error(`unexpected method ${method}`);
   }
   kill(): boolean { this.exitCode = 0; this.emit('close', 0, null); return true; }
+  answerHeldEvidenceRead(): void {
+    const frame = this.heldEvidenceRead;
+    assert.ok(frame);
+    this.heldEvidenceRead = null; this.holdEvidenceRead = false;
+    this.stdout.write(JSON.stringify({ id: frame.id, result: this.answer('thread/read') }) + '\n');
+  }
   answerHeldQueue(): void {
     const frame = this.heldQueueReply;
     assert.ok(frame);
