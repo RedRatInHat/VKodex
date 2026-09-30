@@ -173,9 +173,27 @@ test("private state rejects tampering, mismatched scope, and noncanonical secret
 test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { skip: process.platform !== "win32" }, async t => {
   const unavailablePhase = currentUserDpapiUnavailablePhase();
   if (unavailablePhase) { t.skip(`CurrentUser DPAPI ${unavailablePhase} is unavailable in this Windows execution context`); return; }
-  const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   const sentinel = randomUUID(); const input = { ...manifest(), taskId: sentinel, familyRoot: sentinel,
     resumeParams: { threadId: sentinel, settings: { model: "gpt-5.6-sol" } } };
+  const root = process.env.SystemRoot!;
+  const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const syncProductRunner: ManagedWorkerPrivateStatePowerShellRunner = { async run(script, bytes) {
+    const payload = Buffer.from(bytes);
+    try {
+      const command = `$expected=${payload.byteLength};${script}`;
+      const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")], {
+        input: payload, windowsHide: true, timeout: 10_000,
+        env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
+      });
+      if (result.error || result.status !== 0) assert.fail(`Product script sync preflight failed at exit-${result.status}`);
+      return Uint8Array.from(result.stdout);
+    } finally { payload.fill(0); bytes.fill(0); }
+  } };
+  await createManagedWorkerPrivateState(input, {
+    baseDirectory: fixturePath("private", "sync-dpapi-preflight"),
+    filesystem: new MemoryFilesystem(), powerShellRunner: syncProductRunner,
+  });
+  const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   let created;
   try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
   catch (error) {
