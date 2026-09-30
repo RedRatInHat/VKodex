@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { APIError, VK } from "vk-io";
@@ -17,6 +19,7 @@ import { lstat, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/prom
 import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
 import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type GoalContinuationReceipt, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
@@ -3978,6 +3981,29 @@ test("explicit recovery releases only absent reserved bytes whose original write
   assert.equal(s.store.stageReservedBytes(), 30, "existing staged bytes and legacy reservation stay charged");
   assert.equal(await readFile(existingPath, "utf8"), "written bytes");
   assert.equal(await files.reconcileAbandonedStageReservations(), 0);
+});
+
+test("a child crash after reservation releases only its absent unreceipted stage after restart", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-child-crash-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const stagedPath = path.join(root, "never-written.bin");
+  const storeModule = pathToFileURL(path.join(process.cwd(), "src", "bridge", "store.ts")).href;
+  const script = `import { BridgeStore } from ${JSON.stringify(storeModule)};
+const store = new BridgeStore(process.argv[1]);
+store.reserveStage("child-crash", "binding", "operation", 7, process.argv[2], undefined,
+  { pid: process.pid, birthTicks: "123456789" });
+process.kill(process.pid, "SIGKILL");`;
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, filename, stagedPath],
+    { stdio: "ignore" });
+  await once(child, "exit");
+
+  const recovered = new BridgeStore(filename); t.after(() => recovered.close());
+  assert.equal(recovered.stageReservedBytes(), 7, "the killed child persisted its reservation before the receipt boundary");
+  const files = new TaskFiles(root, recovered, new Chat(), new AccessGate(access, recovered), undefined, false,
+    undefined, undefined, () => null);
+  assert.equal(await files.reconcileAbandonedStageReservations(), 1);
+  assert.equal(recovered.stageReservedBytes(), 0);
+  assert.equal(recovered.reserveStage("child-crash", "binding", "operation", 7, path.join(root, "retry.bin")), "reserved");
 });
 
 test("reserved-stage recovery is bounded and retains uncertain writer evidence", async t => {
