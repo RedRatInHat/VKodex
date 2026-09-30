@@ -17,19 +17,20 @@ const manifest = (): ManagedWorkerPrivateManifest => ({
   resumeParams: { threadId: "task-1", settings: { model: "gpt-5.6-sol" } }, registryPath: fixturePath("private", "registry.sqlite"),
 });
 
-function currentUserDpapiAvailable(): boolean {
+function currentUserDpapiUnavailablePhase(): "protect" | "unprotect" | null {
   const root = process.env.SystemRoot;
-  if (!root || !path.win32.isAbsolute(root)) return false;
+  if (!root || !path.win32.isAbsolute(root)) return "protect";
   const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const script = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$plain=[byte[]](112,114,111,98,101);" +
-    "$cipher=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);" +
-    "$roundtrip=[Security.Cryptography.ProtectedData]::Unprotect($cipher,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);" +
-    "if($roundtrip.Length -ne $plain.Length){exit 1};for($i=0;$i -lt $plain.Length;$i++){if($roundtrip[$i] -ne $plain[$i]){exit 1}}";
-  const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    encoding: "utf8", windowsHide: true, timeout: 10_000,
+  const invoke = (script: string, input: string) => spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
+    input, encoding: "utf8", windowsHide: true, timeout: 10_000,
     env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
   });
-  return !result.error && result.status === 0;
+  const protect = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$raw=[Console]::In.ReadToEnd().Trim();$data=[Convert]::FromBase64String($raw);$out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out))";
+  const unprotect = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$raw=[Console]::In.ReadToEnd().Trim();$data=[Convert]::FromBase64String($raw);$out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out))";
+  const protectedResult = invoke(protect, "cHJvYmU=");
+  if (protectedResult.error || protectedResult.status !== 0 || !protectedResult.stdout.trim()) return "protect";
+  const unprotectedResult = invoke(unprotect, protectedResult.stdout.trim());
+  return unprotectedResult.error || unprotectedResult.status !== 0 || unprotectedResult.stdout.trim() !== "cHJvYmU=" ? "unprotect" : null;
 }
 
 class IdentityProtector implements ManagedWorkerPrivateStateProtector {
@@ -144,7 +145,8 @@ test("private state rejects tampering, mismatched scope, and noncanonical secret
 });
 
 test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { skip: process.platform !== "win32" }, async t => {
-  if (!currentUserDpapiAvailable()) { t.skip("CurrentUser DPAPI is unavailable in this Windows execution context"); return; }
+  const unavailablePhase = currentUserDpapiUnavailablePhase();
+  if (unavailablePhase) { t.skip(`CurrentUser DPAPI ${unavailablePhase} is unavailable in this Windows execution context`); return; }
   const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   const sentinel = randomUUID(); const input = { ...manifest(), taskId: sentinel, familyRoot: sentinel,
     resumeParams: { threadId: sentinel, settings: { model: "gpt-5.6-sol" } } };
