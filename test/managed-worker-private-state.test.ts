@@ -194,6 +194,14 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
     baseDirectory: fixturePath("private", "sync-dpapi-preflight"),
     filesystem: new MemoryFilesystem(), powerShellRunner: syncProductRunner,
   });
+  try {
+    await createManagedWorkerPrivateState(input, {
+      baseDirectory: fixturePath("private", "source-dpapi-preflight"),
+      filesystem: new MemoryFilesystem(),
+    });
+  } catch (error) {
+    assert.fail(`Product source DPAPI-only create failed at ${productDpapiFailurePhase(error)} after fixed preflight`);
+  }
   const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   let created;
   try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
@@ -209,7 +217,7 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
         baseDirectory: fixturePath("private", "compiled-dpapi-preflight"), filesystem: new MemoryFilesystem(),
       });
     } catch (compiledError) { compiledPhase = productDpapiFailurePhase(compiledError); }
-    assert.fail(`Product source DPAPI create failed at ${productDpapiFailurePhase(error)}; compiled ${compiledPhase} after fixed preflight`);
+    assert.fail(`Product default-filesystem create failed at ${productDpapiFailurePhase(error)}; source DPAPI-only passed, compiled ${compiledPhase} after fixed preflight`);
   }
   const statePath = path.join(created.privateDirectory, "state.v1.dpapi");
   const stored = await readFile(statePath);
