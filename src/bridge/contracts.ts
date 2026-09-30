@@ -11,6 +11,8 @@ export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
 export class FileUploadRejectedError extends Error {}
 /** VK upload servers report this when the document storage is full. */
 export class FileUploadStorageFullError extends Error {}
+/** The document upload failed before docs.save was invoked, so one retry is safe. */
+export class FileUploadPreSaveError extends Error {}
 export class ChatRateLimitError extends Error {
   constructor(readonly retryAfterMs: number) { super("VK временно ограничил частоту запросов. Отправка продолжится после паузы."); }
 }

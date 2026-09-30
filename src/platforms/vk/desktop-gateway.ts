@@ -2,7 +2,7 @@ import { APIError, VK, MessageContext, UpdateSource, DocumentAttachment, type Me
 import { BridgeStore } from "../../bridge/store.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
-import { ChatRateLimitError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
+import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../core/codex-tasks.js";
 import { isObject } from "../../desktop/ipc-client.js";
@@ -381,24 +381,33 @@ export class DesktopVkGateway implements BridgeChat {
       // vk-io forwards upload-server errors to docs.save as if they were a
       // successful upload. Preserve the actual failure before it is masked by
       // API error 100 ("file is undefined"). Never log upload tokens or URLs.
-      const saved = await this.vk.upload.conduct({
-        field: "file", params: { peer_id: peerId, title: name, type: "doc", source },
-        getServer: this.vk.api.docs.getMessagesUploadServer, serverParams: ["type", "peer_id"],
-        saveParams: ["title", "tags"], maxFiles: 1, attachmentType: "doc",
-        saveFiles: async uploaded => {
-          const storageFull = isObject(uploaded) && typeof uploaded.error === "string" && /^no_free_space(?:\/|$)/u.test(uploaded.error);
-          if (isObject(uploaded) && uploaded.error === "wrong_file") {
-            this.logger?.warn({ peerId, bytes: contents.length, reason: "wrong_file" }, "VK document upload rejected");
-            throw new FileUploadRejectedError("VK отклонил файл: wrong_file. Это отказ принять формат или содержимое, а не лимит размера VKodex. Автоматические повторы этого файла остановлены.");
-          }
-          if (!isObject(uploaded) || uploaded.error !== undefined || typeof uploaded.file !== "string" || !uploaded.file.trim()) {
-            this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response" }, "VK document upload rejected");
-            throw (storageFull ? new FileUploadStorageFullError("На сервере загрузки VK закончилось свободное место.") : new ActionRejectedError(
-              "Сервер загрузки VK не подтвердил приём файла. Файл не отправлен; повтори /files позже."));
-          }
-          return this.vk.api.docs.save({ file: uploaded.file, title: name });
-        },
-      });
+      let saveInvoked = false;
+      let saved: unknown;
+      try {
+        saved = await this.vk.upload.conduct({
+          field: "file", params: { peer_id: peerId, title: name, type: "doc", source },
+          getServer: this.vk.api.docs.getMessagesUploadServer, serverParams: ["type", "peer_id"],
+          saveParams: ["title", "tags"], maxFiles: 1, attachmentType: "doc",
+          saveFiles: async uploaded => {
+            const storageFull = isObject(uploaded) && typeof uploaded.error === "string" && /^no_free_space(?:\/|$)/u.test(uploaded.error);
+            if (isObject(uploaded) && uploaded.error === "wrong_file") {
+              this.logger?.warn({ peerId, bytes: contents.length, reason: "wrong_file" }, "VK document upload rejected");
+              throw new FileUploadRejectedError("VK отклонил файл: wrong_file. Это отказ принять формат или содержимое, а не лимит размера VKodex. Автоматические повторы этого файла остановлены.");
+            }
+            if (!isObject(uploaded) || uploaded.error !== undefined || typeof uploaded.file !== "string" || !uploaded.file.trim()) {
+              this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response" }, "VK document upload rejected");
+              throw (storageFull ? new FileUploadStorageFullError("На сервере загрузки VK закончилось свободное место.") : new FileUploadPreSaveError(
+                "Сервер загрузки VK не подтвердил приём файла до сохранения документа."));
+            }
+            saveInvoked = true;
+            return this.vk.api.docs.save({ file: uploaded.file, title: name });
+          },
+        });
+      } catch (error) {
+        if (!saveInvoked && !(error instanceof FileUploadRejectedError) && !(error instanceof FileUploadStorageFullError) && !(error instanceof FileUploadPreSaveError))
+          throw new FileUploadPreSaveError("Сервер загрузки VK не подтвердил приём файла до сохранения документа.");
+        throw error;
+      }
       if (!isObject(saved) || saved.type !== "doc" || !isObject(saved.doc) || typeof saved.doc.id !== "number" || typeof saved.doc.owner_id !== "number") throw new ActionRejectedError("VK не подтвердил сохранение документа. Повтори /files позже.");
       attachment = new DocumentAttachment({ api: this.vk.api, payload: { ...saved.doc, id: saved.doc.id, owner_id: saved.doc.owner_id } }).toString();
     }

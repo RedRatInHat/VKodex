@@ -7,7 +7,7 @@ import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
 import type { Binding, BridgeChat } from "./contracts.js";
-import { FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
+import { FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
@@ -412,6 +412,17 @@ export class TaskFiles {
   private stageIndex(bindingId: string, operationId: string): Record<string, StagedFile> {
     return this.store.getValue<Record<string, StagedFile>>(this.stageIndexKey(bindingId, operationId)) ?? {};
   }
+  /** A durable pre-save retry is allowed once even if ordinary late scanning expired. */
+  private hasPendingPreSaveRetry(bindingId: string, operationId: string): boolean {
+    return Object.values(this.stageIndex(bindingId, operationId)).some(receipt =>
+      !this.store.getValue<boolean>(`${receipt.key}:queued`)
+      && !this.store.getValue<string>(`${receipt.key}:uploaded`)
+      && !this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)
+      && !this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)
+      && !this.store.getValue<boolean>(`${receipt.key}:rejected`)
+      && this.store.getValue<number>(`${receipt.key}:pre-save-retries`) === 1
+      && !["uploading", "unknown"].includes(this.store.getValue<string>(`${receipt.key}:upload-state`) ?? ""));
+  }
   private async stageDirectory(job: FileJob, bindingId: string): Promise<string> {
     return directory(this.stageRoot(), digest(bindingId), digest(job.operationId));
   }
@@ -734,8 +745,9 @@ export class TaskFiles {
       if (manual) return true;
       const completed = job.completed === true || (job.completed === undefined && job.done)
         || (job.turnId ? completedTurns.has(job.turnId) : this.completed.has(binding.id));
-      return completed && (!job.done || ((job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil)
-        && (job.nextScanAt === undefined || Date.now() >= job.nextScanAt)));
+      const due = job.nextScanAt === undefined || Date.now() >= job.nextScanAt;
+      const withinLateWindow = job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil;
+      return completed && (!job.done || (due && (withinLateWindow || this.hasPendingPreSaveRetry(binding.id, job.operationId))));
     });
     for (const job of eligible) {
       const outbox = await directory(this.root, job.directory, "outbox");
@@ -807,6 +819,7 @@ export class TaskFiles {
           if (this.store.getValue<boolean>(`${key}:queued`)) return;
           if (!manual && this.store.getValue<boolean>(`${key}:rejected`)) return;
           if (!manual && this.store.getValue<boolean>(`${key}:quota-blocked`)) return;
+          if (!manual && this.store.getValue<boolean>(`${key}:pre-save-blocked`)) return;
           await this.check(binding, generation);
           let attachment = this.store.getValue<string>(`${key}:uploaded`);
           if (!attachment) {
@@ -839,6 +852,37 @@ export class TaskFiles {
               this.store.setValue(`${key}:upload-state`, "uploading");
               try { attachment = await uploadFile(binding.peerId!, receipt?.name ?? file.name, uploadBytes, receipt?.kind ?? file.kind); break; }
               catch (error) {
+                if (error instanceof FileUploadPreSaveError) {
+                  const automaticRetries = this.store.getValue<number>(`${key}:pre-save-retries`) ?? 0;
+                  if (!manual && automaticRetries === 0) {
+                    // Persist an exact immutable copy before the deferred retry.
+                    // This remains safe even outside the general staging pilot.
+                    if (!receipt) {
+                      try {
+                        receipt = await this.stageFile(file, relativePath, fingerprint, key, job, binding);
+                        uploadBytes = await this.stagedContents(receipt, job, binding.id, uploadBytes);
+                      } catch {
+                        this.store.atomic(() => {
+                          this.store.setValue(`${key}:pre-save-blocked`, true);
+                          this.store.setValue(`${key}:upload-state`, null);
+                          this.store.enqueue(`${key}:pre-save-error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен: VK не подтвердил загрузку до сохранения документа, а безопасную версию для повтора сохранить не удалось. Автоматические повторы остановлены; повтори /files вручную.`, silent: true }, binding.id);
+                        });
+                        return;
+                      }
+                    }
+                    this.store.atomic(() => {
+                      this.store.setValue(`${key}:pre-save-retries`, 1);
+                      this.store.setValue(`${key}:upload-state`, null);
+                    });
+                    return;
+                  }
+                  this.store.atomic(() => {
+                    this.store.setValue(`${key}:pre-save-blocked`, true);
+                    this.store.setValue(`${key}:upload-state`, null);
+                    this.store.enqueue(`${key}:pre-save-error`, binding.peerId!, { text: `Файл «${file.name}» не отправлен: VK второй раз не подтвердил загрузку до сохранения документа. Автоматические повторы остановлены; повтори /files вручную.`, silent: true }, binding.id);
+                  });
+                  return;
+                }
                 if (error instanceof FileUploadStorageFullError) {
                   this.store.setValue(`${key}:upload-state`, null);
                   if (cleanupAttempted) {
@@ -884,6 +928,7 @@ export class TaskFiles {
               this.store.setValue(`${key}:uploaded`, uploadedAttachment);
               this.store.setValue(`${key}:upload-state`, "uploaded");
               this.store.setValue(`${key}:quota-blocked`, null);
+              this.store.setValue(`${key}:pre-save-blocked`, null);
             });
           }
           if (pending.length && (pending.length >= FILE_LIMITS.maxFiles || pendingBytes + file.contents.length > FILE_LIMITS.maxTotalBytes)) await flushPending();
@@ -904,6 +949,7 @@ export class TaskFiles {
           }
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:rejected`)) continue;
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)) continue;
+          if (!manual && this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)) continue;
           let contents: Buffer;
           try { contents = await this.stagedContents(receipt, job, binding.id); }
           catch (error) {
@@ -920,7 +966,18 @@ export class TaskFiles {
           allowBatchOverflow: true, skipOversizedFiles: true, skipUnsafeFiles: true, onSkippedFile: error => skipped.push(error),
           skipFile: (relativePath, fingerprint) => {
             if (blockedStageSources.get(relativePath) === fingerprint) return true;
+            // A pre-save retry owns this path through its staged receipt. Do
+            // not turn a changed source file into a second document while the
+            // original immutable version is awaiting its one safe retry.
+            if (Object.values(this.stageIndex(binding.id, job.operationId)).some(receipt => receipt.relativePath === relativePath
+              && !this.store.getValue<boolean>(`${receipt.key}:queued`)
+              && (!!this.store.getValue<number>(`${receipt.key}:pre-save-retries`)
+                || !!this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)))) return true;
             const known = scanned[relativePath];
+            // Staging can itself fail before it creates a receipt. The prior
+            // scan key still owns this path, so a later source mutation must
+            // not escape its terminal automatic block.
+            if (!manual && known && this.store.getValue<boolean>(`${known.key}:pre-save-blocked`)) return true;
             if (!known || known.fingerprint !== fingerprint) return false;
             if (this.store.getValue<boolean>(`${known.key}:queued`)) return true;
             const uploadState = this.store.getValue<string>(`${known.key}:upload-state`);
@@ -930,7 +987,8 @@ export class TaskFiles {
               return true;
             }
             return !manual && (!!this.store.getValue<boolean>(`${known.key}:rejected`)
-              || !!this.store.getValue<boolean>(`${known.key}:quota-blocked`));
+              || !!this.store.getValue<boolean>(`${known.key}:quota-blocked`)
+              || !!this.store.getValue<boolean>(`${known.key}:pre-save-blocked`));
           },
           onFile: processFile,
         });
@@ -967,10 +1025,14 @@ export class TaskFiles {
   private async flush(): Promise<void> {
     for (const id of new Set([...this.completed, ...this.store.bindings().map(binding => binding.id)])) {
       const generation = this.store.streamGeneration(id);
-      if (this.stopped || Date.now() < (this.retries.get(id) ?? 0) || !this.jobs(id).some(job => job.generation === generation && job.state === "accepted" && !job.queued
-        && (job.completed === true || (job.completed === undefined && job.done) || (!job.done && this.completed.has(id)))
-        && (!job.done || ((job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil)
-          && (job.nextScanAt === undefined || Date.now() >= job.nextScanAt))))) continue;
+      const ready = this.jobs(id).some(job => {
+        if (job.generation !== generation || job.state !== "accepted" || job.queued) return false;
+        const completed = job.completed === true || (job.completed === undefined && job.done) || (!job.done && this.completed.has(id));
+        if (!completed || !job.done) return completed;
+        const due = job.nextScanAt === undefined || Date.now() >= job.nextScanAt;
+        return due && ((job.autoScanUntil === undefined || Date.now() <= job.autoScanUntil) || this.hasPendingPreSaveRetry(id, job.operationId));
+      });
+      if (this.stopped || Date.now() < (this.retries.get(id) ?? 0) || !ready) continue;
       const binding = this.store.getBinding(id); if (!binding?.attached || binding.peerId === null) continue;
       try { await this.collect(binding); this.retries.delete(id); }
       catch (error) {

@@ -5,7 +5,7 @@ import test from "node:test";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { APIError, VK } from "vk-io";
 import type { BridgeChat, BridgeInput, MessageHandle, View, VkDocumentRecord } from "../src/bridge/contracts.js";
-import { ChatRateLimitError, FileUploadRejectedError, FileUploadStorageFullError, MENU_BUTTON } from "../src/bridge/contracts.js";
+import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, MENU_BUTTON } from "../src/bridge/contracts.js";
 import { AccessGate, DeliveryWorker } from "../src/bridge/delivery.js";
 import { TaskManager } from "../src/bridge/manager.js";
 import { TaskTransfers, transferStatus } from "../src/bridge/transfers.js";
@@ -5116,12 +5116,147 @@ test("VK upload errors are checked before docs.save and a later retry can succee
   const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
   const send = () => gateway.uploadFile(peerId, "installer.exe", Buffer.from("fixture"), "file");
   await assert.rejects(send, /На сервере загрузки VK закончилось свободное место/u);
-  await assert.rejects(send, /Сервер загрузки VK не подтвердил приём файла/u);
+  await assert.rejects(send, FileUploadPreSaveError);
   await assert.rejects(send, FileUploadRejectedError);
   assert.equal(calls.filter(method => method === "docs.save").length, 0);
   assert.equal(await send(), "doc-202_17_fixture");
   assert.equal(calls.filter(method => method === "docs.getMessagesUploadServer").length, 4);
   assert.equal(calls.filter(method => method === "docs.save").length, 1);
+});
+
+test("a document failure after docs.save starts remains ambiguous", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
+    if (method === "docs.getMessagesUploadServer") return { upload_url: "https://upload.vk.com/fixture" } as never;
+    if (method === "docs.save") throw new Error("save reply lost");
+    throw new Error("Unexpected API call");
+  });
+  t.mock.method(vk.upload, "upload", async () => ({ file: "fixture-upload-token" }));
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  await assert.rejects(gateway.uploadFile(peerId, "result.txt", Buffer.from("fixture"), "file"), /save reply lost/u);
+});
+
+test("a pre-save document failure retries staged bytes after the late window and then requires /files", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-retry-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "pre-save-retry", []);
+  files.finish(binding.id, "pre-save-retry", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  let attempts = 0;
+  const upload = t.mock.method(s.chat, "uploadFile", async (_peer: number, _name: string, contents: Buffer) => {
+    attempts++;
+    assert.equal(contents.toString(), "original bytes");
+    if (attempts <= 2) throw new FileUploadPreSaveError("before save");
+    return "doc-202_91";
+  });
+  assert.equal(await files.collect(binding), 0);
+  assert.equal(upload.mock.callCount(), 1);
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "changed source bytes");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  now += 59_999;
+  await restored.tick();
+  assert.equal(upload.mock.callCount(), 1, "the durable retry still waits for its late-scan backoff");
+  now += 48 * 60 * 60_000 + 1;
+  await restored.tick();
+  assert.equal(upload.mock.callCount(), 2);
+  assert.equal(await restored.collect(binding), 0);
+  assert.equal(upload.mock.callCount(), 2);
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(message => /второй раз не подтвердил загрузку/u.test(message.view.text)));
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.equal(upload.mock.callCount(), 3);
+});
+
+test("a crash after staging but before the pre-save retry marker remains unknown", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-marker-crash-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "pre-save-marker-crash", []);
+  files.finish(binding.id, "pre-save-marker-crash", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const upload = t.mock.method(s.chat, "uploadFile", async () => { throw new FileUploadPreSaveError("before save"); });
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":pre-save-retries") && value === 1) {
+      const scan = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:pre-save-marker-crash`)!;
+      assert.equal(s.store.getValue(`${scan["result.txt"]!.key}:upload-state`), "uploading");
+      throw new Error("crash after durable stage");
+    }
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding), /crash after durable stage/u);
+  crash.mock.restore();
+  const staged = s.store.getValue<Record<string, { key: string }>>(`file-stage-index:${binding.id}:pre-save-marker-crash`)!;
+  const [receipt] = Object.values(staged);
+  assert.equal(s.store.getValue(`${receipt!.key}:upload-state`), "uploading");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await assert.rejects(restored.collect(binding), /неизвестным результатом загрузки/u);
+  assert.equal(upload.mock.callCount(), 1);
+});
+
+test("a terminal deferred pre-save retry never resumes automatic scanning", async t => {
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  for (const [label, terminal] of [
+    ["quota", new FileUploadStorageFullError("storage full")],
+    ["rejected", new FileUploadRejectedError("wrong file")],
+    ["unknown", new Error("response lost")],
+  ] as const) {
+    const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), `vkodex-pre-save-${label}-test-`));
+    const files = new TaskFiles(root, s.store, s.chat, s.gate);
+    const prepared = await files.prepare(binding, `pre-save-${label}`, []);
+    files.finish(binding.id, `pre-save-${label}`, "accepted", "completed-turn");
+    await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
+    files.observe(binding.id, "idle", "completed-turn");
+    let attempts = 0;
+    const upload = t.mock.method(s.chat, "uploadFile", async () => {
+      attempts++;
+      if (attempts === 1) throw new FileUploadPreSaveError("before save");
+      throw terminal;
+    });
+    assert.equal(await files.collect(binding), 0);
+    now += 48 * 60 * 60_000 + 1;
+    await files.tick();
+    assert.equal(upload.mock.callCount(), 2, `${label} consumes the one deferred retry`);
+    now += 60_000;
+    await files.tick();
+    assert.equal(upload.mock.callCount(), 2, `${label} does not re-enter automatic upload`);
+  }
+});
+
+test("a pre-save failure blocks when the staged receipt write fails", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-stage-failure-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "pre-save-stage-failure", []);
+  files.finish(binding.id, "pre-save-stage-failure", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const upload = t.mock.method(s.chat, "uploadFile", async () => { throw new FileUploadPreSaveError("before save"); });
+  const indexKey = `file-stage-index:${binding.id}:pre-save-stage-failure`;
+  const setValue = s.store.setValue.bind(s.store);
+  const stageWrite = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key === indexKey) {
+      const scan = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:pre-save-stage-failure`)!;
+      assert.equal(s.store.getValue(`${scan["result.txt"]!.key}:upload-state`), "uploading");
+      throw new Error("stage receipt write failed");
+    }
+    return setValue(key, value);
+  });
+  assert.equal(await files.collect(binding), 0);
+  stageWrite.mock.restore();
+  assert.equal(upload.mock.callCount(), 1);
+  const scanned = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:pre-save-stage-failure`)!;
+  assert.equal(s.store.getValue<boolean>(`${scanned["result.txt"]!.key}:pre-save-blocked`), true);
+  assert.equal(s.store.getValue(`${scanned["result.txt"]!.key}:upload-state`), null);
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "changed source bytes");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  now += 60_000;
+  await restored.tick();
+  assert.equal(upload.mock.callCount(), 1);
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(message => /безопасную версию для повтора сохранить не удалось/u.test(message.view.text)));
 });
 
 test("a rejected output does not block other files or retry automatically after restart", async t => {
