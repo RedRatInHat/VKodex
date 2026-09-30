@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppServerEnvelope, AppServerRequestOptions, AppServerRpc, AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
 import { AppServerTaskStateTransport, observeAppServerTaskState } from "../src/codex/app-server-task-state.js";
+import { TaskMirror } from "../src/bridge/mirror.js";
+import { BridgeStore } from "../src/bridge/store.js";
 import type { TaskState } from "../src/core/task-state.js";
 
 type JsonObject = Record<string, unknown>;
@@ -534,7 +536,11 @@ test("native observer recovers an accepted final after reconnect without replayi
   assert.deepEqual(recovered.events.filter(event => event.type !== "status").map(event => event.type), ["final"]);
 });
 
-test("native reconnect observes a completed turn started while detached exactly once", () => {
+test("native reconnect enqueues detached-turn input before final without duplicate delivery", t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const binding = store.ensureBinding({ hostId: "h", threadId: "task", title: "Task", workspace: "D:\\work", updatedAt: 0 });
+  store.setChat(binding.id, 200_000_0001, 17);
+  const mirror = new TaskMirror(store, 3_500, () => 20_000);
   const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
     runtimeStatus: "idle", context: null, turns: [] };
   const first = observeAppServerTaskState(empty, null, 10_000);
@@ -546,7 +552,17 @@ test("native reconnect observes a completed turn started while detached exactly 
   ], 11_000)];
   const reconnected = observeAppServerTaskState(completed, first.checkpoint, 20_000, { rebaseline: true });
   assert.deepEqual(reconnected.events.map(event => event.type), ["user", "final", "status"]);
-  assert.deepEqual(observeAppServerTaskState(completed, reconnected.checkpoint, 21_000).events, []);
+  mirror.acceptObservation(binding.id, reconnected.events, reconnected.inputTurnIds, []);
+  const deliveries = store.pendingDeliveries();
+  assert.deepEqual(deliveries.map(delivery => delivery.view.text), [
+    "## user request\n\nnew request",
+    "done\n\nМеню задачи:",
+  ]);
+
+  const repeated = observeAppServerTaskState(completed, reconnected.checkpoint, 21_000);
+  assert.deepEqual(repeated.events, []);
+  mirror.acceptObservation(binding.id, repeated.events, repeated.inputTurnIds, []);
+  assert.equal(store.pendingDeliveries().length, deliveries.length);
 });
 
 test("native reconnect observes live progress from a new turn without replaying an old turn", () => {
