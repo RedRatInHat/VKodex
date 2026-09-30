@@ -3,11 +3,12 @@ import type { IncomingMessage } from "node:http";
 import test from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
 import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
+import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
 
 type JsonObject = Record<string, unknown>;
 
-async function fixture() {
+async function fixture(response: (value: JsonObject) => JsonObject = () => ({ ok: true })) {
   const token = "isolated-test-capability";
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0, maxPayload: 1024 * 1024,
     verifyClient: (info: { req: IncomingMessage }) =>
@@ -29,7 +30,7 @@ async function fixture() {
       if (value.id === undefined) return;
       if (value.method === "hang") return;
       socket.send(JSON.stringify({ id: value.id, result: value.method === "initialize"
-        ? { serverInfo: { name: "isolated-ws" } } : { ok: true } }));
+        ? { serverInfo: { name: "isolated-ws" } } : response(value) }));
     });
   });
   return {
@@ -82,4 +83,24 @@ test("WebSocket App Server capability refuses wrong bearer and non-loopback URLs
     finally { await wrong.close(); }
     assert.equal(native.connections, 0);
   } finally { await native.close(); }
+});
+
+test("profile owner teardown detaches its WebSocket without terminating the backend", async () => {
+  const threadId = "00000000-0000-4000-8000-000000000001";
+  const native = await fixture(value => value.method === "thread/read"
+    ? { thread: { id: threadId, name: "detached owner", cwd: "C:/temp", status: { type: "idle" } } }
+    : { ok: true });
+  const task = { hostId: "local" as const, threadId, sourceId: "source-a" };
+  const first = new AppServerProfileOwner("source-a",
+    createAppServerWebSocketConnection(native.url, native.token, 1000));
+  try {
+    assert.equal((await first.inspectTask(task)).status, "idle");
+    await first.close();
+    const second = new AppServerProfileOwner("source-a",
+      createAppServerWebSocketConnection(native.url, native.token, 1000));
+    try {
+      assert.equal((await second.inspectTask(task)).title, "detached owner");
+      assert.equal(native.connections, 2);
+    } finally { await second.close(); }
+  } finally { await first.close(); await native.close(); }
 });
