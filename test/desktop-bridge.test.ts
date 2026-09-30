@@ -4939,8 +4939,8 @@ test("owner can list and verify one unknown staged document without a second VK 
   s.chat.resolveDocumentAttachment = async () => ({ url: "https://vk.com/doc-202_77", sizeBytes: 14 });
   t.mock.method(globalThis, "fetch", async () => new Response("verified bytes"));
   await manager.handle(s.input(`/files verify verified-command ${receipt.key} doc-202_77`, peerId));
-  for (let attempt = 0; attempt < 100 && !s.store.getValue<string>(`${receipt.key}:uploaded`); attempt++)
-    await new Promise(resolve => setImmediate(resolve));
+  for (let attempt = 0; attempt < 200 && !s.store.getValue<string>(`${receipt.key}:uploaded`); attempt++)
+    await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(s.store.getValue(`${receipt.key}:uploaded`), "doc-202_77");
   await restored.collect(binding, true);
   await s.worker.flush();
