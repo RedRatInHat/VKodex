@@ -304,7 +304,7 @@ export class ManagedWorkerDaemon {
       const read = await host.ownerRead(key, generation, 'thread/read',
         { threadId: taskId, includeTurns: false });
       const page = await host.ownerRead(key, generation, 'thread/turns/list',
-        { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'full' });
+        { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'summary' });
       const goal = await host.ownerRead(key, generation, 'thread/goal/get', { threadId: taskId });
       const queue = await host.ownerRead(key, generation, 'thread/queue/list',
         { threadId: taskId, limit: 2 });

@@ -256,6 +256,12 @@ test('owner-scoped state reads use the exact worker without opening or mutating 
       { threadId: taskId, includeTurns: false }), { thread: { id: taskId } });
     assert.deepEqual(await managed.ownerRead(controlKey, generation, 'thread/read',
       { threadId: taskId, includeTurns: true }), { thread: { id: taskId } });
+    const turns = managed.ownerRead(controlKey, generation, 'thread/turns/list',
+      { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'summary' });
+    const turnsWire = await sentMutation(child, 'thread/turns/list');
+    assert.equal((turnsWire.params as Record<string, unknown>).itemsView, 'summary');
+    child.send({ id: turnsWire.id, result: { data: [], nextCursor: null } });
+    assert.deepEqual(await turns, { data: [], nextCursor: null });
     const queue = managed.ownerRead(controlKey, generation, 'thread/queue/list',
       { threadId: taskId, cursor: null, limit: 100 });
     const wire = await sentMutation(child, 'thread/queue/list');

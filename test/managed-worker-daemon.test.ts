@@ -183,7 +183,7 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
       (frame.params as Record<string, unknown> | undefined)?.includeTurns === false);
     assert.ok(evidenceRead, 'canary evidence must not clone the full thread history');
     assert.ok(own.backend.frames.some(frame => frame.method === 'thread/turns/list' &&
-      (frame.params as Record<string, unknown> | undefined)?.itemsView === 'full'));
+      (frame.params as Record<string, unknown> | undefined)?.itemsView === 'summary'));
     assert.deepEqual(Object.keys(first).sort(), [
       'acceptedStartSha256', 'backendGeneration', 'commandInFlight', 'commandUnconfirmed',
       'goalEmpty', 'nativeState', 'ownerEpoch', 'pendingEvents', 'pendingNativeOperations',

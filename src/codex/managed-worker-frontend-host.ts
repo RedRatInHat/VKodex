@@ -111,7 +111,7 @@ function ownerReadShape(method: string, params: JsonObject, taskId: string, ownC
     (!Object.hasOwn(params, 'limit') || limit(params.limit)) &&
     (!Object.hasOwn(params, 'sortDirection') ||
       params.sortDirection === 'asc' || params.sortDirection === 'desc') &&
-    (!Object.hasOwn(params, 'itemsView') || params.itemsView === 'full');
+    (!Object.hasOwn(params, 'itemsView') || params.itemsView === 'full' || params.itemsView === 'summary');
   return false;
 }
 
