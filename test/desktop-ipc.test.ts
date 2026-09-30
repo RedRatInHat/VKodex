@@ -3097,6 +3097,24 @@ test("version-two full-history cursor is rescanned from oldest summary without s
   assert.equal(calls[0]?.itemsView, "summary");
 });
 
+test("historical queue scan rejects oversized native and persisted opaque cursors", async () => {
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", async () => ({
+    data: [{ id: "oldest", status: "completed", itemsView: "summary", items: [] }],
+    nextCursor: "x".repeat(1_025),
+  })), DesktopUnavailableError);
+  const prior = { scanVersion: 3, headDigest: "a".repeat(64), cursor: "x".repeat(1_025),
+    seenCursors: ["x".repeat(1_025)], pages: 1 } as unknown as
+    import("../src/core/codex-tasks.js").QueuedInputHistoryCursor;
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", async () =>
+    assert.fail("invalid persisted cursor must reject before native reads"), prior), DesktopUnavailableError);
+  const cursors = Array.from({ length: 1_025 }, (_, index) => `${index}-`.padEnd(1_024, "x"));
+  const excessive = { scanVersion: 3, headDigest: "a".repeat(64), cursor: cursors.at(-1),
+    seenCursors: cursors, pages: cursors.length } as unknown as
+    import("../src/core/codex-tasks.js").QueuedInputHistoryCursor;
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", async () =>
+    assert.fail("oversized persisted history must reject before native reads"), excessive), DesktopUnavailableError);
+});
+
 test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {
   const legacy = { headDigest: "a".repeat(64), cursor: "old-descending-page",
     seenCursors: ["old-descending-page"], pages: 1 } as unknown as

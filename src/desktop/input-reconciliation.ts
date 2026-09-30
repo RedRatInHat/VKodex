@@ -45,13 +45,17 @@ export async function scanTerminalQueuedInputTurn(
   previous: QueuedInputHistoryCursor | null = null,
 ): Promise<QueuedInputHistoryScan> {
   if (!threadId || !clientId) throw new DesktopUnavailableError("Не задана задача или операция очереди.");
+  const maxCursorBytes = 1_024;
+  const maxCursorHistoryBytes = 1_024 * 1_024;
+  const cursorBytes = (value: string): number => Buffer.byteLength(value, "utf8");
   // v2 cursors fingerprinted full one-turn pages. They cannot be interpreted
   // as summary-batch boundaries; a read-only restart from oldest is safe.
   const resume = previous?.scanVersion === 3 ? previous : null;
   if (resume && (typeof resume.headDigest !== "string" || !/^[0-9a-f]{64}$/u.test(resume.headDigest) ||
-    typeof resume.cursor !== "string" || !resume.cursor ||
+    typeof resume.cursor !== "string" || !resume.cursor || cursorBytes(resume.cursor) > maxCursorBytes ||
     !Array.isArray(resume.seenCursors) || resume.seenCursors.length !== resume.pages ||
-    resume.seenCursors.some(value => typeof value !== "string" || !value) ||
+    resume.seenCursors.some(value => typeof value !== "string" || !value || cursorBytes(value) > maxCursorBytes) ||
+    resume.seenCursors.reduce((total, value) => total + (typeof value === "string" ? cursorBytes(value) : 0), 0) > maxCursorHistoryBytes ||
     new Set(resume.seenCursors).size !== resume.seenCursors.length ||
     resume.seenCursors.at(-1) !== resume.cursor ||
     !Number.isSafeInteger(resume.pages) || resume.pages < 1 || resume.pages > 5_000))
@@ -66,7 +70,8 @@ export async function scanTerminalQueuedInputTurn(
       ...(cursor ? { cursor } : {}) });
     if (page.threadId !== undefined && page.threadId !== threadId ||
       !Array.isArray(page.data) || page.data.length > limit ||
-      !(page.nextCursor === null || typeof page.nextCursor === "string"))
+      !(page.nextCursor === null || typeof page.nextCursor === "string") ||
+      typeof page.nextCursor === "string" && cursorBytes(page.nextCursor) > maxCursorBytes)
       throw new DesktopUnavailableError("Codex вернул неполную историю очереди.");
     // Summary can still carry text. Bound parsed data separately from the
     // metadata RPC line ceiling; never enlarge that ceiling for this scan.
@@ -83,13 +88,15 @@ export async function scanTerminalQueuedInputTurn(
   if (resume && headDigest !== resume.headDigest)
     throw new DesktopUnavailableError("История очереди изменилась во время проверки.");
   const cursors = new Set(resume?.seenCursors ?? []);
+  let totalCursorBytes = resume?.seenCursors.reduce((total, value) => total + cursorBytes(value), 0) ?? 0;
   let cursor: string | null = resume?.cursor ?? null;
   let pages = resume?.pages ?? 0;
   let calls = 1;
   const consume = async (page: Page, startCursor?: string): Promise<string | null> => {
     const turns = new Set<string>();
     let matchedIndex: number | null = null;
-    if (page.nextCursor !== null && (!page.nextCursor || cursors.has(page.nextCursor) || page.data.length === 0))
+    if (page.nextCursor !== null && (!page.nextCursor || cursors.has(page.nextCursor) || page.data.length === 0 ||
+      totalCursorBytes + cursorBytes(page.nextCursor) > maxCursorHistoryBytes))
       throw new DesktopUnavailableError("Codex не завершил чтение истории очереди.");
     for (const [index, turn] of page.data.entries()) {
       if (!isObject(turn) || turn.threadId !== undefined && turn.threadId !== threadId ||
@@ -135,7 +142,10 @@ export async function scanTerminalQueuedInputTurn(
     }
     pages++;
     cursor = page.nextCursor;
-    if (cursor) cursors.add(cursor);
+    if (cursor) {
+      cursors.add(cursor);
+      totalCursorBytes += cursorBytes(cursor);
+    }
     return matched;
   };
   if (!resume) {
