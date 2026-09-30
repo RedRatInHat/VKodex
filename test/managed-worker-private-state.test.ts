@@ -34,6 +34,19 @@ function currentUserDpapiUnavailablePhase(): "protect" | "unprotect" | null {
   return unprotectedResult.error || unprotectedResult.status !== 0 || unprotectedResult.stdout.trim() !== input ? "unprotect" : null;
 }
 
+function productDpapiFailurePhase(error: unknown): string {
+  let current: unknown = error;
+  for (let depth = 0; depth < 3; depth++) {
+    if (!(current instanceof Error)) break;
+    const cause: unknown = current.cause;
+    if (cause && typeof cause === "object" && "phase" in cause &&
+      typeof cause.phase === "string" && /^(?:timeout|spawn-throw|process-error|output-limit|input-length|stdin-end|output-format|exit-(?:null|\d+))$/u.test(cause.phase))
+      return cause.phase;
+    current = cause;
+  }
+  return "unclassified";
+}
+
 class IdentityProtector implements ManagedWorkerPrivateStateProtector {
   async protect(value: Uint8Array): Promise<Uint8Array> { return Uint8Array.from(value); }
   async unprotect(value: Uint8Array): Promise<Uint8Array> { return Uint8Array.from(value); }
@@ -116,10 +129,15 @@ test("injectable PowerShell runner keeps DPAPI payloads in memory", { skip: proc
 test("protector failure and malformed or oversized strict JSON never reach filesystem writes", async () => {
   const failureFilesystem = new MemoryFilesystem();
   const failingProtector: ManagedWorkerPrivateStateProtector = {
-    async protect(): Promise<Uint8Array> { throw new Error("fixture"); },
-    async unprotect(): Promise<Uint8Array> { throw new Error("fixture"); },
+    async protect(): Promise<Uint8Array> { throw new Error("fixture-secret-must-not-escape"); },
+    async unprotect(): Promise<Uint8Array> { throw new Error("fixture-secret-must-not-escape"); },
   };
-  await assert.rejects(createManagedWorkerPrivateState(manifest(), { ...options(failureFilesystem), protector: failingProtector }), /protection failed/u);
+  await assert.rejects(createManagedWorkerPrivateState(manifest(), { ...options(failureFilesystem), protector: failingProtector }), error => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Managed worker private state protection failed");
+    assert.deepEqual(error.cause, { phase: "unclassified" });
+    return true;
+  });
   assert.deepEqual(failureFilesystem.actions, []);
 
   const malformedOutputFilesystem = new MemoryFilesystem();
@@ -162,7 +180,7 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
   catch (error) {
     if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
-    assert.fail("Product DPAPI create failed after the fixed 2 KiB cross-process preflight");
+    assert.fail(`Product DPAPI create failed at ${productDpapiFailurePhase(error)} after the fixed 2 KiB cross-process preflight`);
   }
   const statePath = path.join(created.privateDirectory, "state.v1.dpapi");
   const stored = await readFile(statePath);
@@ -173,7 +191,7 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   try { loaded = await loadManagedWorkerPrivateState({ baseDirectory, epoch }); }
   catch (error) {
     if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
-    assert.fail("Product DPAPI load failed after the fixed 2 KiB cross-process preflight");
+    assert.fail(`Product DPAPI load failed at ${productDpapiFailurePhase(error)} after the fixed 2 KiB cross-process preflight`);
   }
   assert.deepEqual(loaded.manifest, created.manifest); assert.deepEqual(loaded.keys, created.keys);
 });

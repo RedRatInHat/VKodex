@@ -170,48 +170,57 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
     const output: Buffer[] = []; let size = 0;
     const wipe = (): void => { input.fill(0); for (const chunk of output) chunk.fill(0); output.length = 0; };
     const stop = (): void => { if (!stopped) { stopped = true; try { child?.kill(); } catch { /* best-effort containment */ } } };
-    const settle = (result?: Uint8Array): void => {
+    const settle = (result?: Uint8Array, phase = "unknown"): void => {
       if (settled) return;
       settled = true; clearTimeout(timeout); wipe();
-      if (result) resolve(result); else reject(new Error("Managed worker private state protection failed"));
+      if (result) resolve(result);
+      else reject(new Error("Managed worker private state protection failed", { cause: { phase } }));
     };
-    const timeout = setTimeout(() => { stop(); settle(); }, POWERSHELL_TIMEOUT_MS);
+    const timeout = setTimeout(() => { stop(); settle(undefined, "timeout"); }, POWERSHELL_TIMEOUT_MS);
     try {
       child = spawn(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", ps(command)], {
         windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PSModulePath: modulePath },
       });
-    } catch { settle(); return; }
-    child.stdout.on("data", (chunk: Buffer) => { size += chunk.length; if (size <= MAX_PROTECTED_BYTES) output.push(chunk); else { stop(); settle(); } });
-    child.stderr.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_PROTECTED_BYTES) { stop(); settle(); } });
+    } catch { settle(undefined, "spawn-throw"); return; }
+    child.stdout.on("data", (chunk: Buffer) => { size += chunk.length; if (size <= MAX_PROTECTED_BYTES) output.push(chunk); else { stop(); settle(undefined, "output-limit"); } });
+    child.stderr.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_PROTECTED_BYTES) { stop(); settle(undefined, "output-limit"); } });
     // Windows may report EPIPE/ECONNRESET after PowerShell has consumed the
     // complete pipe. The child close status and bounded stdout are authoritative.
     child.stdin.on("error", () => { /* wait for close or the existing timeout */ });
-    child.once("error", () => settle());
+    child.once("error", () => settle(undefined, "process-error"));
     child.once("close", code => {
-      if (code !== 0 || size > MAX_PROTECTED_BYTES) settle();
+      if (code !== 0 || size > MAX_PROTECTED_BYTES) settle(undefined, code === 42 ? "input-length" : `exit-${code}`);
       else {
         const result = Uint8Array.from(Buffer.concat(output));
         settle(result);
       }
     });
-    try { child.stdin.end(Buffer.from(input)); } catch { stop(); settle(); }
+    try { child.stdin.end(Buffer.from(input)); } catch { stop(); settle(undefined, "stdin-end"); }
   });
 }
 
-const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){throw 'input'}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
-const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){throw 'input'}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
+const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){exit 42}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
+const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){exit 42}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
 const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $before=Get-Acl -LiteralPath $p; if($before.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner'}; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
+
+function safeProtectionPhase(error: unknown): string {
+  if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
+    !("phase" in error.cause) || typeof error.cause.phase !== "string") return "unclassified";
+  const phase = error.cause.phase;
+  return /^(?:timeout|spawn-throw|process-error|output-limit|input-length|stdin-end|output-format|exit-(?:null|\d+))$/u.test(phase)
+    ? phase : "unclassified";
+}
 
 class WindowsDpapiProtector implements ManagedWorkerPrivateStateProtector {
   readonly #runner: ManagedWorkerPrivateStatePowerShellRunner;
   constructor(runner: ManagedWorkerPrivateStatePowerShellRunner = { run: (script, input) => runPowerShell(script, input, true) }) { this.#runner = runner; }
   #decodeOutput(output: Uint8Array): Uint8Array {
     const encoded = Buffer.from(output).toString("utf8");
-    if (!encoded || encoded.trim() !== encoded || !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)) throw new Error("Managed worker private state protection failed");
+    if (!encoded || encoded.trim() !== encoded || !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)) throw new Error("Managed worker private state protection failed", { cause: { phase: "output-format" } });
     let decoded: Buffer;
-    try { decoded = Buffer.from(encoded, "base64"); } catch { throw new Error("Managed worker private state protection failed"); }
+    try { decoded = Buffer.from(encoded, "base64"); } catch { throw new Error("Managed worker private state protection failed", { cause: { phase: "output-format" } }); }
     if (decoded.byteLength < 1 || decoded.byteLength > MAX_PROTECTED_BYTES || decoded.toString("base64") !== encoded)
-      throw new Error("Managed worker private state protection failed");
+      throw new Error("Managed worker private state protection failed", { cause: { phase: "output-format" } });
     return Uint8Array.from(decoded);
   }
   async protect(plaintext: Uint8Array): Promise<Uint8Array> {
@@ -306,7 +315,9 @@ export async function createManagedWorkerPrivateState(manifestInput: ManagedWork
   } }, baseDirectory, checkedManifest.epoch);
   const plaintext = strictEncode({ manifest: initial.manifest, keys: initial.keys });
   let protectedBytes: Uint8Array;
-  try { protectedBytes = await protector.protect(plaintext); } catch { throw new Error("Managed worker private state protection failed"); }
+  try { protectedBytes = await protector.protect(plaintext); } catch (error) {
+    throw new Error("Managed worker private state protection failed", { cause: { phase: safeProtectionPhase(error) } });
+  }
   if (protectedBytes.byteLength < 1 || protectedBytes.byteLength > MAX_PROTECTED_BYTES) fail();
   await filesystem.ensureProtectedDirectory(initial.privateDirectory);
   await filesystem.writeExclusive(privateStateFile(baseDirectory, checkedManifest.epoch), protectedBytes);
@@ -320,6 +331,8 @@ export async function loadManagedWorkerPrivateState(options: LoadManagedWorkerPr
   const { protector, filesystem } = dependencies(options);
   const ciphertext = await filesystem.readProtectedFile(privateStateFile(baseDirectory, epoch));
   let plaintext: Uint8Array;
-  try { plaintext = await protector.unprotect(ciphertext); } catch { throw new Error("Managed worker private state protection failed"); }
+  try { plaintext = await protector.unprotect(ciphertext); } catch (error) {
+    throw new Error("Managed worker private state protection failed", { cause: { phase: safeProtectionPhase(error) } });
+  }
   return parseState(plaintext, baseDirectory, epoch);
 }
