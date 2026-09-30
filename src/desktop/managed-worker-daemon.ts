@@ -83,6 +83,9 @@ export interface ManagedWorkerDaemonOptions {
   }>;
   /** Explicit private native projection listener. It adds no writer capability. */
   readonly nativeTaskState?: true;
+  /** Isolated diagnostic owner: publishes a follower snapshot but never admits a
+   * native mutation. It cannot be combined with any command ingress route. */
+  readonly refusalOnlyProbe?: true;
   /** Isolated read-only CLI WebSocket route. The external callback must prove
    * that no independent goal/scheduler can auto-start a turn; the owner-local
    * projection alone cannot establish that. No bearer is written to disk. */
@@ -217,6 +220,10 @@ export class ManagedWorkerDaemon {
     if (cli?.sourceScope !== undefined) assertControlledNativeCliSourceScope(cli.sourceScope);
     if (options.nativeTaskState !== undefined && options.nativeTaskState !== true)
       throw new TypeError('Managed native task-state listener requires explicit opt-in');
+    if (options.refusalOnlyProbe !== undefined &&
+        (options.refusalOnlyProbe !== true || stock !== undefined || cli !== undefined ||
+          options.oneShotFirstComposer !== undefined))
+      throw new TypeError('Refusal-only probe cannot enable command ingress');
     if (options.oneShotFirstComposer !== undefined &&
         (typeof options.oneShotFirstComposer !== 'function' || stock !== undefined))
       throw new TypeError('One-shot first Composer requires a non-stock synchronous admission');
@@ -617,6 +624,7 @@ export class ManagedWorkerDaemon {
         },
       }) : null;
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
+        if (this.#options.refusalOnlyProbe) return false;
         if (this.#ingressRevoked || !ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
         if (this.#options.nativeStockQueue) {
@@ -756,10 +764,11 @@ export class ManagedWorkerDaemon {
         initialized = await this.#stockInitializer.initialize();
         stockInitialized = true;
       }
-      this.#intentStore = new NativeStartIntentStore({ filePath: path.join(state.privateDirectory, 'start-intents.sqlite'),
-        ownerEpoch: manifest.epoch, backendGeneration: meta.backendGeneration, threadId: manifest.taskId,
-        encryptionKey: Buffer.from(state.keys.intentKey, 'base64'),
-        ...(this.#options.oneShotFirstComposer ? { maxRows: 1 } : {}) });
+      if (!this.#options.refusalOnlyProbe)
+        this.#intentStore = new NativeStartIntentStore({ filePath: path.join(state.privateDirectory, 'start-intents.sqlite'),
+          ownerEpoch: manifest.epoch, backendGeneration: meta.backendGeneration, threadId: manifest.taskId,
+          encryptionKey: Buffer.from(state.keys.intentKey, 'base64'),
+          ...(this.#options.oneShotFirstComposer ? { maxRows: 1 } : {}) });
       let ownedClient: DesktopIpcClient | null = null;
       const confirmStockOwner = async (scope: Readonly<{taskId: string; ownerEpoch: string}>): Promise<boolean> => {
         if (!this.#options.nativeStockQueue || scope.taskId !== manifest.taskId ||
@@ -793,14 +802,17 @@ export class ManagedWorkerDaemon {
         taskId: manifest.taskId, ownerEpoch: manifest.epoch, isOwnerCurrent: ownerCurrent,
         allowFollower: this.#options.allowFollower,
         readInitialState: initialized ? initialized.readInitialState : this.#bootstrap.readInitialState,
-        intentStore: this.#intentStore, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
+        ...(this.#options.refusalOnlyProbe ? { refusalOnlyProbe: true as const } : {}),
+        ...(this.#options.refusalOnlyProbe ? {} : {
+          intentStore: this.#intentStore!, composerDefaults: () => ({ ...this.#bootstrap!.composerDefaults }),
+        }),
         ...(this.#options.oneShotFirstComposer ? { qualifyFirstTurn: this.#options.oneShotFirstComposer,
           onFirstTurnQualification: (command: WorkerCommand,
             phase: 'before-reservation' | 'before-write', passed: boolean) =>
             oneShotGate!.note(command, phase, passed),
           onFirstTurnAttemptSettled: (command: WorkerCommand) => oneShotGate!.settle(command) } : {}),
         ...(queueAdapterFactory ? { queueAdapterFactory } : {}),
-        ...(manifest.approvedTaskPolicy ? {} : {
+        ...(this.#options.refusalOnlyProbe || manifest.approvedTaskPolicy ? {} : {
           qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),
         }),
         clientFactory: handler => {

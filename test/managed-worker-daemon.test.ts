@@ -45,6 +45,69 @@ test('one-shot first Composer cannot be enabled without a callback or alongside 
     nativeStockQueue: {} as never }), /One-shot first Composer/);
 });
 
+test('refusal-only probe admits navigation but refuses Composer start and queue ingress without writes', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  const broker = own.brokers[0]!;
+  try {
+    assert.equal(own.daemon.metadata.state, 'ready');
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'probe-follower', params: { conversationId: own.taskId,
+        hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+
+    const direct = composerRequest(own.taskId, own.home, 'probe-direct-start');
+    direct.sourceClientId = 'probe-follower';
+    direct.requestId = 'probe-direct-start';
+    broker.send(direct);
+    broker.send({ type: 'request', requestId: 'probe-queue-state', sourceClientId: 'probe-follower',
+      targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+      params: { hostId: 'local', conversationId: own.taskId, state: { [own.taskId]: [] } } });
+    await waitFor(() => ['probe-direct-start', 'probe-queue-state'].every(requestId =>
+      broker.frames.some(frame => frame.type === 'response' && frame.requestId === requestId)));
+    for (const requestId of ['probe-direct-start', 'probe-queue-state']) {
+      const response = broker.frames.find(frame => frame.type === 'response' && frame.requestId === requestId)!;
+      assert.equal(response.resultType, 'error');
+      assert.equal(response.error, 'error-handling-request');
+    }
+
+    const ingress = own.daemon.metadata.nativeStartup?.composerIngress;
+    assert.equal(ingress?.directStartTurn.seen, 1);
+    assert.equal(ingress?.directStartTurn.refused, 1);
+    assert.equal(ingress?.queuedFollowUpsState.seen, 1);
+    assert.equal(ingress?.queuedFollowUpsState.refused, 1);
+    assert.equal(own.backend.methods.some(method => method === 'turn/start' ||
+      method === 'thread/queue/add'), false);
+    await assert.rejects(readFile(path.join(own.privateDirectory, 'start-intents.sqlite')));
+    await assert.rejects(readFile(path.join(own.privateDirectory, 'native-stock.sqlite')));
+    broker.send({ type: 'request', requestId: 'probe-discovery', sourceClientId: 'probe-follower',
+      targetClientId: broker.ownerId, hostId: 'local', method: 'thread-owner-discovery', version: 1,
+      params: { hostId: 'local', conversationId: own.taskId } });
+    await waitFor(() => broker.frames.some(frame => frame.type === 'response' &&
+      frame.requestId === 'probe-discovery'));
+    assert.equal(broker.frames.find(frame => frame.type === 'response' &&
+      frame.requestId === 'probe-discovery')?.resultType, 'success');
+  } finally {
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'refusal-only-probe-stop');
+  }
+});
+
+test('refusal-only probe cannot be combined with writer capabilities', () => {
+  const common = { baseDirectory: path.join(os.tmpdir(), 'vkodex-private-test'),
+    epoch: '11111111-1111-4111-8111-111111111111', allowFollower: () => true,
+    clientFactory: () => { throw new Error('unused'); }, verifyFamilyQuiescent: async () => true,
+    refusalOnlyProbe: true as const };
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    oneShotFirstComposer: () => true }), /refusal-only probe/i);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    nativeStockQueue: {} as never }), /refusal-only probe/i);
+  assert.throws(() => new ManagedWorkerDaemon({ ...common,
+    nativeCliWebSocket: { capability: {}, noPendingExternalAutoStart: () => true } }),
+  /refusal-only probe/i);
+});
+
 test('one-shot command policy admits only the exact persisted first Composer intent', () => {
   const operationId = randomUUID(), clientUserMessageId = randomUUID();
   const scope = { ownerEpoch: randomUUID(), backendGeneration: 1, threadId: 'own-zero-turn',
@@ -1385,7 +1448,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   nativeTaskState = false, handoffCapability?: object,
   oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>,
   nativeCliWebSocket?: NonNullable<ManagedWorkerDaemonOptions['nativeCliWebSocket']>,
-  cliApprovedPolicy = true, cliRolloutJunction = false) {
+  cliApprovedPolicy = true, cliRolloutJunction = false, refusalOnlyProbe = false) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-ready-'));
   const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
   await Promise.all([mkdir(home), mkdir(privateDirectory)]);
@@ -1452,6 +1515,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   let launches = 0, observations = 0;
   const daemon = new ManagedWorkerDaemon({
     baseDirectory: root, epoch: reserved.epoch, allowFollower: () => native.enabled,
+    ...(refusalOnlyProbe ? { refusalOnlyProbe: true } as never : {}),
     ...(oneShotFirstComposer ? { oneShotFirstComposer } : {}),
     ...(cliOptions ? { nativeCliWebSocket: cliOptions } : {}),
     ...(nativeTaskState ? { nativeTaskState: true as const } : {}),
@@ -1470,6 +1534,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         false, ownerId, stock && stockFailure !== 'baseline');
       brokers.push(broker); return broker;
     }, 500, { canHandle: request => handler.canHandle(request),
+      onComposerIngress: (method, outcome) => handler.onComposerIngress?.(method, outcome),
       handle: async (request, signal) => {
         try { return await handler.handle(request, signal); }
         catch (error) { handlerErrors.push(error instanceof Error ? error.message : 'non-error'); throw error; }

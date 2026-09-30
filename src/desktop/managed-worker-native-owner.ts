@@ -126,6 +126,9 @@ export interface ManagedWorkerNativeOwnerOptions {
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
   /** Explicit previously qualified native queue adapter; never enabled by default. */
   readonly queueAdapterFactory?: (context: Readonly<ManagedNativeStockQueueContext>) => ManagedNativeStockQueueAdapter;
+  /** Observation-only owner for isolated IPC method diagnosis. Never grants a
+   * Composer, queue, settings, or request-response mutation. */
+  readonly refusalOnlyProbe?: true;
 }
 export interface ManagedWorkerNativeOwnerMetadata {
   readonly state: OwnerState;
@@ -241,7 +244,11 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
             typeof options.host.requestQuiescence !== 'function' ||
             typeof options.host.acceptedCommandReceipts !== 'function') ||
         (options.clientFactory !== undefined && typeof options.clientFactory !== 'function') ||
-        (options.queueAdapterFactory !== undefined && typeof options.queueAdapterFactory !== 'function')) throw refuse();
+        (options.queueAdapterFactory !== undefined && typeof options.queueAdapterFactory !== 'function') ||
+        options.refusalOnlyProbe !== undefined &&
+          (options.refusalOnlyProbe !== true || options.intentStore !== undefined ||
+            options.composerDefaults !== undefined || options.qualifyFirstTurn !== undefined ||
+            options.qualifyContinuation !== undefined || options.queueAdapterFactory !== undefined)) throw refuse();
     this.#options = Object.freeze({ ...options });
   }
 
@@ -882,6 +889,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   async handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject> {
     if (signal.aborted) throw refuse();
     if (!this.#route(request) || this.#state !== 'connected' || !this.#ownerCurrent()) throw refuse();
+    if (this.#options.refusalOnlyProbe && request.method !== 'thread-owner-discovery' &&
+        request.method !== 'thread-follower-load-complete-history') throw refuse();
     if (request.method === 'thread-owner-discovery') return { supportsUntrustedAppInput: false };
     if (request.method === 'thread-follower-load-complete-history') {
       if (!this.#followerCurrent(request.sourceClientId)) throw refuse();

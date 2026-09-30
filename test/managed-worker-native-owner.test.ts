@@ -376,7 +376,8 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   stock = false,
   stockHooks: { confirmOwner?: (qualified: boolean) => boolean | Promise<boolean>;
     baseline?: () => boolean | Promise<boolean> } = {},
-  qualifyFirstTurn?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>) {
+  qualifyFirstTurn?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>,
+  refusalOnlyProbe = false) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
   const host = new ManagedWorkerFrontendHost({ taskId, ownCwd: 'C:/own',
     initializeRequest: { clientInfo: { name: 'fixture' }, capabilities: {} },
@@ -421,6 +422,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     ...(qualifyContinuation ? { qualifyContinuation } : {}),
     ...(qualifyFirstTurn ? { qualifyFirstTurn } : {}),
+    ...(refusalOnlyProbe ? { refusalOnlyProbe: true } as never : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
       return broker;
@@ -1455,6 +1457,30 @@ test('pending user question survives IPC EOF, answers once, completes only on na
     assert.equal(f.host.metadata.state, 'running');
   } finally { f.owner.close(); assert.equal(f.owner.retiredWithoutNativeIngress(), false);
     await f.host.stop('test-cleanup'); }
+});
+
+test('refusal-only owner cannot answer a pending native question', async () => {
+  const f = await fixture(undefined, (_request, response) => !!response.answers,
+    undefined, false, undefined, () => true, false, {}, undefined, true);
+  try {
+    await f.owner.start();
+    f.broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'follower', params: { conversationId: taskId, hostId: 'local', following: true } });
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'question-turn', status: 'inProgress', items: [] } });
+    f.child.stdout.write(`${JSON.stringify({ id: 71, method: 'item/tool/requestUserInput',
+      params: { threadId: taskId, turnId: 'question-turn', itemId: 'question-item', questions: [
+        { id: 'q', header: 'Choose', question: 'Continue?', isSecret: false, isOther: false, options: [] },
+      ] } })}\n`);
+    await waitUntil(() => f.owner.metadata.revision > 2);
+    const request = { requestId: 'refusal-answer', sourceClientId: 'follower', hostId: 'local',
+      method: 'thread-follower-submit-user-input', version: 1,
+      params: { conversationId: taskId, requestId: 71,
+        response: { answers: { q: { answers: ['yes'] } } } } };
+    await assert.rejects(f.owner.handle(request, new AbortController().signal));
+    assert.equal(f.child.frames.some(frame => frame.id === 71 && !!frame.result), false);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
 test('final follower policy cannot retire Gateway and still authorize an answer', async () => {
