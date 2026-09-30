@@ -211,6 +211,10 @@ export class ManagedWorkerCommandDispatcher {
       (this.#confirmingSettings ? 1 : 0),
       unconfirmed: this.#journal.hasUnconfirmed() });
   }
+  operationCounts(key: object): Readonly<{ operations: number; settings: number }> {
+    this.#authenticate(key);
+    return this.#journal.operationCounts();
+  }
   acceptedReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {
     this.#authenticate(key);
     return this.#journal.acceptedReceipts();

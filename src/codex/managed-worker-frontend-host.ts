@@ -259,6 +259,10 @@ export class ManagedWorkerFrontendHost {
     if (!this.#commands) throw new Error('Worker command control unavailable');
     return this.#commands.quiescence(controlKey);
   }
+  operationCounts(controlKey: object): Readonly<{ operations: number; settings: number }> {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.operationCounts(controlKey);
+  }
 
   /** Exact owner-only read on this host's private App Server connection. The
    * native frontend cannot call this method, and it never resumes a task or

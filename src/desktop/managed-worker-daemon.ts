@@ -266,6 +266,54 @@ export class ManagedWorkerDaemon {
         ...(owner.composerIngress ? { composerIngress: owner.composerIngress } : {}) }) : null });
   }
 
+  /** Worker-local diagnostic only. Zero journal rows exclude a mutation
+   * reserved by this worker, including one that later settled. Native task
+   * state and external writers require a separate read-only check. */
+  #refusalOnlyEvidence(controlKey: object): ManagedWorkerControlDiagnosis['refusalOnlyEvidence'] | null {
+    if (!this.#options.refusalOnlyProbe || this.#state !== 'ready' ||
+        this.#startupPhase !== 'ready' || this.#intentStore !== null ||
+        this.#options.nativeStockQueue !== undefined ||
+        this.#currentOwner?.() !== true) return null;
+    const host = this.#host, owner = this.#owner, generation = this.#generation;
+    if (!host || !owner || generation === null ||
+        host.metadata.state !== 'running' ||
+        host.metadata.backendGeneration !== generation ||
+        owner.metadata.state !== 'connected') return null;
+    try {
+      const before = owner.metadata.semanticRevision;
+      const commands = host.commandQuiescence(controlKey);
+      const rows = host.operationCounts(controlKey);
+      const acceptedReceipts = host.acceptedCommandReceipts(controlKey).length;
+      const acceptedQueue = host.acceptedQueueInputs(controlKey).length;
+      const requests = host.requestQuiescence(controlKey);
+      const ownerMeta = owner.metadata;
+      const finalCommands = host.commandQuiescence(controlKey);
+      const finalRows = host.operationCounts(controlKey);
+      const finalRequests = host.requestQuiescence(controlKey);
+      if (this.#host !== host || this.#owner !== owner ||
+          this.#generation !== generation || ownerMeta.semanticRevision !== before ||
+          this.#currentOwner?.() !== true ||
+          host.metadata.state !== 'running' ||
+          host.metadata.backendGeneration !== generation ||
+          owner.metadata.state !== 'connected' ||
+          owner.metadata.semanticRevision !== before ||
+          requests.generation !== generation || finalRequests.generation !== generation ||
+          commands.inFlight !== 0 || finalCommands.inFlight !== 0 ||
+          commands.unconfirmed || rows.operations !== 0 || rows.settings !== 0 ||
+          finalCommands.unconfirmed || finalRows.operations !== 0 || finalRows.settings !== 0 ||
+          acceptedReceipts !== 0 || acceptedQueue !== 0 ||
+          host.acceptedCommandReceipts(controlKey).length !== 0 ||
+          host.acceptedQueueInputs(controlKey).length !== 0 ||
+          requests.unresolved !== 0 || finalRequests.unresolved !== 0 ||
+          ownerMeta.pendingNativeOperations !== 0 || ownerMeta.pendingEvents !== 0)
+        return null;
+      return Object.freeze({ backendGeneration: generation, commandInFlight: 0,
+        commandUnconfirmed: 0, operationJournalRows: 0, settingsJournalRows: 0,
+        acceptedReceipts: 0, acceptedQueue: 0, pendingBackendRequests: 0,
+        pendingNativeOperations: 0, pendingNativeEvents: 0, intentStore: 'absent' });
+    } catch { return null; }
+  }
+
   /** In-process capability only. The native CLI bearer is never included in
    * the private control endpoint, persisted locator, or diagnostic metadata. */
   nativeCliWebSocketCapability(capability: object): Readonly<{
@@ -573,11 +621,15 @@ export class ManagedWorkerDaemon {
           backendGeneration: this.#host?.metadata.backendGeneration ?? null,
           nativeState: this.#owner?.metadata.state ?? null,
           nativeRevision: this.#owner?.metadata.revision ?? 0 }),
-        diagnose: () => ({ schemaVersion: 1, startupPhase: this.#startupPhase,
-          daemonState: this.#state, failureCode: this.#failure,
-          bootstrapFailureCode: this.#bootstrapFailureCode,
-          registryState: currentRegistryState(),
-          owner: this.metadata.nativeStartup }),
+        diagnose: () => {
+          const registryState = currentRegistryState();
+          const proof = registryState === 'ready' ? this.#refusalOnlyEvidence(controlKey) : null;
+          return { schemaVersion: 1, startupPhase: this.#startupPhase,
+            daemonState: this.#state, failureCode: this.#failure,
+            bootstrapFailureCode: this.#bootstrapFailureCode, registryState,
+            owner: this.metadata.nativeStartup,
+            ...(proof ? { refusalOnlyEvidence: proof } : {}) };
+        },
         requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
         ...(this.#options.nativeStockQueue?.handoffCapability ? { handoff: {
           revoke: (expected: ManagedWorkerHandoffScope) => {

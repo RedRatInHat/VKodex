@@ -149,6 +149,16 @@ export class ManagedWorkerOperationJournal {
       .get() !== undefined;
   }
 
+  /** Count all durable mutation rows, including settled rows. A zero count
+   * proves this journal never reserved a command or settings mutation. */
+  operationCounts(): Readonly<{ operations: number; settings: number }> {
+    const operations = this.db.prepare('SELECT COUNT(*) AS count FROM managed_worker_operations')
+      .get() as { count: number };
+    const settings = this.db.prepare('SELECT COUNT(*) AS count FROM managed_worker_settings_operations')
+      .get() as { count: number };
+    return Object.freeze({ operations: operations.count, settings: settings.count });
+  }
+
   /** Scoped metadata only; callers must compare these receipts with terminal
    * full history before treating an idle thread as safe to stop. */
   acceptedReceipts(): ReadonlyArray<Readonly<{ method: WorkerMutationMethod; receiptId: string }>> {

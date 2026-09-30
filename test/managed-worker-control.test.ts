@@ -245,6 +245,45 @@ test('diagnose-v1 accepts only the fixed bounded composer ingress summary', asyn
   } finally { client.socket.destroy(); await server.close(); }
 });
 
+test('diagnose-v1 accepts only exact scoped refusal-only evidence and rejects forged or extra fields', async () => {
+  const epoch = randomUUID();
+  const evidence = { backendGeneration: 7, commandInFlight: 0, commandUnconfirmed: 0,
+    operationJournalRows: 0, settingsJournalRows: 0, acceptedReceipts: 0, acceptedQueue: 0,
+    pendingBackendRequests: 0, pendingNativeOperations: 0, pendingNativeEvents: 0,
+    intentStore: 'absent' };
+  const diagnosis = { schemaVersion: 1 as const, startupPhase: 'ready' as const,
+    daemonState: 'ready' as const, failureCode: null, registryState: 'ready' as const,
+    owner: { startupStage: 'ready' as const, bootstrapEventCount: 0,
+      bootstrapNotifications: { status: 0, settings: 0, goal: 0, usage: 0,
+        'startup-or-warning': 0, turn: 0, item: 0, other: 0 },
+      bootstrapPendingRequests: 0, bootstrapBoundary: null },
+    refusalOnlyEvidence: evidence };
+  type Mode = 'valid' | 'forged' | 'extra' | 'unscoped' | 'not-ready';
+  let mode: Mode = 'valid';
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 7, nativeState: 'connected', nativeRevision: 1 }),
+    diagnose: () => {
+      const proof = { ...evidence };
+      if (mode === 'forged') proof.pendingNativeEvents = 1;
+      if (mode === 'extra') Object.assign(proof, { prompt: 'must never cross control socket' });
+      return { ...diagnosis, ...(mode === 'unscoped' ? { taskId: 'another-task' } : {}),
+        ...(mode === 'not-ready' ? { owner: { ...diagnosis.owner, startupStage: 'connecting' } } : {}),
+        refusalOnlyEvidence: proof } as never;
+    }, requestStop: async () => { throw new Error('stop must not run'); } });
+  const cap = await server.listen(); const client = await peer(cap);
+  try {
+    for (const invalid of ['forged', 'extra', 'unscoped', 'not-ready'] as const) {
+      mode = invalid;
+      client.send({ id: invalid, epoch, method: 'diagnose-v1' });
+      assert.deepEqual(await client.read(), { id: invalid, error: 'diagnosis-unavailable' });
+    }
+    mode = 'valid';
+    client.send({ id: 'valid-refusal-proof', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'valid-refusal-proof', result: {
+      ownerEpoch: epoch, taskId: 'own', ...diagnosis } });
+  } finally { client.socket.destroy(); await server.close(); }
+});
+
 test('authorized stop is single flight and continues after sender disconnect', async () => {
   const epoch = randomUUID(); let stops = 0, finish!: () => void;
   const pending = new Promise<void>(resolve => { finish = resolve; });

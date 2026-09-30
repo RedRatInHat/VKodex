@@ -29,6 +29,21 @@ export interface ManagedWorkerControlDiagnosis {
     'initial-history-not-empty' | 'initial-settings-drift' | 'unclassified' | null;
   readonly registryState: 'reserved' | 'host_registered' | 'backend_registered' |
     'ready' | 'lost' | 'retired' | null;
+  /** Worker-local refusal evidence only. It does not prove that another native
+   * client left the task unchanged; the canary must read native state too. */
+  readonly refusalOnlyEvidence?: Readonly<{
+    backendGeneration: number;
+    commandInFlight: 0;
+    commandUnconfirmed: 0;
+    operationJournalRows: 0;
+    settingsJournalRows: 0;
+    acceptedReceipts: 0;
+    acceptedQueue: 0;
+    pendingBackendRequests: 0;
+    pendingNativeOperations: 0;
+    pendingNativeEvents: 0;
+    intentStore: 'absent';
+  }>;
   readonly owner: Readonly<{
     startupStage: 'not-started' | 'observing' | 'reading-initial' | 'validating-initial' |
       'checking-boundary' | 'connecting' | 'ready';
@@ -179,10 +194,22 @@ const requestFailureCategories = new Set<IpcRequestFailureCategory>([
 ]);
 const boundedCount = (value: unknown): value is number =>
   Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 255;
+const refusalEvidenceKeys = ['backendGeneration', 'commandInFlight', 'commandUnconfirmed',
+  'operationJournalRows', 'settingsJournalRows', 'acceptedReceipts', 'acceptedQueue',
+  'pendingBackendRequests', 'pendingNativeOperations', 'pendingNativeEvents', 'intentStore'] as const;
+const refusalZeroKeys = refusalEvidenceKeys.filter(key => key !== 'backendGeneration' &&
+  key !== 'intentStore');
+function validRefusalEvidence(value: unknown): boolean {
+  return object(value) && exact(value, refusalEvidenceKeys) &&
+    positive(value.backendGeneration) && value.intentStore === 'absent' &&
+    refusalZeroKeys.every(key => value[key] === 0);
+}
 function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis {
-  if (!object(value) || !(exact(value, ['schemaVersion', 'startupPhase', 'daemonState',
-    'failureCode', 'registryState', 'owner']) || exact(value, ['schemaVersion', 'startupPhase',
-    'daemonState', 'failureCode', 'bootstrapFailureCode', 'registryState', 'owner'])) ||
+  if (!object(value) || Object.keys(value).some(key => !['schemaVersion', 'startupPhase',
+    'daemonState', 'failureCode', 'bootstrapFailureCode', 'registryState', 'owner',
+    'refusalOnlyEvidence'].includes(key)) ||
+    ['schemaVersion', 'startupPhase', 'daemonState', 'failureCode', 'registryState', 'owner']
+      .some(key => !Object.hasOwn(value, key)) ||
     value.schemaVersion !== 1 ||
     typeof value.startupPhase !== 'string' || !startupPhases.has(value.startupPhase) ||
     typeof value.daemonState !== 'string' || !daemonStates.has(value.daemonState) ||
@@ -190,7 +217,13 @@ function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis 
     Object.hasOwn(value, 'bootstrapFailureCode') && value.bootstrapFailureCode !== null &&
       (typeof value.bootstrapFailureCode !== 'string' ||
         !bootstrapFailureCodes.has(value.bootstrapFailureCode)) ||
-    value.registryState !== null && (typeof value.registryState !== 'string' || !registryStates.has(value.registryState))) return false;
+    value.registryState !== null && (typeof value.registryState !== 'string' || !registryStates.has(value.registryState)) ||
+    Object.hasOwn(value, 'refusalOnlyEvidence') &&
+      (value.startupPhase !== 'ready' || value.daemonState !== 'ready' ||
+        value.registryState !== 'ready' || value.failureCode !== null ||
+        Object.hasOwn(value, 'bootstrapFailureCode') && value.bootstrapFailureCode !== null ||
+        !object(value.owner) || value.owner.startupStage !== 'ready' ||
+        !validRefusalEvidence(value.refusalOnlyEvidence))) return false;
   const owner = value.owner;
   if (owner === null) return true;
   const ownerKeys = ['startupStage', 'bootstrapEventCount',

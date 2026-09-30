@@ -108,6 +108,118 @@ test('refusal-only probe cannot be combined with writer capabilities', () => {
   /refusal-only probe/i);
 });
 
+test('refusal-only diagnose-v1 reports empty worker-local mutation state after refused ingress', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  const broker = own.brokers[0]!;
+  try {
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'proof-follower', params: { conversationId: own.taskId,
+        hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    const direct = composerRequest(own.taskId, own.home, 'proof-direct-start');
+    direct.sourceClientId = 'proof-follower'; direct.requestId = 'proof-direct-start';
+    broker.send(direct);
+    broker.send({ type: 'request', requestId: 'proof-queue', sourceClientId: 'proof-follower',
+      targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+      params: { hostId: 'local', conversationId: own.taskId, state: { [own.taskId]: [] } } });
+    // A real pending backend question cannot coexist with a zero-unresolved
+    // proof. A synthetic follower answer still exercises the refusal route.
+    broker.send({ type: 'request', requestId: 'proof-answer', sourceClientId: 'proof-follower',
+      targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-submit-user-input', version: 1,
+      params: { conversationId: own.taskId, requestId: 'proof-question', response: { answers: {} } } });
+    await waitFor(() => ['proof-direct-start', 'proof-queue', 'proof-answer'].every(requestId =>
+      broker.frames.some(frame => frame.type === 'response' && frame.requestId === requestId)));
+    for (const requestId of ['proof-direct-start', 'proof-queue', 'proof-answer']) {
+      const response = broker.frames.find(frame => frame.type === 'response' && frame.requestId === requestId)!;
+      assert.equal(response.resultType, 'error');
+      assert.equal(response.error, 'error-handling-request');
+    }
+    const diagnosis = await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'refusal-only-evidence', 'diagnose-v1');
+    assert.equal(diagnosis.error, undefined);
+    const result = diagnosis.result as Record<string, unknown>;
+    assert.equal(result.ownerEpoch, own.reserved.epoch);
+    assert.equal(result.taskId, own.taskId);
+    const evidence = (result as any).refusalOnlyEvidence;
+    assert.deepEqual(evidence, {
+      backendGeneration: own.daemon.metadata.generation,
+      commandInFlight: 0,
+      commandUnconfirmed: 0,
+      operationJournalRows: 0,
+      settingsJournalRows: 0,
+      acceptedReceipts: 0,
+      acceptedQueue: 0,
+      pendingBackendRequests: 0,
+      pendingNativeOperations: 0,
+      pendingNativeEvents: 0,
+      intentStore: 'absent',
+    });
+    assert.deepEqual(Object.keys(evidence).sort(), ['acceptedQueue', 'acceptedReceipts',
+      'backendGeneration', 'commandInFlight', 'commandUnconfirmed', 'intentStore',
+      'operationJournalRows', 'pendingBackendRequests', 'pendingNativeEvents',
+      'pendingNativeOperations', 'settingsJournalRows'].sort());
+    assert.deepEqual(own.backend.methods.filter(method => ['turn/start', 'thread/queue/add'].includes(method)), []);
+    // The scoped operation journal itself exists; the proof covers its empty
+    // mutation tables. Refusal mode must not create separate ingress stores.
+    for (const file of ['start-intents.sqlite', 'native-stock.sqlite'])
+      await assert.rejects(readFile(path.join(own.privateDirectory, file)));
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'refusal-only-evidence-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
+test('ordinary diagnose-v1 never exposes refusal-only evidence', async () => {
+  const own = await readyFixture();
+  try {
+    const diagnosis = await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'ordinary-no-refusal-proof', 'diagnose-v1');
+    assert.equal(diagnosis.error, undefined);
+    assert.equal(Object.hasOwn(diagnosis.result as object, 'refusalOnlyEvidence'), false);
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'ordinary-no-proof-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
+test('refusal-only evidence is absent while a backend question remains unresolved', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  try {
+    const broker = own.brokers[0]!;
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'pending-proof-follower', params: { conversationId: own.taskId,
+        hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    own.backend.stdout.write(JSON.stringify({ id: 'pending-proof-question',
+      method: 'item/tool/requestUserInput', params: { threadId: own.taskId,
+        turnId: 'proof-turn', itemId: 'proof-item', questions: [] } }) + '\n');
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+      JSON.stringify(frame).includes('pending-proof-question')));
+    const diagnosis = await startupControlRequest(own.privateDirectory, own.reserved.epoch,
+      'pending-refusal-proof', 'diagnose-v1');
+    assert.equal(diagnosis.error, undefined);
+    assert.equal(Object.hasOwn(diagnosis.result as object, 'refusalOnlyEvidence'), false);
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'pending-proof-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
 test('one-shot command policy admits only the exact persisted first Composer intent', () => {
   const operationId = randomUUID(), clientUserMessageId = randomUUID();
   const scope = { ownerEpoch: randomUUID(), backendGeneration: 1, threadId: 'own-zero-turn',
@@ -1643,7 +1755,9 @@ async function controlRequest(port: number, epoch: string, id: string, method: s
     socket.once('connect', connected); socket.once('error', failed);
   });
   const wait = async (phase: 'auth' | 'commandreply', predicate: (frame: Record<string, unknown>) => boolean) => {
-    const deadline = Date.now() + 3000;
+    // Windows CI can pause four concurrent test files for several seconds;
+    // this bounds a real missing reply without mistaking runner load for one.
+    const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       const found = frames.find(predicate); if (found) return found;
       if (terminal !== null) throw new Error(`control socket ${terminal} during ${phase}`);
