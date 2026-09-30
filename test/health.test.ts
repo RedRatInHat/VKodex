@@ -50,10 +50,12 @@ class HealthDesktop implements DesktopTasks {
   async checkCompatibility() { this.compatibilityChecks++; return this.compatibilityState; }
 }
 
-function setup(t: { after(fn: () => void): void }, stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
+function setup(t: { after(fn: () => void): void }, stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED,
+  stageLedgerAudit?: { lastAttemptAt: number; eligibleCount: number; ineligibleCount: number; failed: boolean }) {
   const store = new BridgeStore(); t.after(() => store.close());
   const chat = new HealthChat(); const desktop = new HealthDesktop(); let now = 100_000;
-  const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, stagedFilePilot, activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
+  const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, stagedFilePilot,
+    ...(stageLedgerAudit ? { stageLedgerAudit } : {}), activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
   const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
   return { store, chat, desktop, monitor, advance: (ms: number) => { now += ms; } };
 }
@@ -62,7 +64,7 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "stage_pilot", "stage_storage", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "stage_pilot", "stage_storage", "stage_ledger", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
   assert.match(report.checks.find(check => check.name === "stage_pilot")!.detail, /пилот отключена/u);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
@@ -151,6 +153,16 @@ test("stage storage health reports admission quota exhaustion even when maintena
   const check = (await s.monitor.check()).checks.find(item => item.name === "stage_storage")!;
   assert.equal(check.state, "degraded");
   assert.match(check.detail, /квот/u);
+});
+
+test("stage ledger health exposes only bounded scalar audit aggregates", async t => {
+  const s = setup(t, STAGED_FILE_PILOT_DISABLED, { lastAttemptAt: 99_000, eligibleCount: 2, ineligibleCount: 6, failed: false });
+  const check = (await s.monitor.check()).checks.find(item => item.name === "stage_ledger")!;
+  assert.equal(check.state, "ok");
+  assert.match(check.detail, /2/u);
+  assert.match(check.detail, /6/u);
+  assert.match(check.detail, /Read-only|только чтение/u);
+  assert.doesNotMatch(check.detail, /[\\/]|private|content|C:/iu);
 });
 
 test("health detects commentary stuck before the VK queue and clears after mirror recovery", async t => {

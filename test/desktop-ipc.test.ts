@@ -969,14 +969,19 @@ test("runtime audits abandoned staging without scheduling unqualified pathname r
     files: {
       stagedFilePilot: { mode: "disabled" } | { mode: "single-chat"; peerId: number };
       reconcileAbandonedStageReservations(limit?: number): Promise<number>;
+      auditStagedArtifactsBatch(now?: number, limit?: number): Promise<{ eligibleCount: number; ineligibleCount: number }>;
       reconcileStagedArtifactsBatch(now?: number, limit?: number): Promise<number>;
     };
   };
   const files = (s.runtime as unknown as RuntimeInternals).files;
   assert.deepEqual(files.stagedFilePilot, { mode: "disabled" });
   const abandonedLimits: number[] = [];
+  const auditCalls: Array<[number | undefined, number | undefined]> = [];
   const recycleCalls: Array<[number | undefined, number | undefined]> = [];
   t.mock.method(files, "reconcileAbandonedStageReservations", async (limit?: number) => { abandonedLimits.push(limit ?? 64); return 0; });
+  t.mock.method(files, "auditStagedArtifactsBatch", async (now?: number, limit?: number) => {
+    auditCalls.push([now, limit]); return { eligibleCount: 0, ineligibleCount: 0 };
+  });
   t.mock.method(files, "reconcileStagedArtifactsBatch", async (now?: number, limit?: number) => { recycleCalls.push([now, limit]); return 0; });
   const intervals: Array<{ callback: () => void; delay: number }> = [];
   t.mock.method(global, "setInterval", ((callback: () => void, delay?: number) => {
@@ -991,11 +996,13 @@ test("runtime audits abandoned staging without scheduling unqualified pathname r
   tick.callback();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.deepEqual(abandonedLimits, []);
+  assert.deepEqual(auditCalls, []);
   assert.deepEqual(recycleCalls, []);
   s.advance(1);
   tick.callback();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.deepEqual(abandonedLimits, [8]);
+  assert.deepEqual(auditCalls, [[400_000, 8]], "maintenance records bounded read-only ledger evidence");
   assert.deepEqual(recycleCalls, [], "automatic Recycle Bin moves remain off until a handle-bound deletion path is qualified");
 });
 

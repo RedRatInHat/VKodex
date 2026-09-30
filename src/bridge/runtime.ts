@@ -64,6 +64,7 @@ export class BridgeRuntime {
   private stageMaintenanceLastAttemptAt = 0;
   private stageMaintenanceStartedAt: number | null = null;
   private stageMaintenanceFailed = false;
+  private stageLedgerAudit = { lastAttemptAt: 0, eligibleCount: 0, ineligibleCount: 0, failed: false };
   /** Tasks released after a terminal turn stay detached until VK needs them. */
   private readonly releasedIdle = new Set<string>();
   /** A new VK request asks the next update to acquire that task again. */
@@ -207,7 +208,7 @@ export class BridgeRuntime {
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped, stagedFilePilot: this.stagedFilePilot,
       maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
       ...(this.files ? { stageMaintenance: { startedAt: this.stageMaintenanceStartedAt, lastAttemptAt: this.stageMaintenanceLastAttemptAt,
-        failed: this.stageMaintenanceFailed } } : {}),
+        failed: this.stageMaintenanceFailed }, stageLedgerAudit: this.stageLedgerAudit } : {}),
       activeBindings: active.length, connectedBindings: connected, requiredBindings: required.length, connectedRequiredBindings: required.filter(isConnected).length,
       failedBindings: bindings.filter(actionableFailure).length, bindings };
   }
@@ -634,6 +635,13 @@ export class BridgeRuntime {
     this.stageMaintenanceLastAttemptAt = this.now();
     const work = (async () => {
       await this.files!.reconcileAbandonedStageReservations(8);
+      try {
+        const audit = await this.files!.auditStagedArtifactsBatch(this.now(), 8);
+        this.stageLedgerAudit = { lastAttemptAt: this.now(), ...audit, failed: false };
+      } catch (error) {
+        this.stageLedgerAudit = { ...this.stageLedgerAudit, lastAttemptAt: this.now(), failed: true };
+        throw error;
+      }
     })();
     this.stageMaintenance = work;
     void work.then(

@@ -23,6 +23,7 @@ export interface RuntimeHealthState {
   readonly updateStartedAt: number | null;
   readonly maintenance?: readonly { readonly phase: string; readonly bindingId?: string; readonly startedAt: number }[];
   readonly stageMaintenance?: { readonly startedAt: number | null; readonly lastAttemptAt: number; readonly failed: boolean };
+  readonly stageLedgerAudit?: { readonly lastAttemptAt: number; readonly eligibleCount: number; readonly ineligibleCount: number; readonly failed: boolean };
   readonly stagedFilePilot?: StagedFilePilot;
   readonly stopped: boolean;
   readonly activeBindings: number;
@@ -199,6 +200,13 @@ export class BridgeHealthMonitor {
         + (stageStorage.pendingCount ? `, старейший ожидает ${Math.round(pendingAge / 1_000)} с` : "")
         + (atStageQuota ? "; квота staging исчерпана" : "")
         + (stageStorage.legacyUnaccounted ? "; есть неучтённые legacy-записи, объёмы — нижняя граница" : "") + "." });
+    const stageAudit = runtime.stageLedgerAudit;
+    checks.push({ name: "stage_ledger", state: stageAudit?.failed ? "degraded" : "ok",
+      detail: !stageAudit || stageAudit.lastAttemptAt <= 0
+        ? "Read-only аудит staged-реестра ещё не выполнялся; автоматическая уборка копий отключена."
+        : stageAudit.failed
+          ? "Последний Read-only аудит staged-реестра завершился ошибкой; записи сохранены без изменений."
+          : `Read-only аудит очередной ограниченной партии staged-реестра: пригодно для ручной проверки ${stageAudit.eligibleCount}, непригодно ${stageAudit.ineligibleCount}; автоматическая уборка копий отключена.` });
 
     const delivery = this.store.deliveryHealth(checkedAt);
     if (delivery.criticalPending === 0) {

@@ -3382,6 +3382,29 @@ test("bounded staged reconciliation recycles four eligible files before a later 
   assert.equal(recycled.length, 5);
 });
 
+test("bounded stage ledger audit is read-only and uses a cursor separate from recycling", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-ledger-audit-test-"));
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const recycled: string[] = [];
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
+  const delivered = await files.prepare(binding, "ledger-delivered", []);
+  files.finish(binding.id, "ledger-delivered", "accepted", "finished-turn");
+  await writeFile(path.join(delivered.outboxDir, "delivered.txt"), "delivered");
+  assert.equal(await files.collect(binding, true), 1);
+  await s.worker.flush();
+  const pending = await files.prepare(binding, "ledger-pending", []);
+  files.finish(binding.id, "ledger-pending", "accepted", "finished-turn");
+  await writeFile(path.join(pending.outboxDir, "pending.txt"), "pending");
+  assert.equal(await files.collect(binding, true), 1);
+
+  now += 8 * 24 * 60 * 60_000;
+  assert.deepEqual(await files.auditStagedArtifactsBatch(now, 8), { eligibleCount: 1, ineligibleCount: 1 });
+  assert.deepEqual(recycled, []);
+  assert.equal(s.store.stageReservedCount(), 2);
+  assert.equal(s.store.getValue("stage-recycle-cursor"), null);
+  assert.ok(s.store.getValue("stage-audit-cursor"));
+});
+
 test("stopping staged maintenance waits for its in-flight recycle without starting the next file", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-stop-recycle-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);

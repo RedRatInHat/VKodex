@@ -17,6 +17,7 @@ export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxT
 export interface InboundFileLimits { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number }
 export const INBOUND_FILE_LIMITS: InboundFileLimits = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 600_000 };
 export interface OutputFile { readonly name: string; readonly contents: Buffer; readonly kind: "image" | "file" }
+export interface StageLedgerAudit { readonly eligibleCount: number; readonly ineligibleCount: number }
 interface OutputFileReadOptions {
   readonly allowBatchOverflow?: boolean;
   /** Keep valid siblings when one output file is too large. */
@@ -371,6 +372,7 @@ export class TaskFiles {
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
   private reconciliation: Promise<number> | null = null;
+  private stageAudit: Promise<StageLedgerAudit> | null = null;
   private stageWriterIdentity: ReturnType<typeof readWindowsProcessIdentity> = null;
   private stopped = false;
   private maintenanceStopped = false;
@@ -520,6 +522,23 @@ export class TaskFiles {
     this.reconciliation = work;
     return work;
   }
+  /** Read only durable-ledger audit. It intentionally neither reads staged
+   * bytes nor changes recycle state, so it cannot move or release a file. */
+  auditStagedArtifactsBatch(now = Date.now(), limit = 8): Promise<StageLedgerAudit> {
+    if (this.stopped || this.maintenanceStopped) return Promise.resolve({ eligibleCount: 0, ineligibleCount: 0 });
+    if (this.stageAudit) return this.stageAudit;
+    if (!Number.isSafeInteger(now) || now < 0) return Promise.reject(new RangeError("Invalid stage audit time"));
+    const work = Promise.resolve().then(() => {
+      let eligibleCount = 0; let ineligibleCount = 0;
+      for (const row of this.store.nextStageAuditCandidates(limit)) {
+        if (this.stopped || this.maintenanceStopped) break;
+        if (this.stageLedgerEligible(row, now)) eligibleCount++; else ineligibleCount++;
+      }
+      return { eligibleCount, ineligibleCount };
+    }).finally(() => { this.stageAudit = null; });
+    this.stageAudit = work;
+    return work;
+  }
   /** Explicit, bounded repair for a reservation whose writer died before
    * durable receipt creation. It never moves or removes staged bytes. */
   async reconcileAbandonedStageReservations(limit = 64): Promise<number> {
@@ -545,16 +564,10 @@ export class TaskFiles {
     let recycled = 0;
     for (const row of candidates) {
       if (this.stopped || this.maintenanceStopped) break;
-      const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key];
-      if (!receipt || receipt.path !== row.path || receipt.bytes !== row.bytes || receipt.key !== row.key
-        || !validStageIdentity(receipt.identity)
-        || !receipt.deliveryKey?.startsWith(`files:${row.bindingId}:${row.operationId}:`)
-        || !receipt.attachment || !Number.isSafeInteger(receipt.peerId) || receipt.peerId! <= 0
-        || !Number.isSafeInteger(receipt.stagedAt) || receipt.stagedAt <= 0 || receipt.stagedAt > now - STAGE_RETENTION_MS
-        || this.store.getValue<boolean>(`${row.key}:queued`) !== true
-        || this.store.getValue<string>(`${row.key}:upload-state`) !== "uploaded"
-        || this.store.getValue<string>(`${row.key}:uploaded`) !== receipt.attachment
-        || !this.store.hasConfirmedFileDelivery(receipt.deliveryKey, row.bindingId, receipt.peerId!, receipt.attachment)) continue;
+      if (!this.stageLedgerEligible(row, now)) continue;
+      const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key]!;
+      const identity = receipt.identity;
+      if (!validStageIdentity(identity)) continue;
       const job = this.jobs(row.bindingId).find(item => item.operationId === row.operationId);
       if (!job) continue;
       let verified;
@@ -575,9 +588,9 @@ export class TaskFiles {
       try { await this.stagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       const current = await lstat(row.path, { bigint: true }).catch(() => null);
-      const legacyCurrent = current && !("version" in receipt.identity) ? await lstat(row.path).catch(() => null) : undefined;
+      const legacyCurrent = current && !("version" in identity) ? await lstat(row.path).catch(() => null) : undefined;
       if (this.stopped || this.maintenanceStopped || !current || current.dev !== verified.dev || current.ino !== verified.ino
-        || current.birthtimeNs !== verified.birthtimeNs || !sameStageIdentity(current, receipt.identity, legacyCurrent ?? undefined)) continue;
+        || current.birthtimeNs !== verified.birthtimeNs || !sameStageIdentity(current, identity, legacyCurrent ?? undefined)) continue;
       // A failed or interrupted move leaves the reservation charged, even if
       // its pathname subsequently disappears.
       await this.recycleStage(row.path);
@@ -585,6 +598,20 @@ export class TaskFiles {
       recycled++;
     }
     return recycled;
+  }
+  private stageLedgerEligible(row: { key: string; bindingId: string; operationId: string; path: string; bytes: number }, now: number): boolean {
+    const receipt = this.stageIndex(row.bindingId, row.operationId)[row.key];
+    if (!receipt || receipt.path !== row.path || receipt.bytes !== row.bytes || receipt.key !== row.key
+      || !validStageIdentity(receipt.identity)) return false;
+    const deliveryKey = receipt.deliveryKey, attachment = receipt.attachment, peerId = receipt.peerId;
+    if (!deliveryKey?.startsWith(`files:${row.bindingId}:${row.operationId}:`) || !attachment
+      || typeof peerId !== "number" || !Number.isSafeInteger(peerId) || peerId <= 0) return false;
+    return Number.isSafeInteger(receipt.stagedAt) && receipt.stagedAt > 0 && receipt.stagedAt <= now - STAGE_RETENTION_MS
+      && this.store.getValue<boolean>(`${row.key}:queued`) === true
+      && this.store.getValue<string>(`${row.key}:upload-state`) === "uploaded"
+      && this.store.getValue<string>(`${row.key}:uploaded`) === attachment
+      && this.store.hasConfirmedFileDelivery(deliveryKey, row.bindingId, peerId, attachment)
+      && this.jobs(row.bindingId).some(item => item.operationId === row.operationId);
   }
   private async cleanupDocuments(except: readonly string[]): Promise<"removed" | "no-candidate" | "not-removed"> {
     if (!this.chat.cleanupDocuments) return "not-removed";
@@ -925,6 +952,7 @@ export class TaskFiles {
     await this.working;
     await Promise.allSettled(this.collections.values());
     await this.reconciliation?.catch(() => {});
+    await this.stageAudit?.catch(() => {});
   }
   /** Stop scheduling another candidate while a running Recycle Bin call settles. */
   haltStagedMaintenance(): void { this.maintenanceStopped = true; }

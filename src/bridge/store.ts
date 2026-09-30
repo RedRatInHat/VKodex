@@ -1056,6 +1056,36 @@ export class BridgeStore {
       path: row.path, bytes: row.bytes, recycling: row.recycling }));
   }
 
+  /** A separate cursor keeps diagnostic reads from changing the order of a
+   * future explicitly-authorized recycle pass. */
+  nextStageAuditCandidates(limit = 64): readonly { key: string; bindingId: string; operationId: string; path: string; bytes: number; recycling: "pending" | null }[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > BridgeStore.MAX_STAGE_FILES_GLOBAL) throw new RangeError("Invalid stage audit limit");
+    const rows = this.atomic(() => {
+      const cursorKey = "stage-audit-cursor";
+      const saved = this.getValue<{ createdAt: number; key: string }>(cursorKey);
+      const cursor = saved && Number.isSafeInteger(saved.createdAt) && typeof saved.key === "string" && saved.key ? saved : null;
+      type Row = { file_key: string; binding_id: string; operation_id: string; path: string; bytes: number;
+        recycling: "pending" | null; created_at: number };
+      const select = (after: typeof cursor): Row[] => after
+        ? this.db.prepare(`SELECT r.file_key, r.binding_id, r.operation_id, r.path, r.bytes, c.state AS recycling, r.created_at
+          FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key
+          WHERE r.state = 'ready' AND (c.state IS NULL OR c.state = 'pending')
+          AND (r.created_at, r.file_key) > (?, ?) ORDER BY r.created_at, r.file_key LIMIT ?`)
+          .all(after.createdAt, after.key, limit) as Row[]
+        : this.db.prepare(`SELECT r.file_key, r.binding_id, r.operation_id, r.path, r.bytes, c.state AS recycling, r.created_at
+          FROM bridge_stage_reservations r LEFT JOIN bridge_stage_recycling c ON c.file_key = r.file_key
+          WHERE r.state = 'ready' AND (c.state IS NULL OR c.state = 'pending')
+          ORDER BY r.created_at, r.file_key LIMIT ?`).all(limit) as Row[];
+      const page = select(cursor);
+      const result = page.length ? page : cursor ? select(null) : page;
+      const last = result.at(-1);
+      this.setValue(cursorKey, last ? { createdAt: last.created_at, key: last.file_key } : null);
+      return result;
+    });
+    return rows.map(row => ({ key: row.file_key, bindingId: row.binding_id, operationId: row.operation_id,
+      path: row.path, bytes: row.bytes, recycling: row.recycling }));
+  }
+
   markStageRecyclePending(fileKey: string, stagedPath: string): boolean {
     return this.atomic(() => {
       const ready = this.db.prepare("SELECT 1 FROM bridge_stage_reservations WHERE file_key = ? AND path = ? AND state = 'ready'").get(fileKey, stagedPath);
