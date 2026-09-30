@@ -101,7 +101,8 @@ export async function scanTerminalQueuedInputTurn(
     for (const [index, turn] of page.data.entries()) {
       if (!isObject(turn) || turn.threadId !== undefined && turn.threadId !== threadId ||
         typeof turn.id !== "string" || !turn.id || turns.has(turn.id) ||
-        turn.itemsView !== "summary" || !Array.isArray(turn.items) || typeof turn.status !== "string")
+        turn.itemsView !== "summary" || !Array.isArray(turn.items) ||
+        typeof turn.status !== "string" || !["completed", "failed", "interrupted"].includes(turn.status))
         throw new DesktopUnavailableError("Codex вернул неполный ход очереди.");
       turns.add(turn.id);
       for (const item of turn.items) {

@@ -3115,6 +3115,14 @@ test("historical queue scan rejects oversized native and persisted opaque cursor
     assert.fail("oversized persisted history must reject before native reads"), excessive), DesktopUnavailableError);
 });
 
+test("historical queue scan does not checkpoint past a mutable active turn", async () => {
+  const list = async (params: IpcObject): Promise<IpcObject> => ({ data: [
+    { id: "oldest", status: "completed", itemsView: "summary", items: [] },
+    ...(params.limit === 1 ? [] : [{ id: "active", status: "inProgress", itemsView: "summary", items: [] }]),
+  ], nextCursor: params.limit === 1 ? "later" : "after-active" });
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-operation", list), DesktopUnavailableError);
+});
+
 test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {
   const legacy = { headDigest: "a".repeat(64), cursor: "old-descending-page",
     seenCursors: ["old-descending-page"], pages: 1 } as unknown as
