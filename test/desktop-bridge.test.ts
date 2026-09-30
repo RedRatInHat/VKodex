@@ -777,6 +777,63 @@ test("without a goal receipt VK requests native status activation but never star
   assert.match(panelView(s).text, /запуск.*хода.*не подтверждён/u);
 });
 
+test("status-only goal continuation reports later owner observation without claiming its cause", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  let ordinaryTurns = 0;
+  s.desktop.continueGoal = async () => { ordinaryTurns++; return { mode: "started", turnId: "wrong" }; };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  const before = s.store.getValue<{ operationId: string }>(`goal-continuation:${binding.id}`)!.operationId;
+  s.manager.panels.observe(binding.id, { ...s.desktop.details, status: "running" });
+  await clickPanel(s, "Обновить");
+  assert.match(panelView(s).text, /наблюдается выполняющийся ход.*связь с запуском цели не подтверждена/iu);
+  assert.deepEqual(s.store.getValue<{ operationId: string; phase: string; receipt?: GoalContinuationReceipt;
+    observedStatus?: string }>(`goal-continuation:${binding.id}`),
+    { operationId: before, taskKey: taskKey(binding), goalCreatedAt: 1,
+      phase: "statusOnlyActive", generation: s.store.streamGeneration(binding.id), observedStatus: "running" });
+  assert.equal(ordinaryTurns, 0);
+});
+
+test("status-only goal marker retains idle and unavailable observations without retrying activation", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  const before = s.store.getValue<{ operationId: string }>(`goal-continuation:${binding.id}`)!.operationId;
+  s.manager.panels.observe(binding.id, { ...s.desktop.details, status: "idle" });
+  assert.equal(s.store.getValue<{ observedStatus?: string }>(`goal-continuation:${binding.id}`)?.observedStatus, "idle");
+  s.manager.panels.disconnected(binding.id, true);
+  const after = s.store.getValue<{ operationId: string; phase: string; observedStatus?: string;
+    receipt?: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`)!;
+  assert.equal(after.operationId, before);
+  assert.equal(after.phase, "statusOnlyActive");
+  assert.equal(after.observedStatus, "unavailable");
+  assert.equal(after.receipt, undefined);
+  assert.deepEqual(s.desktop.goalUpdates, [{ status: "active" }]);
+});
+
+test("status-only goal observation is fenced after a route or goal generation change", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  s.store.setValue(`stream-generation:${binding.id}`, s.store.streamGeneration(binding.id) + 1);
+  s.manager.panels.observe(binding.id, { ...s.desktop.details, status: "running" });
+  await clickPanel(s, "Обновить");
+  assert.doesNotMatch(panelView(s).text, /наблюдается выполняющийся ход/iu);
+  assert.equal(s.store.getValue<{ observedStatus?: string }>(`goal-continuation:${binding.id}`)?.observedStatus, undefined);
+  s.desktop.goal = { ...s.desktop.goal!, objective: "Replacement goal", createdAt: 2, updatedAt: 2 };
+  await clickPanel(s, "Обновить");
+  assert.match(panelView(s).text, /прежней цели.*не подтверждён/iu);
+});
+
 test("new goals use native status-only activation when no goal-turn receipt exists", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.activateGoalWithReceipt = undefined as never;
@@ -920,7 +977,7 @@ test("goal resume durably records the confirmed continuation turn", async t => {
   await clickPanel(s, "Возобновить");
   assert.deepEqual(s.store.getValue(`goal-continuation:${binding.id}`), {
     operationId: s.store.getValue<{ operationId: string }>(`goal-continuation:${binding.id}`)!.operationId,
-    taskKey: taskKey(binding), goalCreatedAt: 1, phase: "accepted",
+    taskKey: taskKey(binding), goalCreatedAt: 1, generation: s.store.streamGeneration(binding.id), phase: "accepted",
     receipt: { mode: "started", turnId: "goal-turn-1" },
   });
   assert.match(panelView(s).text, /Новый ход запущен/u);

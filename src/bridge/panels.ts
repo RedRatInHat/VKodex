@@ -51,6 +51,10 @@ interface GoalContinuationState {
   taskKey: string;
   goalCreatedAt: number | null;
   phase: "activating" | "sending" | "accepted" | "statusOnlyActive" | "rejected" | "uncertain";
+  /** Route generation at activation; older markers omit it and stay unproved. */
+  generation?: number;
+  /** Owner-observed status only, never a receipt that goal activation started a turn. */
+  observedStatus?: TaskDetails["status"];
   /** Optional so pre-receipt durable markers from earlier releases remain readable. */
   receipt?: GoalContinuationReceipt;
 }
@@ -69,6 +73,8 @@ function validGoalContinuation(value: unknown): value is GoalContinuationState {
     && typeof record.taskKey === "string" && record.taskKey.length > 0
     && (record.goalCreatedAt === null || typeof record.goalCreatedAt === "number" && Number.isFinite(record.goalCreatedAt))
     && ["activating", "sending", "accepted", "statusOnlyActive", "rejected", "uncertain"].includes(String(record.phase))
+    && (record.generation === undefined || Number.isSafeInteger(record.generation) && Number(record.generation) >= 0)
+    && (record.observedStatus === undefined || typeof record.observedStatus === "string" && Object.hasOwn(statuses, record.observedStatus))
     && (record.receipt === undefined || validGoalContinuationReceipt(record.receipt));
 }
 
@@ -184,6 +190,7 @@ export class TaskPanels {
     this.live.set(bindingId, details);
     const key = `task-details:${bindingId}`;
     if (JSON.stringify(this.store.getValue(key)) !== JSON.stringify(details)) this.store.setValue(key, details);
+    this.recordGoalObservation(bindingId, details.status);
     const rename = this.store.getValue<RenameState>(`rename:${bindingId}`);
     if (rename && details.title) {
       const liveTitleUpdated = details.title === rename.title;
@@ -197,6 +204,17 @@ export class TaskPanels {
     const key = `task-details:${bindingId}`;
     const previous = this.store.getValue<TaskDetails>(key) ?? unknownDetails;
     if (previous.status !== "unavailable") this.store.setValue(key, { ...previous, status: "unavailable" });
+    this.recordGoalObservation(bindingId, "unavailable");
+  }
+
+  private recordGoalObservation(bindingId: string, status: TaskDetails["status"]): void {
+    const binding = this.store.getBinding(bindingId);
+    if (!binding) return;
+    const marker = this.goalContinuationMarker(binding);
+    if (!marker || marker === "malformed" || marker.phase !== "statusOnlyActive" ||
+      marker.taskKey !== taskKey(binding) || marker.generation === undefined ||
+      marker.generation !== this.store.streamGeneration(bindingId) || marker.observedStatus === status) return;
+    this.store.setValue(`goal-continuation:${bindingId}`, { ...marker, observedStatus: status } satisfies GoalContinuationState);
   }
 
   async tick(): Promise<void> {
@@ -733,8 +751,12 @@ export class TaskPanels {
     const continuation = this.goalContinuationMarker(binding);
     const pending = continuation === "malformed"
       ? "Запись о запуске цели повреждена. Новый запуск заблокирован до проверки исхода в Codex."
-      : continuation?.phase === "statusOnlyActive" && continuation.taskKey === taskKey(binding) && goal?.status === "active"
-      ? "Цель активна. Нативный запуск следующего хода не подтверждён отдельной квитанцией. Проверь ход в Codex; если цель осталась активной без хода, поставь её на паузу и возобнови после проверки."
+      : continuation?.phase === "statusOnlyActive" && continuation.taskKey === taskKey(binding)
+      ? goal?.status !== "active" || goal.createdAt !== continuation.goalCreatedAt
+        ? "Запуск прежней цели не подтверждён. Проверь её исход в Codex; текущая цель не наследует этот запуск."
+        : continuation.generation === this.store.streamGeneration(binding.id) && continuation.observedStatus === "running"
+          ? "В Codex наблюдается выполняющийся ход; связь с запуском цели не подтверждена отдельной квитанцией. Не повторяй запуск вслепую."
+          : "Цель активна. Нативный запуск следующего хода не подтверждён отдельной квитанцией. Проверь ход в Codex; если цель осталась активной без хода, поставь её на паузу и возобнови после проверки."
       : continuation && ["activating", "sending", "uncertain"].includes(continuation.phase)
       ? continuation.taskKey === taskKey(binding)
         ? "Запуск следующего хода не подтверждён. Проверь состояние задачи в Codex; не повторяй команду вслепую."
@@ -864,7 +886,9 @@ export class TaskPanels {
       if (existing === "malformed" || existing && !["accepted", "statusOnlyActive", "rejected"].includes(existing.phase)) {
         throw new ActionRejectedError("Предыдущий запуск цели не подтверждён. Проверь его исход в Codex; повторный запуск остаётся заблокированным.");
       }
-      const attempt: GoalContinuationState = { operationId: randomUUID(), taskKey: taskKey(binding), goalCreatedAt: goal?.status === "complete" ? null : goal?.createdAt ?? null, phase: "sending" };
+      const attempt: GoalContinuationState = { operationId: randomUUID(), taskKey: taskKey(binding),
+        goalCreatedAt: goal?.status === "complete" ? null : goal?.createdAt ?? null,
+        generation: this.store.streamGeneration(binding.id), phase: "sending" };
       this.store.setValue(`goal-continuation:${binding.id}`, attempt);
       return attempt;
     });
