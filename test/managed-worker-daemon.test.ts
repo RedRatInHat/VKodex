@@ -202,6 +202,32 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
   }
 });
 
+test('isolated CLI Gateway permits only non-refreshing account bootstrap read', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
+  try {
+    await client.request('initialize', 'initialize',
+      { clientInfo: { name: 'fixture' }, capabilities: {} });
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    const allowed = await client.request('account-read', 'account/read', { refreshToken: false });
+    assert.equal((allowed.result as { account: { type: string } }).account.type, 'chatgpt');
+    for (const params of [{ refreshToken: true }, { refreshToken: 'false' },
+      { refreshToken: false, includeToken: true }]) {
+      const rejected = await client.request(randomUUID(), 'account/read', params);
+      assert.equal((rejected.error as { code: number }).code, -32601);
+    }
+    assert.equal(own.backend.methods.filter(method => method === 'account/read').length, 1);
+    assert.equal(own.backend.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    assert.deepEqual((await own.daemon.nativeCliCanaryEvidence(capability)).acceptedStartSha256, []);
+  } finally {
+    client.socket.terminate();
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-account-bootstrap-stop');
+  }
+});
+
 test('controlled native CLI canary evidence permits only one outstanding history read', async () => {
   const capability = {};
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
@@ -1215,6 +1241,8 @@ class Backend extends EventEmitter {
       turns: this.terminalTurns(),
       environments: this.stock ? [] : [{ environmentId: 'local', cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }] });
     if (method === 'initialize') return { serverInfo: { name: 'fixture' } };
+    if (method === 'account/read') return { account: { type: 'chatgpt',
+      email: 'fixture@example.invalid', planType: 'pro' }, requiresOpenaiAuth: false };
     if (method === 'thread/read') return { thread: this.failBootstrap && this.resumed ?
       { ...thread(), status: { type: 'inProgress' } } : thread() };
     if (method === 'thread/turns/list') return { data: this.terminalTurns().map(turn =>

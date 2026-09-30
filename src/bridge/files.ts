@@ -22,6 +22,8 @@ interface OutputFileReadOptions {
   readonly allowBatchOverflow?: boolean;
   /** Keep valid siblings when one output file is too large. */
   readonly skipOversizedFiles?: boolean;
+  /** Reject an unsafe file entry without reading it or blocking valid siblings. */
+  readonly skipUnsafeFiles?: boolean;
   readonly onSkippedFile?: (error: OutputFilesError) => void;
   /** A stable, previously processed file need not be loaded again. */
   readonly skipFile?: (relativePath: string, fingerprint: string) => boolean;
@@ -302,7 +304,11 @@ export async function readOutputFiles(root: string, limits = FILE_LIMITS, option
       if (++entries > MAX_OUTPUT_ENTRIES) throw new OutputFilesError(`В папке выдачи больше ${MAX_OUTPUT_ENTRIES} элементов.`);
       if (entry.startsWith(".")) continue;
       const file = path.join(folder, entry); const before = await lstat(file);
-      if (before.isSymbolicLink() || (before.isFile() && before.nlink !== 1)) throw new OutputFilesError("Ссылки в папке выходных файлов не отправляются.");
+      if (before.isSymbolicLink() || (before.isFile() && before.nlink !== 1)) {
+        const error = new OutputFilesError(`Ссылки в папке выходных файлов не отправляются: «${safeFileName(entry, "file")}».`);
+        if (options.skipUnsafeFiles) { options.onSkippedFile?.(error); continue; }
+        throw error;
+      }
       if (before.isDirectory()) { await walk(file, depth + 1); continue; }
       if (!before.isFile()) continue;
       await checkPath(file);
@@ -883,9 +889,9 @@ export class TaskFiles {
         }
         // Validate the whole tree before the first upload; this pass reads only
         // directory entries and metadata, not file contents.
-        await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true, skipFile: () => true });
+        await readOutputFiles(outbox, FILE_LIMITS, { allowBatchOverflow: true, skipUnsafeFiles: true, skipFile: () => true });
         await readOutputFiles(outbox, FILE_LIMITS, {
-          allowBatchOverflow: true, skipOversizedFiles: true, onSkippedFile: error => skipped.push(error),
+          allowBatchOverflow: true, skipOversizedFiles: true, skipUnsafeFiles: true, onSkippedFile: error => skipped.push(error),
           skipFile: (relativePath, fingerprint) => {
             const known = scanned[relativePath];
             if (!known || known.fingerprint !== fingerprint) return false;

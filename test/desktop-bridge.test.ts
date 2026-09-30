@@ -16,7 +16,7 @@ import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, captureStageIdentity, sameStageIdentity, downloadVkFileToPath } from "../src/bridge/files.js";
 import { STAGED_FILE_PILOT_DISABLED } from "../src/bridge/config.js";
 import type { ProcessIdentity } from "../src/codex/managed-worker-registry.js";
-import { lstat, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -4502,6 +4502,21 @@ test("an outbox with more than ten files is delivered in batches without blockin
 
   await files.tick(); await s.worker.flush();
   assert.equal(s.chat.binaryUploads.length, 12);
+});
+
+test("a forbidden outbox file does not block a valid sibling", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const prepared = await files.prepare(binding, "unsafe-sibling", []);
+  files.finish(binding.id, "unsafe-sibling", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "a-safe.txt"), "safe bytes");
+  const outside = path.join(root, "outside.txt");
+  await writeFile(outside, "must never upload");
+  await link(outside, path.join(prepared.outboxDir, "b-hardlink.txt"));
+
+  assert.equal(await files.collect(binding, true), 1);
+  assert.deepEqual(s.chat.binaryUploads.map(upload => upload.name), ["a-safe.txt"]);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("b-hardlink.txt") && /не отправлен|не добавлен/u.test(delivery.view.text)));
 });
 
 test("late owner input is delivered before already observed commentary", async t => {

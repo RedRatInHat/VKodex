@@ -41,6 +41,64 @@ export async function findAcceptedInputTurn(
   } while (true);
 }
 
+/** Positive-only shortcut for an old queue ACK near the current tail. A miss
+ * never settles the ACK: the durable ascending scan still covers all history. */
+export async function findRecentTerminalQueuedInputTurn(
+  threadId: string,
+  clientId: string,
+  list: (params: IpcObject) => Promise<IpcObject>,
+): Promise<string | null> {
+  if (!threadId || !clientId) throw new DesktopUnavailableError("Не задана задача или операция очереди.");
+  const limit = 5;
+  const read = async (cursor: string | undefined, count: number, itemsView: "summary" | "full") => {
+    const page = await list({ threadId, limit: count, sortDirection: "desc", itemsView,
+      ...(cursor ? { cursor } : {}) });
+    if (page.threadId !== undefined && page.threadId !== threadId ||
+      !Array.isArray(page.data) || page.data.length > count ||
+      !(page.nextCursor === null || typeof page.nextCursor === "string") ||
+      typeof page.nextCursor === "string" && Buffer.byteLength(page.nextCursor, "utf8") > 1_024 ||
+      itemsView === "summary" && Buffer.byteLength(JSON.stringify(page.data), "utf8") > 4 * 1024 * 1024)
+      throw new DesktopUnavailableError("Codex вернул неполную историю очереди.");
+    return page as IpcObject & { data: unknown[]; nextCursor: string | null };
+  };
+  const page = await read(undefined, limit, "summary");
+  const seen = new Set<string>();
+  let candidateIndex: number | null = null;
+  for (const [index, turn] of page.data.entries()) {
+    if (!isObject(turn) || turn.threadId !== undefined && turn.threadId !== threadId ||
+      typeof turn.id !== "string" || !turn.id || seen.has(turn.id) ||
+      turn.itemsView !== "summary" || typeof turn.status !== "string" || !Array.isArray(turn.items) ||
+      turn.items.some(item => !isObject(item) || typeof item.type !== "string"))
+      throw new DesktopUnavailableError("Codex вернул неполный ход очереди.");
+    seen.add(turn.id);
+    if (!["completed", "failed", "interrupted"].includes(turn.status) ||
+      !turn.items.some(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId)) continue;
+    if (candidateIndex !== null) throw new DesktopUnavailableError("Ход очереди неоднозначен.");
+    candidateIndex = index;
+  }
+  if (candidateIndex === null) return null;
+  let cursor: string | undefined;
+  for (let index = 0; index < candidateIndex; index++) {
+    const one = await read(cursor, 1, "summary");
+    const actual = one.data[0], expected = page.data[index];
+    if (one.data.length !== 1 || !isObject(actual) || !isObject(expected) ||
+      actual.id !== expected.id || actual.status !== expected.status || actual.itemsView !== "summary" ||
+      !one.nextCursor)
+      throw new DesktopUnavailableError("История очереди изменилась во время проверки.");
+    cursor = one.nextCursor;
+  }
+  const full = await read(cursor, 1, "full");
+  const turn = full.data[0], expected = page.data[candidateIndex];
+  if (full.data.length !== 1 || !isObject(turn) || !isObject(expected) ||
+    turn.threadId !== undefined && turn.threadId !== threadId ||
+    turn.id !== expected.id || turn.status !== expected.status || turn.itemsView !== "full" ||
+    !["completed", "failed", "interrupted"].includes(String(turn.status)) ||
+    !Array.isArray(turn.items) || turn.items.some(item => !isObject(item) || typeof item.type !== "string") ||
+    turn.items.filter(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId).length !== 1)
+    throw new DesktopUnavailableError("Codex не подтвердил точный завершённый ход очереди.");
+  return turn.id as string;
+}
+
 /** Searches a bounded native history slice. A positive result is exact terminal
  * evidence from a validated page; a negative partial result preserves the ACK. */
 export async function scanTerminalQueuedInputTurn(

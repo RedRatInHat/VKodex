@@ -14,7 +14,7 @@ import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
-import { findAcceptedInputTurn, MutableQueuedInputTurnError, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
+import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, MutableQueuedInputTurnError, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
 import { projectSnapshot, summarizeTurnState } from "../src/desktop/projector.js";
@@ -3067,6 +3067,43 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
     threadId: "different-thread", data: [{ id: "wrong", status: "completed", itemsView: "summary",
       items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
+  })), DesktopUnavailableError);
+});
+
+test("historical queue reconciliation can prove a recent terminal ACK without scanning from the oldest turn", async () => {
+  const calls: IpcObject[] = [];
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    assert.equal(params.threadId, "thread");
+    assert.equal(params.sortDirection, "desc");
+    const start = Number(String(params.cursor ?? "0").replace(/^d/u, ""));
+    const limit = Number(params.limit);
+    const data = Array.from({ length: limit }, (_, offset) => {
+      const index = 99 - start - offset;
+      return { id: `turn-${index}`, status: "completed", itemsView: params.itemsView,
+        items: [{ type: "userMessage", clientId: index === 97 ? "queued-id" : `other-${index}` }] };
+    });
+    return { threadId: "thread", data, nextCursor: `d${start + limit}` };
+  };
+  assert.equal(await findRecentTerminalQueuedInputTurn("thread", "queued-id", list), "turn-97");
+  assert.deepEqual(calls.map(call => [call.itemsView, call.limit, call.cursor]), [
+    ["summary", 5, undefined], ["summary", 1, undefined], ["summary", 1, "d1"], ["full", 1, "d2"],
+  ]);
+});
+
+test("recent queue shortcut never settles an active or unconfirmed candidate", async () => {
+  const active = await findRecentTerminalQueuedInputTurn("thread", "queued-id", async params => ({
+    data: [{ id: "active", status: "inProgress", itemsView: params.itemsView,
+      items: [{ type: "userMessage", clientId: "queued-id" }] }], nextCursor: null,
+  }));
+  assert.equal(active, null);
+  await assert.rejects(findRecentTerminalQueuedInputTurn("thread", "queued-id", async params => ({
+    data: [{ id: "candidate", status: "completed", itemsView: params.itemsView,
+      items: [{ type: "userMessage", clientId: params.itemsView === "full" ? "different" : "queued-id" }] }],
+    nextCursor: null,
+  })), DesktopUnavailableError);
+  await assert.rejects(findRecentTerminalQueuedInputTurn("thread", "queued-id", async () => ({
+    data: [{ id: "candidate", status: "completed", itemsView: "summary", items: [null] }], nextCursor: null,
   })), DesktopUnavailableError);
 });
 

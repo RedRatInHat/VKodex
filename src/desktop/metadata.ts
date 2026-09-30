@@ -13,7 +13,7 @@ import { closeAppServer } from "./app-server-process.js";
 import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
-import { findAcceptedInputTurn, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
+import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
 import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from "../core/codex-tasks.js";
 import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
@@ -341,12 +341,19 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     const rpc = new MetadataRpc(this.sourceHome(task), undefined, 10_000);
     return findAcceptedInputTurn(task.threadId, operationId, params => rpc.call("thread/turns/list", params));
   }
-  scanTerminalQueuedInput(task: TaskRef, clientId: string,
+  async scanTerminalQueuedInput(task: TaskRef, clientId: string,
     cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
     if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("История доступна только для локальной задачи.");
     const rpc = new MetadataRpc(this.sourceHome(task), undefined, 30_000);
-    return scanTerminalQueuedInputTurn(task.threadId, clientId,
-      params => rpc.call("thread/turns/list", params), cursor);
+    const list = (params: IpcObject) => rpc.call("thread/turns/list", params);
+    // An App Server metadata read starts a short-lived process. Probe the tail
+    // on the first few passes and then sparsely while the durable full scan
+    // advances; a later queue start can still be recognized without doubling
+    // every history page's process cost.
+    const recent = !cursor || cursor.pages <= 5 || cursor.pages % 20 === 0
+      ? await findRecentTerminalQueuedInputTurn(task.threadId, clientId, list) : null;
+    return recent ? { done: true, turnId: recent }
+      : scanTerminalQueuedInputTurn(task.threadId, clientId, list, cursor);
   }
   async queue(request: SubmitTaskRequest, input: readonly IpcObject[]): Promise<string> {
     const metadata = this.createMetadata(this.sourceHome(request.task));

@@ -701,7 +701,8 @@ export class ManagedWorkerDaemon {
           { backendTimeoutMs: this.#options.dependencies.backendTimeoutMs } : {}),
         bootstrapReadMethods: this.#options.nativeStockQueue ?
           ['thread/turns/list', 'config/read', 'configRequirements/read'] :
-          ['thread/turns/list', 'config/read'],
+          ['thread/turns/list', 'config/read',
+            ...(this.#options.nativeCliWebSocket ? ['account/read'] : [])],
         launch: () => {
           launchAttempted = true;
           this.#startupPhase = 'launching';
