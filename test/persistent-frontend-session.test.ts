@@ -1136,6 +1136,23 @@ test('native error envelope keeps the frontend typed ID and exact error without 
   assert.equal(Object.hasOwn(frames[1]!, 'result'), false);
 });
 
+test('native CLI thread/read bootstrap fields pass through without a synthetic projection', async () => {
+  const backend = fakeBackend();
+  const native = { thread: { id: taskId, preview: 'isolated test', ephemeral: false,
+    status: { type: 'notLoaded' }, source: 'vscode', turns: [],
+    extra: { nativeOnly: true } } };
+  backend.request = (method, params, options) => {
+    backend.requests.push({ method, params, options });
+    options.onResponseEnvelope({ result: native });
+    return Promise.resolve(native);
+  };
+  const { frames, frontend } = attach(createSessions(backend));
+  await initialize(frontend);
+  assert.equal(await frontend.receive({ id: 'cli-read', method: 'thread/read',
+    params: { threadId: taskId } }), 'forwarded');
+  assert.deepEqual(frames[1], { id: 'cli-read', result: native });
+});
+
 test('Promise-only result is unsupported and cannot become frontend success', async () => {
   const backend = fakeBackend();
   backend.request = (method, params, options) => {
