@@ -98,12 +98,16 @@ process.once("message", (value: unknown) => {
     // it may contain the protected input or the unprotected output.
     let stderrKind = "empty";
     if (Buffer.isBuffer(stderr) && stderr.byteLength > 0) {
-      stderrKind = stderr.includes("ParserError") || stderr.includes("At line:") ? "parser" :
+      stderrKind = stderr.includes("ScriptContainedMaliciousContent") || stderr.includes("malicious content") ||
+        stderr.includes("blocked by your antivirus") ? "security" :
+        stderr.includes("ParserError") || stderr.includes("At line:")
+          ? stderr.includes("UnexpectedToken") ? "parser-token" :
+            stderr.includes("MissingEndParenthesis") ? "parser-parenthesis" : "parser" :
         stderr.includes("Exception") || stderr.includes("InvalidOperation") || stderr.includes("ErrorRecord")
           ? "runtime" : "other";
     }
     const phase = result.error ? "process-error" : result.status === 42 ? "input-length" :
-      `exit-${result.status}-${stderrKind}${stderrKind === "parser" && Buffer.isBuffer(stderr) ? parserCoordinate(stderr) : ""}`;
+      `exit-${result.status}-${stderrKind}${stderrKind.startsWith("parser") && Buffer.isBuffer(stderr) ? parserCoordinate(stderr) : ""}`;
     if (Buffer.isBuffer(stdout)) stdout.fill(0);
     if (Buffer.isBuffer(stderr)) stderr.fill(0);
     send({ ok: false, phase });

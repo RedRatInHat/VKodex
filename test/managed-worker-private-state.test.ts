@@ -40,7 +40,7 @@ function productDpapiFailurePhase(error: unknown): string {
     if (!(current instanceof Error)) break;
     const cause: unknown = current.cause;
     if (cause && typeof cause === "object" && "phase" in cause &&
-      typeof cause.phase === "string" && /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|command-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)(?:-(?:empty|parser(?:-l\d{1,4}c\d{1,5})?|runtime|other))?|helper-exit-\d+)$/u.test(cause.phase))
+      typeof cause.phase === "string" && /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|command-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)(?:-(?:empty|security|parser(?:-token|-parenthesis)?(?:-l\d{1,4}c\d{1,5})?|runtime|other))?|helper-exit-\d+)$/u.test(cause.phase))
       return cause.phase;
     current = cause;
   }
