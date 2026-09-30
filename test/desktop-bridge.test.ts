@@ -485,12 +485,33 @@ test("account limits are available from the manager and task chat without reachi
   assert.doesNotMatch(panelView(s, access.ownerId).text, /Базовые модели/u);
   assert.deepEqual(panelView(s, access.ownerId).buttons!.map(button => button.label), ["Обновить лимиты", "Меню"]);
   await clickPanel(s, "Обновить лимиты", access.ownerId); assert.equal(s.desktop.usageReads, 2);
-  await s.handle("/limits", peerId);
+  await s.handle("/menu", peerId);
+  assert.ok(panelView(s).buttons!.some(button => button.label === "Лимиты Codex"));
+  assert.ok(panelView(s).buttons!.length <= 10);
+  await clickPanel(s, "Лимиты Codex");
   assert.equal(s.desktop.usageReads, 3); assert.equal(s.desktop.submissions.length, 0);
   assert.equal(s.desktop.usageTasks[0], undefined); assert.equal(s.desktop.usageTasks[1], undefined);
   assert.equal(s.desktop.usageTasks[2]!.threadId, task.threadId);
   assert.match(panelView(s).text, /Заполнение контекста конкретной задачи/u);
   await clickPanel(s, "Меню"); assert.match(panelView(s).text, /Контекст:/u);
+  await s.handle("/limits", peerId); assert.equal(s.desktop.usageReads, 4);
+});
+
+test("task limits keep the VK menu within ten buttons during transfer recovery", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.details = { ...s.desktop.details, status: "unavailable" };
+  s.store.markTransfer({ id: "pending-transfer", bindingId: binding.id, startedAt: 1,
+    source: task, targetSourceId: "work", targetProjectId: null, phase: "forking" });
+  s.store.setValue(`rename:${binding.id}`, {
+    title: task.title, liveTitleUpdated: true, vkTitleUpdated: false, origin: "vk", attempts: 1,
+  });
+  await s.handle("/menu", peerId);
+  const labels = panelView(s).buttons!.map(button => button.label);
+  assert.ok(labels.length <= 10);
+  assert.ok(labels.includes("Лимиты Codex"));
+  assert.ok(labels.includes("Продолжить перенос"));
+  assert.ok(labels.includes("Отменить перенос"));
+  assert.ok(labels.includes("Повторить для VK"));
 });
 
 test("usage reset requires confirmation and safely retries an uncertain response", async t => {
@@ -2073,6 +2094,7 @@ test("archive requires confirmation, rechecks current status, and only detaches 
 test("working directory, local link and Markdown export are explicit private outputs", async t => {
   const s = setup(t); s.attach(); await s.handle("/menu", peerId);
   await clickPanel(s, "Рабочая директория"); assert.match(s.chat.sent.at(-1)!.view.text, /\/project/u);
+  await clickPanel(s, "Поделиться");
   await clickPanel(s, "Диплинк"); assert.match(s.chat.sent.at(-1)!.view.text, /codex:\/\/threads\/task-a/u);
   const exportAction = panelView(s).buttons!.find(button => button.label === "Markdown-файл")!.action;
   await clickPanel(s, "Markdown-файл");
@@ -2084,6 +2106,7 @@ test("working directory, local link and Markdown export are explicit private out
 test("an export does not inspect or restrict conversation participants", async t => {
   const s = setup(t); s.attach(); await s.handle("/menu", peerId);
   s.desktop.exportHook = () => { s.chat.participants.push(999); };
+  await clickPanel(s, "Поделиться");
   await clickPanel(s, "Markdown-файл");
   assert.equal(s.chat.uploads.length, 1); assert.equal(s.store.bindings()[0]!.paused, false);
   assert.equal(s.chat.memberReads, 0);

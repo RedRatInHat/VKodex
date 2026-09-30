@@ -982,18 +982,19 @@ export class TaskPanels {
     if (binding.peerId === null) return;
     const button = (label: string, command: PanelAction["command"]) => this.button(binding.peerId!, state, label, command);
     const buttons = [button("Модель / рассуждение", "models"), button("Обновить", "home")];
+    if (this.desktop.capabilities.accountUsage && this.desktop.accountUsage) buttons.push(button("Лимиты Codex", "limits"));
     if (this.desktop.capabilities.goals && this.desktop.getGoal && this.desktop.setGoal && this.desktop.clearGoal) buttons.push(button("Цель", "goal"));
     if (this.desktop.capabilities.renameTask) buttons.push(button("Переименовать", "rename"));
     if (this.desktop.capabilities.archiveTask) buttons.push(button("Архивировать", "archive"));
     if (this.desktop.capabilities.moveTask || this.desktop.capabilities.transferTask) buttons.push(button("Переместить", "move"));
-    buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"),
-      this.details(binding.id).status === "unavailable" && (this.desktop.revealTask || this.desktop.ensureOpen)
-        ? button("Открыть в Codex", "openDesktop") : button("Диплинк", "link"));
-    if (this.desktop.capabilities.exportMarkdown) buttons.push(button("Markdown-файл", "export"));
+    buttons.push(button("Поделиться", "share"), button("Рабочая директория", "path"));
+    if (this.details(binding.id).status === "unavailable" && (this.desktop.revealTask || this.desktop.ensureOpen)) {
+      buttons.push(button("Открыть в Codex", "openDesktop"));
+    }
     const transfer = this.store.transfer(binding.id);
     if (transfer && !["complete", "cancelled"].includes(transfer.phase)) {
       if (buttons.length >= 10) {
-        const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться"].includes(item.label));
+        const index = buttons.findIndex(item => ["Рабочая директория", "Поделиться", "Открыть в Codex"].includes(item.label));
         if (index >= 0) buttons.splice(index, 1);
       }
       if (transfer.phase === "switched" && transfer.blockedReason === "sourceChanged") {
@@ -1003,7 +1004,7 @@ export class TaskPanels {
       }
       if (transfer.phase !== "switched") {
         if (buttons.length >= 10) {
-          const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться", "Markdown-файл"].includes(item.label));
+          const index = buttons.findIndex(item => ["Рабочая директория", "Поделиться", "Открыть в Codex"].includes(item.label));
           if (index >= 0) buttons.splice(index, 1);
         }
         buttons.push(button("Отменить перенос", "moveSourceCancel"));
@@ -1012,7 +1013,7 @@ export class TaskPanels {
     const rename = this.renameState(binding);
     if (rename && !rename.vkTitleUpdated) {
       if (buttons.length >= 10) {
-        const index = buttons.findIndex(item => ["Диплинк", "Рабочая директория", "Поделиться"].includes(item.label));
+        const index = buttons.findIndex(item => ["Рабочая директория", "Поделиться", "Открыть в Codex"].includes(item.label));
         if (index >= 0) buttons.splice(index, 1);
       }
       buttons.push(this.button(binding.peerId, state, "Повторить для VK", "renameVk", { title: rename.title }));
