@@ -747,6 +747,15 @@ export class TaskFiles {
       const blockedStageKeys = new Set<string>();
       const blockedStageSources = new Map<string, string>();
       let pendingBytes = 0;
+      const stageBlocked = (receipt: StagedFile, error: StageContentUnavailableError): void => {
+        blockedStageKeys.add(receipt.key);
+        blockedStageSources.set(receipt.relativePath, receipt.fingerprint);
+        stageFailure ??= error;
+        this.store.enqueue(`${receipt.key}:stage-error`, binding.peerId!, {
+          text: `Staged-версия файла «${receipt.name}» отсутствует или повреждена. Этот файл не отправлен; остальные файлы выдачи продолжают отправляться. Исходный файл не будет использован вместо неё.`,
+          silent: true,
+        }, binding.id);
+      };
       const quotaBlocked = (key: string, name: string, message: string): void => {
         this.store.atomic(() => {
           this.store.setValue(`${key}:upload-state`, null);
@@ -818,7 +827,13 @@ export class TaskFiles {
             }
             // When staging is enabled, VK receives verified staged bytes using
             // the existing bounded buffer. Old jobs continue the old path.
-            const uploadBytes = staged || !receipt ? file.contents : await this.stagedContents(receipt, job, binding.id, file.contents);
+            let uploadBytes: Buffer;
+            try { uploadBytes = staged || !receipt ? file.contents : await this.stagedContents(receipt, job, binding.id, file.contents); }
+            catch (error) {
+              if (!(error instanceof StageContentUnavailableError) || !receipt) throw error;
+              stageBlocked(receipt, error);
+              return;
+            }
             let cleanupAttempted = false;
             for (;;) {
               this.store.setValue(`${key}:upload-state`, "uploading");
@@ -893,13 +908,7 @@ export class TaskFiles {
           try { contents = await this.stagedContents(receipt, job, binding.id); }
           catch (error) {
             if (!(error instanceof StageContentUnavailableError)) throw error;
-            blockedStageKeys.add(receipt.key);
-            blockedStageSources.set(receipt.relativePath, receipt.fingerprint);
-            stageFailure ??= error;
-            this.store.enqueue(`${receipt.key}:stage-error`, binding.peerId!, {
-              text: `Staged-версия файла «${receipt.name}» отсутствует или повреждена. Этот файл не отправлен; остальные файлы выдачи продолжают отправляться. Исходный файл не будет использован вместо неё.`,
-              silent: true,
-            }, binding.id);
+            stageBlocked(receipt, error);
             continue;
           }
           await processFile({ name: receipt.name, contents, kind: receipt.kind }, receipt.relativePath, receipt.fingerprint, receipt);

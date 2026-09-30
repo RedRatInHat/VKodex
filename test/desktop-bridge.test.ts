@@ -4225,6 +4225,26 @@ test("a corrupt staged version does not strand a valid sibling or fall back to s
   assert.ok(s.chat.sent.some(item => /Staged-версия файла «a-corrupt\.txt» отсутствует или повреждена/u.test(item.view.text)));
 });
 
+test("fresh staged readback failure skips only that file and preserves its receipt", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-readback-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "readback-sibling", []);
+  files.finish(binding.id, "readback-sibling", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "a-corrupt.txt"), "first version");
+  await writeFile(path.join(prepared.outboxDir, "b-valid.txt"), "valid bytes");
+  const markReady = s.store.markStageReady.bind(s.store);
+  const corrupt = t.mock.method(s.store, "markStageReady", (key: string, target: string) => {
+    markReady(key, target);
+    const staged = s.store.getValue<Record<string, { key: string; name: string }>>(`file-stage-index:${binding.id}:readback-sibling`)!;
+    if (staged[key]?.name === "a-corrupt.txt") writeFileSync(target, "corrupt bytes");
+  });
+  assert.equal(await files.collect(binding, true), 1);
+  corrupt.mock.restore();
+  assert.deepEqual(s.chat.binaryUploads.map(upload => upload.name), ["b-valid.txt"]);
+  assert.equal(Object.keys(s.store.getValue<Record<string, unknown>>(`file-stage-index:${binding.id}:readback-sibling`)!).length, 2);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.key.endsWith(":stage-error")));
+});
+
 test("a staged receipt cannot change the uploaded filename or file kind", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-metadata-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
