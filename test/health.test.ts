@@ -118,6 +118,7 @@ test("health reports an enabled staging pilot's exact peer scope without storage
   const s = setup(t, Object.freeze({ mode: "single-chat" as const, peerId: 2_000_000_017 }));
   const check = (await s.monitor.check()).checks.find(item => item.name === "stage_pilot")!;
   assert.match(check.detail, /включена только для VK peer 2000000017/u);
+  assert.match(check.detail, /автоматическая уборка staged-копий отключена/u);
   assert.doesNotMatch(check.detail, /[\\/]|token|secret/i);
 });
 

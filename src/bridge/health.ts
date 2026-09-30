@@ -178,18 +178,18 @@ export class BridgeHealthMonitor {
       const stage = runtime.stageMaintenance;
       const age = stage.startedAt === null ? 0 : Math.max(0, checkedAt - stage.startedAt);
       checks.push({ name: "stage_maintenance", state: age > 5 * 60_000 || stage.failed ? "degraded" : "ok",
-        detail: age > 5 * 60_000 ? `Сверка staged-файлов выполняется ${Math.round(age / 1_000)} с; новые версии не создаются автоматически.`
-          : stage.failed ? "Последняя сверка staged-файлов завершилась ошибкой; незавершённые записи сохраняют свою квоту, повтор будет позже."
-            : stage.startedAt !== null ? "Идёт ограниченная сверка staged-файлов."
-              : stage.lastAttemptAt > 0 ? `Ограниченная сверка staged-файлов запланирована; последняя попытка ${new Date(stage.lastAttemptAt).toISOString()}.`
-                : "Ограниченная сверка staged-файлов запланирована; первая попытка ещё не запускалась." });
+        detail: age > 5 * 60_000 ? `Сверка незавершённых staged-резервов выполняется ${Math.round(age / 1_000)} с; автоматическая уборка копий отключена.`
+          : stage.failed ? "Последняя сверка staged-резервов завершилась ошибкой; незавершённые записи сохраняют свою квоту, повтор будет позже."
+            : stage.startedAt !== null ? "Идёт ограниченная сверка незавершённых staged-резервов; автоматическая уборка копий отключена."
+              : stage.lastAttemptAt > 0 ? `Ограниченная сверка staged-резервов запланирована; последняя попытка ${new Date(stage.lastAttemptAt).toISOString()}. Автоматическая уборка копий отключена.`
+                : "Ограниченная сверка staged-резервов запланирована; автоматическая уборка копий отключена." });
     }
 
     const stageStorage = this.store.stageStorageStats();
     const stagedPilot = runtime.stagedFilePilot ?? STAGED_FILE_PILOT_DISABLED;
     checks.push({ name: "stage_pilot", state: "ok", detail: stagedPilot.mode === "single-chat"
-      ? `Изолированная staging-пилот включена только для VK peer ${stagedPilot.peerId}.`
-      : "Изолированная staging-пилот отключена; новые файлы отправляются из исходных байтов." });
+      ? `Изолированная staging-пилот включена только для VK peer ${stagedPilot.peerId}; автоматическая уборка staged-копий отключена.`
+      : "Изолированная staging-пилот отключена; новые файлы отправляются из исходных байтов, автоматическая уборка staged-копий отключена." });
     const pendingAge = stageStorage.oldestPendingAt === null ? 0 : Math.max(0, checkedAt - stageStorage.oldestPendingAt);
     const atStageQuota = stageStorage.chargedBytes >= 2 * 1024 * 1024 * 1024 || stageStorage.chargedCount >= 2_048;
     const stageState: HealthState = stageStorage.legacyUnaccounted || atStageQuota || pendingAge > 10 * 60_000 ? "degraded" : "ok";

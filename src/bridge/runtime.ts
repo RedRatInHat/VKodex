@@ -622,8 +622,8 @@ export class BridgeRuntime {
     }) : Promise.resolve();
   }
 
-  /** A separate, infrequent pass keeps file retention independent of the
-   * one-second delivery loop. Staging new uploads stays disabled in runtime. */
+  /** Audit abandoned writer reservations away from the delivery tick. Automatic
+   * Recycle Bin moves remain off until pathname substitution is eliminated. */
   private scheduleStageMaintenance(): void {
     if (this.stopped || !this.files || this.stageMaintenance
       || this.now() - this.lastStageMaintenanceAt < 5 * 60_000) return;
@@ -632,7 +632,6 @@ export class BridgeRuntime {
     this.stageMaintenanceLastAttemptAt = this.now();
     const work = (async () => {
       await this.files!.reconcileAbandonedStageReservations(8);
-      if (!this.stopped) await this.files!.reconcileStagedArtifactsBatch(this.now(), 4);
     })();
     this.stageMaintenance = work;
     void work.then(

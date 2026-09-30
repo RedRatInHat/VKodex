@@ -879,7 +879,7 @@ test("a rejected scheduled health report cannot terminate the runtime", async t 
   assert.ok(checks > initialChecks);
 });
 
-test("runtime schedules bounded staged maintenance every five minutes without enabling new staging", async t => {
+test("runtime audits abandoned staging without scheduling unqualified pathname recycling", async t => {
   const fileRoot = await mkdtemp(path.join(os.tmpdir(), "vkodex-runtime-stage-maintenance-"));
   const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, fileRoot);
   type RuntimeInternals = {
@@ -913,7 +913,7 @@ test("runtime schedules bounded staged maintenance every five minutes without en
   tick.callback();
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.deepEqual(abandonedLimits, [8]);
-  assert.deepEqual(recycleCalls, [[400_000, 4]]);
+  assert.deepEqual(recycleCalls, [], "automatic Recycle Bin moves remain off until a handle-bound deletion path is qualified");
 });
 
 test("health keeps checking while the initial task subscription is still pending", async t => {
