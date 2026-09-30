@@ -70,10 +70,10 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   const events: TaskEvent[] = [];
   const quietTurns = new Set(previous?.quietTurnIds ?? []);
   const recoverFinal = new Set(options.recoverFinalTurnIds ?? []);
-  const emit = (event: TaskEvent, recover = false): void => {
+  const emit = (event: TaskEvent, recover = false, allowRebaseline = false): void => {
     const key = eventKey(event); const hash = digest(event);
     const changed = seen[key] !== hash;
-    if ((changed && previous !== null && !rebaseline) || recover) events.push(event);
+    if ((changed && previous !== null && (!rebaseline || allowRebaseline)) || recover) events.push(event);
     seen[key] = hash;
   };
   const inputs: TaskObservedInput[] = [];
@@ -81,6 +81,10 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
   for (const turn of turns) {
     if (turn.items.some(item => item.type === "userMessage")) inputTurnIds.push(turn.id);
     const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
+    // A reconnect snapshot may contain a whole turn that started while the
+    // stream was detached. It is new activity, not historical replay.
+    const startedWhileDisconnected = rebaseline && previous?.lastObservedAt !== undefined
+      && turn.startedAt > previous.lastObservedAt;
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
     const automationHeartbeat = quietTurns.has(turn.id)
@@ -92,17 +96,18 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
       if (item.type === "userMessage") {
         const operationId = string(item.clientId); if (operationId) operationIds.push(operationId);
         const text = textInput(item.content);
-        if (eligible && text && !isAutomationHeartbeatInput(text)) emit({ type: "user", id, turnId: turn.id, text, ...(operationId ? { operationId } : {}) });
+        if (eligible && text && !isAutomationHeartbeatInput(text)) emit({ type: "user", id, turnId: turn.id, text, ...(operationId ? { operationId } : {}) }, false, startedWhileDisconnected);
       } else if (item.type === "agentMessage" && typeof item.text === "string" && item.delivery !== "async" && eligible) {
         if (turn.status === "inProgress" || item.phase === "commentary") {
-          if (!automationHeartbeat) emit({ type: "progress", id, turnId: turn.id, text: item.text });
+          if (!automationHeartbeat) emit({ type: "progress", id, turnId: turn.id, text: item.text }, false,
+            startedWhileDisconnected && turn.status === "inProgress");
         } else if (turn.status === "completed" && (item.phase === "final_answer" || item.phase == null) && id === lastAgentId) {
           const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
           if (text) {
             const event = { type: "final", id, turnId: turn.id, text,
               ...(automationHeartbeat ? { showMenu: false as const } : {}) } as const;
             const missingAcceptedFinal = recoverFinal.has(turn.id) && !(options.finalRecorded?.(id) ?? false);
-            emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id));
+            emit(event, missingAcceptedFinal || rebaseline && previousActive.has(turn.id), startedWhileDisconnected);
           }
         }
       }
@@ -112,7 +117,8 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
       const status = turn.status === "inProgress" ? "running" : turn.status === "completed" ? "completed"
         : turn.status === "failed" ? "failed" : turn.status === "interrupted" ? "interrupted" : null;
       if (status) emit({ type: "status", id: `status:${turn.id}`, turnId: turn.id, status },
-        previous === null && status === "running" || status !== "running" && status !== "completed" && recoverFinal.has(turn.id));
+        previous === null && status === "running" || status !== "running" && status !== "completed" && recoverFinal.has(turn.id),
+        startedWhileDisconnected);
     }
   }
   const latest = turns.at(-1);
