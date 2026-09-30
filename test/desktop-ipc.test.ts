@@ -14,7 +14,7 @@ import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
-import { findAcceptedInputTurn, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
+import { findAcceptedInputTurn, MutableQueuedInputTurnError, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
@@ -3115,12 +3115,18 @@ test("historical queue scan rejects oversized native and persisted opaque cursor
     assert.fail("oversized persisted history must reject before native reads"), excessive), DesktopUnavailableError);
 });
 
-test("historical queue scan does not checkpoint past a mutable active turn", async () => {
+test("historical queue scan waits before a mutable active turn without losing the safe cursor", async () => {
   const list = async (params: IpcObject): Promise<IpcObject> => ({ data: [
     { id: "oldest", status: "completed", itemsView: "summary", items: [] },
     ...(params.limit === 1 ? [] : [{ id: "active", status: "inProgress", itemsView: "summary", items: [] }]),
   ], nextCursor: params.limit === 1 ? "later" : "after-active" });
-  await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-operation", list), DesktopUnavailableError);
+  const result = await scanTerminalQueuedInputTurn("thread", "queued-operation", list);
+  assert.equal(result.done, false);
+  if (!result.done) assert.deepEqual({ cursor: result.cursor.cursor, pages: result.cursor.pages },
+    { cursor: "later", pages: 1 });
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-operation", async () => ({
+    data: [{ id: "active", status: "inProgress", itemsView: "summary", items: [] }], nextCursor: null,
+  })), MutableQueuedInputTurnError);
 });
 
 test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {

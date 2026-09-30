@@ -13,7 +13,7 @@ export interface QueueHistoryProgress {
   readonly cursor: QueuedInputHistoryCursor | null;
   readonly pages: number;
   readonly lastAttemptAt: number;
-  readonly lastFailure: "history_unavailable" | "scan_error" | null;
+  readonly lastFailure: "history_unavailable" | "scan_error" | "active_turn" | null;
   readonly nextAt: number;
 }
 
@@ -317,7 +317,7 @@ export class BridgeHealthMonitor {
             current = progress;
         } catch { /* Invalid optional diagnostics must not break the health report. */ }
         const pages = current && Number.isSafeInteger(current.pages) ? Math.min(5_000, Math.max(0, current.pages)) : 0;
-        const failure = current?.lastFailure === "history_unavailable" || current?.lastFailure === "scan_error"
+        const failure = current?.lastFailure === "history_unavailable" || current?.lastFailure === "scan_error" || current?.lastFailure === "active_turn"
           ? current.lastFailure : null;
         const attempt = current && Number.isSafeInteger(current.lastAttemptAt) && current.lastAttemptAt >= 0 && current.lastAttemptAt <= 8.64e15
           ? new Date(current.lastAttemptAt).toISOString() : "ещё не было";

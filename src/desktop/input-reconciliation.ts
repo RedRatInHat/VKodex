@@ -3,6 +3,11 @@ import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from "../core/c
 import { DesktopUnavailableError } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
+/** A live turn can gain items or change status; its page is not a durable scan boundary. */
+export class MutableQueuedInputTurnError extends DesktopUnavailableError {
+  constructor() { super("Ход очереди ещё изменяется."); this.name = "MutableQueuedInputTurnError"; }
+}
+
 /** A clientUserMessageId in persisted history proves that Codex accepted input.
  * Absence is not proof of rejection: the owner may still be writing its turn. */
 export async function findAcceptedInputTurn(
@@ -101,9 +106,10 @@ export async function scanTerminalQueuedInputTurn(
     for (const [index, turn] of page.data.entries()) {
       if (!isObject(turn) || turn.threadId !== undefined && turn.threadId !== threadId ||
         typeof turn.id !== "string" || !turn.id || turns.has(turn.id) ||
-        turn.itemsView !== "summary" || !Array.isArray(turn.items) ||
-        typeof turn.status !== "string" || !["completed", "failed", "interrupted"].includes(turn.status))
+        turn.itemsView !== "summary" || !Array.isArray(turn.items) || typeof turn.status !== "string")
         throw new DesktopUnavailableError("Codex вернул неполный ход очереди.");
+      if (!["completed", "failed", "interrupted"].includes(turn.status))
+        throw new MutableQueuedInputTurnError();
       turns.add(turn.id);
       for (const item of turn.items) {
         if (!isObject(item) || typeof item.type !== "string")
@@ -160,7 +166,12 @@ export async function scanTerminalQueuedInputTurn(
     const startCursor = cursor;
     const page = await read(startCursor);
     calls++;
-    const matched = await consume(page, startCursor);
+    let matched: string | null;
+    try { matched = await consume(page, startCursor); }
+    catch (error) {
+      if (error instanceof MutableQueuedInputTurnError) break;
+      throw error;
+    }
     if (matched) return { done: true, turnId: matched };
   }
   if (cursor !== null) return { done: false, cursor: { scanVersion: 3, headDigest, cursor,
