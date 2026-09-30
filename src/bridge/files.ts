@@ -189,6 +189,50 @@ export async function downloadVkFile(raw: string, maxBytes: number, timeoutMs = 
   } finally { clearTimeout(timer); }
 }
 
+/** Verify a remotely saved document without buffering a second 200 MiB copy. */
+async function verifyVkDocumentDigest(raw: string, expectedBytes: number, expectedSha256: string,
+  timeoutMs = INBOUND_FILE_LIMITS.timeoutMs): Promise<void> {
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let url = validateVkFileUrl(raw);
+    for (let redirects = 0; redirects <= 4; redirects++) {
+      const response = await fetch(url, { signal: controller.signal, redirect: "manual" });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        await response.body?.cancel();
+        const location = response.headers.get("location");
+        if (!location) throw new ActionRejectedError("VK вернул некорректное перенаправление файла.");
+        url = validateVkFileUrl(new URL(location, url).href);
+        continue;
+      }
+      if (!response.ok || !response.body) throw new ActionRejectedError("Не удалось скачать документ VK для сверки.");
+      const declared = response.headers.get("content-length");
+      if (declared !== null && Number(declared) !== expectedBytes) {
+        await response.body.cancel();
+        throw new ActionRejectedError("Размер документа VK не совпадает с сохранённой версией файла.");
+      }
+      const hash = createHash("sha256"); const reader = response.body.getReader(); let size = 0;
+      try {
+        while (true) {
+          const next = await reader.read(); if (next.done) break;
+          size += next.value.length;
+          if (size > expectedBytes) {
+            controller.abort();
+            throw new ActionRejectedError("Размер документа VK не совпадает с сохранённой версией файла.");
+          }
+          hash.update(next.value);
+        }
+      } finally { reader.releaseLock(); }
+      if (size !== expectedBytes || hash.digest("hex") !== expectedSha256)
+        throw new ActionRejectedError("Содержимое документа VK не совпадает с сохранённой версией файла.");
+      return;
+    }
+    throw new ActionRejectedError("Слишком много перенаправлений при сверке документа VK.");
+  } catch (error) {
+    throw error instanceof ActionRejectedError ? error :
+      new ActionRejectedError("Не удалось скачать документ VK для сверки. Неизвестная загрузка остаётся заблокированной.");
+  } finally { clearTimeout(timer); }
+}
+
 /** Download large VK documents directly to the private inbox instead of
  * retaining the complete file in the bridge process heap. */
 export async function downloadVkFileToPath(raw: string, target: string, maxBytes: number,
@@ -378,6 +422,7 @@ export class TaskFiles {
   private readonly retries = new Map<string, number>();
   private working: Promise<void> | null = null;
   private readonly collections = new Map<string, Promise<number>>();
+  private readonly documentReconciliations = new Set<string>();
   private reconciliation: Promise<number> | null = null;
   private stageAudit: Promise<StageLedgerAudit> | null = null;
   private stageWriterIdentity: ReturnType<typeof readWindowsProcessIdentity> = null;
@@ -426,6 +471,73 @@ export class TaskFiles {
   }
   private async stageDirectory(job: FileJob, bindingId: string): Promise<string> {
     return directory(this.stageRoot(), digest(bindingId), digest(job.operationId));
+  }
+  async unknownStagedDocuments(binding: Binding): Promise<readonly {
+    readonly operationId: string; readonly fileKey: string; readonly name: string; readonly bytes: number;
+  }[]> {
+    const generation = this.store.streamGeneration(binding.id);
+    await this.check(binding, generation);
+    const result: { operationId: string; fileKey: string; name: string; bytes: number }[] = [];
+    for (const job of this.jobs(binding.id)) {
+      if (job.generation !== generation || job.state !== "accepted") continue;
+      for (const receipt of Object.values(this.stageIndex(binding.id, job.operationId))) {
+        if (receipt.bindingId !== binding.id || receipt.operationId !== job.operationId ||
+            receipt.peerId !== undefined && receipt.peerId !== binding.peerId ||
+            this.store.getValue<boolean>(`${receipt.key}:queued`) ||
+            this.store.getValue<string>(`${receipt.key}:uploaded`) ||
+            !["uploading", "unknown"].includes(this.store.getValue<string>(`${receipt.key}:upload-state`) ?? "")) continue;
+        result.push({ operationId: job.operationId, fileKey: receipt.key, name: receipt.name, bytes: receipt.bytes });
+      }
+    }
+    await this.check(binding, generation);
+    return result;
+  }
+  /** Operator recovery for a remote save whose local receipt was lost. This
+   * never uploads again. It requires a staged immutable version and a fresh
+   * VK API lookup followed by a byte-for-byte digest check of the VK copy. */
+  async reconcileUnknownDocument(binding: Binding, operationId: string,
+    fileKey: string, attachment: string): Promise<true> {
+    const generation = this.store.streamGeneration(binding.id);
+    await this.check(binding, generation);
+    if (this.documentReconciliations.has(fileKey))
+      throw new ActionRejectedError("Этот документ уже проверяется; дождись результата.");
+    this.documentReconciliations.add(fileKey);
+    try {
+      if (this.collections.has(binding.id)) throw new ActionRejectedError("Дождись окончания проверки файлов перед сверкой документа.");
+      if (!/^doc-?[1-9]\d*_[1-9]\d*(?:_[a-zA-Z0-9_-]+)?$/u.test(attachment) ||
+          !this.chat.resolveDocumentAttachment)
+        throw new ActionRejectedError("Сверка документа VK недоступна или его идентификатор неверен.");
+      const job = this.jobs(binding.id).find(item => item.operationId === operationId &&
+        item.generation === generation && item.state === "accepted");
+      const receipt = this.stageIndex(binding.id, operationId)[fileKey];
+      if (!job || !receipt || receipt.key !== fileKey || receipt.peerId !== undefined && receipt.peerId !== binding.peerId ||
+          this.store.getValue<boolean>(`${fileKey}:queued`) || this.store.getValue<string>(`${fileKey}:uploaded`) ||
+          !["uploading", "unknown"].includes(this.store.getValue<string>(`${fileKey}:upload-state`) ?? ""))
+        throw new ActionRejectedError("Для этого файла нет неподтверждённой staged-загрузки.");
+      await this.stagedContents(receipt, job, binding.id);
+      const remote = await this.chat.resolveDocumentAttachment(attachment);
+      if (remote.sizeBytes !== receipt.bytes || !Number.isSafeInteger(remote.sizeBytes))
+        throw new ActionRejectedError("Размер документа VK не совпадает с сохранённой версией файла.");
+      await verifyVkDocumentDigest(remote.url, receipt.bytes, receipt.sha256);
+      await this.check(binding, generation);
+      this.store.atomic(() => {
+        const currentJob = this.jobs(binding.id).find(item => item.operationId === operationId);
+        const current = this.stageIndex(binding.id, operationId)[fileKey];
+        if (this.collections.has(binding.id) || this.store.streamGeneration(binding.id) !== generation ||
+            !currentJob || currentJob.generation !== generation || currentJob.state !== "accepted" ||
+            !current || current.key !== receipt.key || current.sha256 !== receipt.sha256 ||
+            current.bytes !== receipt.bytes || current.path !== receipt.path ||
+            current.peerId !== undefined && current.peerId !== binding.peerId ||
+            this.store.getValue<boolean>(`${fileKey}:queued`) || this.store.getValue<string>(`${fileKey}:uploaded`) ||
+            !["uploading", "unknown"].includes(this.store.getValue<string>(`${fileKey}:upload-state`) ?? ""))
+          throw new ActionRejectedError("Состояние файла изменилось во время сверки; квитанция не записана.");
+        this.store.setValue(`${fileKey}:uploaded`, attachment);
+        this.store.setValue(`${fileKey}:upload-state`, "uploaded");
+      });
+      // The recovered attachment is intentionally not registered for automatic
+      // cleanup: exact bytes do not prove VKodex originally created this doc.
+      return true;
+    } finally { this.documentReconciliations.delete(fileKey); }
   }
   private async stagedContents(receipt: StagedFile, job: FileJob, bindingId: string, reuse?: Buffer): Promise<Buffer> {
     const folder = await this.stageDirectory(job, bindingId);

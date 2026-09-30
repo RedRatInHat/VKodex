@@ -42,6 +42,9 @@ export interface BridgeChat {
   delete(handle: MessageHandle): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
   uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string>;
+  /** Read-only VK API lookup for an exact document attachment. The caller
+   * independently downloads and hashes the returned URL before binding it. */
+  resolveDocumentAttachment?(attachment: string): Promise<{ readonly url: string; readonly sizeBytes: number }>;
   /** Remove only documents previously registered as VKodex uploads. */
   cleanupDocuments?(records: readonly VkDocumentRecord[]): Promise<readonly string[]>;
   /** Read-only operational checks. Implementations must never expose credentials in details. */

@@ -367,6 +367,24 @@ export class DesktopVkGateway implements BridgeChat {
     return this.uploadFile(peerId, name, Buffer.from(contents, "utf8"), "file");
   }
 
+  async resolveDocumentAttachment(attachment: string): Promise<{ url: string; sizeBytes: number }> {
+    const match = /^doc(-?[1-9]\d*)_([1-9]\d*)(?:_([a-zA-Z0-9_-]+))?$/u.exec(attachment);
+    if (!match || !Number.isSafeInteger(Number(match[1])) || !Number.isSafeInteger(Number(match[2])) ||
+        Number(match[1]) !== -this.config.access.groupId)
+      throw new ActionRejectedError("Неверный идентификатор документа VK.");
+    try {
+      const documents = await this.vk.api.docs.getById({ docs: [attachment.slice(3)] });
+      const doc = documents[0];
+      if (documents.length !== 1 || !doc || doc.owner_id !== Number(match[1]) ||
+          doc.id !== Number(match[2]) || !Number.isSafeInteger(doc.size) || doc.size < 0 ||
+          typeof doc.url !== "string" || !doc.url)
+        throw new ActionRejectedError("VK не подтвердил указанный документ.");
+      return { url: doc.url, sizeBytes: doc.size };
+    } catch {
+      throw new ActionRejectedError("VK не подтвердил указанный документ. Неизвестная загрузка остаётся заблокированной.");
+    }
+  }
+
   async uploadFile(peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string> {
     // An opaque digest of the durable file key links VK diagnostics to one
     // file version across retries without logging paths, names or tokens.

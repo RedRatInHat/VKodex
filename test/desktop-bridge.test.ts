@@ -59,6 +59,7 @@ class Chat implements BridgeChat {
   memberReads = 0;
   readonly uploads: { peerId: number; name: string; contents: string }[] = [];
   readonly binaryUploads: { name: string; contents: Buffer; kind: string; traceId?: string }[] = [];
+  resolveDocumentAttachment?: (attachment: string) => Promise<{ url: string; sizeBytes: number }>;
   readonly cleanupCalls: VkDocumentRecord[][] = [];
   cleanupResult: readonly string[] = [];
   async uploadFile(_peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string> { this.binaryUploads.push({ name, contents, kind, ...(traceId ? { traceId } : {}) }); return `doc-202_${this.binaryUploads.length}`; }
@@ -4836,6 +4837,118 @@ test("an ambiguous VK upload is not retried by automatic scan or /files after re
   assert.equal(upload.mock.callCount(), 1);
 });
 
+test("an unknown staged upload can bind only a VK document with identical verified bytes", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-verified-upload-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "verified-upload", []);
+  files.finish(binding.id, "verified-upload", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "verified bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":uploaded")) throw new Error("crash after remote save");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding), /crash after remote save/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string }>>(
+    `file-stage-index:${binding.id}:verified-upload`) ?? {})[0]!;
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
+  assert.equal(s.chat.binaryUploads.length, 1);
+
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  s.chat.resolveDocumentAttachment = async () => ({ url: "https://vk.com/doc-202_77", sizeBytes: 14 });
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response("changed bytes!"));
+  await assert.rejects(restored.reconcileUnknownDocument(binding, "verified-upload", receipt.key, "doc-202_77"),
+    /не совпад|не подтвержден/iu);
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
+  s.chat.resolveDocumentAttachment = async () => ({ url: "https://example.com/forged", sizeBytes: 14 });
+  await assert.rejects(restored.reconcileUnknownDocument(binding, "verified-upload", receipt.key, "doc-202_77"),
+    /неподдерживаемый сервер/iu);
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
+  s.chat.resolveDocumentAttachment = async () => ({ url: "https://vk.com/doc-202_77", sizeBytes: 14 });
+  fetchMock.mock.mockImplementation(async () => new Response(null, { status: 302, headers: { location: "https://example.com/forged" } }));
+  await assert.rejects(restored.reconcileUnknownDocument(binding, "verified-upload", receipt.key, "doc-202_77"),
+    /неподдерживаемый сервер/iu);
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
+  let entered!: () => void; const downloadEntered = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const downloadRelease = new Promise<void>(resolve => { release = resolve; });
+  fetchMock.mock.mockImplementation(async () => { entered(); await downloadRelease; return new Response("verified bytes"); });
+  const first = restored.reconcileUnknownDocument(binding, "verified-upload", receipt.key, "doc-202_77");
+  await downloadEntered;
+  await assert.rejects(restored.reconcileUnknownDocument(binding, "verified-upload", receipt.key, "doc-202_77"),
+    /уже проверяется/iu);
+  release();
+  assert.equal(await first, true);
+  assert.equal(s.store.getValue(`${receipt.key}:uploaded`), "doc-202_77");
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.attachments?.includes("doc-202_77")));
+});
+
+test("unknown staged document reconciliation stops when the binding changes during download", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-verified-fence-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "verified-fence", []);
+  files.finish(binding.id, "verified-fence", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "verified bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":uploaded")) throw new Error("crash after remote save");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding), /crash after remote save/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string }>>(
+    `file-stage-index:${binding.id}:verified-fence`) ?? {})[0]!;
+  s.chat.resolveDocumentAttachment = async () => ({ url: "https://vk.com/doc-202_77", sizeBytes: 14 });
+  t.mock.method(globalThis, "fetch", async () => {
+    s.store.stopStreaming(binding.id);
+    return new Response("verified bytes");
+  });
+  await assert.rejects(files.reconcileUnknownDocument(binding, "verified-fence", receipt.key, "doc-202_77"),
+    /больше не подключена/iu);
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
+  assert.equal(s.store.getValue(`${receipt.key}:uploaded`), null);
+  assert.equal(s.chat.binaryUploads.length, 1);
+});
+
+test("owner can list and verify one unknown staged document without a second VK upload", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-verified-command-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "verified-command", []);
+  files.finish(binding.id, "verified-command", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "verified bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":uploaded")) throw new Error("crash after remote save");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding), /crash after remote save/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string }>>(
+    `file-stage-index:${binding.id}:verified-command`) ?? {})[0]!;
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate, restored);
+  await manager.handle(s.input("/files unknown", peerId));
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(message => message.view.text.includes(receipt.key) &&
+    message.view.text.includes("verified-command")));
+  s.chat.resolveDocumentAttachment = async () => ({ url: "https://vk.com/doc-202_77", sizeBytes: 14 });
+  t.mock.method(globalThis, "fetch", async () => new Response("verified bytes"));
+  await manager.handle(s.input(`/files verify verified-command ${receipt.key} doc-202_77`, peerId));
+  for (let attempt = 0; attempt < 100 && !s.store.getValue<string>(`${receipt.key}:uploaded`); attempt++)
+    await new Promise(resolve => setImmediate(resolve));
+  assert.equal(s.store.getValue(`${receipt.key}:uploaded`), "doc-202_77");
+  await restored.collect(binding, true);
+  await s.worker.flush();
+  assert.equal(s.chat.binaryUploads.length, 1);
+  assert.ok(s.chat.sent.some(message => message.view.attachments?.includes("doc-202_77")));
+  assert.deepEqual(await restored.unknownStagedDocuments(binding), []);
+});
+
 test("an unknown staged upload does not strand earlier or later independent files", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-unknown-sibling-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
@@ -5650,6 +5763,34 @@ test("late definitive managed refusal settles a lost acknowledgement as rejected
   assert.deepEqual(s.store.queuedInputs(binding.id), []);
   assert.deepEqual(s.store.acceptedTurns(binding.id), []);
   assert.equal(s.desktop.submissions.length, 1);
+});
+
+test("VK document recovery lookup accepts only the exact community document", async t => {
+  const vk = new VK({ token: "fixture-token" });
+  const docs: unknown[] = [];
+  const queried: string[] = [];
+  t.mock.method(vk.api, "callWithRequest", async ({ method, params }: { method: string; params: { docs?: string[] } }) => {
+    assert.equal(method, "docs.getById");
+    queried.push(params.docs?.[0] ?? "");
+    return docs.shift() as never;
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  docs.push([{ owner_id: -202, id: 77, size: 14, url: "https://vk.com/doc-202_77" }]);
+  assert.deepEqual(await gateway.resolveDocumentAttachment("doc-202_77"),
+    { url: "https://vk.com/doc-202_77", sizeBytes: 14 });
+  assert.deepEqual(queried, ["-202_77"]);
+  for (const response of [
+    [{ owner_id: -203, id: 77, size: 14, url: "https://vk.com/doc-203_77" }],
+    [{ owner_id: -202, id: 78, size: 14, url: "https://vk.com/doc-202_78" }],
+    [{ owner_id: -202, id: 77, size: -1, url: "https://vk.com/doc-202_77" }],
+    [{ owner_id: -202, id: 77, size: 14, url: "https://vk.com/doc-202_77" },
+      { owner_id: -202, id: 78, size: 14, url: "https://vk.com/doc-202_78" }],
+  ]) {
+    docs.push(response);
+    await assert.rejects(gateway.resolveDocumentAttachment("doc-202_77"), /не подтвердил/iu);
+  }
+  await assert.rejects(gateway.resolveDocumentAttachment("doc101_77"), /Неверный идентификатор/iu);
+  assert.equal(queried.length, 5, "a non-community owner must not reach VK API");
 });
 
 test("VK upload errors are checked before docs.save and a later retry can succeed", async t => {

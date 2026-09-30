@@ -45,6 +45,8 @@ const taskHelp = [
   "/limits — лимиты аккаунта Codex",
   "/goal — цель задачи, бюджет и управление продолжением",
   "/files — проверить готовые исходящие файлы",
+  "/files unknown — показать неподтверждённые загрузки документов",
+  "/files verify <операция> <ключ файла> <doc...> — сверить документ VK без повторной загрузки",
   "/open — явно открыть эту задачу в настроенном Codex",
   "/stop — остановить текущий ход",
   "/queue <промпт> — добавить запрос в штатную очередь Codex",
@@ -760,6 +762,46 @@ export class TaskManager {
         this.store.enqueue(`files-result:${binding.id}:${input.eventId}`, input.peerId, {
           text: error instanceof ActionRejectedError ? error.message : "Файлы пока не отправлены. Операция оставлена в очереди и будет повторена автоматически; повторный /files не создаст дубликаты.",
           silent: true,
+        }, binding.id);
+      });
+      return;
+    }
+    if (!queued && ownerCommand && /^\/files unknown(?:\s+[1-9]\d*)?$/u.test(text)) {
+      if (!this.files) throw new ActionRejectedError("Передача файлов не настроена.");
+      const rows = await this.files.unknownStagedDocuments(binding);
+      const page = Number(text.split(/\s+/u)[2] ?? "1");
+      if (!Number.isSafeInteger(page) || page > Math.max(1, Math.ceil(rows.length / 5)))
+        throw new ActionRejectedError("Такой страницы неподтверждённых загрузок нет.");
+      const body = rows.slice((page - 1) * 5, page * 5).map(row =>
+        `${row.name} (${row.bytes} байт)\n${row.operationId}\n${row.fileKey}`).join("\n\n");
+      this.reply(input, { text: rows.length
+        ? `Неподтверждённые документы ${rows.length}, страница ${page}:\n\n${body}\n\nДля ручной сверки: /files verify <операция> <ключ файла> <doc...>. VKodex проверит размер и SHA-256 сохранённой версии и VK-документа.`
+        : "Неподтверждённых staged-загрузок для этой задачи нет." });
+      return;
+    }
+    if (!queued && ownerCommand && text.startsWith("/files verify")) {
+      if (!this.files) throw new ActionRejectedError("Передача файлов не настроена.");
+      const match = /^\/files verify\s+([a-zA-Z0-9-]+)\s+(file:[^\s]+)\s+(doc-?[1-9]\d*_[1-9]\d*(?:_[a-zA-Z0-9_-]+)?)$/u.exec(text);
+      if (!match) throw new ActionRejectedError("Формат: /files verify <операция> <ключ файла> <doc...>. Данные покажет /files unknown.");
+      const files = this.files;
+      this.reply(input, { text: "Сверяю сохранённую версию файла с документом VK. До подтверждения повторной загрузки не будет." });
+      void files.reconcileUnknownDocument(binding, match[1]!, match[2]!, match[3]!).then(async () => {
+        try {
+          const count = await files.collect(binding, true);
+          this.store.enqueue(`files-verify-result:${binding.id}:${input.eventId}`, input.peerId, {
+            text: count ? `Документ подтверждён; файл поставлен в очередь доставки VK.` :
+              "Документ подтверждён. Проверь доставку через /files; повторная загрузка не требуется.", silent: true,
+          }, binding.id);
+        } catch (error) {
+          this.store.enqueue(`files-verify-result:${binding.id}:${input.eventId}`, input.peerId, {
+            text: `Документ подтверждён, но поставить файл в очередь пока не удалось. ${error instanceof ActionRejectedError ? error.message : "Повтори /files после проверки моста."}`,
+            silent: true,
+          }, binding.id);
+        }
+      }).catch(error => {
+        this.store.enqueue(`files-verify-result:${binding.id}:${input.eventId}`, input.peerId, {
+          text: error instanceof ActionRejectedError ? error.message :
+            "Сверка документа VK не завершилась. Загрузка остаётся заблокированной; повторной отправки файла не было.", silent: true,
         }, binding.id);
       });
       return;
