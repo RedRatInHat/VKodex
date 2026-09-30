@@ -70,6 +70,50 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   assert.equal(s.store.pendingDeliveries().length, 0);
 });
 
+test("routine health reuses a recent SQLite integrity verdict but explicit checks refresh it", async t => {
+  const s = setup(t);
+  let integrityChecks = 0;
+  let intact = true;
+  t.mock.method(s.store, "quickCheck", () => { integrityChecks++; return intact; });
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "sqlite")?.state, "ok");
+  assert.equal(integrityChecks, 1);
+
+  s.advance(60_000);
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "sqlite")?.state, "ok");
+  assert.equal(integrityChecks, 1, "minute health must not rescan the entire database");
+
+  intact = false;
+  assert.equal((await s.monitor.check(true)).checks.find(item => item.name === "sqlite")?.state, "failed");
+  assert.equal(integrityChecks, 2, "an explicit check must refresh the integrity verdict");
+  s.advance(60_000);
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "sqlite")?.state, "failed");
+  assert.equal(integrityChecks, 2, "a failed verdict must not silently turn green between deep checks");
+
+  intact = true;
+  s.advance(15 * 60_000);
+  assert.equal((await s.monitor.check()).checks.find(item => item.name === "sqlite")?.state, "ok");
+  assert.equal(integrityChecks, 3, "the periodic deep check must eventually refresh integrity");
+});
+
+test("explicit integrity check arriving during routine health runs after that snapshot", async t => {
+  const s = setup(t);
+  let integrityChecks = 0;
+  t.mock.method(s.store, "quickCheck", () => { integrityChecks++; return true; });
+  let releaseHealth!: () => void;
+  const heldHealth = new Promise<readonly HealthCheckResult[]>(resolve => {
+    releaseHealth = () => resolve(s.chat.checks);
+  });
+  t.mock.method(s.chat, "health", () => heldHealth);
+
+  const routine = s.monitor.check();
+  const explicit = s.monitor.check(true);
+  assert.equal(s.monitor.check(true), explicit, "concurrent explicit callers share one deferred scan");
+  releaseHealth();
+  await routine;
+  await explicit;
+  assert.equal(integrityChecks, 2, "explicit request must not inherit a routine cached verdict");
+});
+
 test("health reports an enabled staging pilot's exact peer scope without storage paths", async t => {
   const s = setup(t, Object.freeze({ mode: "single-chat" as const, peerId: 2_000_000_017 }));
   const check = (await s.monitor.check()).checks.find(item => item.name === "stage_pilot")!;

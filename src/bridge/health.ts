@@ -49,6 +49,7 @@ export interface RuntimeHealthState {
 
 const severity: Record<HealthState, number> = { ok: 0, degraded: 1, failed: 2 };
 const labels: Record<HealthState, string> = { ok: "OK", degraded: "DEGRADED", failed: "FAILED" };
+const SQLITE_INTEGRITY_INTERVAL_MS = 15 * 60_000;
 
 function aggregate(checks: readonly HealthCheckResult[]): HealthState {
   return checks.reduce<HealthState>((state, check) => severity[check.state] > severity[state] ? check.state : state, "ok");
@@ -81,6 +82,9 @@ export function formatHealthSummary(snapshot: BridgeHealthSnapshot): string {
 
 export class BridgeHealthMonitor {
   private checking: Promise<BridgeHealthSnapshot> | null = null;
+  private checkingForced = false;
+  private queuedForcedCheck: Promise<BridgeHealthSnapshot> | null = null;
+  private sqliteIntegrity: { readonly checkedAt: number; readonly result: HealthCheckResult } | null = null;
   private lastCompatibilityAt = 0;
   private criticalPendingId: number | null = null;
   private criticalPendingSince: number | null = null;
@@ -98,7 +102,13 @@ export class BridgeHealthMonitor {
   ) {}
 
   check(force = false): Promise<BridgeHealthSnapshot> {
-    if (this.checking) return this.checking;
+    if (this.checking) {
+      if (!force || this.checkingForced) return this.checking;
+      this.queuedForcedCheck ??= this.checking.catch(() => null).then(() => this.check(true))
+        .finally(() => { this.queuedForcedCheck = null; });
+      return this.queuedForcedCheck;
+    }
+    this.checkingForced = force;
     const startedAt = Date.now();
     let phase = "start";
     let pending: readonly string[] = [];
@@ -118,7 +128,7 @@ export class BridgeHealthMonitor {
     this.checking = this.run(force, next => { phase = next; }, next => { pending = next; })
       .then(snapshot => { if (slow) report("recovered"); return snapshot; })
       .catch(error => { report("error", error); throw error; })
-      .finally(() => { clearTimeout(timer); this.checking = null; });
+      .finally(() => { clearTimeout(timer); this.checking = null; this.checkingForced = false; });
     return this.checking;
   }
 
@@ -127,11 +137,23 @@ export class BridgeHealthMonitor {
     const checks: HealthCheckResult[] = [];
 
     setPhase("sqlite");
-    try {
-      checks.push(this.store.quickCheck()
-        ? { name: "sqlite", state: "ok", detail: "База состояния прошла PRAGMA quick_check." }
-        : { name: "sqlite", state: "failed", detail: "SQLite не подтвердил целостность базы состояния." });
-    } catch { checks.push({ name: "sqlite", state: "failed", detail: "База состояния недоступна для проверки." }); }
+    const previousIntegrity = this.sqliteIntegrity;
+    const deepCheckDue = force || !previousIntegrity || checkedAt < previousIntegrity.checkedAt
+      || checkedAt - previousIntegrity.checkedAt >= SQLITE_INTEGRITY_INTERVAL_MS;
+    if (deepCheckDue) {
+      let result: HealthCheckResult;
+      try {
+        result = this.store.quickCheck()
+          ? { name: "sqlite", state: "ok", detail: "База состояния прошла PRAGMA quick_check." }
+          : { name: "sqlite", state: "failed", detail: "SQLite не подтвердил целостность базы состояния." };
+      } catch { result = { name: "sqlite", state: "failed", detail: "База состояния недоступна для проверки." }; }
+      this.sqliteIntegrity = { checkedAt, result };
+    }
+    const integrity = this.sqliteIntegrity!;
+    checks.push(deepCheckDue ? integrity.result : {
+      ...integrity.result,
+      detail: `${integrity.result.detail} Последняя полная проверка ${Math.round((checkedAt - integrity.checkedAt) / 1_000)} с назад.`,
+    });
 
     setPhase("runtime-and-store");
     const runtime = this.runtime();
