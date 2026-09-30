@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 
 const MAX_BYTES = 64 * 1024;
@@ -8,6 +9,7 @@ const TIMEOUT_MS = 10_000;
 interface Request {
   readonly command: string;
   readonly input: Uint8Array;
+  readonly inputHash: Uint8Array;
 }
 
 let replied = false;
@@ -34,12 +36,19 @@ process.once("message", (value: unknown) => {
   if (!value || typeof value !== "object" || !("command" in value) ||
       typeof value.command !== "string" || value.command.length > 16_384 ||
       !/^[A-Za-z0-9+/]*={0,2}$/u.test(value.command) || !("input" in value) ||
-      !(value.input instanceof Uint8Array) || value.input.byteLength > MAX_ENCODED_INPUT_BYTES) {
+      !(value.input instanceof Uint8Array) || value.input.byteLength > MAX_ENCODED_INPUT_BYTES ||
+      !("inputHash" in value) || !(value.inputHash instanceof Uint8Array) || value.inputHash.byteLength !== 32) {
     if (value && typeof value === "object" && "input" in value && value.input instanceof Uint8Array)
       value.input.fill(0);
+    if (value && typeof value === "object" && "inputHash" in value && value.inputHash instanceof Uint8Array)
+      value.inputHash.fill(0);
     send({ ok: false, phase: "invalid-input" }); return;
   }
   const request = value as Request;
+  const actualHash = createHash("sha256").update(request.input).digest();
+  const inputMatches = timingSafeEqual(actualHash, Buffer.from(request.inputHash));
+  actualHash.fill(0); request.inputHash.fill(0);
+  if (!inputMatches) { request.input.fill(0); send({ ok: false, phase: "input-mismatch" }); return; }
   const root = process.env.SystemRoot;
   if (!root || !path.win32.isAbsolute(root)) { request.input.fill(0); send({ ok: false, phase: "spawn-throw" }); return; }
   const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");

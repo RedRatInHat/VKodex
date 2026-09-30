@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -166,6 +167,7 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
   const modulePath = path.win32.join(path.dirname(executable), "Modules");
   const command = requireCompleteInput ? `$expected=${input.byteLength};${encoded}` : encoded;
   const payload = Buffer.from(input);
+  const inputHash = createHash("sha256").update(payload).digest();
   input.fill(0);
   let helper: ReturnType<typeof spawn>;
   try {
@@ -177,14 +179,14 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
       env: { ...process.env, PSModulePath: modulePath },
     });
   } catch {
-    payload.fill(0);
+    payload.fill(0); inputHash.fill(0);
     throw new Error("Managed worker private state protection failed", { cause: { phase: "spawn-throw" } });
   }
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (result?: Uint8Array, phase = "unclassified"): void => {
       if (settled) return;
-      settled = true; clearTimeout(timeout); payload.fill(0);
+      settled = true; clearTimeout(timeout); payload.fill(0); inputHash.fill(0);
       if (result) resolve(result);
       else reject(new Error("Managed worker private state protection failed", { cause: { phase } }));
     };
@@ -196,7 +198,7 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
       if (!message || typeof message !== "object" || !("ok" in message)) return settle();
       if (message.ok !== true) {
         const phase = "phase" in message && typeof message.phase === "string" ? message.phase : "unclassified";
-        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-length|exit-(?:null|\d+))$/u.test(phase)
+        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|input-length|exit-(?:null|\d+))$/u.test(phase)
           ? phase : "unclassified");
       }
       const output = "output" in message ? message.output : null;
@@ -209,23 +211,23 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
     helper.once("error", () => settle(undefined, "process-error"));
     helper.once("close", code => { if (!settled) settle(undefined, `helper-exit-${code}`); });
     try {
-      helper.send({ command: ps(command), input: payload }, error => {
-        payload.fill(0);
+      helper.send({ command: ps(command), input: payload, inputHash }, error => {
+        payload.fill(0); inputHash.fill(0);
         if (error) settle(undefined, "process-error");
       });
     } catch { settle(undefined, "process-error"); }
   });
 }
 
-const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){exit 42}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
-const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){exit 42}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
+const protectScript = "$ErrorActionPreference='Stop';try{Add-Type -AssemblyName System.Security}catch{exit 43};try{$raw=[Console]::In.ReadToEnd().Trim()}catch{exit 44};if($raw.Length -ne $expected){exit 42};try{$data=[Convert]::FromBase64String($raw)}catch{exit 45};try{$out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)}catch{exit 46};try{[Console]::Out.Write([Convert]::ToBase64String($out))}catch{exit 47}";
+const unprotectScript = "$ErrorActionPreference='Stop';try{Add-Type -AssemblyName System.Security}catch{exit 43};try{$raw=[Console]::In.ReadToEnd().Trim()}catch{exit 44};if($raw.Length -ne $expected){exit 42};try{$data=[Convert]::FromBase64String($raw)}catch{exit 45};try{$out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)}catch{exit 46};try{[Console]::Out.Write([Convert]::ToBase64String($out))}catch{exit 47}";
 const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $before=Get-Acl -LiteralPath $p; if($before.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner'}; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
 
 function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
     !("phase" in error.cause) || typeof error.cause.phase !== "string") return "unclassified";
   const phase = error.cause.phase;
-  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-length|stdin-end|output-format|exit-(?:null|\d+)|helper-exit-\d+)$/u.test(phase)
+  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)|helper-exit-\d+)$/u.test(phase)
     ? phase : "unclassified";
 }
 
