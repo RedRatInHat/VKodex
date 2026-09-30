@@ -233,7 +233,28 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
 
 const protectScript = "$ErrorActionPreference='Stop';try{Add-Type -AssemblyName System.Security}catch{exit 43};try{$raw=[Console]::In.ReadToEnd().Trim()}catch{exit 44};if($raw.Length -ne $expected){exit 42};try{$data=[Convert]::FromBase64String($raw)}catch{exit 45};try{$out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)}catch{exit 46};try{[Console]::Out.Write([Convert]::ToBase64String($out))}catch{exit 47}";
 const unprotectScript = "$ErrorActionPreference='Stop';try{Add-Type -AssemblyName System.Security}catch{exit 43};try{$raw=[Console]::In.ReadToEnd().Trim()}catch{exit 44};if($raw.Length -ne $expected){exit 42};try{$data=[Convert]::FromBase64String($raw)}catch{exit 45};try{$out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)}catch{exit 46};try{[Console]::Out.Write([Convert]::ToBase64String($out))}catch{exit 47}";
-const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $before=Get-Acl -LiteralPath $p; if($before.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner'}; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
+const aclScript = [
+  "$ErrorActionPreference='Stop'",
+  "$p=[Console]::In.ReadToEnd().Trim()",
+  "if(!$p){throw 'path'}",
+  "[IO.Directory]::CreateDirectory($p)|Out-Null",
+  "$d=Get-Item -LiteralPath $p -Force",
+  "if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
+  "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User",
+  "$before=Get-Acl -LiteralPath $p",
+  "$beforeOwner=$before.GetOwner([Security.Principal.SecurityIdentifier])",
+  "if($beforeOwner.Value -ne $sid.Value){throw 'owner'}",
+  "$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+  "$acl=[Security.AccessControl.DirectorySecurity]::new()",
+  "$acl.SetAccessRuleProtection($true,$false)",
+  "foreach($id in @($sid,$system)){",
+  "$rule=[Security.AccessControl.FileSystemAccessRule]::new($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)",
+  "$acl.AddAccessRule($rule)",
+  "}",
+  "Set-Acl -LiteralPath $p -AclObject $acl",
+  "$check=Get-Item -LiteralPath $p -Force",
+  "if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
+].join(";");
 
 function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
