@@ -115,7 +115,8 @@ async function safePaginatedRotation(task: TaskRef, checkpoint: TaskObservationC
   if (header.type !== "session_meta") return true;
   if (!isObject(header.payload)) return false;
   const payload = header.payload;
-  if (payload.history_mode !== "paginated" || !Object.hasOwn(payload, "history_base")) return true;
+  if (!Object.hasOwn(payload, "history_base")) return true;
+  if (payload.history_mode !== "paginated") return false;
   const base = payload.history_base;
   if (!isObject(base) || !validHistoryBase(base) || payload.id !== task.threadId
     || base.thread_id !== task.threadId || header.ordinal !== base.end_ordinal_exclusive) return false;

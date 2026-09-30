@@ -481,10 +481,11 @@ test("paginated rotation admits a contiguous anchored source but rejects a chang
   await tailer.poll({ ...ref, rolloutPath: oldPath }, 0);
   const token = tailer.durableCursor({ ...ref, rolloutPath: oldPath });
   assert.ok(token);
-  await writeFile(newPath, JSON.stringify({ ordinal: 2, timestamp: new Date(101_000).toISOString(), type: "session_meta",
+  const overlay = JSON.stringify({ ordinal: 2, timestamp: new Date(101_000).toISOString(), type: "session_meta",
     payload: { id: ref.threadId, history_mode: "paginated", history_base: {
       thread_id: ref.threadId, end_ordinal_exclusive: 2, end_byte_offset: Buffer.byteLength(old),
-    } } }) + "\n" + rolloutFinal(102_000, "new", "new-turn", "New answer"));
+    } } }) + "\n" + rolloutFinal(102_000, "new", "new-turn", "New answer");
+  await writeFile(newPath, overlay);
   const checkpoint = { since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], active: [], seen: {},
     rolloutPath: comparablePath(oldPath), rolloutCursor: token };
   const accepted = new RolloutTaskHistoryRecovery();
@@ -501,6 +502,14 @@ test("paginated rotation admits a contiguous anchored source but rejects a chang
   assert.equal(changed?.failure, "lineageUnverified");
   assert.equal(changed?.checkpoint, undefined);
   assert.deepEqual(changed?.events, []);
+
+  await writeFile(oldPath, old);
+  await writeFile(newPath, overlay.replace('"history_mode":"paginated"', '"history_mode":"unknown"'));
+  const malformed = new RolloutTaskHistoryRecovery();
+  malformed.enable("unknown-mode", 0);
+  const unknownMode = await malformed.poll("unknown-mode", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 105_000);
+  assert.equal(unknownMode?.failure, "lineageUnverified");
+  assert.equal(unknownMode?.checkpoint, undefined);
 });
 
 test("detached idle observation rebases after the existing catalog refresh discovers a rotated rollout", async t => {
