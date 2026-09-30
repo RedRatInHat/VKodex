@@ -100,7 +100,7 @@ process.once("message", (value: unknown) => {
     if (Buffer.isBuffer(stderr) && stderr.byteLength > 0) {
       stderrKind = stderr.includes("ScriptContainedMaliciousContent") || stderr.includes("malicious content") ||
         stderr.includes("blocked by your antivirus") ? "security" :
-        stderr.includes("ParserError") || stderr.includes("At line:")
+        stderr.includes("ParserError")
           ? stderr.includes("UnexpectedToken") ? "parser-token" :
             stderr.includes("MissingEndParenthesis") ? "parser-parenthesis" : "parser" :
         stderr.includes("Exception") || stderr.includes("InvalidOperation") || stderr.includes("ErrorRecord")
