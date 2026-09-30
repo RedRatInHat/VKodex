@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
+import { assertWindowsPrivateDirectory } from "./windows-private-directory.js";
 
 
 
@@ -196,7 +197,7 @@ async function runPowerShell(encoded: string, input: Uint8Array): Promise<Uint8A
 
 const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
 const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
-const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
+const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $before=Get-Acl -LiteralPath $p; if($before.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner'}; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
 
 class WindowsDpapiProtector implements ManagedWorkerPrivateStateProtector {
   readonly #runner: ManagedWorkerPrivateStatePowerShellRunner;
@@ -239,7 +240,10 @@ class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
     try { await createUnlinkedDirectory(directory); await rejectLinked(directory); }
     catch { throw new Error("Managed worker private state directory is unsafe"); }
     if (process.platform !== "win32") throw new Error("Managed worker private state requires Windows");
+    try { assertWindowsPrivateDirectory(directory); return; }
+    catch { /* A new directory needs its private DACL; an unsafe owner still fails below. */ }
     await runPowerShell(aclScript, Buffer.from(directory, "utf8"));
+    assertWindowsPrivateDirectory(directory);
   }
   async writeExclusive(filePath: string, data: Uint8Array): Promise<void> {
     try {
@@ -255,6 +259,12 @@ class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
       return Uint8Array.from(await readFile(filePath));
     } catch { throw new Error("Managed worker private state is unavailable"); }
   }
+}
+
+/** Shared Windows ACL boundary for local capability files. The directory is
+ * private to this OS user and SYSTEM; existing reparse points are refused. */
+export async function ensureProtectedLocalDirectory(directory: string): Promise<void> {
+  await new DefaultFilesystem().ensureProtectedDirectory(directory);
 }
 
 function dependencies(options: CreateManagedWorkerPrivateStateOptions): { protector: ManagedWorkerPrivateStateProtector; filesystem: ManagedWorkerPrivateStateFilesystem } {

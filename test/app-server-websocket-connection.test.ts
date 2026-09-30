@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
 import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
+import { canonicalDetachedProfileHome, createDetachedProfileConnection,
+  detachedProfileKey } from "../src/codex/detached-profile-capability.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -92,8 +96,10 @@ test("profile owner teardown detaches its WebSocket without terminating the back
     : { ok: true });
   const task = { hostId: "local" as const, threadId, sourceId: "source-a" };
   const first = new AppServerProfileOwner("source-a",
-    createAppServerWebSocketConnection(native.url, native.token, 1000));
+    createAppServerWebSocketConnection(native.url, native.token, 1000), undefined, new Set([threadId]));
   try {
+    assert.equal(first.routingPolicy, "exclusive");
+    assert.equal(first.owns({ ...task, threadId: "00000000-0000-4000-8000-000000000002" }), false);
     assert.equal((await first.inspectTask(task)).status, "idle");
     await first.close();
     const second = new AppServerProfileOwner("source-a",
@@ -103,4 +109,117 @@ test("profile owner teardown detaches its WebSocket without terminating the back
       assert.equal(native.connections, 2);
     } finally { await second.close(); }
   } finally { await first.close(); await native.close(); }
+});
+
+test("detached profile fences a mutation against replaced descriptor and process birth", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-private");
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const descriptorFile = path.join(directory, "ready.json");
+  const tokenFile = path.join(directory, epoch, "token");
+  let birthTicks = "12345678";
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const record = { schemaVersion: 1, epoch, profileKey: detachedProfileKey(home), home,
+    url: native.url, backend: { pid: 1234, birthTicks } };
+  const files = new Map([[descriptorFile, JSON.stringify(record)], [tokenFile, native.token]]);
+  const dependencies = {
+    readFile: (file: string) => {
+      const value = files.get(file);
+      if (!value) throw new Error("missing");
+      return value;
+    },
+    identity: (pid: number) => pid === 1234 ? { pid, birthTicks } : null,
+  };
+  const client = createDetachedProfileConnection(directory, record.home, dependencies);
+  try {
+    assert.deepEqual(await client.request("thread/read"), { ok: true });
+    files.set(descriptorFile, JSON.stringify({ ...record, epoch: "00000000-0000-4000-8000-000000000002" }));
+    await assert.rejects(client.request("thread/rename", {}, { mutating: true }), AppServerUnavailableError);
+    assert.equal(native.methods.includes("thread/rename"), false);
+    files.set(descriptorFile, JSON.stringify(record));
+    // A new process can reuse a PID only after the original socket has died.
+    birthTicks = "98765432";
+    for (const socket of native.sockets) socket.terminate();
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+    await assert.rejects(client.request("thread/read"), AppServerUnavailableError);
+  } finally { await client.close(); await native.close(); }
+});
+
+test("detached profile rejects a changed token before first connection", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-first-connection");
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const descriptor = { schemaVersion: 1, epoch, profileKey: detachedProfileKey(home), home,
+    url: native.url, backend: { pid: 1234, birthTicks: "12345678" } };
+  let token = native.token;
+  const client = createDetachedProfileConnection(directory, descriptor.home, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(descriptor) : token,
+    identity: pid => ({ pid, birthTicks: "12345678" }),
+  });
+  try {
+    const start = client.start();
+    token = "replaced-test-capability";
+    await assert.rejects(start, AppServerUnavailableError);
+    assert.equal(native.connections, 0);
+  } finally { await client.close(); await native.close(); }
+});
+
+test("detached profile rejects mismatched home and missing capability without a socket", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-invalid");
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const descriptor = { schemaVersion: 1, epoch, profileKey: detachedProfileKey(home), home,
+    url: native.url, backend: { pid: 1234, birthTicks: "12345678" } };
+  try {
+    const wrongHome = createDetachedProfileConnection(directory, path.dirname(os.tmpdir()), {
+      readFile: () => JSON.stringify(descriptor), identity: pid => ({ pid, birthTicks: "12345678" }),
+    });
+    await assert.rejects(wrongHome.start(), AppServerUnavailableError);
+    await wrongHome.close();
+    const missingToken = createDetachedProfileConnection(directory, descriptor.home, {
+      readFile: file => file.endsWith("ready.json") ? JSON.stringify(descriptor) : "missing token\n",
+      identity: pid => ({ pid, birthTicks: "12345678" }),
+    });
+    await assert.rejects(missingToken.start(), AppServerUnavailableError);
+    await missingToken.close();
+    assert.equal(native.connections, 0);
+  } finally { await native.close(); }
+});
+
+test("one unavailable detached profile can attach when its server later publishes a record", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-late-ready");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const files = new Map<string, string>();
+  const client = createDetachedProfileConnection(directory, home, {
+    readFile: file => {
+      const value = files.get(file);
+      if (!value) throw new Error("missing");
+      return value;
+    },
+    identity: pid => ({ pid, birthTicks: "12345678" }),
+  });
+  try {
+    await assert.rejects(client.start(), AppServerUnavailableError);
+    files.set(path.join(directory, "ready.json"), JSON.stringify({ schemaVersion: 1, epoch,
+      profileKey: detachedProfileKey(home), home, url: native.url, backend: { pid: 1234, birthTicks: "12345678" } }));
+    files.set(path.join(directory, epoch, "token"), native.token);
+    assert.deepEqual(await client.request("thread/read"), { ok: true });
+    assert.equal(native.connections, 1);
+  } finally { await client.close(); await native.close(); }
+});
+
+test("detached profile refuses a capability beneath an unprotected parent", async () => {
+  const directory = path.resolve("test-detached-profile-unprotected-parent");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const client = createDetachedProfileConnection(directory, home, {
+    assertPrivateDirectory: parent => { if (parent === path.dirname(directory)) throw new Error("unsafe ACL"); },
+    readFile: () => { throw new Error("read must not be reached"); },
+    identity: () => null,
+  });
+  try { await assert.rejects(client.start(), AppServerUnavailableError); }
+  finally { await client.close(); }
 });

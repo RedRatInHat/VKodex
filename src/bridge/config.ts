@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { comparablePath } from "../core/paths.js";
 import type { OwnerAccess } from "./contracts.js";
 
@@ -34,7 +34,9 @@ export type CodexLauncherConfig =
 export interface CodexSourceConfig {
   readonly home: string;
   /** Explicit execution owner. Omitted keeps the existing UI-client contract. */
-  readonly owner?: "client" | "app-server";
+  readonly owner?: "client" | "app-server" | "detached-app-server";
+  /** An opt-in detached route is never a profile-wide claim. */
+  readonly detachedThreadIds?: readonly string[];
   readonly launcher?: CodexLauncherConfig;
 }
 
@@ -92,9 +94,24 @@ export function configuredCodexSources(env: NodeJS.ProcessEnv = process.env): Co
     if (seen.has(key)) throw new Error("CODEX_SOURCES contains duplicate homes");
     seen.add(key);
     const owner = item.owner === undefined ? undefined : item.owner;
-    if (owner !== undefined && owner !== "client" && owner !== "app-server") throw new Error(`CODEX_SOURCES[${index}].owner is not supported`);
+    if (owner !== undefined && owner !== "client" && owner !== "app-server" && owner !== "detached-app-server")
+      throw new Error(`CODEX_SOURCES[${index}].owner is not supported`);
+    const detachedThreadIds = item.detachedThreadIds;
+    if (owner === "detached-app-server") {
+      try {
+        if (comparablePath(realpathSync.native(home)) !== comparablePath(home) || !statSync(home).isDirectory())
+          throw new Error("invalid");
+      } catch { throw new Error(`CODEX_SOURCES[${index}].home must be an existing canonical directory`); }
+      if (!Array.isArray(detachedThreadIds) || !detachedThreadIds.length || detachedThreadIds.length > 16 ||
+        detachedThreadIds.some(id => typeof id !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(id)) ||
+        new Set(detachedThreadIds).size !== detachedThreadIds.length)
+        throw new Error(`CODEX_SOURCES[${index}].detachedThreadIds must contain distinct task IDs`);
+    } else if (detachedThreadIds !== undefined) throw new Error(`CODEX_SOURCES[${index}].detachedThreadIds requires a detached owner`);
     const configuredLauncher = launcher(item.launcher, index);
-    result.push({ home, ...(owner ? { owner } : {}), ...(configuredLauncher ? { launcher: configuredLauncher } : {}) });
+    result.push({ home, ...(owner ? { owner } : {}),
+      ...(owner === "detached-app-server" ? { detachedThreadIds: detachedThreadIds as string[] } : {}),
+      ...(configuredLauncher ? { launcher: configuredLauncher } : {}) });
   }
   return result;
 }

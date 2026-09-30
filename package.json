@@ -17,6 +17,7 @@
     "desktop:probe": "node --import tsx src/desktop/launch.ts probe",
     "desktop:dev": "node --import tsx src/desktop/launch.ts dev",
     "desktop:start": "node dist/src/desktop/launch.js start",
+    "profile-server:launch": "node dist/src/profile-server-main.js",
     "vk:check": "node --import tsx src/desktop/launch.ts check",
     "vk:token:setup": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/setup-vk-document-token.ps1",
     "vk:token:import": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/import-vk-document-token.ps1",

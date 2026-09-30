@@ -22,11 +22,13 @@ function parsedIdentity(pid: number, stdout: string | undefined, stderr: string 
   return value === 'ABSENT' ? null : Object.freeze({ pid, birthTicks: value! });
 }
 
-export function readWindowsProcessIdentity(pid: number): ProcessIdentity | null {
+export function readWindowsProcessIdentity(pid: number, timeoutMs = 10_000): ProcessIdentity | null {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10_000)
+    throw new TypeError('Invalid process identity timeout');
   const query = processIdentityQuery(pid);
   const result = spawnSync(query.executable,
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', query.script], {
-      encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 4096,
+      encoding: 'utf8', windowsHide: true, timeout: timeoutMs, maxBuffer: 4096,
       env: { ...process.env, PSModulePath: query.modulePath },
     });
   if (result.error || result.status !== 0)

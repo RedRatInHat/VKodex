@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
+import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 import { configuredCodexHomes, configuredCodexSources } from "../src/bridge/config.js";
 import { BridgeStore, migrateBindingSources } from "../src/bridge/store.js";
@@ -46,6 +47,13 @@ test("structured sources bind each Codex home to a launcher and legacy homes rem
   assert.deepEqual(configuredCodexSources({ CODEX_HOME: primary, CODEX_EXTRA_HOMES: JSON.stringify([extra]) }), [
     { home: primary, launcher: { type: "desktop" } }, { home: extra },
   ]);
+  const detachedHome = realpathSync.native(os.tmpdir());
+  assert.deepEqual(configuredCodexSources({ CODEX_SOURCES: JSON.stringify([
+    { home: os.tmpdir(), owner: "detached-app-server", detachedThreadIds: ["00000000-0000-4000-8000-000000000001"] },
+  ]) }), [{ home: detachedHome, owner: "detached-app-server", detachedThreadIds: ["00000000-0000-4000-8000-000000000001"] }]);
+  assert.throws(() => configuredCodexSources({ CODEX_SOURCES: JSON.stringify([
+    { home: primary, owner: "detached-app-server" },
+  ]) }));
   for (const value of ["PRIVATE", "[]", '[{"home":"PRIVATE","launcher":{"type":"unknown"}}]',
     '[{"home":"PRIVATE","owner":"unknown"}]', '[{"home":"a"},{"home":"a"}]']) {
     assert.throws(() => configuredCodexSources({ CODEX_SOURCES: value }), error => error instanceof Error && !error.message.includes("PRIVATE"));

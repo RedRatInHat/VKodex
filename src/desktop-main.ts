@@ -16,7 +16,7 @@ import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 import { DesktopTaskStateTransport } from "./desktop/state-transport.js";
 import { observeTaskState } from "./desktop/task-observation.js";
 import { RolloutTaskHistoryRecovery } from "./desktop/history-recovery.js";
-import { createAppServerProfileOwner } from "./codex/app-server-profile-owner.js";
+import { createAppServerProfileOwner, createDetachedAppServerProfileOwner } from "./codex/app-server-profile-owner.js";
 import { observeAppServerTaskState } from "./codex/app-server-task-state.js";
 import { inspectThroughOwner } from "./desktop/owner-channel.js";
 import { ManagedOwnerRouteResolver } from "./bridge/managed-owner-route-resolver.js";
@@ -47,11 +47,22 @@ const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task), undefined, () => catalog.listSources()), new ProfileDesktopGoals(task => catalog.sourceHome(task)),
   { launcher, creator, transfer });
 const sourceIds = catalog.listSources();
-const appServerOwners = config.codexSources.flatMap((source, index) => source.owner === "app-server"
-  ? [createAppServerProfileOwner(sourceIds[index]!.id, source.home, async projectId => {
+const detachedProfileBase = process.env.LOCALAPPDATA && path.isAbsolute(process.env.LOCALAPPDATA)
+  ? path.join(process.env.LOCALAPPDATA, "VKodex", "owner-private") : null;
+const appServerOwners = config.codexSources.flatMap((source, index) => {
+  const resolveProject = async (projectId: string) => {
     const resolved = await catalog.resolveProject(projectId);
     return { rawProjectId: resolved.rawProjectId, ...(resolved.sourceId ? { sourceId: resolved.sourceId } : {}) };
-  })] : []);
+  };
+  if (source.owner === "app-server")
+    return [createAppServerProfileOwner(sourceIds[index]!.id, source.home, resolveProject)];
+  if (source.owner === "detached-app-server") {
+    if (!detachedProfileBase) throw new Error("Independent profile owner requires Windows user-local storage");
+    return [createDetachedAppServerProfileOwner(sourceIds[index]!.id, source.home,
+      detachedProfileBase, source.detachedThreadIds!, resolveProject)];
+  }
+  return [];
+});
 const desktopStates = new DesktopTaskStateTransport();
 // The private base is reserved for managed workers; an absent endpoint or
 // unqualified claim stays exclusive but unavailable. No worker is launched here.

@@ -8,9 +8,11 @@ import { AppServerConnection, type AppServerRpc } from "./app-server-connection.
 import { nativeCodexPath } from "./native-cli.js";
 import { AppServerTaskExecutor } from "./app-server-task-executor.js";
 import { AppServerTaskStateTransport, observeAppServerTaskState } from "./app-server-task-state.js";
+import { createDetachedProfileConnection, detachedProfileDirectory } from "./detached-profile-capability.js";
 
 /** One explicit task owner: one CODEX_HOME, one long-lived App Server connection. */
 export class AppServerProfileOwner {
+  readonly routingPolicy?: "exclusive";
   readonly observe = observeAppServerTaskState;
   readonly states: TaskStateTransport;
   private readonly executor: AppServerTaskExecutor;
@@ -18,7 +20,9 @@ export class AppServerProfileOwner {
   private readonly unsubscribeQuestions: () => void;
 
   constructor(readonly sourceId: string, private readonly rpc: AppServerRpc,
-    private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>) {
+    private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
+    private readonly detachedThreadIds?: ReadonlySet<string>) {
+    if (detachedThreadIds) this.routingPolicy = "exclusive";
     this.executor = new AppServerTaskExecutor(rpc);
     this.nativeStates = new AppServerTaskStateTransport(rpc,
       threadId => this.executor.questionSnapshot(threadId),
@@ -35,7 +39,10 @@ export class AppServerProfileOwner {
     };
   }
 
-  owns(task: TaskRef): boolean { return (task.sourceId ?? "") === this.sourceId; }
+  owns(task: TaskRef): boolean {
+    return (task.sourceId ?? "") === this.sourceId &&
+      (this.detachedThreadIds === undefined || this.detachedThreadIds.has(task.threadId));
+  }
 
   private assertOwner(task: TaskRef): void {
     if (!this.owns(task)) throw new ActionRejectedError("Задача относится к другому аккаунту Codex.");
@@ -126,6 +133,16 @@ export function createAppServerProfileOwner(sourceId: string, codexHome: string,
     env: { ...buildCodexEnvironment(process.env), CODEX_HOME: codexHome },
   }));
   return new AppServerProfileOwner(sourceId, rpc, resolveProject);
+}
+
+/** Opt-in only: the bridge obtains a client capability from the independent
+ * profile server's ready record and never becomes its process owner. */
+export function createDetachedAppServerProfileOwner(sourceId: string, codexHome: string,
+  dataDirectory: string, threadIds: readonly string[],
+  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>): AppServerProfileOwner {
+  const privateDirectory = detachedProfileDirectory(dataDirectory, codexHome);
+  return new AppServerProfileOwner(sourceId,
+    createDetachedProfileConnection(privateDirectory, codexHome), resolveProject, new Set(threadIds));
 }
 
 /** Routes state subscriptions to an explicit profile owner without fallback. */

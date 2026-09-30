@@ -101,12 +101,15 @@ class AppServerWebSocketEndpoint extends EventEmitter implements AppServerWireEn
 
 /** The URL and bearer are private owner capabilities, not a public VK setting. */
 export function createAppServerWebSocketConnection(url: string, token: string,
-  timeoutMs = 30_000): AppServerConnection {
+  timeoutMs = 30_000, assertBeforeConnect?: () => void): AppServerConnection {
   const endpoint = new URL(url);
   if (endpoint.protocol !== "ws:" || endpoint.hostname !== "127.0.0.1" ||
     !endpoint.port || endpoint.username || endpoint.password || endpoint.pathname !== "/" ||
     endpoint.search || endpoint.hash || !/^[A-Za-z0-9_-]{16,512}$/u.test(token))
     throw new TypeError("Invalid local App Server WebSocket capability");
-  return new AppServerConnection(() => new AppServerWebSocketEndpoint(endpoint.href, token),
+  return new AppServerConnection(() => {
+    assertBeforeConnect?.();
+    return new AppServerWebSocketEndpoint(endpoint.href, token);
+  },
     undefined, timeoutMs, wire => (wire as AppServerWebSocketEndpoint).close());
 }
