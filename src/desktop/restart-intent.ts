@@ -12,6 +12,10 @@ export interface RestartTaskSnapshot extends TaskRef {
   readonly title: string;
   readonly generation: number;
   readonly activeTurnId: string | null;
+  /** Exact managed owner at capture time; absent for native-owned tasks. */
+  readonly ownerEpoch?: string;
+  readonly ownerClaimId?: string;
+  readonly ownerClaimRevision?: number;
 }
 
 export interface RestartIntent {
@@ -40,7 +44,11 @@ export function parseRestartIntent(value: unknown): RestartIntent {
     if (!safeId(task.bindingId) || !safeText(task.hostId, 200) || !safeText(task.threadId, 200) || !safeText(task.title, 500)
       || !Number.isSafeInteger(task.generation) || Number(task.generation) < 0
       || !(task.activeTurnId === null || safeText(task.activeTurnId, 200))
-      || !(task.sourceId === undefined || safeText(task.sourceId, 500))) throw new Error("Invalid restart task");
+      || !(task.sourceId === undefined || safeText(task.sourceId, 500))
+      || !(task.ownerEpoch === undefined && task.ownerClaimId === undefined && task.ownerClaimRevision === undefined ||
+        safeId(task.ownerEpoch) && safeId(task.ownerClaimId) &&
+        Number.isSafeInteger(task.ownerClaimRevision) && Number(task.ownerClaimRevision) >= 0))
+      throw new Error("Invalid restart task");
     return {
       bindingId: task.bindingId,
       hostId: task.hostId,
@@ -48,6 +56,9 @@ export function parseRestartIntent(value: unknown): RestartIntent {
       title: task.title,
       generation: task.generation,
       activeTurnId: task.activeTurnId,
+      ...(task.ownerEpoch ? { ownerEpoch: task.ownerEpoch } : {}),
+      ...(task.ownerClaimId ? { ownerClaimId: task.ownerClaimId,
+        ownerClaimRevision: Number(task.ownerClaimRevision) } : {}),
       ...(task.sourceId ? { sourceId: task.sourceId } : {}),
     } as RestartTaskSnapshot;
   });
@@ -82,6 +93,7 @@ export async function captureRestartIntent(store: BridgeStore, dataDir: string, 
     const details = store.getValue<{ status?: string }>(`task-details:${binding.id}`);
     if (!binding.attached || binding.peerId === null || details?.status !== "running") return [];
     const activity = store.getValue<{ turnId?: string | null }>(`activity:${binding.id}`);
+    const owner = store.managedOwner(binding);
     return [{
       bindingId: binding.id,
       hostId: binding.hostId,
@@ -89,6 +101,8 @@ export async function captureRestartIntent(store: BridgeStore, dataDir: string, 
       title: binding.title,
       generation: store.streamGeneration(binding.id),
       activeTurnId: typeof activity?.turnId === "string" && activity.turnId ? activity.turnId : null,
+      ...(owner ? { ownerEpoch: owner.ownerEpoch, ownerClaimId: owner.id,
+        ownerClaimRevision: owner.revision } : {}),
       ...(binding.sourceId ? { sourceId: binding.sourceId } : {}),
     } satisfies RestartTaskSnapshot];
   });
@@ -104,6 +118,9 @@ interface RestartSnapshotRow {
   details: string | null;
   activity: string | null;
   generation: string | null;
+  owner_epoch: string | null;
+  owner_claim_id: string | null;
+  owner_claim_revision: number | null;
 }
 
 /** Read one committed SQLite snapshot without opening BridgeStore or running migrations. */
@@ -113,11 +130,14 @@ export async function captureRestartIntentFromDatabase(filename: string, dataDir
   try {
     tasks = db.transaction(() => {
       const rows = db.prepare(`SELECT b.id, b.host_id, b.thread_id, b.title, b.source_id,
-          details.value AS details, activity.value AS activity, generation.value AS generation
+          details.value AS details, activity.value AS activity, generation.value AS generation,
+          owner.owner_epoch AS owner_epoch, owner.id AS owner_claim_id,
+          owner.revision AS owner_claim_revision
         FROM bridge_bindings AS b
         LEFT JOIN bridge_values AS details ON details.key = 'task-details:' || b.id
         LEFT JOIN bridge_values AS activity ON activity.key = 'activity:' || b.id
         LEFT JOIN bridge_values AS generation ON generation.key = 'stream-generation:' || b.id
+        LEFT JOIN managed_owner_bindings AS owner ON owner.binding_id = b.id AND owner.state <> 'retired'
         WHERE b.attached = 1 AND b.peer_id IS NOT NULL ORDER BY b.id`).all() as RestartSnapshotRow[];
       return rows.flatMap(row => {
         const details = row.details === null ? null : JSON.parse(row.details) as { status?: string } | null;
@@ -131,6 +151,9 @@ export async function captureRestartIntentFromDatabase(filename: string, dataDir
           title: row.title,
           generation: generation ?? 0,
           activeTurnId: typeof activity?.turnId === "string" && activity.turnId ? activity.turnId : null,
+          ...(row.owner_epoch && row.owner_claim_id && row.owner_claim_revision !== null
+            ? { ownerEpoch: row.owner_epoch, ownerClaimId: row.owner_claim_id,
+              ownerClaimRevision: row.owner_claim_revision } : {}),
           ...(row.source_id ? { sourceId: row.source_id } : {}),
         } satisfies RestartTaskSnapshot];
       });

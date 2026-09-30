@@ -3,6 +3,7 @@ import type { TaskState, TaskStateStream, TaskStateTransport } from '../core/tas
 import { ManagedClaimStateTransport } from '../codex/managed-claim-state-transport.js';
 import type { ManagedOwnerBinding } from './store.js';
 import type { ManagedOwnerRouteResolution } from './managed-owner-route-resolver.js';
+import type { RestartTaskSnapshot } from '../desktop/restart-intent.js';
 
 /** Read-only subset used by the optional exclusive state-route composition. */
 export interface ManagedOwnerRouteObserver {
@@ -25,7 +26,8 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
   readonly #streams = new Set<() => void>();
   #closed = false;
 
-  constructor(resolver: ManagedOwnerRouteObserver, task: TaskRef) {
+  constructor(resolver: ManagedOwnerRouteObserver, task: TaskRef,
+    private readonly expectedClaim?: Readonly<{ epoch: string; id: string; revision: number }>) {
     if (!resolver || typeof resolver.resolve !== 'function' || typeof resolver.isCurrent !== 'function' ||
       !task || typeof task.hostId !== 'string' || !task.hostId || typeof task.threadId !== 'string' || !task.threadId)
       throw new TypeError('Managed owner observed transport requires an exact task and resolver');
@@ -58,7 +60,11 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
       if (resolution.kind === 'statically-qualified') pendingStates = resolution.states;
       if (closed || this.#closed || resolution.kind !== 'statically-qualified' ||
         resolution.claim.hostId !== this.#task.hostId || resolution.claim.threadId !== this.#task.threadId ||
-        resolution.claim.sourceId !== (this.#task.sourceId ?? '') || !this.#resolver.isCurrent(resolution.claim)) {
+        resolution.claim.sourceId !== (this.#task.sourceId ?? '') ||
+        this.expectedClaim !== undefined && (resolution.claim.ownerEpoch !== this.expectedClaim.epoch ||
+          resolution.claim.id !== this.expectedClaim.id || resolution.claim.revision !== this.expectedClaim.revision ||
+          resolution.claim.state !== 'ready') ||
+        !this.#resolver.isCurrent(resolution.claim)) {
         if (closed) pendingStates?.close();
         else close();
         throw unavailable();
@@ -107,4 +113,32 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
     for (const close of this.#streams) close();
     this.#streams.clear();
   }
+}
+
+/** Read only one exact managed turn through its confirmed owner epoch. A
+ * missing turn, a changed claim or any stream failure is never restart proof. */
+export async function inspectManagedRestartTurn(observer: ManagedOwnerRouteObserver,
+  task: TaskRef, snapshot: RestartTaskSnapshot):
+  Promise<'active' | 'settled' | 'unknown'> {
+  const { ownerEpoch, ownerClaimId, ownerClaimRevision, activeTurnId } = snapshot;
+  if (!ownerEpoch || !ownerClaimId || ownerClaimRevision === undefined || !activeTurnId) return 'unknown';
+  const transport = new ManagedOwnerObservedTaskStateTransport(observer, task,
+    { epoch: ownerEpoch, id: ownerClaimId, revision: ownerClaimRevision });
+  let stateSnapshot: TaskState | null = null;
+  let failed = false;
+  const stream = transport.subscribe(task, value => { stateSnapshot = value; }, () => { failed = true; });
+  try {
+    await stream.start(10_000);
+    await stream.verifyOwner();
+    if (failed || !stateSnapshot) return 'unknown';
+    const turns: unknown = stateSnapshot['turns'];
+    if (!Array.isArray(turns)) return 'unknown';
+    const exact = turns.find((turn: unknown) => turn !== null && typeof turn === 'object' &&
+      !Array.isArray(turn) && 'id' in turn && turn.id === activeTurnId);
+    if (!exact || typeof exact !== 'object' || !('status' in exact)) return 'unknown';
+    return exact.status === 'inProgress' ?
+      stateSnapshot['runtimeStatus'] === 'active' ? 'active' : 'unknown' :
+      ['completed', 'failed'].includes(String(exact.status)) ? 'settled' : 'unknown';
+  } catch { return 'unknown'; }
+  finally { transport.close(); }
 }

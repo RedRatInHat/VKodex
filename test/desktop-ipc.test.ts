@@ -229,7 +229,10 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   streamTransport?: TaskStateTransport,
   inspectExternalOwner?: (task: import("../src/core/codex-tasks.js").TaskRef) => Promise<"idle" | "active" | "systemError" | null>,
   goals?: import("../src/desktop/contracts.js").DesktopGoals,
-  history?: TaskHistoryRecovery, fileRoot?: string) {
+  history?: TaskHistoryRecovery, fileRoot?: string,
+  inspectManagedRestartTurn?: (task: import("../src/core/codex-tasks.js").TaskRef,
+    snapshot: import("../src/desktop/restart-intent.js").RestartTaskSnapshot) =>
+    Promise<"unclaimed" | "active" | "settled" | "unknown">) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -249,9 +252,12 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client,
     undefined, undefined, goals);
   let now = 100_000;
-  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store,
-    { ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
-      ...(inspectExternalOwner ? { inspectExternalOwner } : {}) },
+  const adapters = {
+    ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
+    ...(inspectExternalOwner ? { inspectExternalOwner } : {}),
+    ...(inspectManagedRestartTurn ? { inspectManagedRestartTurn } : {}),
+  };
+  const runtime = new DesktopBridgeRuntime(access, desktop, chat, store, adapters,
     () => now, fileRoot, undefined, 60_000, healthCheckOverride);
   t.after(async () => { await runtime.stop(); store.close(); });
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
@@ -270,6 +276,146 @@ test("restart recovery does not resume a turn still active in a UI owner", async
   await s.runtime.recoverRestartIntent(root);
   assert.equal(inspected, false);
   assert.equal(await readRestartIntent(root), null);
+  assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
+});
+
+function readyManagedRestartOwner(store: BridgeStore, bindingId: string, threadId: string, ownerEpoch: string): void {
+  const evidence = { backendGeneration: 1, registryRevision: 1,
+    endpointRef: "123e4567-e89b-42d3-a456-426614174010",
+    host: { pid: 101, birthTicks: "1" }, backend: { pid: 102, birthTicks: "2" } };
+  const registering = store.claimManagedOwner(bindingId,
+    { ownerEpoch, canonicalHome: "C:\\ManagedOwnerFixture", familyRoot: threadId, evidence });
+  store.transitionManagedOwner(registering, "ready", evidence);
+}
+
+test("managed restart recovery keeps an active intent when its exact managed turn is unknown", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-unknown-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  let inspected = 0;
+  const ownerEpoch = "123e4567-e89b-42d3-a456-426614174000";
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async (task, snapshot) => {
+      assert.equal(task.threadId, s.binding.threadId);
+      assert.equal(snapshot.ownerEpoch, ownerEpoch);
+      assert.equal(snapshot.activeTurnId, "fixture-turn");
+      assert.equal(snapshot.ownerClaimRevision, 1);
+      return "unknown";
+    });
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+  readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, ownerEpoch);
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  s.desktop.inspectTask = async () => {
+    inspected++;
+    return { status: "completed" } as never;
+  };
+
+  await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+
+  assert.equal(inspected, 0);
+  assert.deepEqual(await readRestartIntent(root), intent);
+  assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
+});
+
+test("managed restart recovery archives an active exact managed turn without inspecting or continuing it", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-active-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  let inspected = 0;
+  const ownerEpoch = "123e4567-e89b-42d3-a456-426614174001";
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => "active");
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+  readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, ownerEpoch);
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  s.desktop.inspectTask = async () => {
+    inspected++;
+    return { status: "completed" } as never;
+  };
+
+  await s.runtime.recoverRestartIntent(root);
+
+  assert.equal(inspected, 0);
+  assert.equal(await readRestartIntent(root), null);
+  assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
+});
+
+test("managed restart recovery retains intent if claim changes after active-turn proof", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-revision-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const ownerEpoch = "123e4567-e89b-42d3-a456-426614174002";
+  let inspected = false;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => {
+      const current = s.store.managedOwner(s.binding);
+      assert.ok(current);
+      s.store.transitionManagedOwner(current, "unavailable");
+      return "active";
+    });
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+  readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, ownerEpoch);
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  s.desktop.inspectTask = async () => { inspected = true; return { status: "completed" } as never; };
+
+  await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+
+  assert.equal(inspected, false);
+  assert.deepEqual(await readRestartIntent(root), intent);
+});
+
+test("managed restart recovery rechecks earlier proofs before archiving a multi-task intent", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-multi-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const ownerEpoch = "123e4567-e89b-42d3-a456-426614174003";
+  let first: import("../src/core/codex-tasks.js").TaskRef | null = null;
+  let seen = 0;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async task => {
+      seen++;
+      if (first === null) { first = task; return "active"; }
+      const previous = s.store.managedOwner(first);
+      assert.ok(previous);
+      s.store.transitionManagedOwner(previous, "unavailable");
+      return "active";
+    });
+  const second = s.store.ensureBinding({ hostId: "local", threadId: "fixture-task-two",
+    title: "Second", workspace: "/fixture", updatedAt: 1 });
+  s.store.setChat(second.id, s.peerId + 1, 18);
+  for (const binding of [s.binding, second]) {
+    s.store.setValue(`task-details:${binding.id}`, { status: "running" });
+    s.store.setValue(`activity:${binding.id}`, { turnId: "fixture-turn" });
+    readyManagedRestartOwner(s.store, binding.id, binding.threadId, ownerEpoch);
+  }
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  s.desktop.inspectTask = async () => assert.fail("Desktop must not inspect managed restart tasks");
+
+  await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+
+  assert.equal(seen, 2);
+  assert.deepEqual(await readRestartIntent(root), intent);
+});
+
+test("retired managed restart snapshot never falls through to Desktop continuation", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-retired-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const ownerEpoch = "123e4567-e89b-42d3-a456-426614174004";
+  let inspected = false;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => "unclaimed");
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+  readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, ownerEpoch);
+  const intent = await captureRestartIntent(s.store, root, 1234);
+  const current = s.store.managedOwner(s.binding);
+  assert.ok(current);
+  s.store.retireManagedOwner(s.store.transitionManagedOwner(current, "handoff_pending"));
+  s.desktop.inspectTask = async () => { inspected = true; return { status: "interrupted" } as never; };
+
+  await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+
+  assert.equal(inspected, false);
+  assert.deepEqual(await readRestartIntent(root), intent);
   assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
 });
 

@@ -3,11 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
 import test, { afterEach } from 'node:test';
 import type { ManagedOwnerBinding } from '../src/bridge/store.js';
-import { ManagedOwnerObservedTaskStateTransport, type ManagedOwnerRouteObserver } from
+import { inspectManagedRestartTurn, ManagedOwnerObservedTaskStateTransport, type ManagedOwnerRouteObserver } from
   '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { ManagedWorkerStateTransport } from '../src/codex/managed-worker-state-transport.js';
 import type { TaskRef } from '../src/core/codex-tasks.js';
 import type { TaskStateTransport } from '../src/core/task-state.js';
+import type { RestartTaskSnapshot } from '../src/desktop/restart-intent.js';
 
 const task: TaskRef = { hostId: 'local', threadId: randomUUID(), sourceId: 'vk' };
 const epoch = randomUUID();
@@ -18,6 +19,10 @@ const claim: ManagedOwnerBinding = Object.freeze({ id: randomUUID(), bindingId: 
   evidence: { backendGeneration: 2, registryRevision: 4, endpointRef: randomUUID(),
     host: { pid: 11, birthTicks: '1' }, backend: { pid: 12, birthTicks: '2' } },
   createdAt: 1, updatedAt: 1 });
+const restart = (activeTurnId: string, overrides: Partial<RestartTaskSnapshot> = {}): RestartTaskSnapshot => ({
+  ...task, bindingId: claim.bindingId, title: 'fixture', generation: 1, activeTurnId,
+  ownerEpoch: epoch, ownerClaimId: claim.id, ownerClaimRevision: claim.revision, ...overrides,
+});
 const state = () => ({ kind: 'app-server', threadId: task.threadId, title: null, cwd: 'D:/managed',
   model: 'gpt-6-sol', effort: 'low', runtimeStatus: 'idle', context: null, questions: [], turns: [],
   createdAt: 1, updatedAt: 1 });
@@ -79,6 +84,35 @@ test('lazily proves status then observes an exact loopback worker stream', async
   assert.equal(resolveCalls, 0);
   await stream.start(); await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(seen, [true, false]); assert.equal(resolveCalls, 1); await stream.verifyOwner(); transport.close();
+});
+
+test('restart inspection proves only the exact turn in the captured owner epoch', async () => {
+  const turnId = randomUUID();
+  const port = await loopback(socket => socket.write(line({ ...frame('snapshot', 0), state: {
+    ...state(), runtimeStatus: 'active', turns: [{ id: turnId, status: 'inProgress', startedAt: 2, items: [] }],
+  } })));
+  const observed = resolver(port, () => true);
+  assert.equal(await inspectManagedRestartTurn(observed, task, restart(turnId)), 'active');
+  assert.equal(await inspectManagedRestartTurn(observed, task, restart(turnId, { ownerEpoch: randomUUID() })), 'unknown');
+  assert.equal(await inspectManagedRestartTurn(observed, task, restart(turnId, { ownerClaimRevision: claim.revision + 1 })), 'unknown');
+  assert.equal(await inspectManagedRestartTurn(observed, task, restart(randomUUID())), 'unknown');
+  assert.equal(await inspectManagedRestartTurn(observed, task, restart(turnId, { ownerEpoch: '' })), 'unknown');
+});
+
+test('restart inspection recognizes an exact terminal turn without resubmitting it', async () => {
+  const turnId = randomUUID();
+  const port = await loopback(socket => socket.write(line({ ...frame('snapshot', 0), state: {
+    ...state(), turns: [{ id: turnId, status: 'completed', startedAt: 2, items: [] }],
+  } })));
+  assert.equal(await inspectManagedRestartTurn(resolver(port, () => true), task, restart(turnId)), 'settled');
+});
+
+test('restart inspection retains an exact interrupted turn for explicit managed recovery', async () => {
+  const turnId = randomUUID();
+  const port = await loopback(socket => socket.write(line({ ...frame('snapshot', 0), state: {
+    ...state(), turns: [{ id: turnId, status: 'interrupted', startedAt: 2, items: [] }],
+  } })));
+  assert.equal(await inspectManagedRestartTurn(resolver(port, () => true), task, restart(turnId)), 'unknown');
 });
 
 test('concurrent starts share one status proof and one loopback state socket', async () => {

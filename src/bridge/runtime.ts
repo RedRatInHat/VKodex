@@ -24,6 +24,9 @@ export interface BridgeRuntimeAdapters {
   readonly observe: TaskStateObserver;
   readonly history: TaskHistoryRecovery;
   readonly inspectExternalOwner?: (task: TaskRef) => Promise<"idle" | "active" | "systemError" | null>;
+  /** Read-only exact worker turn proof; 'unknown' must never route to Desktop. */
+  readonly inspectManagedRestartTurn?: (task: TaskRef, snapshot: RestartTaskSnapshot) =>
+    Promise<"unclaimed" | "active" | "settled" | "unknown">;
 }
 
 interface MaintenanceJob {
@@ -109,6 +112,7 @@ export class BridgeRuntime {
   private readonly observeTaskState: TaskStateObserver;
   private readonly historyRecovery: TaskHistoryRecovery;
   private readonly inspectExternalOwner: BridgeRuntimeAdapters["inspectExternalOwner"];
+  private readonly inspectManagedRestartTurn: BridgeRuntimeAdapters["inspectManagedRestartTurn"];
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, chat: BridgeChat, private readonly store: BridgeStore,
     adapters: BridgeRuntimeAdapters, private readonly now: () => number = Date.now, fileRoot?: string,
@@ -121,6 +125,7 @@ export class BridgeRuntime {
     this.observeTaskState = adapters.observe;
     this.historyRecovery = adapters.history;
     this.inspectExternalOwner = adapters.inspectExternalOwner;
+    this.inspectManagedRestartTurn = adapters.inspectManagedRestartTurn;
     for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
     this.gate = new AccessGate(access, store);
     this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits, stagedFilePilot) : undefined;
@@ -408,6 +413,7 @@ export class BridgeRuntime {
     // needs continuation; the value in SQLite is the pre-restart state.
     await this.tick(false);
     const pending: RestartTaskSnapshot[] = [];
+    const verifiedManaged: RestartTaskSnapshot[] = [];
     for (const snapshot of intent.tasks) {
       const binding = this.store.getBinding(snapshot.bindingId);
       if (!binding || !binding.attached || binding.peerId === null || !sameTask(binding, snapshot)
@@ -415,6 +421,27 @@ export class BridgeRuntime {
       const eventId = `restart-recovery:${intent.id}:${binding.id}`;
       const inputKey = JSON.stringify([binding.peerId, eventId]);
       if (this.store.inputSettled(inputKey)) continue;
+      // A managed worker belongs to its captured epoch, not the Desktop owner.
+      // Only an authenticated exact-turn snapshot can retire this intent.
+      try {
+        const managed = await this.inspectManagedRestartTurn?.(binding, snapshot);
+        if (managed === "active" || managed === "settled") {
+          const current = this.store.managedOwner(binding);
+          if (current?.state === "ready" && snapshot.ownerEpoch &&
+            current.ownerEpoch === snapshot.ownerEpoch && current.id === snapshot.ownerClaimId &&
+            current.revision === snapshot.ownerClaimRevision) {
+            verifiedManaged.push(snapshot); continue;
+          }
+          pending.push(snapshot); continue;
+        }
+        if (managed === "unknown") { pending.push(snapshot); continue; }
+      } catch { pending.push(snapshot); continue; }
+      // A captured managed claim must never become a native continuation just
+      // because its worker was retired or the registry temporarily vanished.
+      if (snapshot.ownerEpoch || snapshot.ownerClaimId || snapshot.ownerClaimRevision !== undefined) {
+        pending.push(snapshot); continue;
+      }
+      if (this.store.managedOwner(binding)) { pending.push(snapshot); continue; }
       // A live Desktop/VS Code owner kept its turn through the bridge restart.
       // Do not resume that task through the profile writer or send a duplicate
       // continuation while the owner is still working.
@@ -438,6 +465,16 @@ export class BridgeRuntime {
       this.store.enqueue(`restart-recovery-note:${intent.id}:${binding.id}`, binding.peerId, {
         text: "VKodex восстановил эту задачу после контролируемого перезапуска и отправил один запрос на продолжение.", silent: true,
       }, binding.id);
+    }
+    // Earlier proofs cannot authorize archiving the whole intent after a
+    // later task's asynchronous inspection changed their owner claims.
+    for (const snapshot of verifiedManaged) {
+      const binding = this.store.getBinding(snapshot.bindingId);
+      const current = binding && this.store.managedOwner(binding);
+      if (!binding || !binding.attached || binding.peerId === null || !sameTask(binding, snapshot) ||
+        this.store.streamGeneration(binding.id) !== snapshot.generation || current?.state !== "ready" ||
+        current.ownerEpoch !== snapshot.ownerEpoch || current.id !== snapshot.ownerClaimId ||
+        current.revision !== snapshot.ownerClaimRevision) pending.push(snapshot);
     }
     if (pending.length) throw new Error(`Restart recovery is waiting for ${pending.length} Codex task owner(s)`);
     await archiveRestartIntent(dataDir, intent);

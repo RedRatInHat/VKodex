@@ -20,6 +20,7 @@ import { createAppServerProfileOwner, createDetachedAppServerProfileOwner } from
 import { observeAppServerTaskState } from "./codex/app-server-task-state.js";
 import { inspectThroughOwner } from "./desktop/owner-channel.js";
 import { ManagedOwnerRouteResolver } from "./bridge/managed-owner-route-resolver.js";
+import { inspectManagedRestartTurn } from "./bridge/managed-owner-observed-task-state-transport.js";
 import { createDesktopRouting } from "./desktop/desktop-routing.js";
 
 const formatFatalDetail = (value: unknown): string => {
@@ -76,7 +77,10 @@ const observe = (state: import("./core/task-state.js").TaskState,
     ? observeAppServerTaskState(state, previous, now, options) : observeTaskState(state, previous, now, options);
 const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
   { states, observe, history: new RolloutTaskHistoryRecovery(),
-    inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId) }, undefined,
+    inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId),
+    inspectManagedRestartTurn: (task, snapshot) => managedResolver.owns(task)
+      ? inspectManagedRestartTurn(managedResolver, task, snapshot)
+      : Promise.resolve("unclaimed" as const) }, undefined,
   path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits,
   config.stagedFilePilot);
 const startedAt = Date.now();
