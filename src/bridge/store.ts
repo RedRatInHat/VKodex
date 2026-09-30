@@ -14,6 +14,9 @@ const bindingColumns = `id TEXT PRIMARY KEY, host_id TEXT NOT NULL, thread_id TE
   source_id TEXT NOT NULL DEFAULT '', source_label TEXT, rollout_path TEXT,
   UNIQUE(host_id, thread_id, source_id)`;
 
+/** @internal Keep the per-tick transfer scan on the indexed key prefix. */
+export const TRANSFER_SCAN_SQL = "SELECT value FROM bridge_values WHERE key GLOB 'transfer:*'";
+
 export function migrateBindingSources(db: Database): void {
   if ((db.prepare("PRAGMA table_info(bridge_bindings)").all() as { name: string }[]).some(column => column.name === "source_id")) return;
   const foreignKeys = db.pragma("foreign_keys", { simple: true });
@@ -572,7 +575,9 @@ export class BridgeStore {
   transfer(id: string): TaskTransferRecord | null { return this.getValue<TaskTransferRecord>(`transfer:${id}`); }
 
   transfers(): readonly TaskTransferRecord[] {
-    return (this.db.prepare("SELECT value FROM bridge_values WHERE key LIKE 'transfer:%'").all() as { value: string }[])
+    // GLOB's literal prefix uses the key index; LIKE scans the entire values
+    // journal with SQLite's default case-insensitive collation on every tick.
+    return (this.db.prepare(TRANSFER_SCAN_SQL).all() as { value: string }[])
       .map(row => JSON.parse(row.value) as TaskTransferRecord).filter(Boolean);
   }
 
