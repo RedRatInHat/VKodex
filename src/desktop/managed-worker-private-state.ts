@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -174,11 +174,13 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
   input.fill(0);
   let helper: ReturnType<typeof spawn>;
   try {
-    const sourceMode = import.meta.url.endsWith(".ts");
+    // tsx may expose a .js import.meta.url while resolving the module from
+    // src/*.ts. Detect the physical source sibling instead of the URL suffix.
+    const sourceHelper = fileURLToPath(new URL("./managed-worker-powershell-worker.ts", import.meta.url));
+    const sourceMode = existsSync(sourceHelper);
     const helperPath = fileURLToPath(new URL(sourceMode ? "../../dist/src/desktop/managed-worker-powershell-worker.js" :
       "./managed-worker-powershell-worker.js", import.meta.url));
     if (sourceMode) {
-      const sourceHelper = fileURLToPath(new URL("./managed-worker-powershell-worker.ts", import.meta.url));
       const built = statSync(helperPath), source = statSync(sourceHelper);
       if (!built.isFile() || built.mtimeMs < source.mtimeMs)
         throw new Error("Protected helper build is unavailable or stale");
