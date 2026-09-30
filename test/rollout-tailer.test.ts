@@ -86,6 +86,54 @@ test("rollout tailer advances through one visible record larger than a read bloc
   assert.deepEqual(events, [{ type: "final", id: "large", turnId: "turn", text: answer }]);
 });
 
+test("durable cursor resumes after a multi-block scan without replaying completed records", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  const first = line("2026-09-03T10:00:00.000Z", message("first", "turn", "final_answer", "large ".repeat(80)));
+  await writeFile(rollout, first);
+  const reader = new RolloutTailer(64, 64, 2048);
+  const seen = [];
+  for (let i = 0; i < 20; i++) seen.push(...await reader.poll(task(rollout), 0));
+  assert.deepEqual(seen.map(event => event.id), ["first"]);
+  const cursor = reader.durableCursor(task(rollout));
+  assert.equal(cursor?.offset, Buffer.byteLength(first));
+  assert.ok(cursor && cursor.anchorLength > 0 && cursor.anchorLength <= 64);
+
+  const restarted = new RolloutTailer(64, 64, 2048);
+  assert.equal(await restarted.restore(task(rollout), cursor!), true);
+  assert.deepEqual(await restarted.poll(task(rollout), 0), []);
+  await appendFile(rollout, line("2026-09-03T10:01:00.000Z", message("second", "turn", "final_answer", "new")));
+  const after = [];
+  for (let i = 0; i < 6; i++) after.push(...await restarted.poll(task(rollout), 0));
+  assert.deepEqual(after.map(event => event.id), ["second"]);
+});
+
+test("durable cursor stays before an incomplete record and resumes it after restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  const first = line("2026-09-03T10:00:00.000Z", message("first", "turn", "final_answer", "first"));
+  const second = line("2026-09-03T10:01:00.000Z", message("second", "turn", "final_answer", "second"));
+  await writeFile(rollout, first + second.slice(0, -8));
+  const reader = new RolloutTailer(4096, 4096);
+  assert.deepEqual((await reader.poll(task(rollout), 0)).map(event => event.id), ["first"]);
+  const cursor = reader.durableCursor(task(rollout));
+  assert.equal(cursor?.offset, Buffer.byteLength(first));
+  await appendFile(rollout, second.slice(-8));
+  const restarted = new RolloutTailer();
+  assert.equal(await restarted.restore(task(rollout), cursor!), true);
+  assert.deepEqual((await restarted.poll(task(rollout), 0)).map(event => event.id), ["second"]);
+});
+
+test("changed rollout prefix rejects a stale durable cursor and falls back to the since scan", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
+  await writeFile(rollout, line("2026-09-03T10:00:00.000Z", message("first", "turn", "final_answer", "old")));
+  const reader = new RolloutTailer();
+  await reader.poll(task(rollout), 0);
+  const cursor = reader.durableCursor(task(rollout));
+  await writeFile(rollout, line("2026-09-03T10:00:00.000Z", message("other", "new!", "final_answer", "new")));
+  const restarted = new RolloutTailer();
+  assert.equal(await restarted.restore(task(rollout), cursor!), false);
+  assert.deepEqual((await restarted.poll(task(rollout), 0)).map(event => event.id), ["other"]);
+});
+
 test("oversized rollout records fail explicitly instead of leaving the recovery cursor stuck", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
   await writeFile(rollout, line("2026-09-03T10:00:00.000Z", message("too-large", "turn", "final_answer", "x".repeat(1024))));

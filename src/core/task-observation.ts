@@ -2,6 +2,14 @@ import type { CodexQuestions } from "./codex-questions.js";
 import type { TaskDetails, TaskEvent } from "./codex-tasks.js";
 import type { TaskState } from "./task-state.js";
 
+/** Last complete LF-terminated rollout record committed with projected events. */
+export interface RolloutCursorCheckpoint {
+  readonly version: 1;
+  readonly offset: number;
+  readonly anchorLength: number;
+  readonly anchorSha256: string;
+}
+
 export interface TaskObservationCheckpoint {
   readonly since: number;
   readonly lastObservedAt?: number;
@@ -10,6 +18,8 @@ export interface TaskObservationCheckpoint {
   readonly seen: Readonly<Record<string, string>>;
   readonly semanticByIdentity?: Readonly<Record<string, string>>;
   readonly rolloutPath?: string;
+  /** Valid only for rolloutPath; never contains source file bytes. */
+  readonly rolloutCursor?: RolloutCursorCheckpoint;
   /** Explicit scheduler visibility policy, independent of turn initiation. */
   readonly quietTurnIds?: readonly string[];
 }

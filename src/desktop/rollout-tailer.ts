@@ -1,9 +1,12 @@
 import { open, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { normalize } from "node:path";
 import type { TaskEvent, TaskRef } from "./contracts.js";
+import type { RolloutCursorCheckpoint } from "../core/task-observation.js";
 import { isAutomationHeartbeatInput, visibleAutomationHeartbeatOutput } from "../core/automation-heartbeat.js";
 
-interface Cursor { readonly offset: number; readonly pending: Buffer; readonly anchor: Buffer; }
+interface Cursor { readonly offset: number; readonly pending: Buffer; readonly anchor: Buffer;
+  readonly durable: RolloutCursorCheckpoint | null; }
 
 interface RolloutRecord {
   readonly timestamp: number;
@@ -36,6 +39,28 @@ export class RolloutTailer {
     this.quiet.delete(key);
   }
   quietTurnIds(task: TaskRef): readonly string[] { return this.quiet.get(this.key(task)) ?? []; }
+  durableCursor(task: TaskRef): RolloutCursorCheckpoint | null { return this.cursors.get(this.key(task))?.durable ?? null; }
+
+  /** Restore only a verified complete-record boundary. Invalid tokens leave the normal since scan in charge. */
+  async restore(task: TaskRef, token: RolloutCursorCheckpoint): Promise<boolean> {
+    const key = this.key(task);
+    if (this.cursors.has(key) || !task.rolloutPath || !validToken(token)) return false;
+    const generation = this.generations.get(key) ?? 0;
+    const path = rolloutPath(task.rolloutPath);
+    try {
+      const info = await stat(path);
+      if (!info.isFile() || token.offset > info.size) return false;
+      const anchor = Buffer.allocUnsafe(token.anchorLength);
+      const handle = await open(path, "r");
+      let bytesRead: number;
+      try { ({ bytesRead } = await handle.read(anchor, 0, anchor.length, token.offset - anchor.length)); }
+      finally { await handle.close(); }
+      if (bytesRead !== anchor.length || anchor.at(-1) !== 0x0a || digest(anchor) !== token.anchorSha256
+        || (this.generations.get(key) ?? 0) !== generation) return false;
+      this.cursors.set(key, { offset: token.offset, pending: Buffer.alloc(0), anchor, durable: token });
+      return true;
+    } catch { return false; }
+  }
 
   async poll(task: TaskRef, since: number, knownQuietTurns: readonly string[] = []): Promise<readonly TaskEvent[]> {
     const key = this.key(task);
@@ -74,7 +99,8 @@ export class RolloutTailer {
     const complete = last < 0 ? Buffer.alloc(0) : data.subarray(0, last);
     if (complete.length > this.maxRecordBytes && !complete.includes(0x0a)) throw new RolloutRecordTooLargeError();
     if (last < 0) {
-      this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending), anchor: this.anchor(buffer, bytesRead) });
+      this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending),
+        anchor: this.anchor(buffer, bytesRead), durable: saved && !fresh ? saved.durable : null });
       return [];
     }
     const lines = complete.toString("utf8").split("\n");
@@ -87,7 +113,12 @@ export class RolloutTailer {
         && !(record.event.type === "progress" && quietTurns.has(record.event.turnId))) events.push(record.event);
     }
     this.quiet.set(key, [...quietTurns].slice(-256));
-    this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending), anchor: this.anchor(buffer, bytesRead) });
+    const offset = start + bytesRead - pending.length;
+    const anchor = data.subarray(Math.max(0, last + 1 - 64), last + 1);
+    const durable: RolloutCursorCheckpoint = { version: 1, offset, anchorLength: anchor.length,
+      anchorSha256: digest(anchor) };
+    this.cursors.set(key, { offset: start + bytesRead, pending: Buffer.from(pending),
+      anchor: this.anchor(buffer, bytesRead), durable });
     return events;
   }
 
@@ -134,6 +165,17 @@ export class RolloutTailer {
   }
 
   private key(task: TaskRef): string { return JSON.stringify([task.sourceId ?? "", task.threadId, task.rolloutPath ?? ""]); }
+}
+
+function digest(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
+
+function validToken(value: unknown): value is RolloutCursorCheckpoint {
+  if (!value || typeof value !== "object") return false;
+  const token = value as Partial<RolloutCursorCheckpoint>;
+  return token.version === 1 && Number.isSafeInteger(token.offset) && token.offset! > 0
+    && Number.isSafeInteger(token.anchorLength) && token.anchorLength! >= 1 && token.anchorLength! <= 64
+    && token.anchorLength! <= token.offset! && typeof token.anchorSha256 === "string"
+    && /^[a-f0-9]{64}$/u.test(token.anchorSha256);
 }
 
 export class RolloutRecordTooLargeError extends Error {

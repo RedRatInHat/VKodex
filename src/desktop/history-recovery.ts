@@ -11,6 +11,7 @@ export type { TaskHistoryRecovery, TaskHistoryRecoveryResult } from "../core/tas
 export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
   private readonly enabled = new Map<string, number>();
   private readonly pollAfter = new Map<string, number>();
+  private readonly restoredPath = new Map<string, string>();
 
   constructor(private readonly tailer = new RolloutTailer()) {}
 
@@ -22,6 +23,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
   disable(id: string, task: TaskRef): void {
     this.enabled.delete(id);
     this.pollAfter.delete(id);
+    this.restoredPath.delete(id);
     this.tailer.clear(task);
   }
 
@@ -39,6 +41,12 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
     const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
       oldestAcceptedAt ?? Infinity, Math.max(enabledSince, currentEpoch));
     try {
+      const path = task.rolloutPath ? comparablePath(task.rolloutPath) : "";
+      if (this.restoredPath.get(id) !== path) {
+        this.restoredPath.set(id, path);
+        if (path && checkpoint?.rolloutCursor && checkpoint.rolloutPath
+          && comparablePath(checkpoint.rolloutPath) === path) await this.tailer.restore(task, checkpoint.rolloutCursor);
+      }
       const events = await this.tailer.poll(task, since, checkpoint?.quietTurnIds);
       // A rebuilt rollout contains both the old branch and anything that was
       // written directly in Codex while VKodex was detached.  The old code
@@ -56,6 +64,8 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
         semanticByIdentity: checkpoint?.semanticByIdentity ?? {},
         ...(this.tailer.quietTurnIds(task).length ? { quietTurnIds: this.tailer.quietTurnIds(task) } : {}),
         ...(task.rolloutPath ? { rolloutPath: comparablePath(task.rolloutPath) } : {}),
+        ...(task.rolloutPath && this.tailer.durableCursor(task)
+          ? { rolloutCursor: this.tailer.durableCursor(task)! } : {}),
       };
       return { events: visible, historyRebuilt, checkpoint: nextCheckpoint, failure: null };
     } catch (error) {

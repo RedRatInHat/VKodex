@@ -178,5 +178,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
   return { checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen, semanticByIdentity,
-    ...(quietTurns.size ? { quietTurnIds: [...quietTurns].slice(-256) } : {}), ...(rolloutPath ? { rolloutPath } : {}) }, events };
+    ...(quietTurns.size ? { quietTurnIds: [...quietTurns].slice(-256) } : {}), ...(rolloutPath ? { rolloutPath } : {}),
+    ...(rolloutPath && previous?.rolloutPath && comparablePath(previous.rolloutPath) === rolloutPath && previous.rolloutCursor
+      ? { rolloutCursor: previous.rolloutCursor } : {}) }, events };
 }

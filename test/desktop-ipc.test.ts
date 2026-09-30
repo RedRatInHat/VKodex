@@ -531,6 +531,42 @@ test("a transferred binding never replays copied history from its old fallback e
   assert.deepEqual(result?.events.filter(event => event.type === "final").map(event => event.text), ["New target answer"]);
 });
 
+test("history recovery restores a matching durable cursor and rejects it for a rotated rollout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-cursor-recovery-"));
+  const oldPath = path.join(root, "old.jsonl"), newPath = path.join(root, "new.jsonl");
+  const first = rolloutFinal(101_000, "first", "turn", "First");
+  const second = rolloutFinal(102_000, "second", "turn", "Second");
+  await writeFile(oldPath, first);
+  const original = new RolloutTailer();
+  await original.poll({ ...ref, rolloutPath: oldPath }, 0);
+  const token = original.durableCursor({ ...ref, rolloutPath: oldPath });
+  assert.ok(token);
+  await writeFile(newPath, first + second);
+  const checkpoint = { since: 0, activeAtAttach: [], seen: {}, rolloutPath: comparablePath(oldPath), rolloutCursor: token! };
+
+  const same = new RolloutTaskHistoryRecovery();
+  same.enable("same", 0);
+  const onSame = await same.poll("same", { ...ref, rolloutPath: oldPath }, checkpoint, null, new Set(), 200_000);
+  assert.deepEqual(onSame?.events, []);
+  assert.equal(onSame?.checkpoint?.rolloutCursor?.offset, token!.offset);
+
+  const rotated = new RolloutTaskHistoryRecovery();
+  rotated.enable("rotated", 0);
+  const onNew = await rotated.poll("rotated", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 200_000);
+  assert.deepEqual(onNew?.events.map(event => event.id), ["first", "second"]);
+  assert.equal(onNew?.checkpoint?.rolloutPath, comparablePath(newPath));
+});
+
+test("native projector preserves the cursor only while the rollout path is unchanged", () => {
+  const rolloutPath = "C:/profiles/work/sessions/base.jsonl";
+  const token = { version: 1 as const, offset: 123, anchorLength: 32, anchorSha256: "a".repeat(64) };
+  const previous = { since: 100, activeAtAttach: [], seen: {}, rolloutPath: comparablePath(rolloutPath), rolloutCursor: token };
+  const unchanged = projectSnapshot({ rolloutPath, turns: [] }, previous, 200);
+  assert.deepEqual(unchanged.checkpoint.rolloutCursor, token);
+  const rotated = projectSnapshot({ rolloutPath: "C:/profiles/work/sessions/edited.jsonl", turns: [] }, unchanged.checkpoint, 300);
+  assert.equal(rotated.checkpoint.rolloutCursor, undefined);
+});
+
 test("runtime reconciles an uncertain prompt from Codex history after restart", async t => {
   const s = runtimeSetup(t);
   const operationId = "recovered-vk-operation";
