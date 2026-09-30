@@ -530,6 +530,7 @@ export class TaskFiles {
     if (!Number.isSafeInteger(now) || now < 0) return Promise.reject(new RangeError("Invalid stage audit time"));
     const work = Promise.resolve().then(() => {
       let eligibleCount = 0; let ineligibleCount = 0;
+      if (this.stopped || this.maintenanceStopped) return { eligibleCount, ineligibleCount };
       for (const row of this.store.nextStageAuditCandidates(limit)) {
         if (this.stopped || this.maintenanceStopped) break;
         if (this.stageLedgerEligible(row, now)) eligibleCount++; else ineligibleCount++;

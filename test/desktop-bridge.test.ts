@@ -3403,6 +3403,12 @@ test("bounded stage ledger audit is read-only and uses a cursor separate from re
   assert.equal(s.store.stageReservedCount(), 2);
   assert.equal(s.store.getValue("stage-recycle-cursor"), null);
   assert.ok(s.store.getValue("stage-audit-cursor"));
+  s.store.setValue("stage-audit-cursor", null);
+  const stoppedAudit = files.auditStagedArtifactsBatch(now, 8);
+  await files.stop();
+  await stoppedAudit;
+  assert.equal(s.store.getValue("stage-audit-cursor"), null,
+    "a stopped maintenance task must not advance an unexamined audit page");
 });
 
 test("stopping staged maintenance waits for its in-flight recycle without starting the next file", async t => {
