@@ -4196,6 +4196,35 @@ test("a corrupt durable stage fails closed even when the source is still availab
   assert.equal(s.chat.binaryUploads.length, 0);
 });
 
+test("a corrupt staged version does not strand a valid sibling or fall back to source bytes", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-corrupt-stage-sibling-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "corrupt-stage-sibling", []);
+  files.finish(binding.id, "corrupt-stage-sibling", "accepted", "finished-turn");
+  await writeFile(path.join(prepared.outboxDir, "a-corrupt.txt"), "first version");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":upload-state") && value === "uploading") throw new Error("executor lost before VK upload");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding, true), /executor lost/u);
+  crash.mock.restore();
+  const staged = s.store.getValue<Record<string, { key: string; path: string }>>(`file-stage-index:${binding.id}:corrupt-stage-sibling`)!;
+  const corrupt = Object.values(staged)[0]!;
+  await writeFile(corrupt.path, "corrupt bytes");
+  await writeFile(path.join(prepared.outboxDir, "b-valid.txt"), "valid bytes");
+
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  assert.equal(await restored.collect(binding, true), 1);
+  assert.deepEqual(s.chat.binaryUploads.map(upload => upload.name), ["b-valid.txt"]);
+  assert.ok(s.store.pendingDeliveries().some(delivery => delivery.key === `${corrupt.key}:stage-error`));
+  const batch = s.store.pendingDeliveries().find(delivery => delivery.key.startsWith(`files:${binding.id}:corrupt-stage-sibling:`));
+  assert.deepEqual(batch?.view.attachments, ["doc-202_1"]);
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(item => item.view.attachments?.join(",") === "doc-202_1"));
+  assert.ok(s.chat.sent.some(item => /Staged-версия файла «a-corrupt\.txt» отсутствует или повреждена/u.test(item.view.text)));
+});
+
 test("a staged receipt cannot change the uploaded filename or file kind", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-metadata-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);

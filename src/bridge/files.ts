@@ -82,6 +82,7 @@ class OutputFilesError extends ActionRejectedError {
   constructor(message: string, readonly retryable = false) { super(message); this.name = "OutputFilesError"; }
 }
 class StageQuotaError extends ActionRejectedError {}
+class StageContentUnavailableError extends ActionRejectedError {}
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const positiveDecimal = (value: unknown): value is string => typeof value === "string" && /^[1-9]\d*$/u.test(value);
 const validStageIdentity = (value: unknown): value is StageIdentity => {
@@ -461,7 +462,7 @@ export class TaskFiles {
         throw new Error("corrupt stage file");
       return contents;
     } catch {
-      throw new ActionRejectedError(`Staged-версия файла «${receipt.name}» отсутствует или повреждена; загрузка остановлена. Исходный файл не будет использован вместо неё.`);
+      throw new StageContentUnavailableError(`Staged-версия файла «${receipt.name}» отсутствует или повреждена; загрузка остановлена. Исходный файл не будет использован вместо неё.`);
     } finally { await handle?.close(); }
   }
   private async stageFile(file: OutputFile, relativePath: string, fingerprint: string, key: string, job: FileJob, binding: Binding): Promise<StagedFile> {
@@ -725,6 +726,7 @@ export class TaskFiles {
     const uploadFile = this.chat.uploadFile.bind(this.chat);
     let count = 0; let unknownFiles = 0; let retryableFailure: OutputFilesError | null = null;
     let quotaFailure: ActionRejectedError | null = null;
+    let stageFailure: ActionRejectedError | null = null;
     let unknownFailure: ActionRejectedError | null = null;
     const completedTurns = this.terminalTurns(binding.id);
     const eligible = this.jobs(binding.id).filter(job => {
@@ -742,6 +744,8 @@ export class TaskFiles {
       const scanned = this.store.getValue<Record<string, { fingerprint: string; key: string }>>(metadataKey) ?? {};
       const pending: { name: string; key: string; attachment: string; bytes: number }[] = [];
       const processed = new Set<string>();
+      const blockedStageKeys = new Set<string>();
+      const blockedStageSources = new Map<string, string>();
       let pendingBytes = 0;
       const quotaBlocked = (key: string, name: string, message: string): void => {
         this.store.atomic(() => {
@@ -783,6 +787,7 @@ export class TaskFiles {
             ? JSON.stringify([relativePath.replaceAll(path.sep, "/"), contentHash])
             : file.name + ":" + contentHash;
           const key = `file:${binding.id}:${job.operationId}:${digest(identity)}`;
+          if (blockedStageKeys.has(key)) return;
           if (processed.has(key)) return;
           if (staged && (staged.key !== key || staged.sha256 !== contentHash || staged.relativePath !== relativePath))
             throw new ActionRejectedError("Квитанция staged-файла не соответствует его содержимому; загрузка остановлена.");
@@ -884,7 +889,19 @@ export class TaskFiles {
           }
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:rejected`)) continue;
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)) continue;
-          const contents = await this.stagedContents(receipt, job, binding.id);
+          let contents: Buffer;
+          try { contents = await this.stagedContents(receipt, job, binding.id); }
+          catch (error) {
+            if (!(error instanceof StageContentUnavailableError)) throw error;
+            blockedStageKeys.add(receipt.key);
+            blockedStageSources.set(receipt.relativePath, receipt.fingerprint);
+            stageFailure ??= error;
+            this.store.enqueue(`${receipt.key}:stage-error`, binding.peerId!, {
+              text: `Staged-версия файла «${receipt.name}» отсутствует или повреждена. Этот файл не отправлен; остальные файлы выдачи продолжают отправляться. Исходный файл не будет использован вместо неё.`,
+              silent: true,
+            }, binding.id);
+            continue;
+          }
           await processFile({ name: receipt.name, contents, kind: receipt.kind }, receipt.relativePath, receipt.fingerprint, receipt);
         }
         // Validate the whole tree before the first upload; this pass reads only
@@ -893,6 +910,7 @@ export class TaskFiles {
         await readOutputFiles(outbox, FILE_LIMITS, {
           allowBatchOverflow: true, skipOversizedFiles: true, skipUnsafeFiles: true, onSkippedFile: error => skipped.push(error),
           skipFile: (relativePath, fingerprint) => {
+            if (blockedStageSources.get(relativePath) === fingerprint) return true;
             const known = scanned[relativePath];
             if (!known || known.fingerprint !== fingerprint) return false;
             if (this.store.getValue<boolean>(`${known.key}:queued`)) return true;
@@ -930,6 +948,7 @@ export class TaskFiles {
     if (retryableFailure && !manual) throw retryableFailure;
     if (!count && unknownFiles) throw unknownFailure ?? new ActionRejectedError("Есть файл с неизвестным результатом загрузки в VK. Повтор остановлен, чтобы не создать дубль; проверь документы VK перед новой попыткой.");
     if (!count && quotaFailure) throw quotaFailure;
+    if (!count && stageFailure) throw stageFailure;
     return count;
   }
   tick(): Promise<void> {
