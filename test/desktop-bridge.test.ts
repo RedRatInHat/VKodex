@@ -550,15 +550,16 @@ test("task goals can be inspected, budgeted, paused, resumed and cleared without
   assert.match(panelView(s).text, /Выбери общий бюджет токенов/u);
   assert.equal(s.desktop.submissions.length, 0);
   await clickPanel(s, "250 000");
-  assert.deepEqual(s.desktop.goalUpdates[0], { objective: "Довести релиз до проверенного результата", tokenBudget: 250_000, status: "active" });
+  assert.deepEqual(s.desktop.goalUpdates[0], { objective: "Довести релиз до проверенного результата", tokenBudget: 250_000, status: "paused" });
+  assert.deepEqual(s.desktop.goalUpdates[1], { status: "active" });
   assert.equal(s.desktop.goalContinuations, 1);
   assert.match(panelView(s).text, /Статус: Выполняется[\s\S]*Бюджет: 250 000 · осталось 250 000/u);
 
   await clickPanel(s, "Пауза");
-  assert.deepEqual(s.desktop.goalUpdates[1], { status: "paused" });
+  assert.deepEqual(s.desktop.goalUpdates[2], { status: "paused" });
   assert.match(panelView(s).text, /Статус: На паузе/u);
   await clickPanel(s, "Возобновить");
-  assert.deepEqual(s.desktop.goalUpdates[2], { status: "active" });
+  assert.deepEqual(s.desktop.goalUpdates[3], { status: "active" });
   assert.equal(s.desktop.goalContinuations, 2);
 
   await clickPanel(s, "Снять цель");
@@ -569,16 +570,92 @@ test("task goals can be inspected, budgeted, paused, resumed and cleared without
   assert.equal(s.desktop.submissions.length, 0);
 });
 
-test("goal resume reports active state without claiming a turn started when the owner is absent", async t => {
+test("new goal apply saves a paused goal before continuation and never publishes active without a receipt", async t => {
+  for (const error of [new TaskNotOpenError(), new ActionRejectedError("Continuation rejected"), new UncertainActionError()]) {
+    const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+    let continuations = 0;
+    s.desktop.continueGoal = async () => { continuations++; throw error; };
+    await s.handle("/goal", peerId);
+    await clickPanel(s, "Задать цель");
+    await s.handle("A new goal", peerId);
+    await clickPanel(s, "Без лимита");
+    assert.equal(s.desktop.goal?.status, "paused");
+    assert.deepEqual(s.desktop.goalUpdates, [{ objective: "A new goal", tokenBudget: null, status: "paused" }]);
+    assert.equal(s.store.getValue<{ goalCreatedAt: number | null }>(`goal-continuation:${binding.id}`)?.goalCreatedAt,
+      s.desktop.goal!.createdAt);
+    assert.match(panelView(s).text, error instanceof UncertainActionError
+      ? /Цель сохранена на паузе, но исход запуска хода неизвестен/u
+      : /Цель сохранена на паузе; следующий ход не запущен/u);
+    if (error instanceof UncertainActionError) {
+      await s.handle("/goal", peerId);
+      await clickPanel(s, "Возобновить");
+      assert.equal(continuations, 1);
+      assert.deepEqual(s.desktop.goalUpdates, [{ objective: "A new goal", tokenBudget: null, status: "paused" }]);
+      assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "uncertain");
+    }
+  }
+});
+
+test("completed goal apply saves its replacement paused without a continuation receipt", async t => {
+  for (const error of [new TaskNotOpenError(), new ActionRejectedError("Continuation rejected"), new UncertainActionError()]) {
+    const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+    s.desktop.goal = { threadId: task.threadId, objective: "Completed", status: "complete",
+      tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+    s.desktop.continueGoal = async () => { throw error; };
+    await s.handle("/goal", peerId);
+    await clickPanel(s, "Новая цель");
+    await s.handle("Replacement goal", peerId);
+    await clickPanel(s, "Без лимита");
+    assert.equal(s.desktop.goal?.status, "paused");
+    assert.deepEqual(s.desktop.goalUpdates, [{ objective: "Replacement goal", tokenBudget: null, status: "paused" }]);
+    assert.equal(s.store.getValue<{ goalCreatedAt: number | null }>(`goal-continuation:${binding.id}`)?.goalCreatedAt,
+      s.desktop.goal!.createdAt);
+    assert.match(panelView(s).text, error instanceof UncertainActionError
+      ? /Цель сохранена на паузе, но исход запуска хода неизвестен/u
+      : /Цель сохранена на паузе; следующий ход не запущен/u);
+  }
+});
+
+test("new goal apply saves paused, receives a continuation receipt, then publishes active status", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  const calls: string[] = [];
+  const originalSet = s.desktop.setGoal.bind(s.desktop);
+  s.desktop.continueGoal = async () => { calls.push("continue"); return { mode: "started", turnId: "new-goal-turn" }; };
+  s.desktop.setGoal = async (ref, update) => { calls.push(update.status === "paused" ? "set-paused" : "set-active"); return originalSet(ref, update); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Задать цель");
+  await s.handle("A new goal", peerId);
+  await clickPanel(s, "Без лимита");
+  assert.deepEqual(calls, ["set-paused", "continue", "set-active"]);
+  assert.deepEqual(s.desktop.goalUpdates, [
+    { objective: "A new goal", tokenBudget: null, status: "paused" }, { status: "active" },
+  ]);
+});
+
+test("goal resume leaves a paused goal unchanged when the owner is absent", async t => {
   const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
   s.desktop.continueGoal = async () => { throw new TaskNotOpenError(); };
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
-  assert.equal(s.desktop.goal?.status, "active");
-  assert.match(panelView(s).text, /следующий ход не запущен/u);
-  assert.doesNotMatch(panelView(s).text, /продолжит её автоматически/u);
+  assert.equal(s.desktop.goal?.status, "paused");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
+test("goal resume leaves its prior status unchanged when continuation is rejected or uncertain", async t => {
+  for (const error of [new ActionRejectedError("Continuation rejected"), new UncertainActionError()]) {
+    const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+    s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "blocked",
+      tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+    s.desktop.continueGoal = async () => { throw error; };
+    await s.handle("/goal", peerId);
+    await clickPanel(s, "Возобновить");
+    assert.equal(s.desktop.goal?.status, "blocked");
+    assert.deepEqual(s.desktop.goalUpdates, []);
+    assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase,
+      error instanceof UncertainActionError ? "uncertain" : "rejected");
+  }
 });
 
 test("goal resume records a scoped start attempt before submission and keeps an uncertain result", async t => {
@@ -607,7 +684,10 @@ test("goal resume durably records the confirmed continuation turn", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
-  s.desktop.continueGoal = async () => ({ mode: "started" as const, turnId: "goal-turn-1" });
+  const calls: string[] = [];
+  const originalSet = s.desktop.setGoal.bind(s.desktop);
+  s.desktop.continueGoal = async () => { calls.push("continue"); return { mode: "started" as const, turnId: "goal-turn-1" }; };
+  s.desktop.setGoal = async (ref, update) => { calls.push("set-active"); return originalSet(ref, update); };
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   assert.deepEqual(s.store.getValue(`goal-continuation:${binding.id}`), {
@@ -616,41 +696,50 @@ test("goal resume durably records the confirmed continuation turn", async t => {
     receipt: { mode: "started", turnId: "goal-turn-1" },
   });
   assert.match(panelView(s).text, /Новый ход запущен/u);
+  assert.deepEqual(calls, ["continue", "set-active"]);
 });
 
 test("goal resume reports an already-running turn without claiming a new start", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
-  s.desktop.continueGoal = async () => ({ mode: "alreadyRunning" as const, turnId: "active-turn" });
+  const calls: string[] = [];
+  const originalSet = s.desktop.setGoal.bind(s.desktop);
+  s.desktop.continueGoal = async () => { calls.push("continue"); return { mode: "alreadyRunning" as const, turnId: "active-turn" }; };
+  s.desktop.setGoal = async (ref, update) => { calls.push("set-active"); return originalSet(ref, update); };
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   const marker = s.store.getValue<{ receipt: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`);
   assert.deepEqual(marker?.receipt, { mode: "alreadyRunning", turnId: "active-turn" });
   assert.match(panelView(s).text, /новый ход не запускался/u);
+  assert.deepEqual(calls, ["continue", "set-active"]);
 });
 
-test("lost goal activation acknowledgment preserves intent and blocks another start", async t => {
+test("post-receipt goal activation uncertainty preserves one continuation attempt and blocks retries", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  let continuations = 0;
+  s.desktop.continueGoal = async () => {
+    continuations++;
+    return { mode: "started", turnId: "goal-turn-once" };
+  };
   const originalSet = s.desktop.setGoal.bind(s.desktop);
   s.desktop.setGoal = async (ref, update) => {
-    assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "activating");
     await originalSet(ref, update);
     throw new UncertainActionError();
   };
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   assert.equal(s.desktop.goal?.status, "active");
-  assert.equal(s.desktop.goalContinuations, 0);
+  assert.equal(continuations, 1);
   assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "uncertain");
   await s.handle("/goal", peerId);
   assert.match(panelView(s).text, /не подтверждён/u);
   s.desktop.goal = { ...s.desktop.goal!, status: "paused" };
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
-  assert.equal(s.desktop.goalContinuations, 0);
+  assert.equal(continuations, 1);
   assert.equal(s.desktop.goalUpdates.length, 1);
 });
 
