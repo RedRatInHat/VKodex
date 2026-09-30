@@ -10,6 +10,7 @@ interface Request {
   readonly command: string;
   readonly input: Uint8Array;
   readonly inputHash: Uint8Array;
+  readonly commandHash: Uint8Array;
 }
 
 let replied = false;
@@ -37,18 +38,25 @@ process.once("message", (value: unknown) => {
       typeof value.command !== "string" || value.command.length > 16_384 ||
       !/^[A-Za-z0-9+/]*={0,2}$/u.test(value.command) || !("input" in value) ||
       !(value.input instanceof Uint8Array) || value.input.byteLength > MAX_ENCODED_INPUT_BYTES ||
-      !("inputHash" in value) || !(value.inputHash instanceof Uint8Array) || value.inputHash.byteLength !== 32) {
+      !("inputHash" in value) || !(value.inputHash instanceof Uint8Array) || value.inputHash.byteLength !== 32 ||
+      !("commandHash" in value) || !(value.commandHash instanceof Uint8Array) || value.commandHash.byteLength !== 32) {
     if (value && typeof value === "object" && "input" in value && value.input instanceof Uint8Array)
       value.input.fill(0);
     if (value && typeof value === "object" && "inputHash" in value && value.inputHash instanceof Uint8Array)
       value.inputHash.fill(0);
+    if (value && typeof value === "object" && "commandHash" in value && value.commandHash instanceof Uint8Array)
+      value.commandHash.fill(0);
     send({ ok: false, phase: "invalid-input" }); return;
   }
   const request = value as Request;
   const actualHash = createHash("sha256").update(request.input).digest();
   const inputMatches = timingSafeEqual(actualHash, Buffer.from(request.inputHash));
   actualHash.fill(0); request.inputHash.fill(0);
-  if (!inputMatches) { request.input.fill(0); send({ ok: false, phase: "input-mismatch" }); return; }
+  if (!inputMatches) { request.input.fill(0); request.commandHash.fill(0); send({ ok: false, phase: "input-mismatch" }); return; }
+  const actualCommandHash = createHash("sha256").update(request.command, "utf8").digest();
+  const commandMatches = timingSafeEqual(actualCommandHash, Buffer.from(request.commandHash));
+  actualCommandHash.fill(0); request.commandHash.fill(0);
+  if (!commandMatches) { request.input.fill(0); send({ ok: false, phase: "command-mismatch" }); return; }
   const root = process.env.SystemRoot;
   if (!root || !path.win32.isAbsolute(root)) { request.input.fill(0); send({ ok: false, phase: "spawn-throw" }); return; }
   const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -66,7 +74,16 @@ process.once("message", (value: unknown) => {
   const stdout = result.stdout;
   const stderr = result.stderr;
   if (result.error || result.status !== 0 || !Buffer.isBuffer(stdout) || stdout.byteLength > MAX_BYTES) {
-    const phase = result.error ? "process-error" : result.status === 42 ? "input-length" : `exit-${result.status}`;
+    // Classify only a fixed failure category. Never forward PowerShell text:
+    // it may contain the protected input or the unprotected output.
+    let stderrKind = "empty";
+    if (Buffer.isBuffer(stderr) && stderr.byteLength > 0) {
+      stderrKind = stderr.includes("ParserError") || stderr.includes("At line:") ? "parser" :
+        stderr.includes("Exception") || stderr.includes("InvalidOperation") || stderr.includes("ErrorRecord")
+          ? "runtime" : "other";
+    }
+    const phase = result.error ? "process-error" : result.status === 42 ? "input-length" :
+      `exit-${result.status}-${stderrKind}`;
     if (Buffer.isBuffer(stdout)) stdout.fill(0);
     if (Buffer.isBuffer(stderr)) stderr.fill(0);
     send({ ok: false, phase });

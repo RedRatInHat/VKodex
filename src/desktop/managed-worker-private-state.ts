@@ -168,6 +168,8 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
   const command = requireCompleteInput ? `$expected=${input.byteLength};${encoded}` : encoded;
   const payload = Buffer.from(input);
   const inputHash = createHash("sha256").update(payload).digest();
+  const encodedCommand = ps(command);
+  const commandHash = createHash("sha256").update(encodedCommand, "utf8").digest();
   input.fill(0);
   let helper: ReturnType<typeof spawn>;
   try {
@@ -175,23 +177,18 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
     const helperPath = fileURLToPath(new URL(sourceMode ? "./managed-worker-powershell-worker.ts" : "./managed-worker-powershell-worker.js", import.meta.url));
     helper = spawn(process.execPath, [...(sourceMode ? ["--import", "tsx"] : []), helperPath], {
       serialization: "advanced", windowsHide: true,
-      // Keep real standard handles across the extra Windows process boundary.
-      // Drain and discard them: no protected payload or diagnostics may leak.
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
       env: { ...process.env, PSModulePath: modulePath },
     });
-    helper.stdin?.end();
-    helper.stdout?.resume();
-    helper.stderr?.resume();
   } catch {
-    payload.fill(0); inputHash.fill(0);
+    payload.fill(0); inputHash.fill(0); commandHash.fill(0);
     throw new Error("Managed worker private state protection failed", { cause: { phase: "spawn-throw" } });
   }
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (result?: Uint8Array, phase = "unclassified"): void => {
       if (settled) return;
-      settled = true; clearTimeout(timeout); payload.fill(0); inputHash.fill(0);
+      settled = true; clearTimeout(timeout); payload.fill(0); inputHash.fill(0); commandHash.fill(0);
       if (result) resolve(result);
       else reject(new Error("Managed worker private state protection failed", { cause: { phase } }));
     };
@@ -203,7 +200,7 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
       if (!message || typeof message !== "object" || !("ok" in message)) return settle();
       if (message.ok !== true) {
         const phase = "phase" in message && typeof message.phase === "string" ? message.phase : "unclassified";
-        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|input-length|exit-(?:null|\d+))$/u.test(phase)
+        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|command-mismatch|input-length|exit-(?:null|\d+)(?:-(?:empty|parser|runtime|other))?)$/u.test(phase)
           ? phase : "unclassified");
       }
       const output = "output" in message ? message.output : null;
@@ -216,8 +213,8 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
     helper.once("error", () => settle(undefined, "process-error"));
     helper.once("close", code => { if (!settled) settle(undefined, `helper-exit-${code}`); });
     try {
-      helper.send({ command: ps(command), input: payload, inputHash }, error => {
-        payload.fill(0); inputHash.fill(0);
+      helper.send({ command: encodedCommand, input: payload, inputHash, commandHash }, error => {
+        payload.fill(0); inputHash.fill(0); commandHash.fill(0);
         if (error) settle(undefined, "process-error");
       });
     } catch { settle(undefined, "process-error"); }
@@ -232,7 +229,7 @@ function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
     !("phase" in error.cause) || typeof error.cause.phase !== "string") return "unclassified";
   const phase = error.cause.phase;
-  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)|helper-exit-\d+)$/u.test(phase)
+  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|command-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)(?:-(?:empty|parser|runtime|other))?|helper-exit-\d+)$/u.test(phase)
     ? phase : "unclassified";
 }
 
