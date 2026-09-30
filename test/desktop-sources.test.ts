@@ -5,7 +5,8 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { configuredCodexHomes, configuredCodexSources } from "../src/bridge/config.js";
 import { BridgeStore, migrateBindingSources } from "../src/bridge/store.js";
-import { DesktopUnavailableError, taskKey, type AccountUsage, type DesktopMetadata, type DesktopTask } from "../src/desktop/contracts.js";
+import { DesktopUnavailableError, taskKey, type AccountUsage, type DesktopMetadata, type DesktopProject, type DesktopTask } from "../src/desktop/contracts.js";
+import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
 import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
 import { ProfileAccountUsage, ProfileDesktopMetadata } from "../src/desktop/metadata.js";
 import { comparablePath } from "../src/desktop/paths.js";
@@ -136,6 +137,43 @@ test("metadata uses the configured source home for rename, archive and export", 
   assert.deepEqual(calls, [extra, extra, extra]);
   assert.throws(() => metadata.markdown({ ...task, sourceId: "removed-source" }), DesktopUnavailableError);
   assert.equal(calls.length, 3);
+});
+
+test("project creation keeps a secondary profile isolated and returns its source-qualified catalog ID", async () => {
+  const secondaryProjects: DesktopProject[] = [];
+  const combined = new MultiDesktopCatalog([primary, extra], home => ({
+    listTasks: async () => [],
+    listModels: async () => [],
+    listProjects: async () => home === extra ? secondaryProjects : [],
+  }));
+  const secondary = combined.listSources()[1]!;
+  const nativeByKey = new Map<string, DesktopProject>();
+  const metadataHomes: string[] = [];
+  const metadata = new ProfileDesktopMetadata(ref => combined.sourceHome(ref), home => {
+    metadataHomes.push(home);
+    return {
+      createProject: async (_sourceId, name, roots, idempotencyKey) => {
+        const existing = nativeByKey.get(idempotencyKey);
+        if (existing) return existing;
+        const created: DesktopProject = { id: "native-created", title: name, workspace: roots[0] ?? "", workspaceRoots: [...roots] };
+        nativeByKey.set(idempotencyKey, created);
+        if (home === extra) secondaryProjects.push(created);
+        return created;
+      },
+      rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    } satisfies DesktopMetadata;
+  });
+  const connected = new ConnectedDesktopTasks(combined, undefined, metadata);
+
+  const first = await connected.createProject(secondary.id, "Transferred project", ["/secondary-workspace"], "same-key");
+  const repeated = await connected.createProject(secondary.id, "Transferred project", ["/secondary-workspace"], "same-key");
+
+  assert.equal(first.id, JSON.stringify([secondary.id, "native-created"]));
+  assert.equal(repeated.id, first.id);
+  assert.deepEqual(metadataHomes, [extra, extra]);
+  assert.equal(secondaryProjects.length, 1);
+  assert.deepEqual(await combined.listProjects(""), []);
+  assert.deepEqual(await connected.listProjects(secondary.id), [first]);
 });
 
 test("account limits use the selected task source while the manager reads every configured account", async () => {
