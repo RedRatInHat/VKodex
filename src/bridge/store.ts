@@ -290,6 +290,11 @@ export class BridgeStore {
     const deliveryColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_delivery)").all() as { name: string }[]).map(column => column.name));
     if (!deliveryColumns.has("priority_revision")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN priority_revision INTEGER NOT NULL DEFAULT 0");
     if (!deliveryColumns.has("turn_id")) this.db.exec("ALTER TABLE bridge_delivery ADD COLUMN turn_id TEXT");
+    // Most historical deliveries are already acknowledged. The one-second
+    // delivery loop must not scan and parse the entire accumulated outbox to
+    // find the handful of pending rows. Both queue queries can use this index.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS bridge_delivery_pending
+      ON bridge_delivery(kind, id) WHERE revision > delivered_revision`);
     const stageColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_stage_reservations)").all() as { name: string }[]).map(column => column.name));
     if (!stageColumns.has("writer_pid")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_pid INTEGER");
     if (!stageColumns.has("writer_birth")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_birth TEXT");

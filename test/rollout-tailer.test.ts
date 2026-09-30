@@ -3,12 +3,30 @@ import { appendFile, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { RolloutTaskHistoryRecovery } from "../src/desktop/history-recovery.js";
 import { RolloutRecordTooLargeError, RolloutTailer } from "../src/desktop/rollout-tailer.js";
 
 const task = (rolloutPath: string) => ({ hostId: "local", threadId: "thread", rolloutPath });
 const line = (timestamp: string, item: unknown) => JSON.stringify({ timestamp, type: "response_item", payload: item }) + "\n";
 const message = (id: string, turnId: string, phase: string, text: string) => ({ type: "message", id, role: "assistant", phase,
   content: [{ type: "output_text", text }], internal_chat_message_metadata_passthrough: { turn_id: turnId } });
+
+test("re-enabling an active rollout observer preserves its poll throttle", async () => {
+  class CountingTailer extends RolloutTailer {
+    reads = 0;
+    override async poll(): Promise<[]> { this.reads++; return []; }
+  }
+  const tailer = new CountingTailer();
+  const recovery = new RolloutTaskHistoryRecovery(tailer);
+  const ref = task("C:/profiles/work/sessions/detached.jsonl");
+  recovery.enable("binding", 0);
+  assert.ok(await recovery.poll("binding", ref, null, null, new Set(), 1_000));
+  recovery.enable("binding", 0); // Called again by each bridge tick while detached.
+  assert.equal(await recovery.poll("binding", ref, null, null, new Set(), 1_500), null);
+  assert.equal(tailer.reads, 1);
+  assert.ok(await recovery.poll("binding", ref, null, null, new Set(), 2_000));
+  assert.equal(tailer.reads, 2);
+});
 
 test("rollout tailer ignores old history and incrementally reads new visible assistant messages", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");

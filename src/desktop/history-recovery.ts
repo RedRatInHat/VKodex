@@ -16,8 +16,12 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
   constructor(private readonly tailer = new RolloutTailer()) {}
 
   enable(id: string, since: number): void {
-    this.enabled.set(id, Math.min(this.enabled.get(id) ?? since, since));
-    this.pollAfter.delete(id);
+    const previous = this.enabled.get(id);
+    this.enabled.set(id, Math.min(previous ?? since, since));
+    // The bridge reasserts detached observation on every tick. Clearing the
+    // deadline for an already enabled observer turns its bounded recovery
+    // reader into an unthrottled filesystem poll.
+    if (previous === undefined) this.pollAfter.delete(id);
   }
 
   disable(id: string, task: TaskRef): void {
