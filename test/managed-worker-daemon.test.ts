@@ -297,6 +297,79 @@ test('native CLI WebSocket admits one qualified plain-text turn through the same
   }
 });
 
+test('active CLI turn survives native Gateway reconnect without a second worker start', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
+  let stopResult: Record<string, unknown> | undefined;
+  try {
+    await client.request('initialize', 'initialize',
+      { clientInfo: { name: 'fixture' }, capabilities: {} });
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    await client.request('resume', 'thread/resume', { threadId: own.taskId });
+    const params = { threadId: own.taskId, clientUserMessageId: randomUUID(),
+      input: [{ type: 'text', text: 'one active CLI turn' }], turnTrigger: null,
+      toolOutput: null, responsesapiClientMetadata: null, additionalContext: null,
+      environments: null, cwd: own.home, runtimeWorkspaceRoots: [own.home],
+      approvalPolicy: 'never', approvalsReviewer: 'user', sandboxPolicy: null,
+      permissions: ':read-only', model: 'gpt-5.6-sol', serviceTier: null,
+      serviceTierForTurn: null, effort: 'low', summary: null, personality: null,
+      outputSchema: null, collaborationMode: { mode: 'default', settings: {
+        model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } },
+      multiAgentMode: null, cyberAccessProgram: null };
+    const accepted = await client.request('accepted', 'turn/start', params);
+    assert.equal((accepted.result as { turn: { status: string } }).turn.status, 'inProgress');
+    own.backend.activeTurn = true;
+    own.backend.readStatusOverride = 'inProgress';
+    const active = await own.daemon.nativeCliCanaryEvidence(capability);
+    const turnHash = createHash('sha256').update('accepted-composer-turn').digest('hex');
+    assert.deepEqual(active.turns, [{ idSha256: turnHash, status: 'inProgress' }]);
+    assert.deepEqual(active.acceptedStartSha256, [turnHash]);
+    const resumesBeforeFault = own.backend.methods.filter(method => method === 'thread/resume').length;
+
+    own.brokers[0]!.destroy();
+    await waitFor(() => own.daemon.metadata.nativeState === 'disconnected', 1500);
+    assert.equal(own.backend.exitCode, null);
+    await waitFor(() => own.brokers.length === 2 &&
+      own.daemon.metadata.nativeState === 'connected', 4000);
+    const rejoined = await own.daemon.nativeCliCanaryEvidence(capability);
+    assert.deepEqual(rejoined.turns, active.turns);
+    assert.deepEqual(rejoined.acceptedStartSha256, active.acceptedStartSha256);
+    assert.equal(rejoined.backendGeneration, active.backendGeneration);
+    assert.equal(rejoined.ownerEpoch, active.ownerEpoch);
+    assert.equal(rejoined.commandInFlight, 0);
+    assert.equal(rejoined.commandUnconfirmed, false);
+    assert.equal(rejoined.requestsUnresolved, 0);
+    assert.equal(rejoined.goalEmpty, true);
+    assert.equal(rejoined.queueEmpty, true);
+    assert.equal(own.daemon.metadata.state, 'ready');
+    assert.equal(own.launches, 1);
+    assert.equal(own.backend.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length,
+      resumesBeforeFault);
+    assert.ok((await client.request('after-reconnect', 'thread/read',
+      { threadId: own.taskId, includeTurns: true })).result);
+
+    own.backend.activeTurn = false;
+    own.backend.readStatusOverride = null;
+    const terminal = await own.daemon.nativeCliCanaryEvidence(capability);
+    assert.deepEqual(terminal.turns, [{ idSha256: turnHash, status: 'completed' }]);
+    assert.deepEqual(terminal.acceptedStartSha256, [turnHash]);
+  } finally {
+    client.socket.terminate();
+    try {
+      stopResult = await controlStop(own.privateDirectory, own.reserved.epoch,
+        'active-cli-reconnect-stop');
+    } finally {
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+    }
+  }
+  assert.deepEqual(stopResult?.result, { stopped: true });
+});
+
 test('controlled CLI source scope refuses journal, source, and manifest drift', async () => {
   const capability = {};
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
@@ -1069,6 +1142,7 @@ class Backend extends EventEmitter {
   readonly stdin = new PassThrough(); readonly stdout = new PassThrough(); readonly stderr = new PassThrough();
   readonly pid = 42424; exitCode: number | null = null; signalCode: NodeJS.Signals | null = null;
   readonly methods: string[] = []; resumed = false; writes = 0; materializeTurn = true;
+  activeTurn = false;
   stock = false; settingsWrites = 0; queueWrites = 0; emitSettingsNotice = true; birthDrift = false;
   holdQueueReply = false; heldQueueReply: Record<string, unknown> | null = null;
   readonly frames: Record<string, unknown>[] = [];
@@ -1204,7 +1278,8 @@ class Backend extends EventEmitter {
       items: this.terminalQueueClients.map((clientId, index) => ({ id: `queue-user-${index}`,
         type: 'userMessage', clientId, content: [{ type: 'text', text: 'fixture only' }] })) }];
     return this.writes && this.materializeTurn ?
-      [{ id: 'accepted-composer-turn', status: 'completed', items: [] }] : [];
+      [{ id: 'accepted-composer-turn', status: this.activeTurn ? 'inProgress' : 'completed',
+        items: [] }] : [];
   }
 }
 class Broker extends Duplex {
