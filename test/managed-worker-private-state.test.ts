@@ -105,7 +105,9 @@ test("strict JSON preserves an own __proto__ field through protected roundtrip",
 
 test("injectable PowerShell runner keeps DPAPI payloads in memory", { skip: process.platform !== "win32" }, async () => {
   const filesystem = new MemoryFilesystem(); let calls = 0;
-  const runner: ManagedWorkerPrivateStatePowerShellRunner = { async run(_script, input) { calls++; return Uint8Array.from(input); } };
+  const runner: ManagedWorkerPrivateStatePowerShellRunner = { async run(script, input) {
+    calls++; assert.match(script, /\$raw\.Length -ne \$expected/u); return Uint8Array.from(input);
+  } };
   const created = await createManagedWorkerPrivateState(manifest(), { baseDirectory: fixturePath("private", "managed"), filesystem, powerShellRunner: runner });
   const loaded = await loadManagedWorkerPrivateState({ baseDirectory: fixturePath("private", "managed"), epoch, filesystem, powerShellRunner: runner });
   assert.equal(calls, 2); assert.deepEqual(loaded.keys, created.keys);
@@ -119,6 +121,11 @@ test("protector failure and malformed or oversized strict JSON never reach files
   };
   await assert.rejects(createManagedWorkerPrivateState(manifest(), { ...options(failureFilesystem), protector: failingProtector }), /protection failed/u);
   assert.deepEqual(failureFilesystem.actions, []);
+
+  const malformedOutputFilesystem = new MemoryFilesystem();
+  const malformedOutputRunner: ManagedWorkerPrivateStatePowerShellRunner = { async run() { return Buffer.from("not base64!"); } };
+  await assert.rejects(createManagedWorkerPrivateState(manifest(), { baseDirectory: fixturePath("private", "managed"), filesystem: malformedOutputFilesystem, powerShellRunner: malformedOutputRunner }), /protection failed/u);
+  assert.deepEqual(malformedOutputFilesystem.actions, []);
 
   const malformedFilesystem = new MemoryFilesystem();
   const malformed = { ...manifest(), initializeRequest: new Date() as unknown as ManagedWorkerPrivateManifest["initializeRequest"] };

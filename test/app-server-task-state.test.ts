@@ -39,6 +39,7 @@ const resume = (turns: JsonObject[], nextCursor: string | null = null) => ({
   thread: { id: "task", name: "Task", cwd: "D:\\work", status: { type: "idle" } }, model: "gpt-test", reasoningEffort: "high", cwd: "D:\\work",
   initialTurnsPage: { data: turns, nextCursor },
 });
+const unsubscribed = { status: "unsubscribed" };
 
 test("accepted resume is unsubscribed even if local initialization fails", async () => {
   for (const failure of ["ownership-callback", "questions"] as const) {
@@ -138,7 +139,7 @@ test("native state stream starts at most two profile reads concurrently", async 
   const releases: Array<() => void> = [];
   rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
     rpc.calls.push({ method, params });
-    if (method === "thread/unsubscribe") return {};
+    if (method === "thread/unsubscribe") return unsubscribed;
     assert.equal(method, "thread/resume"); active++; maximum = Math.max(maximum, active);
     await new Promise<void>(resolve => releases.push(resolve)); active--;
     const id = String(params.threadId);
@@ -158,7 +159,7 @@ test("native state stream starts at most two profile reads concurrently", async 
 test("native state stream releases only its task lease when closed", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([])]);
-  rpc.responses.set("thread/unsubscribe", [{}]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed]);
   const transport = new AppServerTaskStateTransport(rpc);
   const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
   await stream.start();
@@ -171,7 +172,7 @@ test("native state stream releases only its task lease when closed", async () =>
 test("same-task consumers share one upstream lease until the last consumer closes, then can reconnect", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([]), resume([]), resume([])]);
-  rpc.responses.set("thread/unsubscribe", [{}, {}, {}]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed, unsubscribed, unsubscribed]);
   const firstStates: TaskState[] = [];
   const remainingStates: TaskState[] = [];
   const transport = new AppServerTaskStateTransport(rpc);
@@ -215,7 +216,7 @@ test("a consumer waits for the previous final unsubscribe before resuming the sa
     if (method === "thread/resume") return resume([]);
     assert.equal(method, "thread/unsubscribe");
     if (++unsubscribeCount === 1) await unsubscribePending;
-    return {};
+    return unsubscribed;
   };
   const transport = new AppServerTaskStateTransport(rpc);
   const task = { hostId: "h", threadId: "task" };
@@ -257,6 +258,32 @@ test("a rejected final unsubscribe with an idle backend remains fail-closed", as
     assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
     next.close();
   } finally { transport.close(); }
+});
+
+test("notSubscribed or malformed unsubscribe results remain fail-closed before another resume", async () => {
+  for (const result of [{ status: "notSubscribed" }, {}] as const) {
+    const rpc = new FakeRpc();
+    rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+      rpc.calls.push({ method, params });
+      if (method === "thread/resume") return resume([]);
+      if (method === "thread/read") return { thread: { id: "task", status: { type: "active" } } };
+      assert.equal(method, "thread/unsubscribe");
+      return result;
+    };
+    const transport = new AppServerTaskStateTransport(rpc);
+    const task = { hostId: "h", threadId: "task" };
+    const first = transport.subscribe(task, () => {}, () => {});
+    try {
+      await first.start();
+      first.close();
+      await new Promise(resolve => setImmediate(resolve));
+      const next = transport.subscribe(task, () => {}, () => {});
+      await assert.rejects(next.start(), /Предыдущая подписка не подтверждена как выгруженная/u);
+      assert.equal(rpc.calls.filter(call => call.method === "thread/read").length, 1);
+      assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
+      next.close();
+    } finally { transport.close(); }
+  }
 });
 
 test("a rejected final unsubscribe can resume only after a read proves the backend unloaded", async () => {
@@ -312,7 +339,7 @@ test("a rejected final unsubscribe never blindly resumes an active or unknown ba
 test("a late same-task consumer receives the latest shared snapshot without another resume", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([])]);
-  rpc.responses.set("thread/unsubscribe", [{}]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed]);
   const transport = new AppServerTaskStateTransport(rpc);
   const task = { hostId: "h", threadId: "task" };
   const first = transport.subscribe(task, () => {}, () => {});
@@ -337,7 +364,7 @@ test("closing the transport while a shared start is pending cannot revive its co
   rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
     rpc.calls.push({ method, params });
     if (method === "thread/resume") { await resumePending; return resume([]); }
-    assert.equal(method, "thread/unsubscribe"); return {};
+    assert.equal(method, "thread/unsubscribe"); return unsubscribed;
   };
   const states: TaskState[] = [];
   const transport = new AppServerTaskStateTransport(rpc);
@@ -359,7 +386,7 @@ test("closing the transport while a shared start is pending cannot revive its co
 test("a dormant same-task subscriber holds no lease after the only started consumer closes", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([]), resume([])]);
-  rpc.responses.set("thread/unsubscribe", [{}, {}]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed, unsubscribed]);
   const transport = new AppServerTaskStateTransport(rpc);
   const task = { hostId: "h", threadId: "task" };
   const started = transport.subscribe(task, () => {}, () => {});
@@ -394,7 +421,7 @@ test("closing the only starting consumer before its microtask does not resume fo
 test("a mutating consumer cannot corrupt live or later same-task consumer snapshots", async () => {
   const rpc = new FakeRpc();
   rpc.responses.set("thread/resume", [resume([])]);
-  rpc.responses.set("thread/unsubscribe", [{}]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed]);
   const transport = new AppServerTaskStateTransport(rpc);
   const task = { hostId: "h", threadId: "task" };
   const mutating = transport.subscribe(task, state => {

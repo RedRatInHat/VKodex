@@ -23,7 +23,7 @@ class Rpc implements AppServerRpc {
     if (method === "thread/unsubscribe") {
       if (this.waitUnsubscribe) await this.waitUnsubscribe;
       if (this.failUnsubscribe) throw new Error("release result unknown");
-      return {};
+      return { status: "unsubscribed" };
     }
     if (method === "turn/start") return { turn: { id: "turn" } };
     if (method === "thread/read") return { thread: { id: "task", name: "Task", projectId: this.projectId, status: { type: this.threadStatus } } };

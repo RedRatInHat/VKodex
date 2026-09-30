@@ -304,7 +304,14 @@ class AppServerTaskStream implements TaskStateStream {
     // proof that its writer was unloaded; never close the shared connection
     // as cleanup, since that would disrupt unrelated VK conversations.
     const release = this.resumeConfirmed && !this.disconnected
-      ? this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 30_000 }).then(() => {})
+      ? this.rpc.request("thread/unsubscribe", { threadId: this.task.threadId }, { timeoutMs: 30_000 }).then(result => {
+        // `notSubscribed` does not establish which writer owns the loaded
+        // thread. Only a completed unsubscribe or an already-unloaded thread
+        // can let a later consumer issue another resume.
+        if (result.status !== "unsubscribed" && result.status !== "notLoaded") {
+          throw new AppServerUnavailableError("Codex не подтвердил освобождение подписки задачи.");
+        }
+      })
       : null;
     // The transport may be used without a command executor; never leave an
     // unhandled rejection if its release callback does not observe the result.

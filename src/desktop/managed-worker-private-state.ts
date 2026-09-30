@@ -160,9 +160,10 @@ function windowsPowerShell(): string {
   if (!root || !path.win32.isAbsolute(root)) throw new Error("Managed worker private state requires Windows PowerShell");
   return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
-async function runPowerShell(encoded: string, input: Uint8Array): Promise<Uint8Array> {
+async function runPowerShell(encoded: string, input: Uint8Array, requireCompleteInput = false): Promise<Uint8Array> {
   const executable = windowsPowerShell();
   const modulePath = path.win32.join(path.dirname(executable), "Modules");
+  const command = requireCompleteInput ? `$expected=${input.byteLength};${encoded}` : encoded;
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams | undefined;
     let settled = false; let stopped = false;
@@ -176,13 +177,15 @@ async function runPowerShell(encoded: string, input: Uint8Array): Promise<Uint8A
     };
     const timeout = setTimeout(() => { stop(); settle(); }, POWERSHELL_TIMEOUT_MS);
     try {
-      child = spawn(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", ps(encoded)], {
+      child = spawn(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", ps(command)], {
         windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PSModulePath: modulePath },
       });
     } catch { settle(); return; }
     child.stdout.on("data", (chunk: Buffer) => { size += chunk.length; if (size <= MAX_PROTECTED_BYTES) output.push(chunk); else { stop(); settle(); } });
     child.stderr.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_PROTECTED_BYTES) { stop(); settle(); } });
-    child.stdin.on("error", () => { stop(); settle(); });
+    // Windows may report EPIPE/ECONNRESET after PowerShell has consumed the
+    // complete pipe. The child close status and bounded stdout are authoritative.
+    child.stdin.on("error", () => { /* wait for close or the existing timeout */ });
     child.once("error", () => settle());
     child.once("close", code => {
       if (code !== 0 || size > MAX_PROTECTED_BYTES) settle();
@@ -195,22 +198,31 @@ async function runPowerShell(encoded: string, input: Uint8Array): Promise<Uint8A
   });
 }
 
-const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
-const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
+const protectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){throw 'input'}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
+const unprotectScript = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd().Trim(); if($raw.Length -ne $expected){throw 'input'}; $data=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))";
 const aclScript = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd().Trim(); if(!$p){throw 'path'}; [IO.Directory]::CreateDirectory($p)|Out-Null; $d=Get-Item -LiteralPath $p -Force; if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $before=Get-Acl -LiteralPath $p; if($before.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner'}; $system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($id in @($sid,$system)){ $rule=New-Object Security.AccessControl.FileSystemAccessRule($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $p -AclObject $acl; $check=Get-Item -LiteralPath $p -Force; if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}";
 
 class WindowsDpapiProtector implements ManagedWorkerPrivateStateProtector {
   readonly #runner: ManagedWorkerPrivateStatePowerShellRunner;
-  constructor(runner: ManagedWorkerPrivateStatePowerShellRunner = { run: runPowerShell }) { this.#runner = runner; }
+  constructor(runner: ManagedWorkerPrivateStatePowerShellRunner = { run: (script, input) => runPowerShell(script, input, true) }) { this.#runner = runner; }
+  #decodeOutput(output: Uint8Array): Uint8Array {
+    const encoded = Buffer.from(output).toString("utf8");
+    if (!encoded || encoded.trim() !== encoded || !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)) throw new Error("Managed worker private state protection failed");
+    let decoded: Buffer;
+    try { decoded = Buffer.from(encoded, "base64"); } catch { throw new Error("Managed worker private state protection failed"); }
+    if (decoded.byteLength < 1 || decoded.byteLength > MAX_PROTECTED_BYTES || decoded.toString("base64") !== encoded)
+      throw new Error("Managed worker private state protection failed");
+    return Uint8Array.from(decoded);
+  }
   async protect(plaintext: Uint8Array): Promise<Uint8Array> {
     if (process.platform !== "win32" || plaintext.byteLength > MAX_PROTECTED_BYTES) throw new Error("Managed worker private state protection failed");
     const output = await this.#runner.run(protectScript, Buffer.from(Buffer.from(plaintext).toString("base64"), "utf8"));
-    try { return Uint8Array.from(Buffer.from(Buffer.from(output).toString("utf8").trim(), "base64")); } catch { throw new Error("Managed worker private state protection failed"); }
+    return this.#decodeOutput(output);
   }
   async unprotect(ciphertext: Uint8Array): Promise<Uint8Array> {
     if (process.platform !== "win32" || ciphertext.byteLength > MAX_PROTECTED_BYTES) throw new Error("Managed worker private state protection failed");
     const output = await this.#runner.run(unprotectScript, Buffer.from(Buffer.from(ciphertext).toString("base64"), "utf8"));
-    try { return Uint8Array.from(Buffer.from(Buffer.from(output).toString("utf8").trim(), "base64")); } catch { throw new Error("Managed worker private state protection failed"); }
+    return this.#decodeOutput(output);
   }
 }
 
