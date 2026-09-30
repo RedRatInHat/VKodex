@@ -14,6 +14,7 @@ import { TaskNotOpenError } from "../src/desktop/contracts.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { TaskActivity } from "../src/bridge/activity.js";
 import { TaskFiles, captureStageIdentity, sameStageIdentity, downloadVkFileToPath } from "../src/bridge/files.js";
+import { STAGED_FILE_PILOT_DISABLED } from "../src/bridge/config.js";
 import type { ProcessIdentity } from "../src/codex/managed-worker-registry.js";
 import { lstat, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { renameSync, writeFileSync } from "node:fs";
@@ -33,6 +34,7 @@ import { pendingCodexQuestions, type CodexQuestions } from "../src/desktop/quest
 const access = { ownerId: 101, groupId: 202 };
 const task: DesktopTask = { hostId: "local", threadId: "task-a", title: "Existing desktop task", workspace: "/project", projectId: "project-a", updatedAt: 10 };
 const peerId = 2_000_000_017;
+const STAGED_FILE_PILOT_FOR_TEST = Object.freeze({ mode: "single-chat" as const, peerId });
 
 class Chat implements BridgeChat {
   participants = [access.ownerId, -access.groupId];
@@ -3167,7 +3169,7 @@ test("idle observations without file jobs do not write a file journal", t => {
 
 test("different relative paths with the same display name and bytes are distinct file versions", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-path-key-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "path-key", []);
   await mkdir(path.join(prepared.outboxDir, "a"));
   await writeFile(path.join(prepared.outboxDir, "a", "b.txt"), "same bytes");
@@ -3198,6 +3200,30 @@ test("default file delivery does not reserve staged storage", async t => {
   assert.equal(s.store.stageReservedCount(), 0);
 });
 
+test("single-chat staging pilot leaves every unallowlisted peer on source-byte delivery", async t => {
+  const s = setup(t); const initial = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-single-chat-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const otherPeer = peerId - 1;
+  s.store.setChat(initial.id, otherPeer, 18);
+  const unallowlisted = s.store.getBinding(initial.id)!;
+  const direct = await files.prepare(unallowlisted, "direct-peer", []);
+  files.finish(unallowlisted.id, "direct-peer", "accepted", "direct-turn");
+  await writeFile(path.join(direct.outboxDir, "result.txt"), "original bytes");
+  assert.equal(await files.collect(unallowlisted, true), 1);
+  assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "original bytes");
+  assert.equal(s.store.getValue(`file-stage-index:${unallowlisted.id}:direct-peer`), null);
+  assert.equal(s.store.stageReservedCount(), 0);
+
+  s.store.setChat(initial.id, peerId, 17);
+  const allowlisted = s.store.getBinding(initial.id)!;
+  const staged = await files.prepare(allowlisted, "pilot-peer", []);
+  files.finish(allowlisted.id, "pilot-peer", "accepted", "pilot-turn");
+  await writeFile(path.join(staged.outboxDir, "result.txt"), "pilot bytes");
+  assert.equal(await files.collect(allowlisted, true), 1);
+  assert.equal(s.chat.binaryUploads[1]!.contents.toString(), "pilot bytes");
+  assert.equal(Object.keys(s.store.getValue<Record<string, unknown>>(`file-stage-index:${allowlisted.id}:pilot-peer`) ?? {}).length, 1);
+});
+
 test("terminal history proof completes only its matching queued file job", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-history-file-job-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
@@ -3218,7 +3244,7 @@ test("terminal history proof completes only its matching queued file job", async
 
 test("opt-in file delivery stages immutable bytes before VK upload and recovers after source mutation", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-default-stage-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "default-stage", []);
   files.finish(binding.id, "default-stage", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
@@ -3239,14 +3265,14 @@ test("opt-in file delivery stages immutable bytes before VK upload and recovers 
   assert.equal(await readFile(staged.path, "utf8"), "first version");
 
   await writeFile(source, "second version");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   assert.equal(await restored.collect(binding, true), 2);
   assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["first version", "second version"]);
 });
 
 test("a queued staged file records its exact delivery key and attachment atomically", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-delivery-link-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "delivery-link", []);
   files.finish(binding.id, "delivery-link", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3264,7 +3290,7 @@ test("a queued staged file records its exact delivery key and attachment atomica
 
 test("a queue transaction failure leaves neither a delivery nor a staged delivery link", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-queue-atomic-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "queue-atomic", []);
   files.finish(binding.id, "queue-atomic", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3321,7 +3347,7 @@ test("stage retention waits seven days and an exact confirmed send before recycl
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-retention-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "retention", []);
   files.finish(binding.id, "retention", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "retained bytes");
@@ -3342,7 +3368,7 @@ test("bounded staged reconciliation recycles four eligible files before a later 
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-batch-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "bounded-recycle", []);
   files.finish(binding.id, "bounded-recycle", "accepted", "finished-turn");
   for (let index = 0; index < 5; index++) await writeFile(path.join(prepared.outboxDir, `${index}.txt`), `file-${index}`);
@@ -3364,7 +3390,7 @@ test("stopping staged maintenance waits for its in-flight recycle without starti
   const recycleBlocked = new Promise<void>(resolve => { releaseRecycle = resolve; });
   let firstRecycleStarted!: () => void;
   const firstStarted = new Promise<void>(resolve => { firstRecycleStarted = resolve; });
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => {
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => {
     recycled.push(target);
     if (recycled.length === 1) { firstRecycleStarted(); await recycleBlocked; }
   });
@@ -3390,7 +3416,7 @@ test("stopping staged maintenance waits for its in-flight recycle without starti
 
 test("staging refuses low physical free space even when logical quota is available", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-free-space-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {}, async () => 0n);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => {}, async () => 0n);
   const prepared = await files.prepare(binding, "low-space", []);
   files.finish(binding.id, "low-space", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3411,7 +3437,7 @@ test("transactional admission accounts for concurrent reservations against one f
 
 test("stageFile submits its free-space snapshot to transactional admission", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-concurrent-free-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {}, async () => 700n * 1024n * 1024n);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => {}, async () => 700n * 1024n * 1024n);
   const prepared = await files.prepare(binding, "snapshot-admission", []);
   files.finish(binding.id, "snapshot-admission", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3424,7 +3450,7 @@ test("stageFile submits its free-space snapshot to transactional admission", asy
 test("a staging quota failure does not strand uploaded siblings in one batch", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-sibling-test-"));
   const freeBytes = async () => 8n * 1024n * 1024n * 1024n;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined, freeBytes);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, undefined, freeBytes);
   const prepared = await files.prepare(binding, "stage-quota-sibling", []);
   files.finish(binding.id, "stage-quota-sibling", "accepted", "finished-turn");
   for (const name of ["a-good.txt", "b-blocked.txt", "c-good.txt"]) await writeFile(path.join(prepared.outboxDir, name), name);
@@ -3439,7 +3465,7 @@ test("a staging quota failure does not strand uploaded siblings in one batch", a
   assert.deepEqual(batch?.view.attachments, ["doc-202_1", "doc-202_2"]);
   await s.worker.flush();
   assert.ok(s.chat.sent.some(item => item.view.attachments?.join(",") === "doc-202_1,doc-202_2"));
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined, freeBytes);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, undefined, freeBytes);
   assert.equal(await restored.collect(binding), 0);
   assert.equal(s.chat.binaryUploads.length, 2);
   admission.mock.restore();
@@ -3449,7 +3475,7 @@ test("a staging quota failure does not strand uploaded siblings in one batch", a
 
 test("a staging quota failure after a full batch preserves that batch and a newer job", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-quota-boundary-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined,
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, undefined,
     async () => 8n * 1024n * 1024n * 1024n);
   const first = await files.prepare(binding, "stage-quota-boundary", []);
   files.finish(binding.id, "stage-quota-boundary", "accepted");
@@ -3474,7 +3500,7 @@ test("stage retention fails closed for unknown upload, incomplete reserve, and c
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-retention-guard-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "guards", []);
   files.finish(binding.id, "guards", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "good bytes");
@@ -3495,7 +3521,7 @@ for (const replacement of ["other", "bytes"] as const) test(`stage retention doe
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-replaced-path-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "replaced-path", []);
   files.finish(binding.id, "replaced-path", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3520,7 +3546,7 @@ test("pending recycle does not accept a same-byte path replacement on a later re
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-pending-replaced-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "pending-replaced", []);
   files.finish(binding.id, "pending-replaced", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3530,7 +3556,7 @@ test("pending recycle does not accept a same-byte path replacement on a later re
   renameSync(receipt.path, `${receipt.path}.original`);
   writeFileSync(receipt.path, "bytes");
   now += 8 * 24 * 60 * 60_000;
-  const recovered = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const recovered = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   assert.equal(await recovered.reconcileStagedArtifacts(), 0);
   assert.deepEqual(recycled, []);
   assert.equal(s.store.stageReservedBytes(binding.id, "pending-replaced"), 5);
@@ -3557,7 +3583,7 @@ test("a safe numeric v1 receipt remains readable and recyclable", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-v1-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "v1-receipt", []);
   files.finish(binding.id, "v1-receipt", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3577,7 +3603,7 @@ test("legacy staged receipts without file identity remain charged during retenti
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-legacy-retention-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   const recycled: string[] = [];
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => { recycled.push(target); });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => { recycled.push(target); });
   const prepared = await files.prepare(binding, "legacy-retention", []);
   files.finish(binding.id, "legacy-retention", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3597,7 +3623,7 @@ test("failed recycling keeps the reservation charged and a retry can complete", 
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-retry-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let attempts = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => {
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => {
     if (++attempts === 1) throw new Error("Recycle Bin unavailable");
   });
   const prepared = await files.prepare(binding, "retry-recycle", []);
@@ -3615,7 +3641,7 @@ test("a lost recycle acknowledgement remains charged when the staged path cannot
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-uncertain-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => { moves++; });
   const prepared = await files.prepare(binding, "uncertain-recycle", []);
   files.finish(binding.id, "uncertain-recycle", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3639,7 +3665,7 @@ test("a pending recycle with a missing staged path retains charge after a lost a
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-recycle-lost-ack-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async target => {
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async target => {
     moves++;
     await rename(target, `${target}.recycled-fixture`);
     throw new Error("acknowledgement lost after move");
@@ -3664,7 +3690,7 @@ test("a staged path disappearing after the pending journal write is not proof of
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-pending-disappeared-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => { moves++; });
   const prepared = await files.prepare(binding, "pending-disappeared", []);
   files.finish(binding.id, "pending-disappeared", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3684,7 +3710,7 @@ test("a ready reservation with a missing staged path remains charged", async t =
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-ready-missing-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => { moves++; });
   const prepared = await files.prepare(binding, "ready-missing", []);
   files.finish(binding.id, "ready-missing", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3702,7 +3728,7 @@ test("a pending recycle remains charged when lstat fails with a non-ENOENT error
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-lstat-error-test-"));
   let now = Date.now(); t.mock.method(Date, "now", () => now);
   let moves = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, async () => { moves++; });
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, async () => { moves++; });
   const prepared = await files.prepare(binding, "lstat-error", []);
   files.finish(binding.id, "lstat-error", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -3796,7 +3822,7 @@ test("stage recycle pages advance past blocked old rows, survive restart, and wr
 
 test("stage admission denies an operation at 512 MiB before VK upload", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-cap-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "stage-cap", []);
   files.finish(binding.id, "stage-cap", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "new bytes");
@@ -3824,7 +3850,7 @@ test("zero-byte staged versions still consume per-operation and global file slot
 
 test("stage admission counts prior versions and the global budget", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-versions-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "versions", []);
   files.finish(binding.id, "versions", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
@@ -3840,7 +3866,7 @@ test("stage admission counts prior versions and the global budget", async t => {
   for (const [index, bytes] of [200, 200, 112].entries())
     assert.equal(s.store.reserveStage(`almost-full-${index}`, binding.id, "versions", bytes * 1024 * 1024 - (index === 2 ? 6 : 0), `private-other-${index}`), "reserved");
   await writeFile(source, "four");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   assert.equal(await restored.collect(binding, true), 1);
   assert.deepEqual(s.chat.binaryUploads.map(item => item.contents.toString()), ["one"]);
   const blockedKey = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:versions`)!["result.txt"]!.key;
@@ -3896,7 +3922,7 @@ test("a staged version survives source mutation and restart before upload", asyn
   const bindingId = store.ensureBinding(task).id;
   store.setChat(bindingId, peerId, 17);
   const binding = store.getBinding(bindingId)!;
-  const files = new TaskFiles(root, store, chat, new AccessGate(access, store), undefined, true);
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store), undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "staged-restart", []);
   files.finish(binding.id, "staged-restart", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
@@ -3922,7 +3948,7 @@ test("a staged version survives source mutation and restart before upload", asyn
   const recovered = new BridgeStore(filename);
   t.after(() => recovered.close());
   const recoveredBinding = recovered.getBinding(binding.id)!;
-  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered), undefined, true);
+  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered), undefined, STAGED_FILE_PILOT_FOR_TEST);
   const receiptKey = Object.keys(staged)[0]!;
   recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, {
     ...staged, [receiptKey]: { ...receipt, threadId: "another-source-task" },
@@ -3943,7 +3969,7 @@ test("a staged version survives source mutation and restart before upload", asyn
 
 test("a staged version remains recoverable when the native turn ID arrives after staging", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-late-turn-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "staged-late-turn", []);
   files.finish(binding.id, "staged-late-turn", "accepted");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
@@ -3955,7 +3981,7 @@ test("a staged version remains recoverable when the native turn ID arrives after
   await assert.rejects(files.collect(binding, true), /executor lost/u);
   crash.mock.restore();
   files.associateTurn(binding.id, "staged-late-turn", "native-turn-later");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   assert.equal(await restored.collect(binding, true), 1);
   assert.equal(s.chat.binaryUploads[0]!.contents.toString(), "first version");
 });
@@ -3972,7 +3998,7 @@ test("explicit recovery releases only absent reserved bytes whose original write
   assert.equal(s.store.reserveStage("legacy", "binding", "operation", 17, legacyPath), "reserved");
   await writeFile(existingPath, "written bytes");
   let observed: ProcessIdentity | null = writer;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_DISABLED, undefined, undefined,
     () => observed);
   assert.equal(await files.reconcileAbandonedStageReservations(), 0, "a live writer retains its lease");
   assert.equal(s.store.stageReservedBytes(), 41);
@@ -3999,7 +4025,7 @@ process.kill(process.pid, "SIGKILL");`;
 
   const recovered = new BridgeStore(filename); t.after(() => recovered.close());
   assert.equal(recovered.stageReservedBytes(), 7, "the killed child persisted its reservation before the receipt boundary");
-  const files = new TaskFiles(root, recovered, new Chat(), new AccessGate(access, recovered), undefined, false,
+  const files = new TaskFiles(root, recovered, new Chat(), new AccessGate(access, recovered), undefined, STAGED_FILE_PILOT_DISABLED,
     undefined, undefined, () => null);
   assert.equal(await files.reconcileAbandonedStageReservations(), 1);
   assert.equal(recovered.stageReservedBytes(), 0);
@@ -4012,15 +4038,15 @@ test("reserved-stage recovery is bounded and retains uncertain writer evidence",
   for (let index = 0; index < 3; index++)
     s.store.reserveStage(`bounded-${index}`, "binding", "operation", 1, path.join(root, `${index}.bin`), undefined, writer);
   let calls = 0;
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_DISABLED, undefined, undefined,
     () => { calls++; throw new Error("identity query unavailable"); });
   assert.equal(await files.reconcileAbandonedStageReservations(2), 0);
   assert.equal(calls, 2);
   assert.equal(s.store.stageReservedBytes(), 3);
-  const uncertain = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined,
+  const uncertain = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_DISABLED, undefined, undefined,
     () => undefined as unknown as ProcessIdentity | null);
   assert.equal(await uncertain.reconcileAbandonedStageReservations(2), 0, "missing observer result is not proof");
-  const absent = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined, () => null);
+  const absent = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_DISABLED, undefined, undefined, () => null);
   assert.equal(await absent.reconcileAbandonedStageReservations(2), 2);
   assert.equal(s.store.stageReservedBytes(), 1);
   assert.equal(await absent.reconcileAbandonedStageReservations(2), 1);
@@ -4039,12 +4065,12 @@ test("reserved-stage recovery reaches a dead writer after 64 live reservations a
       undefined, index === 64 ? dead : live), "reserved");
   }
   const observe = (pid: number): ProcessIdentity | null => pid === live.pid ? live : null;
-  const scan = new TaskFiles(root, first, new Chat(), new AccessGate(access, first), undefined, false,
+  const scan = new TaskFiles(root, first, new Chat(), new AccessGate(access, first), undefined, STAGED_FILE_PILOT_DISABLED,
     undefined, undefined, observe);
   assert.equal(await scan.reconcileAbandonedStageReservations(), 0);
   first.close();
   const reopened = new BridgeStore(filename); t.after(() => reopened.close());
-  const resumed = new TaskFiles(root, reopened, new Chat(), new AccessGate(access, reopened), undefined, false,
+  const resumed = new TaskFiles(root, reopened, new Chat(), new AccessGate(access, reopened), undefined, STAGED_FILE_PILOT_DISABLED,
     undefined, undefined, observe);
   assert.equal(await resumed.reconcileAbandonedStageReservations(), 1);
   assert.equal(reopened.stageReservedBytes(), 64);
@@ -4057,7 +4083,7 @@ test("abandoned-stage audit survives restart while the same file key can be stag
   const store = new BridgeStore(filename); t.after(() => store.close());
   const stagePath = path.join(root, "old.bin");
   assert.equal(store.reserveStage("retry", "binding", "operation", 5, stagePath, undefined, writer), "reserved");
-  const files = new TaskFiles(root, store, new Chat(), new AccessGate(access, store), undefined, false,
+  const files = new TaskFiles(root, store, new Chat(), new AccessGate(access, store), undefined, STAGED_FILE_PILOT_DISABLED,
     undefined, undefined, () => null);
   assert.equal(await files.reconcileAbandonedStageReservations(), 1);
   assert.equal(store.reserveStage("retry", "binding", "operation", 5, path.join(root, "new.bin")), "reserved");
@@ -4075,7 +4101,7 @@ test("reserved-stage recovery cannot discard a receipted or ready version", asyn
   assert.equal(s.store.reserveStage("ready", "binding", "operation", 9, ready, undefined, writer), "reserved");
   s.store.setValue("file-stage-index:binding:operation", { receipted: { path: receipted } });
   s.store.markStageReady("ready", ready);
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, false, undefined, undefined, () => null);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_DISABLED, undefined, undefined, () => null);
   assert.equal(await files.reconcileAbandonedStageReservations(), 0);
   assert.equal(s.store.stageReservedBytes(), 16);
   assert.equal(s.store.abandonedStageCandidates().length, 1, "ready versions never enter the recovery scan");
@@ -4083,7 +4109,7 @@ test("reserved-stage recovery cannot discard a receipted or ready version", asyn
 
 test("an incomplete stage cannot be treated as a durable upload version", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-incomplete-stage-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "incomplete-stage", []);
   files.finish(binding.id, "incomplete-stage", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
@@ -4099,7 +4125,7 @@ test("an incomplete stage cannot be treated as a durable upload version", async 
   assert.equal(s.store.stageReservedBytes(binding.id, "incomplete-stage"), "first version".length);
   assert.equal(s.store.abandonedStageCandidates().length, process.platform === "win32" ? 1 : 0,
     "platforms without the Windows birth observer retain legacy reservations");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   await assert.rejects(restored.collect(binding, true), /незавершённая staged/u);
   assert.equal(s.chat.binaryUploads.length, 0);
   assert.equal(s.store.stageReservedBytes(binding.id, "incomplete-stage"), "first version".length);
@@ -4107,7 +4133,7 @@ test("an incomplete stage cannot be treated as a durable upload version", async 
 
 test("a receipt transaction crash preserves its reservation and blocks a second write", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-receipt-crash-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "receipt-crash", []);
   files.finish(binding.id, "receipt-crash", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "bytes");
@@ -4116,14 +4142,14 @@ test("a receipt transaction crash preserves its reservation and blocks a second 
   crash.mock.restore();
   assert.equal(s.store.getValue(`file-stage-index:${binding.id}:receipt-crash`), null);
   assert.equal(s.store.stageReservedBytes(binding.id, "receipt-crash"), 5);
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   await assert.rejects(restored.collect(binding, true), /незавершённая staged/u);
   assert.equal(s.chat.binaryUploads.length, 0);
 });
 
 test("a corrupt durable stage fails closed even when the source is still available", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-corrupt-stage-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "corrupt-stage", []);
   files.finish(binding.id, "corrupt-stage", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "first version");
@@ -4136,14 +4162,14 @@ test("a corrupt durable stage fails closed even when the source is still availab
   crash.mock.restore();
   const receipt = Object.values(s.store.getValue<Record<string, { path: string }>>(`file-stage-index:${binding.id}:corrupt-stage`)!)[0]!;
   await writeFile(receipt.path, "corrupt bytes");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   await assert.rejects(restored.collect(binding, true), /отсутствует или повреждена/u);
   assert.equal(s.chat.binaryUploads.length, 0);
 });
 
 test("a staged receipt cannot change the uploaded filename or file kind", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-stage-metadata-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "metadata-integrity", []);
   files.finish(binding.id, "metadata-integrity", "accepted", "finished-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
@@ -4157,7 +4183,7 @@ test("a staged receipt cannot change the uploaded filename or file kind", async 
   const indexKey = `file-stage-index:${binding.id}:metadata-integrity`;
   const index = s.store.getValue<Record<string, { name: string; kind: "image" | "file" }>>(indexKey)!;
   const [key, receipt] = Object.entries(index)[0]!;
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   s.store.setValue(indexKey, { ...index, [key]: { ...receipt, name: "other.txt" } });
   await assert.rejects(restored.collect(binding, true), /Квитанция staged-файла повреждена/u);
   s.store.setValue(indexKey, { ...index, [key]: { ...receipt, kind: "image" } });
@@ -4184,7 +4210,7 @@ test("an ambiguous VK upload is not retried by automatic scan or /files after re
 
 test("an unknown staged upload does not strand earlier or later independent files", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-unknown-sibling-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "unknown-sibling", []);
   files.finish(binding.id, "unknown-sibling", "accepted", "completed-turn");
   for (const name of ["a-good.txt", "b-unknown.txt", "c-good.txt"]) await writeFile(path.join(prepared.outboxDir, name), name);
@@ -4204,7 +4230,7 @@ test("an unknown staged upload does not strand earlier or later independent file
   const staged = s.store.getValue<Record<string, { name: string; key: string }>>(`file-stage-index:${binding.id}:unknown-sibling`)!;
   const unknown = Object.values(staged).find(receipt => receipt.name === "b-unknown.txt")!;
   assert.equal(s.store.getValue(`${unknown.key}:upload-state`), "unknown");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true);
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   await assert.rejects(restored.collect(binding, true), /неизвестным результатом загрузки/u);
   assert.equal(upload.mock.callCount(), 3);
 });
@@ -4428,7 +4454,7 @@ test("a stale idle snapshot cannot collect a new turn's outbox before that exact
 
 test("an outbox with more than ten files is delivered in batches without blocking newer turns", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, true, undefined,
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST, undefined,
     async () => 8n * 1024n * 1024n * 1024n);
   const invalid = await files.prepare(binding, "invalid-output", []); files.finish(binding.id, "invalid-output", "accepted");
   for (let index = 0; index <= 10; index++) await writeFile(path.join(invalid.outboxDir, `${index}.txt`), "fixture");
@@ -4564,6 +4590,13 @@ test("config accepts one owner and never includes private values in validation e
     maxTotalBytes: 200 * 1024 * 1024,
     timeoutMs: 600_000,
   });
+  assert.deepEqual(defaults.stagedFilePilot, { mode: "disabled" });
+  assert.deepEqual(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "single-chat", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }).stagedFilePilot,
+    { mode: "single-chat", peerId });
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "single-chat" }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "", VKODEX_STAGED_FILE_PILOT_PEER_ID: "" }));
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "enabled", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }));
   assert.deepEqual(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", MAX_INBOUND_FILES: "2", MAX_INBOUND_FILE_BYTES: "1048576", MAX_INBOUND_TOTAL_BYTES: "2097152", DOWNLOAD_TIMEOUT_MS: "90000" }).inboundFileLimits,
     { maxFiles: 2, maxFileBytes: 1_048_576, maxTotalBytes: 2_097_152, timeoutMs: 90_000 });
   assert.equal(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", HEALTH_CHECK_INTERVAL_MS: "30000" }).healthIntervalMs, 30_000);

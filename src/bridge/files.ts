@@ -10,6 +10,7 @@ import type { Binding, BridgeChat } from "./contracts.js";
 import { FileUploadRejectedError, FileUploadStorageFullError, type VkDocumentRecord } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
+import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 import { readWindowsProcessIdentity, readWindowsProcessIdentityAsync } from "../desktop/windows-process-identity.js";
 
 export const FILE_LIMITS = { maxFiles: 10, maxFileBytes: 200 * 1024 * 1024, maxTotalBytes: 200 * 1024 * 1024, timeoutMs: 30_000 };
@@ -375,8 +376,8 @@ export class TaskFiles {
   private maintenanceStopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
-    /** Opt-in pilot: stage new output versions before upload; default delivery uses source bytes. */
-    private readonly stageNewUploads = false,
+    /** Explicit one-chat pilot. Every other chat keeps direct source-byte delivery. */
+    private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED,
     private readonly recycleStage: (target: string) => Promise<void> = recycleStageOnWindows,
     private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
       const free = await statfs(folder);
@@ -768,7 +769,7 @@ export class TaskFiles {
               return;
             }
             let receipt = staged;
-            if (!receipt && this.stageNewUploads) {
+            if (!receipt && this.stagedFilePilot.mode === "single-chat" && binding.peerId === this.stagedFilePilot.peerId) {
               try { receipt = await this.stageFile(file, relativePath, fingerprint, key, job, binding); }
               catch (error) {
                 if (!(error instanceof StageQuotaError)) throw error;

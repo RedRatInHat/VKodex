@@ -4,6 +4,12 @@ import { realpathSync } from "node:fs";
 import { comparablePath } from "../core/paths.js";
 import type { OwnerAccess } from "./contracts.js";
 
+export type StagedFilePilot =
+  | Readonly<{ readonly mode: "disabled" }>
+  | Readonly<{ readonly mode: "single-chat"; readonly peerId: number }>;
+
+export const STAGED_FILE_PILOT_DISABLED: StagedFilePilot = Object.freeze({ mode: "disabled" });
+
 export interface DesktopBridgeConfig {
   readonly access: OwnerAccess;
   readonly token: string;
@@ -16,6 +22,8 @@ export interface DesktopBridgeConfig {
   readonly inboundFileLimits: { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number };
   /** DPAPI-protected file read by the local PowerShell helper on demand. */
   readonly documentTokenPath: string;
+  /** Explicitly scoped pilot; absent configuration disables new staging. */
+  readonly stagedFilePilot: StagedFilePilot;
 }
 
 export type CodexLauncherConfig =
@@ -126,6 +134,15 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
   const maxInboundTotalBytes = positive("MAX_INBOUND_TOTAL_BYTES", 200 * 1024 * 1024, 200 * 1024 * 1024);
   if (maxInboundTotalBytes < maxInboundFileBytes) throw new Error("MAX_INBOUND_TOTAL_BYTES must not be smaller than MAX_INBOUND_FILE_BYTES");
   const downloadTimeoutMs = positive("DOWNLOAD_TIMEOUT_MS", 600_000, 60 * 60_000);
+  const stagedPilotMode = env.VKODEX_STAGED_FILE_PILOT;
+  const stagedPilotPeer = env.VKODEX_STAGED_FILE_PILOT_PEER_ID;
+  const stagedPilotPeerId = stagedPilotPeer?.trim();
+  const stagedFilePilot: StagedFilePilot = stagedPilotMode === undefined && stagedPilotPeer === undefined
+    ? STAGED_FILE_PILOT_DISABLED
+    : stagedPilotMode?.trim() === "single-chat" && !!stagedPilotPeerId && /^\d+$/u.test(stagedPilotPeerId)
+      && Number.isSafeInteger(Number(stagedPilotPeerId)) && Number(stagedPilotPeerId) > 0 && Number(stagedPilotPeerId) <= 2_147_483_647
+      ? Object.freeze({ mode: "single-chat", peerId: Number(stagedPilotPeerId) })
+      : (() => { throw new Error("VKODEX_STAGED_FILE_PILOT must be single-chat with one valid VKODEX_STAGED_FILE_PILOT_PEER_ID"); })();
   const codexSources = configuredCodexSources(env);
   const codexHomes = codexSources.map(source => source.home);
   const automaticRoot = env.VKODEX_PROJECTLESS_ROOT?.trim();
@@ -139,6 +156,6 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
     projectlessRoot: path.resolve(automaticRoot || path.join(localData, "VKodex", "workspaces")),
     codexHome: codexHomes[0]!, codexHomes, codexSources, healthIntervalMs,
     inboundFileLimits: { maxFiles: maxInboundFiles, maxFileBytes: maxInboundFileBytes, maxTotalBytes: maxInboundTotalBytes, timeoutMs: downloadTimeoutMs },
-    documentTokenPath,
+    documentTokenPath, stagedFilePilot,
   };
 }

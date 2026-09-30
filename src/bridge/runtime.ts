@@ -16,6 +16,7 @@ import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
 import { comparablePath } from "../core/paths.js";
+import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -111,7 +112,7 @@ export class BridgeRuntime {
     adapters: BridgeRuntimeAdapters, private readonly now: () => number = Date.now, fileRoot?: string,
     healthFile?: string, private readonly healthIntervalMs = 60_000,
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
-    inboundFileLimits?: InboundFileLimits) {
+    inboundFileLimits?: InboundFileLimits, private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.connections = new TaskStateConnections(adapters.states, now);
@@ -120,10 +121,7 @@ export class BridgeRuntime {
     this.inspectExternalOwner = adapters.inspectExternalOwner;
     for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
     this.gate = new AccessGate(access, store);
-    // The immutable staging implementation is qualified in isolation, but its
-    // retention/recovery path is not yet safe for unattended production. Keep
-    // the runtime gate closed until those receipts can be reconciled.
-    this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits, false) : undefined;
+    this.files = fileRoot ? new TaskFiles(fileRoot, store, chat, this.gate, inboundFileLimits, stagedFilePilot) : undefined;
     this.delivery = new DeliveryWorker(chat, store, this.gate, undefined, now);
     this.health = new BridgeHealthMonitor(access, desktop, chat, store, () => this.runtimeHealth(), healthFile, now);
     this.manager = new TaskManager(access, desktop, chat, store, this.gate, this.files, () => this.checkHealth(true), () => systemLoadText(fileRoot), projectlessRoot,
@@ -205,7 +203,7 @@ export class BridgeRuntime {
     });
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
-    return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped,
+    return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped, stagedFilePilot: this.stagedFilePilot,
       maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
       ...(this.files ? { stageMaintenance: { startedAt: this.stageMaintenanceStartedAt, lastAttemptAt: this.stageMaintenanceLastAttemptAt,
         failed: this.stageMaintenanceFailed } } : {}),

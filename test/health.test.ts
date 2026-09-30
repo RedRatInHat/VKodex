@@ -3,6 +3,7 @@ import test from "node:test";
 import { BridgeHealthMonitor } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
+import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "../src/bridge/config.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import type { BridgeChat, HealthCheckResult, MessageHandle, View } from "../src/bridge/contracts.js";
 import type { CreateTaskRequest, DesktopCompatibility, DesktopModel, DesktopProject, DesktopTask, DesktopTasks, SubmitTaskRequest, TaskDetails, TaskGoalUpdate, TaskRef, TaskRenameResult } from "../src/desktop/contracts.js";
@@ -49,10 +50,10 @@ class HealthDesktop implements DesktopTasks {
   async checkCompatibility() { this.compatibilityChecks++; return this.compatibilityState; }
 }
 
-function setup(t: { after(fn: () => void): void }) {
+function setup(t: { after(fn: () => void): void }, stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
   const store = new BridgeStore(); t.after(() => store.close());
   const chat = new HealthChat(); const desktop = new HealthDesktop(); let now = 100_000;
-  const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
+  const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, stagedFilePilot, activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
   const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
   return { store, chat, desktop, monitor, advance: (ms: number) => { now += ms; } };
 }
@@ -61,11 +62,19 @@ test("health monitor verifies the complete healthy bridge and persists its snaps
   const s = setup(t);
   const report = await s.monitor.check(true);
   assert.equal(report.state, "ok");
-  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "stage_storage", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.deepEqual(report.checks.map(check => check.name), ["sqlite", "runtime", "stage_pilot", "stage_storage", "vk_delivery", "codex_mirror", "codex_streams", "codex_tasks", "codex_uncertain_inputs", "vk_inbound_batches", "vk_inbound_journal", "task_transfers", "vk_long_poll", "vk_api", "codex_catalog", "codex_goals", "codex_live_api"]);
+  assert.match(report.checks.find(check => check.name === "stage_pilot")!.detail, /пилот отключена/u);
   assert.equal(s.desktop.compatibilityChecks, 1);
   assert.equal(s.desktop.goalReads, 1);
   assert.deepEqual(s.store.getValue("health:latest"), report);
   assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("health reports an enabled staging pilot's exact peer scope without storage paths", async t => {
+  const s = setup(t, Object.freeze({ mode: "single-chat" as const, peerId: 2_000_000_017 }));
+  const check = (await s.monitor.check()).checks.find(item => item.name === "stage_pilot")!;
+  assert.match(check.detail, /включена только для VK peer 2000000017/u);
+  assert.doesNotMatch(check.detail, /[\\/]|token|secret/i);
 });
 
 test("stage storage health distinguishes normal retention from stale pending recycle and never exposes paths", async t => {

@@ -884,13 +884,13 @@ test("runtime schedules bounded staged maintenance every five minutes without en
   const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, fileRoot);
   type RuntimeInternals = {
     files: {
-      stageNewUploads: boolean;
+      stagedFilePilot: { mode: "disabled" } | { mode: "single-chat"; peerId: number };
       reconcileAbandonedStageReservations(limit?: number): Promise<number>;
       reconcileStagedArtifactsBatch(now?: number, limit?: number): Promise<number>;
     };
   };
   const files = (s.runtime as unknown as RuntimeInternals).files;
-  assert.equal(files.stageNewUploads, false);
+  assert.deepEqual(files.stagedFilePilot, { mode: "disabled" });
   const abandonedLimits: number[] = [];
   const recycleCalls: Array<[number | undefined, number | undefined]> = [];
   t.mock.method(files, "reconcileAbandonedStageReservations", async (limit?: number) => { abandonedLimits.push(limit ?? 64); return 0; });

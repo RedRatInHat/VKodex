@@ -5,6 +5,7 @@ import type { TaskStateRouteDiagnostic } from "../core/task-state.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 import type { QueuedInputHistoryCursor } from "../core/codex-tasks.js";
+import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 
 /** Only scanner metadata is surfaced; native cursors and exception text stay private. */
 export interface QueueHistoryProgress {
@@ -22,6 +23,7 @@ export interface RuntimeHealthState {
   readonly updateStartedAt: number | null;
   readonly maintenance?: readonly { readonly phase: string; readonly bindingId?: string; readonly startedAt: number }[];
   readonly stageMaintenance?: { readonly startedAt: number | null; readonly lastAttemptAt: number; readonly failed: boolean };
+  readonly stagedFilePilot?: StagedFilePilot;
   readonly stopped: boolean;
   readonly activeBindings: number;
   readonly connectedBindings: number;
@@ -162,6 +164,10 @@ export class BridgeHealthMonitor {
     }
 
     const stageStorage = this.store.stageStorageStats();
+    const stagedPilot = runtime.stagedFilePilot ?? STAGED_FILE_PILOT_DISABLED;
+    checks.push({ name: "stage_pilot", state: "ok", detail: stagedPilot.mode === "single-chat"
+      ? `Изолированная staging-пилот включена только для VK peer ${stagedPilot.peerId}.`
+      : "Изолированная staging-пилот отключена; новые файлы отправляются из исходных байтов." });
     const pendingAge = stageStorage.oldestPendingAt === null ? 0 : Math.max(0, checkedAt - stageStorage.oldestPendingAt);
     const atStageQuota = stageStorage.chargedBytes >= 2 * 1024 * 1024 * 1024 || stageStorage.chargedCount >= 2_048;
     const stageState: HealthState = stageStorage.legacyUnaccounted || atStageQuota || pendingAge > 10 * 60_000 ? "degraded" : "ok";

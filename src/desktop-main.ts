@@ -66,7 +66,8 @@ const observe = (state: import("./core/task-state.js").TaskState,
 const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
   { states, observe, history: new RolloutTaskHistoryRecovery(),
     inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId) }, undefined,
-  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits);
+  path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits,
+  config.stagedFilePilot);
 const startedAt = Date.now();
 let exitReason = "process_exit";
 let stopping = false;
