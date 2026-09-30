@@ -1212,6 +1212,27 @@ test("a lost project-create reply reuses the created target project without a du
   assert.equal(s.store.transfer(original.id)!.phase, "complete");
 });
 
+test("a changed source project fingerprint uses a new native project-create idempotency key", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  s.desktop.projectCreateError = new UncertainActionError();
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Перенести");
+  assert.equal(s.desktop.projectCreations.length, 1);
+  const originalKey = s.desktop.projectCreations[0]!.idempotencyKey;
+
+  s.desktop.sourceProjects[""] = [{ id: "project-a", title: "Renamed Project", workspace: "/changed-project", workspaceRoots: ["/changed-project"] }];
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Перенести");
+
+  assert.equal(s.desktop.projectCreations.length, 2);
+  assert.notEqual(s.desktop.projectCreations[1]!.idempotencyKey, originalKey);
+  assert.deepEqual(s.desktop.projectCreations[1]!.roots, ["/changed-project"]);
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+});
+
 test("a switched transfer retries only source archiving and completes", async t => {
   const s = setup(t); const original = s.attach();
   s.desktop.tasks = [{ ...task, projectId: null }];

@@ -77,8 +77,9 @@ const projectRoots = (project: DesktopProject): string[] => [...(project.workspa
 const sameProject = (left: DesktopProject, right: DesktopProject): boolean => left.title === right.title
   && projectRoots(left).length === projectRoots(right).length
   && projectRoots(left).every((root, index) => comparablePath(root) === comparablePath(projectRoots(right)[index]!));
-function projectCreationKey(sourceId: string, targetSourceId: string, projectId: string): string {
-  const digest = createHash("sha256").update(JSON.stringify([sourceId, targetSourceId, projectId])).digest("hex");
+function projectCreationKey(sourceId: string, targetSourceId: string, project: DesktopProject): string {
+  const digest = createHash("sha256").update(JSON.stringify([sourceId, targetSourceId, project.id, project.title,
+    projectRoots(project).map(root => comparablePath(root))])).digest("hex");
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
@@ -768,7 +769,7 @@ export class TaskPanels {
     if (matches.length > 1) throw new ActionRejectedError("В каталоге назначения несколько одинаковых проектов. Перенос не начат.");
     if (matches.length === 1) return matches[0]!.id;
     const created = await this.desktop.createProject(state.targetSourceId, source.title, projectRoots(source),
-      projectCreationKey(binding.sourceId ?? "", state.targetSourceId, source.id));
+      projectCreationKey(binding.sourceId ?? "", state.targetSourceId, source));
     if (!sameProject(source, created)) throw new UncertainActionError();
     const visible = (await this.desktop.listProjects(state.targetSourceId)).find(project => project.id === created.id);
     if (!visible || !sameProject(source, visible)) throw new UncertainActionError();
