@@ -215,6 +215,7 @@ class Desktop implements DesktopTasks {
     const goal = await this.setGoal(task, { status: "active" });
     return { receipt, goal };
   }
+  async prepareGoalRuntime(task: TaskRef): Promise<void> { await this.ensureOpen(task); }
   async listTasks() { return this.tasks; }
   listSources() { return this.sources; }
   async listProjects(sourceId?: string) { if (this.projectsError) throw this.projectsError; return sourceId !== undefined && this.sourceProjects ? (this.sourceProjects[sourceId] ?? []) : this.projects; }
@@ -664,6 +665,7 @@ test("without a goal receipt VK requests native status activation but never star
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   assert.equal(legacyCalls, 0);
+  assert.equal(s.desktop.opened.length, 1);
   assert.equal(s.desktop.goal?.status, "active");
   assert.deepEqual(s.desktop.goalUpdates, [{ status: "active" }]);
   assert.equal(s.store.getValue<{ phase: string; receipt?: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`)?.phase,
@@ -705,6 +707,19 @@ test("uncertain native status-only activation is fenced without a second write",
   assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "uncertain");
   await clickPanel(s, "Возобновить");
   assert.equal(writes, 1);
+});
+
+test("goal runtime refusal does not activate the goal or write through another owner", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  s.desktop.prepareGoalRuntime = async () => { throw new ActionRejectedError("Owner unavailable"); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(s.desktop.goal?.status, "paused");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "rejected");
 });
 
 test("a foreign native goal activation response stays uncertain and cannot claim a started turn", async t => {

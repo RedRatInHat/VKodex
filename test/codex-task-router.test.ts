@@ -97,6 +97,17 @@ test("native goal activation cannot fall back from an owner to a legacy empty tu
   assert.deepEqual(f.calls, ["base:native-goal"]);
 });
 
+test("goal runtime preparation loads only its selected owner and never launches the base client", async () => {
+  const f = fixture();
+  await f.routed.prepareGoalRuntime!(work);
+  assert.deepEqual(f.calls, ["owner:open"]);
+  await f.routed.prepareGoalRuntime!(primary);
+  assert.deepEqual(f.calls, ["owner:open"]);
+  f.owner.ensureOpen = async () => { throw new TaskOwnedByClientError(); };
+  await assert.rejects(f.routed.prepareGoalRuntime!(work), /другом клиенте Codex/u);
+  assert.deepEqual(f.calls, ["owner:open"]);
+});
+
 test("health goal reads are isolated from the long-lived task owner", async () => {
   const f = fixture(); let ownerReads = 0; let healthReads = 0;
   f.owner.getGoal = async () => { ownerReads++; return null; };

@@ -287,6 +287,20 @@ export class RoutedCodexTasks implements CodexTasks {
   async clearGoal(task: TaskRef): Promise<boolean> {
     const owner = this.owner(task); return owner?.clearGoal(task) ?? this.base.clearGoal?.(task) ?? Promise.resolve(false);
   }
+  async prepareGoalRuntime(task: TaskRef): Promise<void> {
+    const owner = this.owner(task);
+    if (!owner) return;
+    if (owner.routingPolicy === "exclusive") this.unsupportedExclusive();
+    if (!owner.ensureOpen) throw new ActionRejectedError("Нативный исполнитель цели недоступен в этом подключении.");
+    try { await owner.ensureOpen(task); }
+    catch (error) {
+      // A different UI host owns the live goal runtime. Updating profile
+      // SQLite here would show an active goal without triggering that host.
+      if (error instanceof TaskOwnedByClientError)
+        throw new ActionRejectedError("Задача открыта в другом клиенте Codex; продолжи цель в нём или дождись освобождения задачи.");
+      throw error;
+    }
+  }
   async activateGoalWithReceipt(task: TaskRef, operationId: string): Promise<NativeGoalActivation> {
     const owner = this.owner(task);
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();

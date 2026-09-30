@@ -351,6 +351,8 @@ export interface CodexTasks {
   healthGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
+  /** Prepare only the selected in-process native goal runtime; never launch a UI. */
+  prepareGoalRuntime?(task: TaskRef): Promise<void>;
   activateGoalWithReceipt?(task: TaskRef, operationId: string): Promise<NativeGoalActivation>;
   /** Legacy ordinary empty-input turn; does not activate a native goal. */
   continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;

@@ -886,6 +886,9 @@ export class TaskPanels {
   private async requestGoalStatusActivation(binding: Binding, goal: TaskGoal,
     attempt: GoalContinuationState): Promise<string> {
     try {
+      // The native goal loop runs only in a loaded thread. This preparation
+      // stays on the selected owner and never launches a visible UI client.
+      await this.desktop.prepareGoalRuntime?.(binding);
       const updated = await this.desktop.setGoal!(binding, { status: "active" });
       if (updated.threadId !== binding.threadId || updated.status !== "active"
         || updated.objective !== goal.objective || updated.createdAt !== goal.createdAt)
