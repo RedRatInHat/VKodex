@@ -143,6 +143,20 @@ export interface NativeCliCanaryEvidence {
   readonly pendingEvents: number;
 }
 
+/** Content-free native snapshot for an isolated, zero-turn refusal probe.
+ * This is a sampled pre/postcondition, not an exclusive native writer claim. */
+export interface NativeRefusalCanaryEvidence {
+  readonly ownerEpoch: string;
+  readonly taskId: string;
+  readonly backendGeneration: number;
+  readonly nativeState: 'connected';
+  readonly threadStatus: 'idle';
+  readonly turnsEmpty: true;
+  readonly queueEmpty: true;
+  readonly goalEmpty: true;
+  readonly refusalOnlyEvidence: NonNullable<ManagedWorkerControlDiagnosis['refusalOnlyEvidence']>;
+}
+
 /** Quiescence evidence for entering handoff_pending only. Retiring the claim
  * or assigning a new writer additionally requires proven process release and
  * reconciliation of late receipts. */
@@ -275,7 +289,10 @@ export class ManagedWorkerDaemon {
         this.#options.nativeStockQueue !== undefined ||
         this.#currentOwner?.() !== true) return null;
     const host = this.#host, owner = this.#owner, generation = this.#generation;
+    const self = this.#self, backend = this.#backend;
+    const observe = this.#options.dependencies?.observeProcess ?? readWindowsProcessIdentity;
     if (!host || !owner || generation === null ||
+        !self || !backend || backend.generation !== generation ||
         host.metadata.state !== 'running' ||
         host.metadata.backendGeneration !== generation ||
         owner.metadata.state !== 'connected') return null;
@@ -293,6 +310,7 @@ export class ManagedWorkerDaemon {
       if (this.#host !== host || this.#owner !== owner ||
           this.#generation !== generation || ownerMeta.semanticRevision !== before ||
           this.#currentOwner?.() !== true ||
+          !same(observe(self.pid), self) || !same(observe(backend.pid), backend) ||
           host.metadata.state !== 'running' ||
           host.metadata.backendGeneration !== generation ||
           owner.metadata.state !== 'connected' ||
@@ -312,6 +330,54 @@ export class ManagedWorkerDaemon {
         acceptedReceipts: 0, acceptedQueue: 0, pendingBackendRequests: 0,
         pendingNativeOperations: 0, pendingNativeEvents: 0, intentStore: 'absent' });
     } catch { return null; }
+  }
+
+  /** Same-worker native reads, twice bracketed by worker-local refusal proof.
+   * The response contains no turn, queue, goal, or request content. Callers
+   * must perform independent pre/post captures around a disposable UI action. */
+  async nativeRefusalCanaryEvidence(): Promise<NativeRefusalCanaryEvidence> {
+    const unavailable = (): never => { throw new Error('Native refusal canary evidence unavailable'); };
+    try {
+      const host = this.#host, owner = this.#owner, key = this.#vkControlKey;
+      const taskId = this.#taskId, generation = this.#generation;
+      if (!this.#options.refusalOnlyProbe || !host || !owner || !key || !taskId || !generation)
+        throw new Error('refusal probe unavailable');
+      const initialRevision = owner.metadata.semanticRevision;
+      const current = (): NonNullable<ManagedWorkerControlDiagnosis['refusalOnlyEvidence']> => {
+        if (this.#host !== host || this.#owner !== owner || this.#vkControlKey !== key ||
+            this.#taskId !== taskId || this.#generation !== generation ||
+            owner.metadata.semanticRevision !== initialRevision ||
+            host.metadata.state !== 'running' || host.metadata.backendGeneration !== generation)
+          unavailable();
+        return this.#refusalOnlyEvidence(key) ?? unavailable();
+      };
+      current();
+      for (let pass = 0; pass < 2; pass++) {
+        const read = await host.ownerRead(key, generation, 'thread/read',
+          { threadId: taskId, includeTurns: false });
+        current();
+        const turns = await host.ownerRead(key, generation, 'thread/turns/list',
+          { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'summary' });
+        current();
+        const goal = await host.ownerRead(key, generation, 'thread/goal/get', { threadId: taskId });
+        current();
+        const queue = await host.ownerRead(key, generation, 'thread/queue/list',
+          { threadId: taskId, limit: 2 });
+        current();
+        const thread = read.thread;
+        if (!object(thread) || thread.id !== taskId || !object(thread.status) ||
+            thread.status.type !== 'idle' || !Array.isArray(turns.data) ||
+            turns.data.length !== 0 || turns.nextCursor !== null ||
+            !Object.hasOwn(goal, 'goal') || goal.goal !== null ||
+            !Array.isArray(queue.data) || queue.data.length !== 0 ||
+            queue.nextCursor !== null) unavailable();
+      }
+      const refusalOnlyEvidence = current();
+      return Object.freeze({ ownerEpoch: this.#options.epoch, taskId,
+        backendGeneration: generation, nativeState: 'connected' as const,
+        threadStatus: 'idle' as const, turnsEmpty: true as const,
+        queueEmpty: true as const, goalEmpty: true as const, refusalOnlyEvidence });
+    } catch { return unavailable(); }
   }
 
   /** In-process capability only. The native CLI bearer is never included in

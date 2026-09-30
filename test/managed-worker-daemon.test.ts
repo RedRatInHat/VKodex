@@ -220,6 +220,157 @@ test('refusal-only evidence is absent while a backend question remains unresolve
   }
 });
 
+test('refusal-only async canary evidence returns only scoped empty-state facts', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  try {
+    const evidence = await (own.daemon as any).nativeRefusalCanaryEvidence();
+    const zero = { backendGeneration: own.daemon.metadata.generation, commandInFlight: 0,
+      commandUnconfirmed: 0, operationJournalRows: 0, settingsJournalRows: 0,
+      acceptedReceipts: 0, acceptedQueue: 0, pendingBackendRequests: 0,
+      pendingNativeOperations: 0, pendingNativeEvents: 0, intentStore: 'absent' };
+    assert.deepEqual(evidence, { ownerEpoch: own.reserved.epoch, taskId: own.taskId,
+      backendGeneration: own.daemon.metadata.generation, nativeState: 'connected',
+      threadStatus: 'idle', turnsEmpty: true, queueEmpty: true, goalEmpty: true,
+      refusalOnlyEvidence: zero });
+    assert.deepEqual(Object.keys(evidence).sort(), ['backendGeneration', 'goalEmpty',
+      'nativeState', 'ownerEpoch', 'queueEmpty', 'refusalOnlyEvidence', 'taskId',
+      'threadStatus', 'turnsEmpty'].sort());
+    assert.deepEqual(Object.keys(evidence.refusalOnlyEvidence).sort(), Object.keys(zero).sort());
+    assert.doesNotMatch(JSON.stringify(evidence), /prompt|PRIVATE_|requestId|turnId|goalText/iu);
+    assert.ok(own.backend.frames.some(frame => frame.method === 'thread/read' &&
+      (frame.params as Record<string, unknown> | undefined)?.includeTurns === false));
+    assert.ok(own.backend.frames.some(frame => frame.method === 'thread/turns/list' &&
+      (frame.params as Record<string, unknown> | undefined)?.itemsView === 'summary'));
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'native-refusal-evidence-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
+test('refusal-only async canary evidence rejects missing local proof and native nonempty state', async () => {
+  const ordinary = await readyFixture();
+  try {
+    await assert.rejects((ordinary.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+  } finally {
+    try { await controlStop(ordinary.privateDirectory, ordinary.reserved.epoch, 'no-local-proof-stop'); }
+    finally {
+      await (ordinary.control as ManagedWorkerControlServer | null)?.close();
+      if (ordinary.backend.exitCode === null) ordinary.backend.stdin.end();
+    }
+  }
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  try {
+    own.backend.readStatusOverride = 'active';
+    await assert.rejects((own.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+    own.backend.readStatusOverride = null;
+    own.backend.terminalQueueClients = [];
+    await assert.rejects((own.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+    own.backend.terminalQueueClients = null;
+    own.backend.goalOverride = { text: 'PRIVATE_GOAL_SENTINEL' };
+    await assert.rejects((own.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+    own.backend.goalOverride = null;
+    own.backend.queueEntries = [{ text: 'PRIVATE_QUEUE_SENTINEL' }];
+    await assert.rejects((own.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'native-nonempty-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
+test('refusal-only async canary evidence rejects a backend question unresolved before its scoped reads', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  const broker = own.brokers[0]!;
+  try {
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'async-proof-follower', params: { conversationId: own.taskId,
+        hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    own.backend.stdout.write(JSON.stringify({ id: 'async-proof-question',
+      method: 'item/tool/requestUserInput', params: { threadId: own.taskId,
+        turnId: 'private-turn-id', itemId: 'private-item-id', questions: [] } }) + '\n');
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+      JSON.stringify(frame).includes('async-proof-question')));
+    await assert.rejects((own.daemon as any).nativeRefusalCanaryEvidence(),
+      /Native refusal canary evidence unavailable$/);
+    own.backend.stdout.write(JSON.stringify({ method: 'serverRequest/resolved',
+      params: { threadId: own.taskId, requestId: 'async-proof-question' } }) + '\n');
+    await waitFor(() => {
+      const latest = broker.frames.filter(frame => frame.method === 'thread-stream-state-changed').at(-1);
+      return !!latest && !JSON.stringify(latest).includes('async-proof-question');
+    });
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'native-pending-question-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+});
+
+test('refusal-only async canary evidence rejects semantic and backend identity races during ownerRead', async () => {
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  const broker = own.brokers[0]!;
+  try {
+    broker.send({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
+      sourceClientId: 'race-proof-follower', params: { conversationId: own.taskId,
+        hostId: 'local', following: true } });
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed'));
+    own.backend.holdEvidenceRead = true;
+    const semanticRace = (own.daemon as any).nativeRefusalCanaryEvidence();
+    await waitFor(() => own.backend.heldEvidenceRead !== null);
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started', params: {
+      threadId: own.taskId, turn: { id: 'private-race-turn', status: 'inProgress',
+        startedAt: 1780000000, items: [] } } }) + '\n');
+    await waitFor(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+      JSON.stringify(frame).includes('private-race-turn')));
+    own.backend.answerHeldEvidenceRead();
+    await assert.rejects(semanticRace, /Native refusal canary evidence unavailable$/);
+  } finally {
+    try { await controlStop(own.privateDirectory, own.reserved.epoch, 'native-race-evidence-stop'); }
+    finally {
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+    }
+  }
+  const identity = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    undefined, true, false, true);
+  try {
+    identity.backend.holdEvidenceRead = true;
+    const identityRace = (identity.daemon as any).nativeRefusalCanaryEvidence();
+    await waitFor(() => identity.backend.heldEvidenceRead !== null);
+    identity.backend.birthDrift = true;
+    identity.backend.answerHeldEvidenceRead();
+    await assert.rejects(identityRace, /Native refusal canary evidence unavailable$/);
+  } finally {
+    identity.backend.birthDrift = false;
+    try { await controlStop(identity.privateDirectory, identity.reserved.epoch, 'native-identity-evidence-stop'); }
+    finally {
+      await (identity.control as ManagedWorkerControlServer | null)?.close();
+      if (identity.backend.exitCode === null) identity.backend.stdin.end();
+    }
+  }
+});
+
 test('one-shot command policy admits only the exact persisted first Composer intent', () => {
   const operationId = randomUUID(), clientUserMessageId = randomUUID();
   const scope = { ownerEpoch: randomUUID(), backendGeneration: 1, threadId: 'own-zero-turn',
