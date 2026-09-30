@@ -774,6 +774,8 @@ VKodex is an independent project and is not an official VK or OpenAI product.
 
 Send `/queue <prompt>` in a task conversation (newlines and attachments are supported). VKodex calls `thread/queue/add` to append to the **native Codex queue**, without steering the current turn. Codex may start it immediately when idle. Codex owns persistence and execution; VKodex has no separate queue scheduler. The task client must be connected. An uncertain insertion is never retried automatically. Edit an already queued prompt in Codex.
 
+If Codex acknowledged the insertion but VKodex has not observed the resulting turn, `/health` shows the retained acknowledgement and read-only history scan progress. The bridge settles it only after matching the exact request ID in a complete native terminal turn. An empty current queue or absence from the history inspected so far does not prove rejection: VKodex neither retries the prompt nor deletes the acknowledgement automatically.
+
 ### Codex questions in VK: `/questions`
 
 An open Codex question appears in the task conversation with option buttons and **“Свой ответ”** (custom answer). You can also use VK's **Reply** on the question card and type your answer. Multiple questions are collected in order and submitted together. `/questions` checks current questions and refreshes buttons, which expire after 30 minutes.
