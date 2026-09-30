@@ -1,40 +1,70 @@
 import { spawnSync } from "node:child_process";
-import { parentPort, workerData } from "node:worker_threads";
+import path from "node:path";
+
+const MAX_BYTES = 64 * 1024;
+const MAX_ENCODED_INPUT_BYTES = 4 * Math.ceil(MAX_BYTES / 3);
+const TIMEOUT_MS = 10_000;
 
 interface Request {
-  readonly executable: string;
-  readonly modulePath: string;
   readonly command: string;
   readonly input: Uint8Array;
-  readonly timeoutMs: number;
-  readonly maxBytes: number;
 }
 
-const request = workerData as Request;
-const payload = Buffer.from(request.input);
-let result: ReturnType<typeof spawnSync> | null = null;
-try {
-  result = spawnSync(request.executable,
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", request.command], {
-      input: payload, windowsHide: true, timeout: request.timeoutMs, maxBuffer: request.maxBytes,
-      env: { ...process.env, PSModulePath: request.modulePath },
+let replied = false;
+function send(message: { readonly ok: false; readonly phase: string } |
+  { readonly ok: true; readonly output: Uint8Array }, after?: () => void): void {
+  let released = false;
+  const release = (): void => { if (!released) { released = true; after?.(); } };
+  const disconnect = (): void => {
+    if (process.connected) { try { process.disconnect(); } catch { process.exitCode = 1; } }
+  };
+  if (!process.send || !process.connected) { release(); process.exitCode = 1; return; }
+  try {
+    process.send(message, (error: Error | null) => {
+      release();
+      if (error) process.exitCode = 1;
+      else replied = true;
+      disconnect();
     });
-} catch {
-  parentPort?.postMessage({ ok: false, phase: "spawn-throw" });
-} finally {
-  payload.fill(0); request.input.fill(0);
+  } catch { release(); process.exitCode = 1; disconnect(); }
 }
 
-if (result) {
-  if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout) ||
-      result.stdout.byteLength > request.maxBytes) {
-    const phase = result.error ? "process-error" : result.status === 42 ? "input-length" : `exit-${result.status}`;
-    parentPort?.postMessage({ ok: false, phase });
-  } else {
-    const output = Uint8Array.from(result.stdout);
-    parentPort?.postMessage({ ok: true, output });
-    output.fill(0);
+process.once("disconnect", () => { if (!replied) process.exitCode = 1; });
+process.once("message", (value: unknown) => {
+  if (!value || typeof value !== "object" || !("command" in value) ||
+      typeof value.command !== "string" || value.command.length > 16_384 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/u.test(value.command) || !("input" in value) ||
+      !(value.input instanceof Uint8Array) || value.input.byteLength > MAX_ENCODED_INPUT_BYTES) {
+    if (value && typeof value === "object" && "input" in value && value.input instanceof Uint8Array)
+      value.input.fill(0);
+    send({ ok: false, phase: "invalid-input" }); return;
   }
-  if (Buffer.isBuffer(result.stdout)) result.stdout.fill(0);
-  if (Buffer.isBuffer(result.stderr)) result.stderr.fill(0);
-}
+  const request = value as Request;
+  const root = process.env.SystemRoot;
+  if (!root || !path.win32.isAbsolute(root)) { request.input.fill(0); send({ ok: false, phase: "spawn-throw" }); return; }
+  const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const payload = Buffer.from(request.input);
+  let result: ReturnType<typeof spawnSync> | null = null;
+  try {
+    result = spawnSync(executable,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", request.command], {
+        input: payload, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: MAX_BYTES,
+        env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
+      });
+  } catch { send({ ok: false, phase: "spawn-throw" }); }
+  finally { payload.fill(0); request.input.fill(0); }
+  if (!result) return;
+  const stdout = result.stdout;
+  const stderr = result.stderr;
+  if (result.error || result.status !== 0 || !Buffer.isBuffer(stdout) || stdout.byteLength > MAX_BYTES) {
+    const phase = result.error ? "process-error" : result.status === 42 ? "input-length" : `exit-${result.status}`;
+    if (Buffer.isBuffer(stdout)) stdout.fill(0);
+    if (Buffer.isBuffer(stderr)) stderr.fill(0);
+    send({ ok: false, phase });
+    return;
+  }
+  const output = Uint8Array.from(stdout);
+  stdout.fill(0);
+  if (Buffer.isBuffer(stderr)) stderr.fill(0);
+  send({ ok: true, output }, () => output.fill(0));
+});

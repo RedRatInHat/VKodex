@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
-import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
 import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
 import { assertWindowsPrivateDirectory } from "./windows-private-directory.js";
 
@@ -164,47 +165,55 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
   const executable = windowsPowerShell();
   const modulePath = path.win32.join(path.dirname(executable), "Modules");
   const command = requireCompleteInput ? `$expected=${input.byteLength};${encoded}` : encoded;
-  const payload = Uint8Array.from(input);
+  const payload = Buffer.from(input);
   input.fill(0);
-  let worker: Worker;
+  let helper: ReturnType<typeof spawn>;
   try {
     const sourceMode = import.meta.url.endsWith(".ts");
-    worker = new Worker(new URL(sourceMode ? "./managed-worker-powershell-worker.ts" : "./managed-worker-powershell-worker.js", import.meta.url), {
-      execArgv: sourceMode ? ["--import", "tsx"] : [],
-      workerData: { executable, modulePath, command: ps(command), input: payload,
-        timeoutMs: POWERSHELL_TIMEOUT_MS, maxBytes: MAX_PROTECTED_BYTES },
+    const helperPath = fileURLToPath(new URL(sourceMode ? "./managed-worker-powershell-worker.ts" : "./managed-worker-powershell-worker.js", import.meta.url));
+    helper = spawn(process.execPath, [...(sourceMode ? ["--import", "tsx"] : []), helperPath], {
+      serialization: "advanced", windowsHide: true,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      env: { ...process.env, PSModulePath: modulePath },
     });
   } catch {
     payload.fill(0);
     throw new Error("Managed worker private state protection failed", { cause: { phase: "spawn-throw" } });
   }
-  payload.fill(0);
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (result?: Uint8Array, phase = "unclassified"): void => {
       if (settled) return;
-      settled = true; clearTimeout(timeout);
+      settled = true; clearTimeout(timeout); payload.fill(0);
       if (result) resolve(result);
       else reject(new Error("Managed worker private state protection failed", { cause: { phase } }));
     };
     const timeout = setTimeout(() => {
-      void worker.terminate().catch(() => {}); settle(undefined, "timeout");
+      try { helper.kill(); } catch { /* best-effort containment */ }
+      settle(undefined, "timeout");
     }, POWERSHELL_TIMEOUT_MS + 3_000);
-    worker.once("message", (message: unknown) => {
+    helper.once("message", (message: unknown) => {
       if (!message || typeof message !== "object" || !("ok" in message)) return settle();
       if (message.ok !== true) {
         const phase = "phase" in message && typeof message.phase === "string" ? message.phase : "unclassified";
-        return settle(undefined, /^(?:spawn-throw|process-error|input-length|exit-(?:null|\d+))$/u.test(phase)
+        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-length|exit-(?:null|\d+))$/u.test(phase)
           ? phase : "unclassified");
       }
       const output = "output" in message ? message.output : null;
-      if (!(output instanceof Uint8Array) || output.byteLength > MAX_PROTECTED_BYTES)
-        return settle(undefined, "output-limit");
-      settle(Uint8Array.from(output));
-      output.fill(0);
+      if (!(output instanceof Uint8Array)) return settle(undefined, "output-limit");
+      try {
+        if (output.byteLength > MAX_PROTECTED_BYTES) return settle(undefined, "output-limit");
+        settle(Uint8Array.from(output));
+      } finally { output.fill(0); }
     });
-    worker.once("error", () => settle(undefined, "process-error"));
-    worker.once("exit", code => { if (!settled) settle(undefined, `worker-exit-${code}`); });
+    helper.once("error", () => settle(undefined, "process-error"));
+    helper.once("close", code => { if (!settled) settle(undefined, `helper-exit-${code}`); });
+    try {
+      helper.send({ command: ps(command), input: payload }, error => {
+        payload.fill(0);
+        if (error) settle(undefined, "process-error");
+      });
+    } catch { settle(undefined, "process-error"); }
   });
 }
 
@@ -216,7 +225,7 @@ function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
     !("phase" in error.cause) || typeof error.cause.phase !== "string") return "unclassified";
   const phase = error.cause.phase;
-  return /^(?:timeout|spawn-throw|process-error|output-limit|input-length|stdin-end|output-format|exit-(?:null|\d+)|worker-exit-\d+)$/u.test(phase)
+  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-length|stdin-end|output-format|exit-(?:null|\d+)|helper-exit-\d+)$/u.test(phase)
     ? phase : "unclassified";
 }
 
