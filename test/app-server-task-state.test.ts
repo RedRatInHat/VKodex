@@ -502,17 +502,22 @@ test("native observer unwraps a notifying heartbeat", () => {
   ]);
 });
 
-test("a streamed final-answer item remains progress until the turn completes", () => {
+test("a streamed final-answer item is withheld until the turn completes", () => {
   const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
     runtimeStatus: "idle", context: null, turns: [] };
   const first = observeAppServerTaskState(empty, null, 10_000);
   const streaming = structuredClone(empty); streaming.runtimeStatus = "active";
   streaming.turns = [turn("turn", "inProgress", [item("answer", "partial", "final_answer")], 11_000)];
   const live = observeAppServerTaskState(streaming, first.checkpoint, 11_500);
-  assert.deepEqual(live.events.map(event => event.type), ["progress", "status"]);
-  const done = structuredClone(streaming); done.runtimeStatus = "idle"; (done.turns as JsonObject[])[0]!.status = "completed";
-  const completed = observeAppServerTaskState(done, live.checkpoint, 12_000);
+  assert.deepEqual(live.events.map(event => event.type), ["status"]);
+  const expanded = structuredClone(streaming);
+  ((expanded.turns as JsonObject[])[0]!.items as JsonObject[])[0]!.text = "partial and complete answer";
+  const stillLive = observeAppServerTaskState(expanded, live.checkpoint, 11_750);
+  assert.deepEqual(stillLive.events, []);
+  const done = structuredClone(expanded); done.runtimeStatus = "idle"; (done.turns as JsonObject[])[0]!.status = "completed";
+  const completed = observeAppServerTaskState(done, stillLive.checkpoint, 12_000);
   assert.deepEqual(completed.events.map(event => event.type), ["final", "status"]);
+  assert.equal(completed.events[0]?.type === "final" ? completed.events[0].text : null, "partial and complete answer");
 });
 
 test("native observer accepts a turn started later in the attachment second", () => {
