@@ -7,7 +7,8 @@ import { projectNativeStartIntents } from '../codex/native-start-intent-projecti
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import { applyNotification, projectNativeServerRequest } from '../codex/managed-native-projection.js';
 import { DesktopIpcClient } from './ipc-client.js';
-import type { IpcIncomingRequest, IpcObject, IpcRequestFailureCategory, IpcRequestHandler } from './ipc-client.js';
+import type { IpcComposerIngressMethod, IpcComposerIngressOutcome, IpcIncomingRequest,
+  IpcObject, IpcRequestFailureCategory, IpcRequestHandler } from './ipc-client.js';
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
 import type { NativeStartAuthority } from './managed-worker-native-start.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
@@ -39,6 +40,12 @@ function bootstrapCategory(method: unknown): BootstrapCategory {
 type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
 type QueueGrant = { readonly requestId: string; readonly sourceClientId: string;
   readonly lease: object; revoked: boolean };
+export type ComposerIngressCounts = Readonly<{ seen: number; handled: number;
+  refused: number; lastAtMs: number }>;
+export type ComposerIngressDiagnosis = Readonly<{
+  directStartTurn: ComposerIngressCounts;
+  queuedFollowUpsState: ComposerIngressCounts;
+}>;
 export interface ManagedNativeStockQueueContext {
   readonly host: Host;
   readonly controlKey: object;
@@ -143,6 +150,8 @@ export interface ManagedWorkerNativeOwnerMetadata {
   }> | null;
   /** Fixed, bounded IPC failure category, never an exception body or request identity. */
   readonly lastRequestFailure?: Readonly<{ category: IpcRequestFailureCategory; count: number; atMs: number }>;
+  /** Only the two fixed Composer method classes and bounded counts; no IDs or content. */
+  readonly composerIngress?: ComposerIngressDiagnosis;
 }
 
 export interface ManagedWorkerBridgeStateEvent {
@@ -189,6 +198,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #bootstrapPendingRequests = 0;
   #bootstrapBoundary: ManagedWorkerNativeOwnerMetadata['bootstrapBoundary'] = null;
   #lastRequestFailure: ManagedWorkerNativeOwnerMetadata['lastRequestFailure'];
+  #composerIngress: ComposerIngressDiagnosis | undefined;
   #detachObserver: (() => void) | null = null;
   #detachRequests: (() => void) | null = null;
   #client: DesktopIpcClient | null = null;
@@ -247,7 +257,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       bootstrapNotifications: Object.freeze({ ...this.#bootstrapNotifications }),
       bootstrapPendingRequests: this.#bootstrapPendingRequests,
       bootstrapBoundary: this.#bootstrapBoundary,
-      ...(this.#lastRequestFailure ? { lastRequestFailure: this.#lastRequestFailure } : {}) });
+      ...(this.#lastRequestFailure ? { lastRequestFailure: this.#lastRequestFailure } : {}),
+      ...(this.#composerIngress ? { composerIngress: this.#composerIngress } : {}) });
   }
 
   /** Owner-local necessary condition for native CLI source qualification. This
@@ -291,6 +302,20 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   onRequestFailure(category: IpcRequestFailureCategory): void {
     this.#lastRequestFailure = Object.freeze({ category,
       count: Math.min((this.#lastRequestFailure?.count ?? 0) + 1, diagnosticCap), atMs: Date.now() });
+  }
+
+  onComposerIngress(method: IpcComposerIngressMethod, outcome: IpcComposerIngressOutcome): void {
+    const key = method === 'thread-follower-start-turn' ? 'directStartTurn' :
+      method === 'thread-follower-set-queued-follow-ups-state' ? 'queuedFollowUpsState' : null;
+    if (!key || !['seen', 'handled', 'refused'].includes(outcome)) return;
+    const empty = (): ComposerIngressCounts => Object.freeze({ seen: 0, handled: 0,
+      refused: 0, lastAtMs: 0 });
+    const before = this.#composerIngress ?? Object.freeze({
+      directStartTurn: empty(), queuedFollowUpsState: empty() });
+    const count = before[key];
+    this.#composerIngress = Object.freeze({ ...before,
+      [key]: Object.freeze({ ...count, [outcome]: Math.min(count[outcome] + 1, diagnosticCap),
+        lastAtMs: Date.now() }) });
   }
 
   /** Subscribe before capturing the complete same-generation snapshot. Native

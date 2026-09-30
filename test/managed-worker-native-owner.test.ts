@@ -208,6 +208,43 @@ test('managed owner retains only a bounded category for native IPC refusal diagn
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('managed owner diagnosis records only the incoming Composer method and generic refusal', async () => {
+  const f = await fixture(async () => state(), undefined, undefined, false,
+    undefined, () => true, true);
+  try {
+    await f.owner.start();
+    followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    for (const [index, method] of ['thread-follower-start-turn',
+      'thread-follower-set-queued-follow-ups-state'].entries()) {
+      const request = { type: 'request', requestId: `private-request-id-${index}`,
+        sourceClientId: 'private-source-id',
+        hostId: 'local', targetClientId: 'owner-peer', method,
+        version: method === 'thread-follower-start-turn' ? 2 : 1,
+        params: { conversationId: taskId, text: 'private-prompt-sentinel',
+          opaque: 'private-param-sentinel' } };
+      f.broker.send(request);
+      const response = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+        frame.requestId === request.requestId);
+      assert.equal(response.resultType, 'error');
+    }
+    const diagnosis = f.owner.metadata.composerIngress;
+    assert.deepEqual(diagnosis, {
+      directStartTurn: { seen: 1, handled: 0, refused: 1, lastAtMs: diagnosis?.directStartTurn.lastAtMs },
+      queuedFollowUpsState: { seen: 1, handled: 0, refused: 1,
+        lastAtMs: diagnosis?.queuedFollowUpsState.lastAtMs },
+    });
+    assert.ok(Number.isFinite(diagnosis?.directStartTurn.lastAtMs));
+    assert.ok(Number.isFinite(diagnosis?.queuedFollowUpsState.lastAtMs));
+    assert.ok(diagnosis!.directStartTurn.seen <= 255 && diagnosis!.directStartTurn.handled <= 255 &&
+      diagnosis!.directStartTurn.refused <= 255 && diagnosis!.queuedFollowUpsState.seen <= 255 &&
+      diagnosis!.queuedFollowUpsState.handled <= 255 && diagnosis!.queuedFollowUpsState.refused <= 255);
+    const serialized = JSON.stringify(diagnosis);
+    for (const sentinel of ['private-request-id', 'private-source-id',
+      'private-prompt-sentinel', 'private-param-sentinel']) assert.equal(serialized.includes(sentinel), false);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('managed bridge observation continues through frontend EOF without reopening the backend', async () => {
   const f = await fixture();
   try {

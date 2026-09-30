@@ -208,6 +208,43 @@ test('versioned diagnosis returns only fixed startup metadata and no private cal
   } finally { client.socket.destroy(); await server.close(); }
 });
 
+test('diagnose-v1 accepts only the fixed bounded composer ingress summary', async () => {
+  const epoch = randomUUID();
+  const diagnosis = { schemaVersion: 1 as const, startupPhase: 'ready' as const,
+    daemonState: 'ready' as const, failureCode: null, registryState: 'ready' as const,
+    owner: { startupStage: 'ready' as const, bootstrapEventCount: 0,
+      bootstrapNotifications: { status: 0, settings: 0, goal: 0, usage: 0,
+        'startup-or-warning': 0, turn: 0, item: 0, other: 0 },
+      bootstrapPendingRequests: 0, bootstrapBoundary: null,
+      composerIngress: {
+        directStartTurn: { seen: 2, handled: 1, refused: 1, lastAtMs: 1780000000000 },
+        queuedFollowUpsState: { seen: 3, handled: 2, refused: 1, lastAtMs: 1780000000001 },
+      } } };
+  type Mode = 'valid' | 'extra' | 'raw' | 'count' | 'time';
+  let mode: Mode = 'valid';
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 1, nativeState: 'connected', nativeRevision: 1 }),
+    diagnose: () => {
+      const composerIngress = structuredClone(diagnosis.owner.composerIngress);
+      if (mode === 'extra') Object.assign(composerIngress.directStartTurn, { requestId: 'private-request' });
+      if (mode === 'raw') Object.assign(composerIngress.queuedFollowUpsState, { params: { prompt: 'private' } });
+      if (mode === 'count') composerIngress.directStartTurn.seen = 256;
+      if (mode === 'time') composerIngress.queuedFollowUpsState.lastAtMs = Number.MAX_SAFE_INTEGER + 1;
+      return { ...diagnosis, owner: { ...diagnosis.owner, composerIngress } };
+    },
+    requestStop: async () => { throw new Error('stop must not run'); } });
+  const cap = await server.listen(); const client = await peer(cap);
+  try {
+    client.send({ id: 'valid', epoch, method: 'diagnose-v1' });
+    assert.deepEqual(await client.read(), { id: 'valid', result: { ownerEpoch: epoch, taskId: 'own', ...diagnosis } });
+    for (const invalid of ['extra', 'raw', 'count', 'time'] as const) {
+      mode = invalid;
+      client.send({ id: invalid, epoch, method: 'diagnose-v1' });
+      assert.deepEqual(await client.read(), { id: invalid, error: 'diagnosis-unavailable' });
+    }
+  } finally { client.socket.destroy(); await server.close(); }
+});
+
 test('authorized stop is single flight and continues after sender disconnect', async () => {
   const epoch = randomUUID(); let stops = 0, finish!: () => void;
   const pending = new Promise<void>(resolve => { finish = resolve; });

@@ -106,7 +106,14 @@ export interface IpcRequestHandler {
   handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject>;
   /** Fixed diagnostic category only; never receives an exception or request data. */
   onRequestFailure?(category: IpcRequestFailureCategory): void;
+  /** Content-free first Composer ingress diagnostics. This is observation only:
+   * it grants no route and cannot turn a refusal into an accepted write. */
+  onComposerIngress?(method: IpcComposerIngressMethod, outcome: IpcComposerIngressOutcome): void;
 }
+
+export type IpcComposerIngressMethod = 'thread-follower-start-turn' |
+  'thread-follower-set-queued-follow-ups-state';
+export type IpcComposerIngressOutcome = 'seen' | 'handled' | 'refused';
 
 export type IpcRequestFailureCategory = 'owner-refused' | 'queue-gate-refused' |
   'queue-shape-refused' | 'queue-baseline-refused' |
@@ -323,13 +330,24 @@ export class DesktopIpcClient {
     const stream = this.stream; const clientId = this.clientId;
     const signal = this.incomingAbort.signal;
     const request = incomingRequest(message);
+    const targetMatches = message.targetClientId === undefined || message.targetClientId === clientId;
+    const composerMethod: IpcComposerIngressMethod | null = request && targetMatches &&
+      (request.method === 'thread-follower-start-turn' ||
+        request.method === 'thread-follower-set-queued-follow-ups-state') ? request.method : null;
+    const observeComposer = (outcome: IpcComposerIngressOutcome) => {
+      if (!composerMethod) return;
+      try { this.requestHandler?.onComposerIngress?.(composerMethod, outcome); }
+      catch { /* Observation must never change native IPC routing. */ }
+    };
+    observeComposer('seen');
+    let composerHandled = false;
     let response: IpcObject = { type: "response", requestId: message.requestId,
       resultType: "error", error: "no-handler-for-request" };
     try {
-      const targetMatches = message.targetClientId === undefined || message.targetClientId === clientId;
       if (request && targetMatches && this.acceptsIncoming(request) && this.requestHandler) {
         const result = await this.requestHandler.handle(request, signal);
         if (!isObject(result)) throw new Error("Invalid owner response");
+        composerHandled = true;
         response = { type: "response", requestId: request.requestId, resultType: "success",
           method: request.method, handledByClientId: clientId, result };
       }
@@ -339,6 +357,7 @@ export class DesktopIpcClient {
       catch { /* Diagnostics must not alter the generic IPC refusal. */ }
       response = { type: "response", requestId: message.requestId, resultType: "error", error: "error-handling-request" };
     }
+    observeComposer(composerHandled ? 'handled' : 'refused');
     // A result from the old owner session must never reach a replacement pipe.
     if (signal.aborted || this.stream !== stream || this.clientId !== clientId || !clientId) return;
     try { this.write(response); } catch { /* The requester will reconcile its unknown outcome. */ }

@@ -118,7 +118,7 @@ export interface ManagedWorkerDaemonMetadata {
   readonly startupPhase: ManagedWorkerControlDiagnosis['startupPhase'];
   readonly nativeStartup: Pick<ManagedWorkerNativeOwnerMetadata,
     'startupStage' | 'bootstrapEventCount' | 'bootstrapNotifications' |
-    'bootstrapPendingRequests' | 'bootstrapBoundary' | 'lastRequestFailure'> | null;
+    'bootstrapPendingRequests' | 'bootstrapBoundary' | 'lastRequestFailure' | 'composerIngress'> | null;
 }
 
 /** Fixed, content-free evidence for an opt-in controlled first-start canary. */
@@ -255,7 +255,8 @@ export class ManagedWorkerDaemon {
         bootstrapNotifications: owner.bootstrapNotifications,
         bootstrapPendingRequests: owner.bootstrapPendingRequests,
         bootstrapBoundary: owner.bootstrapBoundary,
-        ...(owner.lastRequestFailure ? { lastRequestFailure: owner.lastRequestFailure } : {}) }) : null });
+        ...(owner.lastRequestFailure ? { lastRequestFailure: owner.lastRequestFailure } : {}),
+        ...(owner.composerIngress ? { composerIngress: owner.composerIngress } : {}) }) : null });
   }
 
   /** In-process capability only. The native CLI bearer is never included in

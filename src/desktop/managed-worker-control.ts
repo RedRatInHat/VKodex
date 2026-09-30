@@ -4,6 +4,7 @@ import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
 import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { IpcRequestFailureCategory } from './ipc-client.js';
+import type { ComposerIngressDiagnosis } from './managed-worker-native-owner.js';
 
 export interface ManagedWorkerControlStatus {
   readonly hostState: string;
@@ -38,6 +39,7 @@ export interface ManagedWorkerControlDiagnosis {
     bootstrapBoundary: Readonly<{ stateIsBootstrapping: boolean;
       hasEvents: boolean; ownerCurrent: boolean | null }> | null;
     lastRequestFailure?: Readonly<{ category: IpcRequestFailureCategory; count: number; atMs: number }>;
+    composerIngress?: ComposerIngressDiagnosis;
   }> | null;
 }
 export interface ManagedWorkerControlOptions {
@@ -193,7 +195,9 @@ function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis 
   if (owner === null) return true;
   const ownerKeys = ['startupStage', 'bootstrapEventCount',
     'bootstrapNotifications', 'bootstrapPendingRequests', 'bootstrapBoundary'];
-  if (!object(owner) || !(exact(owner, ownerKeys) || exact(owner, [...ownerKeys, 'lastRequestFailure'])) ||
+  if (!object(owner) || Object.keys(owner).some(key => ![...ownerKeys,
+    'lastRequestFailure', 'composerIngress'].includes(key)) ||
+    ownerKeys.some(key => !Object.hasOwn(owner, key)) ||
     typeof owner.startupStage !== 'string' || !startupStages.has(owner.startupStage) ||
     !boundedCount(owner.bootstrapEventCount) ||
     !boundedCount(owner.bootstrapPendingRequests) || !object(owner.bootstrapNotifications) ||
@@ -205,7 +209,19 @@ function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis 
         !requestFailureCategories.has(owner.lastRequestFailure.category as IpcRequestFailureCategory) ||
         !boundedCount(owner.lastRequestFailure.count) || owner.lastRequestFailure.count === 0 ||
         !Number.isSafeInteger(owner.lastRequestFailure.atMs) ||
-        (owner.lastRequestFailure.atMs as number) <= 0))
+        (owner.lastRequestFailure.atMs as number) <= 0) ||
+    Object.hasOwn(owner, 'composerIngress') &&
+      (!object(owner.composerIngress) || !exact(owner.composerIngress,
+        ['directStartTurn', 'queuedFollowUpsState']) ||
+        !['directStartTurn', 'queuedFollowUpsState'].every(key => {
+          const counts = (owner.composerIngress as Record<string, unknown>)[key];
+          return object(counts) && exact(counts, ['seen', 'handled', 'refused', 'lastAtMs']) &&
+            boundedCount(counts.seen) && boundedCount(counts.handled) &&
+            boundedCount(counts.refused) &&
+            Number.isSafeInteger(counts.lastAtMs) && (counts.lastAtMs as number) >= 0 &&
+            (counts.handled as number) <= (counts.seen as number) &&
+            (counts.refused as number) <= (counts.seen as number);
+        })))
     return false;
   const boundary = owner.bootstrapBoundary;
   return boundary === null || object(boundary) &&
