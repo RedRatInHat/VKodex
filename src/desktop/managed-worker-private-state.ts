@@ -175,9 +175,14 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
     const helperPath = fileURLToPath(new URL(sourceMode ? "./managed-worker-powershell-worker.ts" : "./managed-worker-powershell-worker.js", import.meta.url));
     helper = spawn(process.execPath, [...(sourceMode ? ["--import", "tsx"] : []), helperPath], {
       serialization: "advanced", windowsHide: true,
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      // Keep real standard handles across the extra Windows process boundary.
+      // Drain and discard them: no protected payload or diagnostics may leak.
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
       env: { ...process.env, PSModulePath: modulePath },
     });
+    helper.stdin?.end();
+    helper.stdout?.resume();
+    helper.stderr?.resume();
   } catch {
     payload.fill(0); inputHash.fill(0);
     throw new Error("Managed worker private state protection failed", { cause: { phase: "spawn-throw" } });
