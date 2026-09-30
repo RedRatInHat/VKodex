@@ -9,7 +9,7 @@ export interface TaskRef {
 
 export interface QueuedInputHistoryCursor {
   /** Increment when pagination order or checkpoint meaning changes. Legacy checkpoints are rescanned. */
-  readonly scanVersion: 2;
+  readonly scanVersion: 3;
   readonly headDigest: string;
   readonly cursor: string;
   readonly seenCursors: readonly string[];

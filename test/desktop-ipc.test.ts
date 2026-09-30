@@ -510,6 +510,14 @@ test("paginated rotation admits a contiguous anchored source but rejects a chang
   const unknownMode = await malformed.poll("unknown-mode", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 105_000);
   assert.equal(unknownMode?.failure, "lineageUnverified");
   assert.equal(unknownMode?.checkpoint, undefined);
+
+  await writeFile(newPath, overlay.replace(/,"history_base":\{[^}]+\}/u, ""));
+  const missingBase = new RolloutTaskHistoryRecovery();
+  missingBase.enable("missing-base", 0);
+  const noBase = await missingBase.poll("missing-base", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 105_000);
+  assert.equal(noBase?.failure, "lineageUnverified");
+  assert.equal(noBase?.checkpoint, undefined);
+  assert.deepEqual(noBase?.events, []);
 });
 
 test("detached idle observation rebases after the existing catalog refresh discovers a rotated rollout", async t => {
@@ -824,7 +832,7 @@ test("historical queue scan persists partial progress without settling its ACK",
   s.store.finishOperation(operationId, "accepted");
   s.store.rememberQueuedInput(s.binding.id, operationId, "deep-queue-id");
   const desktop = s.desktop as import("../src/core/codex-tasks.js").CodexTasks;
-  const cursor = { scanVersion: 2 as const, headDigest: "a".repeat(64), cursor: "next-page", seenCursors: ["next-page"],
+  const cursor = { scanVersion: 3 as const, headDigest: "a".repeat(64), cursor: "next-page", seenCursors: ["next-page"],
     pages: 1 };
   let observedCursor: typeof cursor | null = null;
   desktop.scanTerminalQueuedInput = async (_task, id, previous) => {
@@ -841,8 +849,8 @@ test("historical queue scan persists partial progress without settling its ACK",
   assert.equal(progress.pages, 1);
   assert.equal(progress.lastAttemptAt, 100_000);
   assert.equal(progress.lastFailure, null);
-  assert.equal(progress.nextAt, 100_000 + 5 * 60_000);
-  s.advance(5 * 60_000 + 1);
+  assert.equal(progress.nextAt, 100_000 + 30_000);
+  s.advance(30_000 + 1);
   reconcile();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(observedCursor, cursor);
@@ -2939,7 +2947,7 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   const list = async (params: IpcObject): Promise<IpcObject> => {
     calls.push(params);
     const index = Number(params.cursor ?? 0);
-    return { data: [{ id: `turn-${index}`, status: "completed", itemsView: "full",
+    return { data: [{ id: `turn-${index}`, status: "completed", itemsView: params.itemsView,
       items: [{ type: "userMessage", clientId: index === 125 ? "old-queue-id" : `other-${index}` }] }],
       nextCursor: index === 125 ? null : String(index + 1) };
   };
@@ -2948,41 +2956,41 @@ test("terminal queue reconciliation searches beyond the recent turn window and r
   for (let scanNumber = 0; scanNumber < 130; scanNumber++) {
     const before = calls.length;
     const result = await scanTerminalQueuedInputTurn("thread", "old-queue-id", list, cursor);
-    assert.ok(calls.length - before <= 2, "one scan may parse at most two full native turns");
+    assert.ok(calls.length - before <= 4, "a scan reads two bounded summary pages and exact candidate proof");
     if (result.done) { turnId = result.turnId; break; }
     cursor = result.cursor;
   }
   assert.equal(turnId, "turn-125");
   assert.ok(calls.length > 126);
-  assert.ok(calls.every(call => call.threadId === "thread" && call.itemsView === "full" && call.limit === 1 &&
-    call.sortDirection === "asc"));
+  assert.ok(calls.every(call => call.threadId === "thread" && call.sortDirection === "asc" &&
+    (call.itemsView === "summary" && (call.limit === 12 || call.limit === 1) || call.itemsView === "full" && call.limit === 1)));
   let positiveReads = 0;
-  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => {
+  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "old-queue-id", async params => {
     positiveReads++;
-    return { data: [{ id: "exact-terminal", status: "completed", itemsView: "full",
+    return { data: [{ id: "exact-terminal", status: "completed", itemsView: params.itemsView,
       items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: "older" };
   }), { done: true, turnId: "exact-terminal" });
-  assert.equal(positiveReads, 1, "positive page proof needs no speculative older-page read");
+  assert.equal(positiveReads, 2, "a summary candidate needs exactly one full-view proof");
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
-    data: [{ id: "incomplete", status: "completed", itemsView: "full",
+    data: [{ id: "incomplete", status: "completed", itemsView: "summary",
       items: [{ type: "userMessage", clientId: "old-queue-id" }, null] }], nextCursor: null,
   })), DesktopUnavailableError);
   const first = await scanTerminalQueuedInputTurn("thread", "old-queue-id", list);
   assert.equal(first.done, false);
   if (!first.done) {
     await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async params =>
-      params.cursor ? list(params) : { data: [{ id: "new-head", status: "completed", itemsView: "full", items: [] }],
+      params.cursor ? list(params) : { data: [{ id: "new-head", status: "completed", itemsView: "summary", items: [] }],
         nextCursor: "different" }, first.cursor), DesktopUnavailableError);
   }
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
-    data: [{ id: "active", status: "inProgress", itemsView: "full",
+    data: [{ id: "active", status: "inProgress", itemsView: "summary",
       items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
   })), DesktopUnavailableError);
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
     data: [], nextCursor: "missing-page",
   })), DesktopUnavailableError);
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "old-queue-id", async () => ({
-    threadId: "different-thread", data: [{ id: "wrong", status: "completed", itemsView: "full",
+    threadId: "different-thread", data: [{ id: "wrong", status: "completed", itemsView: "summary",
       items: [{ type: "userMessage", clientId: "old-queue-id" }] }], nextCursor: null,
   })), DesktopUnavailableError);
 });
@@ -2995,7 +3003,8 @@ test("terminal queue reconciliation survives appended turns but rejects a change
     calls.push(params);
     assert.equal(params.sortDirection, "asc");
     const index = Number(params.cursor ?? 0);
-    return { data: turns.slice(index, index + 1), nextCursor: index + 1 < turns.length ? String(index + 1) : null };
+    return { data: turns.slice(index, index + 1).map(turn => ({ ...turn, itemsView: params.itemsView })),
+      nextCursor: index + 1 < turns.length ? String(index + 1) : null };
   };
   const first = await scanTerminalQueuedInputTurn("thread", "queued-id", list);
   assert.equal(first.done, false);
@@ -3016,6 +3025,78 @@ test("terminal queue reconciliation survives appended turns but rejects a change
   await assert.rejects(scanTerminalQueuedInputTurn("thread", "missing", list, prefix.cursor), DesktopUnavailableError);
 });
 
+test("historical queue scan batches summaries but settles only after exact full terminal proof", async () => {
+  const turns = Array.from({ length: 25 }, (_, index) => ({ id: `turn-${index}`, status: "completed",
+    items: [{ type: "userMessage", clientId: index === 24 ? "queued-id" : `other-${index}` }] }));
+  const calls: IpcObject[] = [];
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    const index = Number(params.cursor ?? 0), limit = Number(params.limit);
+    const data = turns.slice(index, index + limit).map(turn => ({ ...turn, itemsView: params.itemsView }));
+    return { threadId: "thread", data, nextCursor: index + limit < turns.length ? String(index + limit) : null };
+  };
+  const first = await scanTerminalQueuedInputTurn("thread", "queued-id", list);
+  assert.equal(first.done, false);
+  if (first.done) return;
+  assert.equal(first.cursor.scanVersion, 3);
+  assert.equal(calls.filter(call => call.itemsView === "full").length, 0);
+  const found = await scanTerminalQueuedInputTurn("thread", "queued-id", list, first.cursor);
+  assert.deepEqual(found, { done: true, turnId: "turn-24" });
+  assert.equal(calls.filter(call => call.itemsView === "full").length, 1);
+  assert.ok(calls.filter(call => call.itemsView === "summary").every(call => call.limit === 12 || call.limit === 1));
+
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-id", async params => {
+    const page = await list(params);
+    if (params.itemsView === "full") return { ...page, data: [{ id: "turn-24", status: "completed",
+      itemsView: "full", items: [{ type: "userMessage", clientId: "different-id" }] }] };
+    return page;
+  }, first.cursor), DesktopUnavailableError);
+});
+
+test("historical queue scan replays an interior summary candidate to its opaque full-view cursor", async () => {
+  const calls: IpcObject[] = [];
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    const start = Number(params.cursor ?? 0), limit = Number(params.limit);
+    const data = Array.from({ length: Math.min(limit, 24 - start) }, (_, offset) => {
+      const index = start + offset;
+      return { id: `turn-${index}`, status: "completed", itemsView: params.itemsView,
+        items: [{ type: "userMessage", clientId: index === 18 ? "queued-id" : `other-${index}` }] };
+    });
+    return { data, nextCursor: start + data.length < 24 ? String(start + data.length) : null };
+  };
+  const first = await scanTerminalQueuedInputTurn("thread", "queued-id", list);
+  assert.equal(first.done, false);
+  if (first.done) return;
+  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "queued-id", list, first.cursor),
+    { done: true, turnId: "turn-18" });
+  assert.deepEqual(calls.filter(call => call.itemsView === "full").map(call => call.cursor), ["18"]);
+  assert.equal(calls.filter(call => call.itemsView === "summary" && call.limit === 1).length, 7);
+
+  await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-id", async params => {
+    const page = await list(params);
+    if (params.itemsView === "summary" && params.limit === 1 && params.cursor === "15")
+      return { ...page, data: [{ id: "different-turn", status: "completed", itemsView: "summary", items: [] }] };
+    return page;
+  }, first.cursor), DesktopUnavailableError);
+});
+
+test("version-two full-history cursor is rescanned from oldest summary without settling on absence", async () => {
+  const legacy = { scanVersion: 2, headDigest: "a".repeat(64), cursor: "old-v2-page",
+    seenCursors: ["old-v2-page"], pages: 1 } as unknown as
+    import("../src/core/codex-tasks.js").QueuedInputHistoryCursor;
+  const calls: IpcObject[] = [];
+  const result = await scanTerminalQueuedInputTurn("thread", "missing", async params => {
+    calls.push(params);
+    return { data: [{ id: "oldest", status: "completed", itemsView: "summary",
+      items: [{ type: "userMessage", clientId: "another-id" }] }], nextCursor: null };
+  }, legacy);
+  assert.deepEqual(result, { done: true, turnId: null });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.cursor, undefined);
+  assert.equal(calls[0]?.itemsView, "summary");
+});
+
 test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {
   const legacy = { headDigest: "a".repeat(64), cursor: "old-descending-page",
     seenCursors: ["old-descending-page"], pages: 1 } as unknown as
@@ -3024,11 +3105,11 @@ test("terminal queue reconciliation restarts an unversioned legacy cursor from o
   const result = await scanTerminalQueuedInputTurn("thread", "queued-id", async params => {
     calls.push(params);
     assert.equal(params.cursor, undefined, "a legacy checkpoint must not skip the oldest page");
-    return { data: [{ id: "terminal", status: "completed", itemsView: "full",
+    return { data: [{ id: "terminal", status: "completed", itemsView: params.itemsView,
       items: [{ type: "userMessage", clientId: "queued-id" }] }], nextCursor: null };
   }, legacy);
   assert.deepEqual(result, { done: true, turnId: "terminal" });
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2, "legacy scan restarts at oldest summary and confirms a candidate in full view");
 });
 
 test("semantic transfer checkpoints ignore harmless file metadata changes but retain legacy checks", async () => {

@@ -115,6 +115,9 @@ async function safePaginatedRotation(task: TaskRef, checkpoint: TaskObservationC
   if (header.type !== "session_meta") return true;
   if (!isObject(header.payload)) return false;
   const payload = header.payload;
+  // A rotated paginated segment without its base cannot establish whether it
+  // appends to, replaces, or predates the already projected source history.
+  if (payload.history_mode === "paginated" && !Object.hasOwn(payload, "history_base")) return false;
   if (!Object.hasOwn(payload, "history_base")) return true;
   if (payload.history_mode !== "paginated") return false;
   const base = payload.history_base;

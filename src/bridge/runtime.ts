@@ -297,7 +297,7 @@ export class BridgeRuntime {
         if (!result.done) {
           this.store.setValue(checkpointKey, { taskKey: key, cursor: result.cursor,
             pages: Math.min(5_000, Math.max(0, result.cursor.pages)), lastAttemptAt: attemptAt,
-            lastFailure: null, nextAt: this.now() + 5 * 60_000 } satisfies QueueHistoryProgress);
+            lastFailure: null, nextAt: this.now() + 30_000 } satisfies QueueHistoryProgress);
         } else if (result.turnId) {
           this.store.settleQueuedInput(binding.id, operation.operationId);
           this.store.setValue(checkpointKey, null);
