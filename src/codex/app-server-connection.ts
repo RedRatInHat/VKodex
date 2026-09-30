@@ -1,8 +1,18 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import { closeAppServer } from "./app-server-process.js";
 
 type JsonObject = Record<string, unknown>;
+
+/** A JSONL wire. Closing it may detach a client without stopping the backend. */
+export interface AppServerWireEndpoint {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  once(event: "error" | "close", listener: () => void): this;
+  off(event: "error" | "close", listener: () => void): this;
+}
 
 export class AppServerUnavailableError extends Error {
   constructor(message = "Codex App Server недоступен.") { super(message); this.name = "AppServerUnavailableError"; }
@@ -133,7 +143,7 @@ const MAX_LATE_RESPONSE_RECEIPTS = 128;
 
 /** One restartable JSONL App Server connection owned by a single Codex profile. */
 export class AppServerConnection implements AppServerRpc {
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: AppServerWireEndpoint | null = null;
   private generation = 0;
   private initialized: AppServerInitializedSession | null = null;
   private nextId = 1;
@@ -149,10 +159,12 @@ export class AppServerConnection implements AppServerRpc {
   private readonly disconnectListeners = new Set<(error: Error) => void>();
   private serverRequestHandler: AppServerServerRequestHandler | null = null;
 
-  constructor(private readonly launch: () => ChildProcessWithoutNullStreams,
+  constructor(private readonly launch: () => AppServerWireEndpoint,
     private readonly initializeParams: JsonObject = {
       clientInfo: { name: "vkodex", title: "VKodex", version: "0.1.0" }, capabilities: { experimentalApi: true },
-    }, private readonly defaultTimeoutMs = 30_000) {}
+    }, private readonly defaultTimeoutMs = 30_000,
+    private readonly closeWire: (endpoint: AppServerWireEndpoint) => Promise<void> = endpoint =>
+      closeAppServer(endpoint as ChildProcessWithoutNullStreams)) {}
 
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
     this.notificationListeners.add(listener);
@@ -204,7 +216,7 @@ export class AppServerConnection implements AppServerRpc {
   private async open(): Promise<void> {
     await this.closing;
     if (this.stopped) throw new AppServerUnavailableError("Подключение Codex App Server уже остановлено.");
-    let child: ChildProcessWithoutNullStreams;
+    let child: AppServerWireEndpoint;
     try { child = this.launch(); } catch { throw new AppServerUnavailableError(); }
     const generation = ++this.generation;
     this.child = child; this.fragments = []; this.fragmentBytes = 0; this.nextId = 1;
@@ -269,12 +281,12 @@ export class AppServerConnection implements AppServerRpc {
     });
   }
 
-  private write(child: ChildProcessWithoutNullStreams, value: JsonObject): void {
+  private write(child: AppServerWireEndpoint, value: JsonObject): void {
     if (this.child !== child || child.stdin.destroyed || child.stdin.writableEnded || !child.stdin.writable) throw new AppServerUnavailableError();
     child.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
-  private receive(child: ChildProcessWithoutNullStreams, generation: number, chunk: string): void {
+  private receive(child: AppServerWireEndpoint, generation: number, chunk: string): void {
     if (this.child !== child || this.generation !== generation) return;
     let start = 0;
     while (start < chunk.length && this.child === child && this.generation === generation) {
@@ -368,7 +380,7 @@ export class AppServerConnection implements AppServerRpc {
     pending.resolve(value.result);
   }
 
-  private async acceptServerRequest(child: ChildProcessWithoutNullStreams, generation: number, id: string | number,
+  private async acceptServerRequest(child: AppServerWireEndpoint, generation: number, id: string | number,
     request: AppServerEnvelope): Promise<void> {
     const previous = this.pendingServerRequests.get(id);
     if (previous) {
@@ -425,23 +437,23 @@ export class AppServerConnection implements AppServerRpc {
     for (const pending of requests) this.invalidateServerRequest(pending);
   }
 
-  private replyToServer(child: ChildProcessWithoutNullStreams, generation: number, reply: JsonObject): boolean {
+  private replyToServer(child: AppServerWireEndpoint, generation: number, reply: JsonObject): boolean {
     if (this.child !== child || this.generation !== generation) return false;
     try { this.write(child, reply); return this.child === child && this.generation === generation; }
     catch { this.connectionFailed(child, generation); return false; }
   }
 
-  private connectionFailed(child: ChildProcessWithoutNullStreams, generation: number): void {
+  private connectionFailed(child: AppServerWireEndpoint, generation: number): void {
     this.failConnection(child, generation, new AppServerUnavailableError());
   }
 
-  private failConnection(child: ChildProcessWithoutNullStreams, generation: number, fallback: Error, skipId?: number): void {
+  private failConnection(child: AppServerWireEndpoint, generation: number, fallback: Error, skipId?: number): void {
     if (this.child !== child || this.generation !== generation) return;
     this.child = null; this.initialized = null; this.fragments = []; this.fragmentBytes = 0;
     this.lateResponseReceipts.clear();
     // Abort listeners can synchronously request a reconnect. Install the
     // teardown barrier before notifying them so open() cannot overtake it.
-    this.closing = this.closing.then(() => closeAppServer(child)).catch(() => {});
+    this.closing = this.closing.then(() => this.closeWire(child)).catch(() => {});
     this.clearServerRequests();
     for (const [id, pending] of this.pending) {
       if (id === skipId) continue;
@@ -465,6 +477,6 @@ export class AppServerConnection implements AppServerRpc {
     }
     this.pending.clear();
     await this.closing;
-    if (child) await closeAppServer(child);
+    if (child) await this.closeWire(child);
   }
 }
