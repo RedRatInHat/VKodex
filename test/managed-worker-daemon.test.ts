@@ -131,6 +131,11 @@ test('native CLI WebSocket is opt-in and requires an isolated read-only policy',
     await controlStop(ordinary.privateDirectory, ordinary.reserved.epoch, 'ordinary-stop');
   }
   const capability = {}, cli = { capability, noPendingExternalAutoStart: () => true };
+  const readOnly = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined, cli);
+  try {
+    await assert.rejects(readOnly.daemon.nativeCliCanaryEvidence(capability), /unavailable/i);
+  } finally { await controlStop(readOnly.privateDirectory, readOnly.reserved.epoch, 'read-only-evidence-stop'); }
   await assert.rejects(readyFixture({ allow: true }, { enabled: true, early: false },
     'normal', false, null, undefined, undefined, false, undefined, undefined, cli, false),
   /startup unavailable/);
@@ -146,6 +151,55 @@ test('native CLI WebSocket is opt-in and requires an isolated read-only policy',
   assert.throws(() => new ManagedWorkerDaemon({ ...common,
     nativeCliWebSocket: { ...cli, singleAcceptedStart: true,
       sourceScope: {} as never } }), /source scope/i);
+});
+
+test('controlled native CLI canary evidence is capability-bound and contains only scalar receipts', async () => {
+  const ordinary = await readyFixture();
+  try {
+    await assert.rejects(ordinary.daemon.nativeCliCanaryEvidence({}), /unavailable/i);
+  } finally { await controlStop(ordinary.privateDirectory, ordinary.reserved.epoch, 'ordinary-evidence-stop'); }
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  try {
+    await assert.rejects(own.daemon.nativeCliCanaryEvidence({}), /unavailable/i);
+    const first = await own.daemon.nativeCliCanaryEvidence(capability);
+    assert.equal(first.taskId, own.taskId);
+    assert.equal(first.ownerEpoch, own.reserved.epoch);
+    assert.equal(first.backendGeneration, own.daemon.metadata.generation);
+    assert.equal(first.nativeState, 'connected');
+    assert.equal(first.threadStatus, 'idle');
+    assert.deepEqual(first.turns, []);
+    assert.deepEqual(first.acceptedStartSha256, []);
+    assert.equal(first.goalEmpty, true);
+    assert.equal(first.queueEmpty, true);
+    assert.equal(first.commandInFlight, 0);
+    assert.equal(first.commandUnconfirmed, false);
+    assert.equal(first.requestsUnresolved, 0);
+    assert.equal(first.pendingNativeOperations, 0);
+    assert.equal(first.pendingEvents, 0);
+    const evidenceRead = own.backend.frames.find(frame => frame.method === 'thread/read' &&
+      (frame.params as Record<string, unknown> | undefined)?.includeTurns === false);
+    assert.ok(evidenceRead, 'canary evidence must not clone the full thread history');
+    assert.ok(own.backend.frames.some(frame => frame.method === 'thread/turns/list' &&
+      (frame.params as Record<string, unknown> | undefined)?.itemsView === 'full'));
+    assert.deepEqual(Object.keys(first).sort(), [
+      'acceptedStartSha256', 'backendGeneration', 'commandInFlight', 'commandUnconfirmed',
+      'goalEmpty', 'nativeState', 'ownerEpoch', 'pendingEvents', 'pendingNativeOperations',
+      'queueEmpty', 'requestsUnresolved', 'taskId', 'threadStatus', 'turns', 'turnsPageComplete',
+    ].sort());
+    own.backend.goalOverride = { text: 'PRIVATE_GOAL_SENTINEL' };
+    own.backend.queueEntries = [{ text: 'PRIVATE_QUEUE_SENTINEL' }];
+    const occupied = await own.daemon.nativeCliCanaryEvidence(capability);
+    assert.equal(occupied.goalEmpty, false);
+    assert.equal(occupied.queueEmpty, false);
+    assert.doesNotMatch(JSON.stringify(occupied), /PRIVATE_(?:GOAL|QUEUE)_SENTINEL/u);
+    own.backend.goalOverride = null;
+    own.backend.queueEntries = [];
+  } finally {
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'canary-evidence-stop');
+  }
 });
 
 test('native CLI WebSocket admits one qualified plain-text turn through the same durable worker', async () => {
@@ -198,6 +252,13 @@ test('native CLI WebSocket admits one qualified plain-text turn through the same
     const accepted = await client.request('accepted', 'turn/start', params);
     assert.deepEqual(accepted.result, { turn: { id: 'accepted-composer-turn',
       status: 'inProgress', extra: true } });
+    const evidence = await own.daemon.nativeCliCanaryEvidence(capability);
+    const acceptedSha256 = createHash('sha256').update('accepted-composer-turn').digest('hex');
+    assert.deepEqual(evidence.acceptedStartSha256, [acceptedSha256]);
+    assert.deepEqual(evidence.turns, [{ idSha256: acceptedSha256, status: 'completed' }]);
+    assert.equal(evidence.turnsPageComplete, true);
+    assert.equal(evidence.commandUnconfirmed, false);
+    assert.doesNotMatch(JSON.stringify(evidence), /accepted-composer-turn|one CLI turn|extra/iu);
     assert.equal(own.backend.writes, 1);
     assert.equal(own.launches, 1);
     assert.equal(own.backend.frames.filter(frame => frame.method === 'turn/start').length, 1);
@@ -352,6 +413,7 @@ for (const failure of ['owner-unconfirmed', 'native-owner-unavailable'] as const
       await waitFor(() => own.daemon.metadata.failure === failure, 3500);
       assert.equal(own.backend.exitCode, null);
       assert.throws(() => own.daemon.nativeCliWebSocketCapability(capability), /unavailable/i);
+      await assert.rejects(own.daemon.nativeCliCanaryEvidence(capability), /unavailable/i);
       await waitFor(() => client.socket.readyState === WebSocket.CLOSED, 1500);
       const probe = new WebSocket(`ws://${bearer.host}:${bearer.port}/`, {
         headers: { Authorization: `Bearer ${bearer.token}` }, perMessageDeflate: false });

@@ -121,6 +121,25 @@ export interface ManagedWorkerDaemonMetadata {
     'bootstrapPendingRequests' | 'bootstrapBoundary' | 'lastRequestFailure'> | null;
 }
 
+/** Fixed, content-free evidence for an opt-in controlled first-start canary. */
+export interface NativeCliCanaryEvidence {
+  readonly taskId: string;
+  readonly ownerEpoch: string;
+  readonly backendGeneration: number;
+  readonly nativeState: 'connected';
+  readonly threadStatus: 'idle' | 'active' | 'inProgress' | 'notLoaded';
+  readonly turns: readonly Readonly<{ idSha256: string; status: 'inProgress' | 'completed' | 'failed' | 'interrupted' }>[];
+  readonly turnsPageComplete: boolean;
+  readonly goalEmpty: boolean;
+  readonly queueEmpty: boolean;
+  readonly acceptedStartSha256: readonly string[];
+  readonly commandInFlight: number;
+  readonly commandUnconfirmed: boolean;
+  readonly requestsUnresolved: number;
+  readonly pendingNativeOperations: number;
+  readonly pendingEvents: number;
+}
+
 /** Quiescence evidence for entering handoff_pending only. Retiring the claim
  * or assigning a new writer additionally requires proven process release and
  * reconciliation of late receipts. */
@@ -174,6 +193,7 @@ export class ManagedWorkerDaemon {
   #reconnectPending = false;
   #reconnectDelayMs = 1_000;
   #currentOwner: (() => boolean) | null = null;
+  #cliEvidencePending = false;
 
   constructor(options: ManagedWorkerDaemonOptions) {
     if (!options || !path.isAbsolute(options.baseDirectory) || !uuid.test(options.epoch) ||
@@ -250,6 +270,91 @@ export class ManagedWorkerDaemon {
         this.#currentOwner?.() !== true)
       throw new Error('Native CLI frontend unavailable');
     return this.#host.frontendWebSocketCapability(this.#cliAdapterKey);
+  }
+
+  /** Independent owner reads for a controlled, single-start canary. Native
+   * response objects are projected immediately; no transcript field escapes. */
+  async nativeCliCanaryEvidence(capability: object): Promise<NativeCliCanaryEvidence> {
+    const unavailable = (): never => { throw new Error('Native CLI canary evidence unavailable'); };
+    let acquired = false;
+    try {
+      const cli = this.#options.nativeCliWebSocket;
+      const host = this.#host, owner = this.#owner, key = this.#cliControlKey;
+      const taskId = this.#taskId, generation = this.#generation;
+      if (!cli || cli.singleAcceptedStart !== true || !cli.sourceScope ||
+          capability !== cli.capability || this.#state !== 'ready' ||
+          !this.#admissionOpen || this.#ingressRevoked || !host || !owner || !key ||
+          !taskId || !generation || this.#cliEvidencePending) throw new Error();
+      this.#cliEvidencePending = true;
+      acquired = true;
+      const current = (): void => {
+        if (this.#state !== 'ready' || !this.#admissionOpen || this.#ingressRevoked ||
+            this.#host !== host || this.#owner !== owner ||
+            this.#taskId !== taskId || this.#generation !== generation ||
+            host.metadata.state !== 'running' ||
+            host.metadata.backendGeneration !== generation ||
+            owner.metadata.state !== 'connected' ||
+            this.#currentOwner?.() !== true) unavailable();
+      };
+      const text = (value: unknown): value is string => typeof value === 'string' &&
+        value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/u.test(value);
+      current();
+      const revision = owner.metadata.semanticRevision;
+      const initialReceipts = host.acceptedCommandReceipts(key);
+      const read = await host.ownerRead(key, generation, 'thread/read',
+        { threadId: taskId, includeTurns: false });
+      const page = await host.ownerRead(key, generation, 'thread/turns/list',
+        { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'full' });
+      const goal = await host.ownerRead(key, generation, 'thread/goal/get', { threadId: taskId });
+      const queue = await host.ownerRead(key, generation, 'thread/queue/list',
+        { threadId: taskId, limit: 2 });
+      current();
+      const commands = host.commandQuiescence(key);
+      const requests = host.requestQuiescence(key);
+      const finalReceipts = host.acceptedCommandReceipts(key);
+      const ownerMeta = owner.metadata;
+      const thread = read.thread;
+      const pageData = page.data;
+      const queueData = queue.data;
+      if (ownerMeta.semanticRevision !== revision ||
+          !isDeepStrictEqual(initialReceipts, finalReceipts) ||
+          !object(thread) || thread.id !== taskId ||
+          !object(thread.status) ||
+          !['idle', 'active', 'inProgress', 'notLoaded'].includes(thread.status.type as string) ||
+          !Array.isArray(pageData) || pageData.length > 1 ||
+          typeof page.nextCursor !== 'string' && page.nextCursor !== null ||
+          !Array.isArray(queueData) || queueData.length > 2 ||
+          typeof queue.nextCursor !== 'string' && queue.nextCursor !== null ||
+          !Object.hasOwn(goal, 'goal') || requests.generation !== generation ||
+          initialReceipts.length > 1 ||
+          initialReceipts.some(receipt => receipt.method !== 'turn/start' || !text(receipt.receiptId)))
+        throw new Error();
+      const listed = pageData.map((value: unknown) => {
+        if (!object(value) || !text(value.id) ||
+            !['inProgress', 'completed', 'failed', 'interrupted'].includes(value.status as string))
+          return unavailable();
+        return { id: value.id, status: value.status };
+      });
+      const turns = listed.map(value => Object.freeze({
+        idSha256: createHash('sha256').update(value.id as string).digest('hex'),
+        status: value.status as NativeCliCanaryEvidence['turns'][number]['status'],
+      }));
+      current();
+      if (owner.metadata.semanticRevision !== revision) unavailable();
+      return Object.freeze({ taskId, ownerEpoch: this.#options.epoch,
+        backendGeneration: generation, nativeState: 'connected' as const,
+        threadStatus: thread.status.type as NativeCliCanaryEvidence['threadStatus'],
+        turns: Object.freeze(turns), turnsPageComplete: page.nextCursor === null,
+        goalEmpty: goal.goal === null,
+        queueEmpty: queueData.length === 0 && queue.nextCursor === null,
+        acceptedStartSha256: Object.freeze(initialReceipts.map(receipt =>
+          createHash('sha256').update(receipt.receiptId).digest('hex'))),
+        commandInFlight: commands.inFlight, commandUnconfirmed: commands.unconfirmed,
+        requestsUnresolved: requests.unresolved,
+        pendingNativeOperations: ownerMeta.pendingNativeOperations,
+        pendingEvents: ownerMeta.pendingEvents });
+    } catch { return unavailable(); }
+    finally { if (acquired) this.#cliEvidencePending = false; }
   }
 
   /** Capability-bound queue ingress, also exposed only by opt-in private control. */
