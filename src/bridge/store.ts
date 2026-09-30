@@ -295,6 +295,15 @@ export class BridgeStore {
     // find the handful of pending rows. Both queue queries can use this index.
     this.db.exec(`CREATE INDEX IF NOT EXISTS bridge_delivery_pending
       ON bridge_delivery(kind, id) WHERE revision > delivered_revision`);
+    // Activity markers compare their position with the newest message on
+    // every tick. Without peer-local indexes each active chat scans the whole
+    // historical delivery journal twice per second.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS bridge_delivery_peer_order
+      ON bridge_delivery(peer_id, id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS bridge_delivery_peer_message
+      ON bridge_delivery(peer_id,
+        CASE WHEN json_valid(handle) THEN json_extract(handle, '$.conversationMessageId') END)
+      WHERE handle IS NOT NULL`);
     const stageColumns = new Set((this.db.prepare("PRAGMA table_info(bridge_stage_reservations)").all() as { name: string }[]).map(column => column.name));
     if (!stageColumns.has("writer_pid")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_pid INTEGER");
     if (!stageColumns.has("writer_birth")) this.db.exec("ALTER TABLE bridge_stage_reservations ADD COLUMN writer_birth TEXT");
@@ -1266,7 +1275,9 @@ export class BridgeStore {
     if (messageId > (this.getValue<number>(key) ?? 0)) this.setValue(key, messageId);
   }
   latestPeerMessage(peerId: number): number {
-    const sent = (this.db.prepare("SELECT MAX(json_extract(handle, '$.conversationMessageId')) AS id FROM bridge_delivery WHERE peer_id = ?").get(peerId) as { id: number | null }).id ?? 0;
+    const sent = (this.db.prepare(`SELECT MAX(CASE WHEN json_valid(handle)
+      THEN json_extract(handle, '$.conversationMessageId') END) AS id
+      FROM bridge_delivery WHERE peer_id = ? AND handle IS NOT NULL`).get(peerId) as { id: number | null }).id ?? 0;
     return Math.max(sent, this.getValue<number>(`peer-message:${peerId}`) ?? 0);
   }
 
