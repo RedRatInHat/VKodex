@@ -851,7 +851,8 @@ export class TaskFiles {
             let cleanupAttempted = false;
             for (;;) {
               this.store.setValue(`${key}:upload-state`, "uploading");
-              try { attachment = await uploadFile(binding.peerId!, receipt?.name ?? file.name, uploadBytes, receipt?.kind ?? file.kind); break; }
+              try { attachment = await uploadFile(binding.peerId!, receipt?.name ?? file.name, uploadBytes,
+                receipt?.kind ?? file.kind, digest(key)); break; }
               catch (error) {
                 if (error instanceof FileUploadPreSaveError) {
                   // A typed failure proves docs.save was not invoked. Record

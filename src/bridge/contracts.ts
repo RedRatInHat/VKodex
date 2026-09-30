@@ -41,7 +41,7 @@ export interface BridgeChat {
   edit(handle: MessageHandle, view: View): Promise<void>;
   delete(handle: MessageHandle): Promise<void>;
   uploadDocument(peerId: number, name: string, contents: string): Promise<string>;
-  uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string>;
+  uploadFile?(peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string>;
   /** Remove only documents previously registered as VKodex uploads. */
   cleanupDocuments?(records: readonly VkDocumentRecord[]): Promise<readonly string[]>;
   /** Read-only operational checks. Implementations must never expose credentials in details. */

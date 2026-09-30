@@ -367,7 +367,10 @@ export class DesktopVkGateway implements BridgeChat {
     return this.uploadFile(peerId, name, Buffer.from(contents, "utf8"), "file");
   }
 
-  async uploadFile(peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string> {
+  async uploadFile(peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string> {
+    // An opaque digest of the durable file key links VK diagnostics to one
+    // file version across retries without logging paths, names or tokens.
+    const audit = traceId && /^[a-f0-9]{64}$/u.test(traceId) ? { traceId } : {};
     const source = { values: [{ value: contents, filename: name, contentLength: contents.length,
       ...(/\.mp4$/iu.test(name) ? { contentType: "video/mp4" } : {}) }], timeout: 600_000 };
     let attachment: string | undefined;
@@ -375,7 +378,11 @@ export class DesktopVkGateway implements BridgeChat {
     // that VK accepted the bytes but its receipt was lost; falling back to a
     // document in that case would upload the same version twice.
     if (kind === "image" && /\.(?:png|jpe?g)$/iu.test(name)) {
-      attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString();
+      try { attachment = (await this.vk.upload.messagePhoto({ peer_id: peerId, source })).toString(); }
+      catch (error) {
+        this.logger?.warn({ peerId, bytes: contents.length, reason: "photo_upload_result_unknown", ...audit }, "VK photo upload result unknown");
+        throw error;
+      }
     }
     if (!attachment) {
       // vk-io forwards upload-server errors to docs.save as if they were a
@@ -391,11 +398,11 @@ export class DesktopVkGateway implements BridgeChat {
           saveFiles: async uploaded => {
             const storageFull = isObject(uploaded) && typeof uploaded.error === "string" && /^no_free_space(?:\/|$)/u.test(uploaded.error);
             if (isObject(uploaded) && uploaded.error === "wrong_file") {
-              this.logger?.warn({ peerId, bytes: contents.length, reason: "wrong_file" }, "VK document upload rejected");
+              this.logger?.warn({ peerId, bytes: contents.length, reason: "wrong_file", ...audit }, "VK document upload rejected");
               throw new FileUploadRejectedError("VK отклонил файл: wrong_file. Это отказ принять формат или содержимое, а не лимит размера VKodex. Автоматические повторы этого файла остановлены.");
             }
             if (!isObject(uploaded) || uploaded.error !== undefined || typeof uploaded.file !== "string" || !uploaded.file.trim()) {
-              this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response" }, "VK document upload rejected");
+              this.logger?.warn({ peerId, bytes: contents.length, reason: storageFull ? "upload_storage_full" : "invalid_upload_response", ...audit }, "VK document upload rejected");
               throw (storageFull ? new FileUploadStorageFullError("На сервере загрузки VK закончилось свободное место.") : new FileUploadPreSaveError(
                 "Сервер загрузки VK не подтвердил приём файла до сохранения документа."));
             }
@@ -404,11 +411,17 @@ export class DesktopVkGateway implements BridgeChat {
           },
         });
       } catch (error) {
-        if (!saveInvoked && !(error instanceof FileUploadRejectedError) && !(error instanceof FileUploadStorageFullError) && !(error instanceof FileUploadPreSaveError))
+        if (saveInvoked) this.logger?.warn({ peerId, bytes: contents.length, reason: "document_save_result_unknown", ...audit }, "VK document save result unknown");
+        if (!saveInvoked && !(error instanceof FileUploadRejectedError) && !(error instanceof FileUploadStorageFullError) && !(error instanceof FileUploadPreSaveError)) {
+          this.logger?.warn({ peerId, bytes: contents.length, reason: "document_upload_pre_save_error", ...audit }, "VK document upload failed before save");
           throw new FileUploadPreSaveError("Сервер загрузки VK не подтвердил приём файла до сохранения документа.");
+        }
         throw error;
       }
-      if (!isObject(saved) || saved.type !== "doc" || !isObject(saved.doc) || typeof saved.doc.id !== "number" || typeof saved.doc.owner_id !== "number") throw new ActionRejectedError("VK не подтвердил сохранение документа. Повтори /files позже.");
+      if (!isObject(saved) || saved.type !== "doc" || !isObject(saved.doc) || typeof saved.doc.id !== "number" || typeof saved.doc.owner_id !== "number") {
+        this.logger?.warn({ peerId, bytes: contents.length, reason: "document_save_invalid_response", ...audit }, "VK document save response invalid");
+        throw new ActionRejectedError("VK не подтвердил сохранение документа. Повтори /files позже.");
+      }
       attachment = new DocumentAttachment({ api: this.vk.api, payload: { ...saved.doc, id: saved.doc.id, owner_id: saved.doc.owner_id } }).toString();
     }
     if (!/^(?:photo|doc)-?\d+_\d+(?:_[a-zA-Z0-9_-]+)?$/u.test(attachment)) throw new ActionRejectedError("VK не подтвердил загрузку файла. Повтори /files позже.");

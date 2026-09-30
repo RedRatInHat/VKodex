@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
@@ -57,10 +58,10 @@ class Chat implements BridgeChat {
   memberError = false;
   memberReads = 0;
   readonly uploads: { peerId: number; name: string; contents: string }[] = [];
-  readonly binaryUploads: { name: string; contents: Buffer; kind: string }[] = [];
+  readonly binaryUploads: { name: string; contents: Buffer; kind: string; traceId?: string }[] = [];
   readonly cleanupCalls: VkDocumentRecord[][] = [];
   cleanupResult: readonly string[] = [];
-  async uploadFile(_peerId: number, name: string, contents: Buffer, kind: "image" | "file"): Promise<string> { this.binaryUploads.push({ name, contents, kind }); return `doc-202_${this.binaryUploads.length}`; }
+  async uploadFile(_peerId: number, name: string, contents: Buffer, kind: "image" | "file", traceId?: string): Promise<string> { this.binaryUploads.push({ name, contents, kind, ...(traceId ? { traceId } : {}) }); return `doc-202_${this.binaryUploads.length}`; }
   async cleanupDocuments(records: readonly VkDocumentRecord[]): Promise<readonly string[]> { this.cleanupCalls.push([...records]); return this.cleanupResult; }
   async uploadDocument(peerId: number, name: string, contents: string): Promise<string> { this.uploads.push({ peerId, name, contents }); return "doc-202_42_fixture"; }
   async members(): Promise<readonly number[]> { this.memberReads++; if (this.memberError) throw new Error("offline"); return this.participants; }
@@ -3766,7 +3767,10 @@ test("single-chat staging pilot leaves every unallowlisted peer on source-byte d
   await writeFile(path.join(staged.outboxDir, "result.txt"), "pilot bytes");
   assert.equal(await files.collect(allowlisted, true), 1);
   assert.equal(s.chat.binaryUploads[1]!.contents.toString(), "pilot bytes");
-  assert.equal(Object.keys(s.store.getValue<Record<string, unknown>>(`file-stage-index:${allowlisted.id}:pilot-peer`) ?? {}).length, 1);
+  const index = s.store.getValue<Record<string, { key: string }>>(`file-stage-index:${allowlisted.id}:pilot-peer`) ?? {};
+  assert.equal(Object.keys(index).length, 1);
+  assert.equal(s.chat.binaryUploads[1]!.traceId,
+    createHash("sha256").update(Object.values(index)[0]!.key).digest("hex"));
 });
 
 test("terminal history proof completes only its matching queued file job", async t => {
@@ -5651,6 +5655,7 @@ test("late definitive managed refusal settles a lost acknowledgement as rejected
 test("VK upload errors are checked before docs.save and a later retry can succeed", async t => {
   const vk = new VK({ token: "fixture-token" });
   const calls: string[] = [];
+  const warnings: Record<string, unknown>[] = [];
   t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
     calls.push(method);
     if (method === "docs.getMessagesUploadServer") return { upload_url: "https://upload.vk.com/fixture" } as never;
@@ -5659,11 +5664,16 @@ test("VK upload errors are checked before docs.save and a later retry can succee
   });
   const responses: unknown[] = [{ error: "no_free_space/var/www/pi", error_descr: "private server response" }, {}, { error: "wrong_file" }, { file: "fixture-upload-token" }];
   t.mock.method(vk.upload, "upload", async () => responses.shift());
-  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
-  const send = () => gateway.uploadFile(peerId, "installer.exe", Buffer.from("fixture"), "file");
+  const logger = { warn: (fields: Record<string, unknown>) => { warnings.push(fields); } } as unknown as ConstructorParameters<typeof DesktopVkGateway>[3];
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 2_000, logger);
+  const traceId = "a".repeat(64);
+  const send = () => gateway.uploadFile(peerId, "installer.exe", Buffer.from("fixture"), "file", traceId);
   await assert.rejects(send, /На сервере загрузки VK закончилось свободное место/u);
   await assert.rejects(send, FileUploadPreSaveError);
   await assert.rejects(send, FileUploadRejectedError);
+  assert.deepEqual(warnings.map(item => [item.reason, item.traceId]), [
+    ["upload_storage_full", traceId], ["invalid_upload_response", traceId], ["wrong_file", traceId],
+  ]);
   assert.equal(calls.filter(method => method === "docs.save").length, 0);
   assert.equal(await send(), "doc-202_17_fixture");
   assert.equal(calls.filter(method => method === "docs.getMessagesUploadServer").length, 4);
@@ -5672,14 +5682,18 @@ test("VK upload errors are checked before docs.save and a later retry can succee
 
 test("a document failure after docs.save starts remains ambiguous", async t => {
   const vk = new VK({ token: "fixture-token" });
+  const warnings: Record<string, unknown>[] = [];
   t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
     if (method === "docs.getMessagesUploadServer") return { upload_url: "https://upload.vk.com/fixture" } as never;
     if (method === "docs.save") throw new Error("save reply lost");
     throw new Error("Unexpected API call");
   });
   t.mock.method(vk.upload, "upload", async () => ({ file: "fixture-upload-token" }));
-  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
-  await assert.rejects(gateway.uploadFile(peerId, "result.txt", Buffer.from("fixture"), "file"), /save reply lost/u);
+  const logger = { warn: (fields: Record<string, unknown>) => { warnings.push(fields); } } as unknown as ConstructorParameters<typeof DesktopVkGateway>[3];
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 2_000, logger);
+  const traceId = "b".repeat(64);
+  await assert.rejects(gateway.uploadFile(peerId, "result.txt", Buffer.from("fixture"), "file", traceId), /save reply lost/u);
+  assert.deepEqual(warnings.map(item => [item.reason, item.traceId]), [["document_save_result_unknown", traceId]]);
 });
 
 test("a pre-save document failure retries staged bytes after the late window and then requires /files", async t => {
