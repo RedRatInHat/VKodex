@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import type { TaskEvent, TaskRef } from "./contracts.js";
 import type { TaskHistoryRecovery, TaskHistoryRecoveryResult } from "../core/task-history.js";
 import type { TaskObservationCheckpoint } from "../core/task-observation.js";
@@ -45,6 +46,13 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
     const since = Math.min(checkpoint?.lastObservedAt ?? checkpoint?.since ?? Infinity,
       oldestAcceptedAt ?? Infinity, Math.max(enabledSince, currentEpoch));
     try {
+      // Native edit/revert can create a paginated overlay whose inherited base
+      // predates the durable boundary we already projected. Its later records
+      // replace part of the old branch, not merely extend it. Until the old
+      // source boundary is proven, neither deliver nor persist a new cursor.
+      if (historyRebuilt && checkpoint && !await safePaginatedRotation(task, checkpoint)) {
+        return { events: [], historyRebuilt, failure: "lineageUnverified" };
+      }
       const path = task.rolloutPath ? comparablePath(task.rolloutPath) : "";
       if (this.restoredPath.get(id) !== path) {
         this.restoredPath.set(id, path);
@@ -97,3 +105,57 @@ function newRolloutEvents(events: readonly TaskEvent[], checkpoint: TaskObservat
 }
 
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+interface HistoryBase { readonly thread_id: string; readonly end_ordinal_exclusive: number; readonly end_byte_offset: number; }
+
+async function safePaginatedRotation(task: TaskRef, checkpoint: TaskObservationCheckpoint): Promise<boolean> {
+  if (!task.rolloutPath || !checkpoint.rolloutPath) return false;
+  const header = await firstRolloutRecord(task.rolloutPath);
+  if (!isObject(header)) return false;
+  if (header.type !== "session_meta") return true;
+  if (!isObject(header.payload)) return false;
+  const payload = header.payload;
+  if (payload.history_mode !== "paginated" || !Object.hasOwn(payload, "history_base")) return true;
+  const base = payload.history_base;
+  if (!isObject(base) || !validHistoryBase(base) || payload.id !== task.threadId
+    || base.thread_id !== task.threadId || header.ordinal !== base.end_ordinal_exclusive) return false;
+  const cursor = checkpoint.rolloutCursor;
+  if (!cursor || cursor.version !== 1 || base.end_byte_offset !== cursor.offset
+    || !Number.isSafeInteger(cursor.anchorLength) || cursor.anchorLength < 1 || cursor.anchorLength > 64
+    || cursor.anchorLength > cursor.offset || !/^[a-f0-9]{64}$/u.test(cursor.anchorSha256)) return false;
+  try {
+    const oldHeader = await firstRolloutRecord(checkpoint.rolloutPath);
+    if (!isObject(oldHeader) || oldHeader.type !== "session_meta" || !isObject(oldHeader.payload)
+      || oldHeader.payload.id !== task.threadId) return false;
+    const handle = await open(checkpoint.rolloutPath, "r");
+    try {
+      if ((await handle.stat()).size < cursor.offset) return false;
+      const anchor = Buffer.alloc(cursor.anchorLength);
+      const { bytesRead } = await handle.read(anchor, 0, anchor.length, cursor.offset - anchor.length);
+      return bytesRead === anchor.length && anchor.at(-1) === 0x0a
+        && createHash("sha256").update(anchor).digest("hex") === cursor.anchorSha256;
+    } finally { await handle.close(); }
+  } catch { return false; }
+}
+
+async function firstRolloutRecord(path: string): Promise<unknown> {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline < 0) return null;
+    try { return JSON.parse(buffer.subarray(0, newline).toString("utf8")) as unknown; }
+    catch { return null; }
+  } finally { await handle.close(); }
+}
+
+function validHistoryBase(value: Record<string, unknown>): value is Record<string, unknown> & HistoryBase {
+  return typeof value.thread_id === "string" && value.thread_id.length > 0
+    && Number.isSafeInteger(value.end_ordinal_exclusive) && Number(value.end_ordinal_exclusive) >= 0
+    && Number.isSafeInteger(value.end_byte_offset) && Number(value.end_byte_offset) >= 0;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}

@@ -10,7 +10,7 @@ export interface TaskHistoryRecoveryResult {
    * restart resumes after the exact point that was observed.
    */
   readonly checkpoint?: TaskObservationCheckpoint;
-  readonly failure: "recordTooLarge" | "readFailed" | null;
+  readonly failure: "recordTooLarge" | "readFailed" | "lineageUnverified" | null;
 }
 
 export interface TaskHistoryRecovery {

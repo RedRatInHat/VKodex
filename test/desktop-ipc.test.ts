@@ -437,6 +437,72 @@ test("rollout fallback rebases a rebuilt branch and resumes new events without r
   assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.text.includes("New direct answer")));
 });
 
+test("rollout fallback does not rebase a paginated edit behind its durable boundary", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-edited-rotation-"));
+  const oldPath = path.join(root, "original.jsonl");
+  const newPath = path.join(root, "edited.jsonl");
+  const first = JSON.stringify({ ordinal: 0, timestamp: new Date(80_000).toISOString(), type: "session_meta",
+    payload: { id: ref.threadId, history_mode: "paginated" } }) + "\n";
+  await writeFile(oldPath, first + rolloutFinal(90_000, "old-final", "old-turn", "Already delivered"));
+  const tailer = new RolloutTailer();
+  await tailer.poll({ ...ref, rolloutPath: oldPath }, 0);
+  const cursor = tailer.durableCursor({ ...ref, rolloutPath: oldPath });
+  assert.ok(cursor);
+  await writeFile(newPath, JSON.stringify({ ordinal: 1, timestamp: new Date(101_000).toISOString(), type: "session_meta",
+    payload: { id: ref.threadId, history_mode: "paginated", history_base: {
+      thread_id: ref.threadId, end_ordinal_exclusive: 1, end_byte_offset: Buffer.byteLength(first),
+    } } }) + "\n" + rolloutFinal(102_000, "edited-final", "edited-turn", "Replacement after edit"));
+  const binding = s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath: newPath });
+  const checkpoint = { since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], active: [],
+    seen: { '["old-turn","final","old-final"]': "known" }, rolloutPath: comparablePath(oldPath), rolloutCursor: cursor };
+  s.store.setValue(`projection:${binding.id}`, checkpoint);
+  const fallback = s.runtime as unknown as {
+    enableRolloutFallback(binding: Binding): void;
+    mirrorRolloutFallback(binding: Binding): Promise<void>;
+  };
+  fallback.enableRolloutFallback(binding);
+  s.advance(3_000);
+  await fallback.mirrorRolloutFallback(binding);
+  assert.equal(s.store.pendingDeliveries().some(item => item.view.text.includes("Replacement after edit")), false);
+  assert.deepEqual(s.store.getValue(`projection:${binding.id}`), checkpoint);
+  assert.equal(s.store.getValue<{ kind: string }>(`rollout-failure:${binding.id}`)?.kind, "lineageUnverified");
+});
+
+test("paginated rotation admits a contiguous anchored source but rejects a changed old source", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-anchored-rotation-"));
+  const oldPath = path.join(root, "old.jsonl");
+  const newPath = path.join(root, "new.jsonl");
+  const old = JSON.stringify({ ordinal: 0, timestamp: new Date(80_000).toISOString(), type: "session_meta",
+    payload: { id: ref.threadId, history_mode: "paginated" } }) + "\n"
+    + JSON.stringify({ ordinal: 1, ...JSON.parse(rolloutFinal(90_000, "old", "old-turn", "Old answer")) }) + "\n";
+  await writeFile(oldPath, old);
+  const tailer = new RolloutTailer();
+  await tailer.poll({ ...ref, rolloutPath: oldPath }, 0);
+  const token = tailer.durableCursor({ ...ref, rolloutPath: oldPath });
+  assert.ok(token);
+  await writeFile(newPath, JSON.stringify({ ordinal: 2, timestamp: new Date(101_000).toISOString(), type: "session_meta",
+    payload: { id: ref.threadId, history_mode: "paginated", history_base: {
+      thread_id: ref.threadId, end_ordinal_exclusive: 2, end_byte_offset: Buffer.byteLength(old),
+    } } }) + "\n" + rolloutFinal(102_000, "new", "new-turn", "New answer"));
+  const checkpoint = { since: 80_000, lastObservedAt: 90_000, activeAtAttach: [], active: [], seen: {},
+    rolloutPath: comparablePath(oldPath), rolloutCursor: token };
+  const accepted = new RolloutTaskHistoryRecovery();
+  accepted.enable("contiguous", 0);
+  const result = await accepted.poll("contiguous", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 105_000);
+  assert.equal(result?.failure, null);
+  assert.deepEqual(result?.events.filter(item => item.type === "final").map(item => item.text), ["New answer"]);
+  assert.equal(result?.checkpoint?.rolloutPath, comparablePath(newPath));
+
+  await writeFile(oldPath, old.replace("old-turn", "bad-turn"));
+  const rejected = new RolloutTaskHistoryRecovery();
+  rejected.enable("changed-source", 0);
+  const changed = await rejected.poll("changed-source", { ...ref, rolloutPath: newPath }, checkpoint, null, new Set(), 105_000);
+  assert.equal(changed?.failure, "lineageUnverified");
+  assert.equal(changed?.checkpoint, undefined);
+  assert.deepEqual(changed?.events, []);
+});
+
 test("detached idle observation rebases after the existing catalog refresh discovers a rotated rollout", async t => {
   const s = runtimeSetup(t);
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-detached-rotation-"));
