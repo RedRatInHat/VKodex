@@ -1,5 +1,5 @@
 import type { CodexQuestions } from "./codex-questions.js";
-import { ActionRejectedError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { ActionRejectedError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -291,10 +291,10 @@ export class RoutedCodexTasks implements CodexTasks {
     const owner = this.owner(task);
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
     if (owner) {
-      if (!owner.activateGoalWithReceipt) throw new ActionRejectedError("Нативное продолжение цели недоступно для этого владельца задачи.");
+      if (!owner.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
       return owner.activateGoalWithReceipt(task, operationId);
     }
-    if (!this.base.activateGoalWithReceipt) throw new ActionRejectedError("Нативное продолжение цели недоступно в этом подключении.");
+    if (!this.base.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
     return this.base.activateGoalWithReceipt(task, operationId);
   }
   async continueGoal(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt> {

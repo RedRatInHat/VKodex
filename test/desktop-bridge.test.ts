@@ -624,7 +624,7 @@ test("completed goal apply saves its replacement paused without a continuation r
   }
 });
 
-test("new goal apply saves paused, receives a continuation receipt, then publishes active status", async t => {
+test("new goal apply saves paused, then accepts an atomic native activation result", async t => {
   const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
   const calls: string[] = [];
   const originalSet = s.desktop.setGoal.bind(s.desktop);
@@ -654,8 +654,8 @@ test("goal resume leaves a paused goal unchanged when the owner is absent", asyn
   assert.deepEqual(s.desktop.goalUpdates, []);
 });
 
-test("legacy empty-input continuation alone cannot qualify native goal activation", async t => {
-  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+test("without a goal receipt VK requests native status activation but never starts an ordinary empty turn", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
   let legacyCalls = 0;
@@ -664,9 +664,47 @@ test("legacy empty-input continuation alone cannot qualify native goal activatio
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   assert.equal(legacyCalls, 0);
+  assert.equal(s.desktop.goal?.status, "active");
+  assert.deepEqual(s.desktop.goalUpdates, [{ status: "active" }]);
+  assert.equal(s.store.getValue<{ phase: string; receipt?: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`)?.phase,
+    "statusOnlyActive");
+  assert.equal(s.store.getValue<{ receipt?: GoalContinuationReceipt }>(`goal-continuation:${binding.id}`)?.receipt, undefined);
+  assert.match(panelView(s).text, /запуск.*хода.*не подтверждён/u);
+  await clickPanel(s, "Обновить");
+  assert.match(panelView(s).text, /запуск.*хода.*не подтверждён/u);
+});
+
+test("new goals use native status-only activation when no goal-turn receipt exists", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  let ordinaryTurns = 0;
+  s.desktop.continueGoal = async () => { ordinaryTurns++; return { mode: "started", turnId: "ordinary-turn" }; };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Задать цель");
+  await s.handle("A new goal", peerId);
+  await clickPanel(s, "Без лимита");
+  assert.equal(ordinaryTurns, 0);
+  assert.deepEqual(s.desktop.goalUpdates, [
+    { objective: "A new goal", tokenBudget: null, status: "paused" }, { status: "active" },
+  ]);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "statusOnlyActive");
+  assert.match(panelView(s).text, /запуск.*хода.*не подтверждён/u);
+});
+
+test("uncertain native status-only activation is fenced without a second write", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  let writes = 0;
+  s.desktop.setGoal = async () => { writes++; throw new UncertainActionError(); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(writes, 1);
   assert.equal(s.desktop.goal?.status, "paused");
-  assert.deepEqual(s.desktop.goalUpdates, []);
-  assert.match(panelView(s).text, /нативное продолжение цели недоступно/u);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "uncertain");
+  await clickPanel(s, "Возобновить");
+  assert.equal(writes, 1);
 });
 
 test("a foreign native goal activation response stays uncertain and cannot claim a started turn", async t => {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import { comparablePath } from "../core/paths.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
@@ -48,7 +48,7 @@ interface GoalContinuationState {
   operationId: string;
   taskKey: string;
   goalCreatedAt: number | null;
-  phase: "activating" | "sending" | "accepted" | "rejected" | "uncertain";
+  phase: "activating" | "sending" | "accepted" | "statusOnlyActive" | "rejected" | "uncertain";
   /** Optional so pre-receipt durable markers from earlier releases remain readable. */
   receipt?: GoalContinuationReceipt;
 }
@@ -66,7 +66,7 @@ function validGoalContinuation(value: unknown): value is GoalContinuationState {
   return typeof record.operationId === "string" && record.operationId.length > 0
     && typeof record.taskKey === "string" && record.taskKey.length > 0
     && (record.goalCreatedAt === null || typeof record.goalCreatedAt === "number" && Number.isFinite(record.goalCreatedAt))
-    && ["activating", "sending", "accepted", "rejected", "uncertain"].includes(String(record.phase))
+    && ["activating", "sending", "accepted", "statusOnlyActive", "rejected", "uncertain"].includes(String(record.phase))
     && (record.receipt === undefined || validGoalContinuationReceipt(record.receipt));
 }
 
@@ -595,7 +595,7 @@ export class TaskPanels {
         this.consume(input);
         if (!await this.desktop.clearGoal!(binding)) throw new ActionRejectedError("Цель уже была снята. Обнови /goal.");
         const continuation = this.goalContinuationMarker(binding);
-        if (!continuation || continuation !== "malformed" && ["accepted", "rejected"].includes(continuation.phase))
+        if (!continuation || continuation !== "malformed" && ["accepted", "statusOnlyActive", "rejected"].includes(continuation.phase))
           this.store.setValue(`goal-continuation:${binding.id}`, null);
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, "Цель снята. История задачи и VK-беседа сохранены.");
@@ -698,6 +698,8 @@ export class TaskPanels {
     const continuation = this.goalContinuationMarker(binding);
     const pending = continuation === "malformed"
       ? "Запись о запуске цели повреждена. Новый запуск заблокирован до проверки исхода в Codex."
+      : continuation?.phase === "statusOnlyActive" && continuation.taskKey === taskKey(binding) && goal?.status === "active"
+      ? "Цель активна. Нативный запуск следующего хода не подтверждён отдельной квитанцией. Проверь ход в Codex; если цель осталась активной без хода, поставь её на паузу и возобнови после проверки."
       : continuation && ["activating", "sending", "uncertain"].includes(continuation.phase)
       ? continuation.taskKey === taskKey(binding)
         ? "Запуск следующего хода не подтверждён. Проверь состояние задачи в Codex; не повторяй команду вслепую."
@@ -820,7 +822,7 @@ export class TaskPanels {
   private beginGoalContinuation(binding: Binding, goal: TaskGoal | null): GoalContinuationState {
     return this.store.atomic(() => {
       const existing = this.goalContinuationMarker(binding);
-      if (existing === "malformed" || existing && !["accepted", "rejected"].includes(existing.phase)) {
+      if (existing === "malformed" || existing && !["accepted", "statusOnlyActive", "rejected"].includes(existing.phase)) {
         throw new ActionRejectedError("Предыдущий запуск цели не подтверждён. Проверь его исход в Codex; повторный запуск остаётся заблокированным.");
       }
       const attempt: GoalContinuationState = { operationId: randomUUID(), taskKey: taskKey(binding), goalCreatedAt: goal?.status === "complete" ? null : goal?.createdAt ?? null, phase: "sending" };
@@ -850,10 +852,7 @@ export class TaskPanels {
       : "Статус цели не изменён; следующий ход не запущен";
     const unknownStart = createdPaused ? "Цель сохранена на паузе, но исход запуска хода неизвестен"
       : "Статус цели не изменён, но исход запуска хода неизвестен";
-    if (!this.desktop.activateGoalWithReceipt) {
-      this.markGoalContinuation(binding, attempt, "rejected", goal);
-      return `${noStart}: нативное продолжение цели недоступно в этом подключении.`;
-    }
+    if (!this.desktop.activateGoalWithReceipt) return this.requestGoalStatusActivation(binding, goal, attempt);
     let receipt: GoalContinuationReceipt;
     let updated: TaskGoal;
     try {
@@ -864,6 +863,8 @@ export class TaskPanels {
         || updated?.status !== "active" || updated.objective !== goal.objective
         || updated.createdAt !== goal.createdAt) throw new UncertainActionError();
     } catch (error) {
+      if (error instanceof NativeGoalReceiptUnavailableError)
+        return this.requestGoalStatusActivation(binding, goal, attempt);
       if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
         this.markGoalContinuation(binding, attempt, "rejected", goal);
         return `${noStart}: ${error.message}`;
@@ -878,6 +879,27 @@ export class TaskPanels {
     return receipt.mode === "started"
       ? "Цель возобновлена. Новый ход запущен."
       : "Цель активна. В задаче уже выполняется ход; новый ход не запускался.";
+  }
+
+  /** Codex 0.155.1 confirms the active goal state before its best-effort runtime continuation.
+   * This path never creates an ordinary empty-input turn or claims a turn receipt. */
+  private async requestGoalStatusActivation(binding: Binding, goal: TaskGoal,
+    attempt: GoalContinuationState): Promise<string> {
+    try {
+      const updated = await this.desktop.setGoal!(binding, { status: "active" });
+      if (updated.threadId !== binding.threadId || updated.status !== "active"
+        || updated.objective !== goal.objective || updated.createdAt !== goal.createdAt)
+        throw new UncertainActionError();
+      this.markGoalContinuation(binding, attempt, "statusOnlyActive", updated);
+      return "Цель активна. Нативный запуск следующего хода не подтверждён отдельной квитанцией. Проверь ход в Codex; если цель осталась активной без хода, поставь её на паузу и возобнови после проверки.";
+    } catch (error) {
+      if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
+        this.markGoalContinuation(binding, attempt, "rejected", goal);
+        return `Статус цели не изменён: ${error.message}`;
+      }
+      this.markGoalContinuation(binding, attempt, "uncertain", goal);
+      return "Исход нативной активации цели неизвестен. Проверь задачу в Codex; не повторяй команду вслепую.";
+    }
   }
 
   private async models(binding: Binding, requestedPage: number): Promise<void> {

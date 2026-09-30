@@ -428,6 +428,14 @@ export class ActionRejectedError extends Error {
   }
 }
 
+/** The selected owner has native goal state writes but no atomic goal-turn receipt. */
+export class NativeGoalReceiptUnavailableError extends ActionRejectedError {
+  constructor() {
+    super("Подтверждение нативного хода цели недоступно в этом подключении.");
+    this.name = "NativeGoalReceiptUnavailableError";
+  }
+}
+
 /** A transfer snapshot conflict cannot be resolved by retrying the same write. */
 export class TransferConflictError extends ActionRejectedError {}
 

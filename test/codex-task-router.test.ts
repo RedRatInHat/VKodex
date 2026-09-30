@@ -90,7 +90,7 @@ test("native goal activation cannot fall back from an owner to a legacy empty tu
   };
   const routed = new RoutedCodexTasks(base, [f.owner]);
   f.owner.continueGoal = async () => { f.calls.push("owner:legacy-empty-turn"); return { mode: "started", turnId: "ordinary-turn" }; };
-  await assert.rejects(routed.activateGoalWithReceipt!(work, "native-goal"), /Нативное продолжение цели недоступно/u);
+  await assert.rejects(routed.activateGoalWithReceipt!(work, "native-goal"), /Подтверждение нативного хода цели недоступно/u);
   assert.deepEqual(f.calls, []);
   const accepted = await routed.activateGoalWithReceipt!(primary, "native-goal");
   assert.equal(accepted.receipt.turnId, "base-turn");
