@@ -27,7 +27,7 @@
     "service:controlled-restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/controlled-restart.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test --test-concurrency=4 test/*.test.ts",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm run build && npm test"
   },
   "dependencies": {
     "@openai/codex-sdk": "0.155.1",

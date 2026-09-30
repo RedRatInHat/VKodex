@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { mkdir, mkdtemp, readFile, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -198,7 +199,17 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
   catch (error) {
     if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
-    assert.fail(`Product DPAPI create failed at ${productDpapiFailurePhase(error)} after the fixed 2 KiB cross-process preflight`);
+    // Compare the production compiled helper with source/tsx under the same
+    // synthetic payload. Only fixed phase labels are reported; no outputs.
+    const compiledPath = path.resolve("dist/src/desktop/managed-worker-private-state.js");
+    const compiled = await import(pathToFileURL(compiledPath).href) as typeof import("../src/desktop/managed-worker-private-state.js");
+    let compiledPhase = "passed";
+    try {
+      await compiled.createManagedWorkerPrivateState(input, {
+        baseDirectory: fixturePath("private", "compiled-dpapi-preflight"), filesystem: new MemoryFilesystem(),
+      });
+    } catch (compiledError) { compiledPhase = productDpapiFailurePhase(compiledError); }
+    assert.fail(`Product source DPAPI create failed at ${productDpapiFailurePhase(error)}; compiled ${compiledPhase} after fixed preflight`);
   }
   const statePath = path.join(created.privateDirectory, "state.v1.dpapi");
   const stored = await readFile(statePath);
