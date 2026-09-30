@@ -1,5 +1,5 @@
 import type { CodexQuestions } from "./codex-questions.js";
-import { ActionRejectedError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -93,9 +93,12 @@ export class RoutedCodexTasks implements CodexTasks {
     cursor: import("./codex-tasks.js").QueuedInputHistoryCursor | null):
     Promise<import("./codex-tasks.js").QueuedInputHistoryScan> {
     const owner = this.owner(task);
-    if (owner?.routingPolicy === "exclusive") return { done: true, turnId: null };
+    if (owner?.routingPolicy === "exclusive" && !owner.scanTerminalQueuedInput)
+      throw new DesktopUnavailableError("Сверка терминальной истории недоступна для этого исполнителя.");
     if (owner?.scanTerminalQueuedInput) return owner.scanTerminalQueuedInput(task, clientId, cursor);
-    return this.base.scanTerminalQueuedInput?.(task, clientId, cursor) ?? { done: true, turnId: null };
+    if (!this.base.scanTerminalQueuedInput)
+      throw new DesktopUnavailableError("Сверка терминальной истории недоступна для этого исполнителя.");
+    return this.base.scanTerminalQueuedInput(task, clientId, cursor);
   }
   async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
     const owner = this.owner(task);

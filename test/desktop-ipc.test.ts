@@ -946,6 +946,14 @@ test("historical queue scan restarts read-only verification after a malformed ch
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(calls, 1);
   assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "a negative scan does not settle the ACK");
+  const completed = s.store.getValue<Record<string, unknown>>(`queue-history:${s.binding.id}:${operationId}`)!;
+  assert.equal(completed.lastCompletedNoTerminalProofAt, 100_000);
+  assert.equal(completed.lastFailure, null);
+});
+
+test("a Desktop adapter without a native history scanner cannot invent a negative result", async () => {
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [], listProjects: async () => [] });
+  await assert.rejects(adapter.scanTerminalQueuedInput({ hostId: "local", threadId: "unused" }, "queued-operation", null), DesktopUnavailableError);
 });
 
 test("bridge core consumes task state through a transport without Desktop IPC", async t => {

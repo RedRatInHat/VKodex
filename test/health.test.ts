@@ -498,6 +498,7 @@ test("health exposes bounded per-operation queue scan progress without native hi
   store.setValue(`queue-history:${binding.id}:queued-op`, {
     taskKey: taskKey(binding), cursor: { cursor: "secret cursor", headDigest: "secret digest", pages: 3 },
     pages: 3, lastAttemptAt: 190_000, lastFailure: "history_unavailable", nextAt: 3_790_000,
+    lastCompletedNoTerminalProofAt: 180_000,
   });
   const now = 200_000;
   const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
@@ -510,6 +511,7 @@ test("health exposes bounded per-operation queue scan progress without native hi
   const progress = report.checks.find(check => check.name === `codex_queue_scan:${binding.id}:1`)!;
   assert.equal(progress.state, "ok");
   assert.match(progress.detail, /3.*1970-01-01T00:03:10\.000Z.*history_unavailable.*1970-01-01T01:03:10\.000Z/u);
+  assert.match(progress.detail, /полный проход.*1970-01-01T00:03:00\.000Z.*без терминального доказательства/u);
   assert.doesNotMatch(JSON.stringify(report), /secret/u);
   assert.equal(report.state, "ok", JSON.stringify(report.checks.filter(check => check.state !== "ok")));
   for (let index = 2; index <= 5; index++) {

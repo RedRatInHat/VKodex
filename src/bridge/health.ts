@@ -14,6 +14,8 @@ export interface QueueHistoryProgress {
   readonly pages: number;
   readonly lastAttemptAt: number;
   readonly lastFailure: "history_unavailable" | "scan_error" | "active_turn" | null;
+  /** A complete read-only scan found no exact terminal turn; never settles the ACK. */
+  readonly lastCompletedNoTerminalProofAt?: number | null;
   readonly nextAt: number;
 }
 
@@ -331,8 +333,12 @@ export class BridgeHealthMonitor {
           ? new Date(current.lastAttemptAt).toISOString() : "ещё не было";
         const nextAt = current && Number.isSafeInteger(current.nextAt) && current.nextAt >= 0 && current.nextAt <= 8.64e15
           ? new Date(current.nextAt).toISOString() : "не назначена";
+        const negativeTimestamp = current?.lastCompletedNoTerminalProofAt;
+        const negativeAt = typeof negativeTimestamp === "number" && Number.isSafeInteger(negativeTimestamp)
+          && negativeTimestamp >= 0 && negativeTimestamp <= 8.64e15
+          ? new Date(negativeTimestamp).toISOString() : null;
         checks.push({ name: `codex_queue_scan:${binding.id}:${index + 1}`, state: "ok",
-          detail: `Сверка ACK ${index + 1}/${queued.length}: страниц не менее ${pages}; последняя попытка ${attempt}; ошибка ${failure ?? "нет"}; следующая попытка ${nextAt}.` });
+          detail: `Сверка ACK ${index + 1}/${queued.length}: страниц не менее ${pages}; последняя попытка ${attempt}; ошибка ${failure ?? "нет"}; следующая попытка ${nextAt}.${negativeAt ? ` Последний полный проход ${negativeAt} завершён без терминального доказательства.` : ""}` });
       }
       if (queued.length > 4) checks.push({ name: `codex_queue_scan_more:${binding.id}`, state: "ok",
         detail: `Ещё ${queued.length - 4} ACK ожидают сверки; подробности ограничены первыми 4.` });

@@ -557,8 +557,9 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
   scanTerminalQueuedInput(task: TaskRef, clientId: string,
     cursor: import("../core/codex-tasks.js").QueuedInputHistoryCursor | null) {
-    return this.metadata?.scanTerminalQueuedInput?.(task, clientId, cursor) ??
-      Promise.resolve({ done: true as const, turnId: null });
+    if (!this.metadata?.scanTerminalQueuedInput)
+      return Promise.reject(new DesktopUnavailableError("Сверка терминальной истории недоступна в этом подключении Codex."));
+    return this.metadata.scanTerminalQueuedInput(task, clientId, cursor);
   }
 
   async queue(request: SubmitTaskRequest): Promise<string> {

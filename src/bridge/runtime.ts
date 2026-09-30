@@ -286,9 +286,13 @@ export class BridgeRuntime {
     this.lastQueueReconciliationAt = this.now();
     const attemptAt = this.now();
     const pages = Math.min(5_000, Math.max(0, checkpoint?.pages ?? checkpoint?.cursor?.pages ?? 0));
+    const previousNegativeAt = checkpoint?.lastCompletedNoTerminalProofAt;
+    const lastCompletedNoTerminalProofAt = typeof previousNegativeAt === "number"
+      && Number.isSafeInteger(previousNegativeAt) && previousNegativeAt >= 0
+      ? previousNegativeAt : null;
     this.store.setValue(checkpointKey, { taskKey: key, cursor: checkpoint?.cursor ?? null,
       pages, lastAttemptAt: attemptAt, lastFailure: checkpoint?.lastFailure ?? null,
-      nextAt: checkpoint?.nextAt ?? attemptAt } satisfies QueueHistoryProgress);
+      lastCompletedNoTerminalProofAt, nextAt: checkpoint?.nextAt ?? attemptAt } satisfies QueueHistoryProgress);
     const work = this.desktop.scanTerminalQueuedInput(binding, operation.operationId, checkpoint?.cursor ?? null).then(result => {
       if (this.stopped) return;
       const current = this.store.getBinding(binding.id);
@@ -299,7 +303,7 @@ export class BridgeRuntime {
         if (!result.done) {
           this.store.setValue(checkpointKey, { taskKey: key, cursor: result.cursor,
             pages: Math.min(5_000, Math.max(0, result.cursor.pages)), lastAttemptAt: attemptAt,
-            lastFailure: null, nextAt: this.now() + 30_000 } satisfies QueueHistoryProgress);
+            lastFailure: null, lastCompletedNoTerminalProofAt, nextAt: this.now() + 30_000 } satisfies QueueHistoryProgress);
         } else if (result.turnId) {
           this.store.settleQueuedInput(binding.id, operation.operationId);
           this.store.setValue(checkpointKey, null);
@@ -307,7 +311,7 @@ export class BridgeRuntime {
         } else {
           this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
             pages, lastAttemptAt: attemptAt, lastFailure: null,
-            nextAt: this.now() + 60 * 60_000 } satisfies QueueHistoryProgress);
+            lastCompletedNoTerminalProofAt: this.now(), nextAt: this.now() + 60 * 60_000 } satisfies QueueHistoryProgress);
         }
       });
     }).catch(error => {
@@ -320,6 +324,7 @@ export class BridgeRuntime {
           pages, lastAttemptAt: attemptAt,
           lastFailure: error instanceof MutableQueuedInputTurnError ? "active_turn"
             : error instanceof DesktopUnavailableError ? "history_unavailable" : "scan_error",
+          lastCompletedNoTerminalProofAt,
           nextAt: this.now() + (error instanceof MutableQueuedInputTurnError ? 30_000 : 60 * 60_000) } satisfies QueueHistoryProgress);
     })
       .finally(() => { if (this.queueReconciliation === work) this.queueReconciliation = null; });

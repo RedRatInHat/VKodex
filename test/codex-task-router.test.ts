@@ -266,6 +266,14 @@ test("exclusive queue reconciliation never treats the legacy writer as proof of 
   assert.equal(baseReads, 0);
 });
 
+test("missing terminal history scanner cannot fabricate a completed negative scan", async () => {
+  const f = fixture();
+  await assert.rejects(f.routed.scanTerminalQueuedInput!(primary, "missing", null), /Сверка терминальной истории недоступна/u);
+  const exclusive = { ...f.owner, routingPolicy: "exclusive" as const };
+  const routed = new RoutedCodexTasks(f.base, [exclusive]);
+  await assert.rejects(routed.scanTerminalQueuedInput!(work, "missing", null), /Сверка терминальной истории недоступна/u);
+});
+
 test("accepted-input reconciliation falls back to the exact profile task after a nonexclusive owner read error", async () => {
   const f = fixture(); const sourceTask = { ...work, rolloutPath: "C:/codex/sessions/exact.jsonl" };
   let baseTask: TaskRef | undefined; let baseOperationId: string | undefined;
