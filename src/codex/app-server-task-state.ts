@@ -83,8 +83,16 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
     const eligible = activeAtAttach.includes(turn.id) || turn.startedAt >= since || recoverFinal.has(turn.id);
     // A reconnect snapshot may contain a whole turn that started while the
     // stream was detached. It is new activity, not historical replay.
-    const startedWhileDisconnected = rebaseline && previous?.lastObservedAt !== undefined
-      && turn.startedAt > previous.lastObservedAt;
+    const lastObservedAt = previous?.lastObservedAt;
+    const priorStatusKey = JSON.stringify([turn.id, "status", `status:${turn.id}`]);
+    // Native startedAt is second-granular. An unseen turn in the boundary
+    // second may have begun after the previous millisecond checkpoint.
+    const newInBoundarySecond = lastObservedAt !== undefined
+      && turn.startedAt === Math.floor(lastObservedAt / 1_000) * 1_000
+      && !previousActive.has(turn.id) && !previous?.activeAtAttach?.includes(turn.id)
+      && previous?.seen[priorStatusKey] === undefined;
+    const startedWhileDisconnected = rebaseline && lastObservedAt !== undefined
+      && (turn.startedAt > lastObservedAt || newInBoundarySecond);
     const operationIds: string[] = [];
     const agentItems = turn.items.filter(item => item.type === "agentMessage");
     const automationHeartbeat = quietTurns.has(turn.id)

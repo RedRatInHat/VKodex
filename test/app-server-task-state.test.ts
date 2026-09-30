@@ -565,6 +565,21 @@ test("native reconnect observes live progress from a new turn without replaying 
   assert.deepEqual(observeAppServerTaskState(resumed, reconnected.checkpoint, 21_000).events, []);
 });
 
+test("native reconnect distinguishes a new turn within the last observed second", () => {
+  const old: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "active", context: null, turns: [turn("old", "inProgress", [item("old-progress", "old work", "commentary")], 10_000)] };
+  const first = observeAppServerTaskState(old, null, 10_999);
+  const resumed = structuredClone(old);
+  resumed.turns = [turn("old", "inProgress", [item("old-progress", "changed old work", "commentary")], 10_000),
+    turn("new", "inProgress", [
+      { type: "userMessage", id: "new-user", content: [{ type: "text", text: "new request" }] },
+      item("new-progress", "working", "commentary"),
+    ], 10_000)];
+  const reconnected = observeAppServerTaskState(resumed, first.checkpoint, 11_500, { rebaseline: true });
+  assert.deepEqual(reconnected.events.map(event => event.type), ["user", "progress", "status"]);
+  assert.ok(reconnected.events.every(event => event.turnId === "new"));
+});
+
 test("native observer recovers the terminal status of an accepted interrupted turn", () => {
   const interrupted: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
     runtimeStatus: "idle", context: null, turns: [turn("turn", "interrupted", [
