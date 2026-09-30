@@ -27,10 +27,11 @@ function currentUserDpapiUnavailablePhase(): "protect" | "unprotect" | null {
   });
   const protect = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$raw=[Console]::In.ReadToEnd().Trim();$data=[Convert]::FromBase64String($raw);$out=[Security.Cryptography.ProtectedData]::Protect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out))";
   const unprotect = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$raw=[Console]::In.ReadToEnd().Trim();$data=[Convert]::FromBase64String($raw);$out=[Security.Cryptography.ProtectedData]::Unprotect($data,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out))";
-  const protectedResult = invoke(protect, "cHJvYmU=");
+  const input = Buffer.alloc(2_048, 0x61).toString("base64");
+  const protectedResult = invoke(protect, input);
   if (protectedResult.error || protectedResult.status !== 0 || !protectedResult.stdout.trim()) return "protect";
   const unprotectedResult = invoke(unprotect, protectedResult.stdout.trim());
-  return unprotectedResult.error || unprotectedResult.status !== 0 || unprotectedResult.stdout.trim() !== "cHJvYmU=" ? "unprotect" : null;
+  return unprotectedResult.error || unprotectedResult.status !== 0 || unprotectedResult.stdout.trim() !== input ? "unprotect" : null;
 }
 
 class IdentityProtector implements ManagedWorkerPrivateStateProtector {
@@ -150,13 +151,23 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   const sentinel = randomUUID(); const input = { ...manifest(), taskId: sentinel, familyRoot: sentinel,
     resumeParams: { threadId: sentinel, settings: { model: "gpt-5.6-sol" } } };
-  const created = await createManagedWorkerPrivateState(input, { baseDirectory });
+  let created;
+  try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
+  catch (error) {
+    if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
+    assert.fail("Product DPAPI create failed after the fixed 2 KiB cross-process preflight");
+  }
   const statePath = path.join(created.privateDirectory, "state.v1.dpapi");
   const stored = await readFile(statePath);
   assert.equal(stored.includes(Buffer.from(sentinel, "utf8")), false);
   await assert.rejects(createManagedWorkerPrivateState(input, { baseDirectory }), /Managed worker private state/u);
   assert.deepEqual(await readFile(statePath), stored);
-  const loaded = await loadManagedWorkerPrivateState({ baseDirectory, epoch });
+  let loaded;
+  try { loaded = await loadManagedWorkerPrivateState({ baseDirectory, epoch }); }
+  catch (error) {
+    if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
+    assert.fail("Product DPAPI load failed after the fixed 2 KiB cross-process preflight");
+  }
   assert.deepEqual(loaded.manifest, created.manifest); assert.deepEqual(loaded.keys, created.keys);
 });
 
