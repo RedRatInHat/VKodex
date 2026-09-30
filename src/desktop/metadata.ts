@@ -19,8 +19,8 @@ import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
 import { nativeCodexPath } from "../codex/native-cli.js";
 
-export type LocalAppServerMethod = "model/list" | "thread/queue/add" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
-const methods = new Set<LocalAppServerMethod>(["model/list","thread/queue/add","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
+export type LocalAppServerMethod = "model/list" | "project/create" | "thread/queue/add" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
+const methods = new Set<LocalAppServerMethod>(["model/list","project/create","thread/queue/add","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
 
 function rejectedMetadata(method: LocalAppServerMethod, error: unknown): ActionRejectedError {
   if (method === "thread/queue/add") return new ActionRejectedError("Codex отклонил добавление в штатную очередь. Проверь версию Codex и состояние задачи. В текущий ход запрос не отправлялся.");
@@ -225,6 +225,18 @@ export function conversationMarkdown(thread: IpcObject): string {
 
 export class NativeDesktopMetadata implements DesktopMetadata {
   constructor(private readonly rpc: Pick<MetadataRpc, "call">) {}
+  async createProject(_sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
+    const response = await this.rpc.call("project/create", {
+      name, roots: roots.map(root => ({ path: root })), idempotencyKey,
+    });
+    const project = response.project;
+    if (!isObject(project) || typeof project.id !== "string" || !project.id
+      || project.name !== name || !Array.isArray(project.roots)
+      || project.roots.length !== roots.length
+      || project.roots.some((root, index) => !isObject(root) || typeof root.path !== "string"
+        || comparablePath(root.path) !== comparablePath(roots[index]!))) throw new UncertainActionError();
+    return { id: project.id, title: name, workspace: roots[0] ?? "", workspaceRoots: [...roots] };
+  }
   private local(task: TaskRef): void {
     if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("Метаданные доступны только для локальных задач.");
   }
@@ -317,6 +329,12 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
   ) {}
+  async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
+    const home = this.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
+    const metadata = this.createMetadata(home);
+    if (!metadata.createProject) throw new ActionRejectedError("Создание проекта недоступно в выбранном каталоге Codex.");
+    return metadata.createProject(sourceId, name, roots, idempotencyKey);
+  }
   async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
     if (task.hostId !== "local") return "missing";
     return await inspectThroughOwner(this.sourceHome(task), task.threadId, undefined, 3_000) === null ? "missing" : "ready";

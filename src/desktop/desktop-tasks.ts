@@ -6,6 +6,7 @@ import { taskDetails } from "./details.js";
 import { activeTurnsFromState, summarizeTurnState, turnsFromState } from "./projector.js";
 import { asyncQuestionReply, pendingCodexQuestions, type CodexQuestions } from "./questions.js";
 import { taskInput, type PreparedTaskInput } from "../core/task-input.js";
+import { comparablePath } from "./paths.js";
 
 class TransientSubmissionStateError extends ActionRejectedError {}
 
@@ -103,6 +104,21 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   listTasks() { return this.catalog.listTasks(); }
   listSources() { return this.catalog.listSources?.() ?? [{ id: "", label: "Основной" }]; }
   listProjects(sourceId?: string) { return this.catalog.listProjects(sourceId); }
+  async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
+    if (!this.metadata?.createProject) throw new ActionRejectedError("Создание проекта недоступно в этом подключении.");
+    const created = await this.metadata.createProject(sourceId, name, roots, idempotencyKey);
+    const expectedId = sourceId ? JSON.stringify([sourceId, created.id]) : created.id;
+    let visible;
+    try { visible = (await this.catalog.listProjects(sourceId)).find(project => project.id === expectedId); }
+    catch { throw new UncertainActionError(); }
+    const projectRoots = (project: typeof created): readonly string[] => project.workspaceRoots?.length
+      ? project.workspaceRoots : project.workspace ? [project.workspace] : [];
+    if (!visible || visible.title !== created.title || projectRoots(visible).length !== projectRoots(created).length
+      || projectRoots(visible).some((root, index) => comparablePath(root) !== comparablePath(projectRoots(created)[index]!))) {
+      throw new UncertainActionError();
+    }
+    return visible;
+  }
   catalogWarnings() { return this.catalog.catalogWarnings?.() ?? []; }
   async accountUsage(task?: TaskRef) {
     if (!this.usage) throw new ActionRejectedError("Данные о лимитах недоступны в этом подключении.");

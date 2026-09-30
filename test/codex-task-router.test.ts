@@ -12,6 +12,7 @@ function fixture() {
   const base = {
     capabilities: { createTask: true, startTurn: true, steerTurn: true, interruptTurn: true, selectModel: true },
     listTasks: async () => [], listProjects: async () => [], createTask: async () => { throw new Error("unused"); },
+    createProject: async () => ({ id: "unused", title: "Unused", workspace: "/unused" }),
     submit: async () => { calls.push("base:submit"); },
     submitWithReceipt: async () => { calls.push("base:submitWithReceipt"); return { mode: "start" as const, turnId: "base-turn" }; },
     submitConnectedWithReceipt: async () => { calls.push("base:connectedSubmit"); return { mode: "steer" as const, turnId: "client-turn" }; },
@@ -57,6 +58,16 @@ test("metadata and goals use the selected profile owner", async () => {
   assert.equal(await f.routed.clearGoal!(work), true);
   await assert.rejects(f.routed.continueGoal!(work, "resume-exclusive"), /Автоматическое продолжение цели недоступно/u);
   assert.deepEqual(f.calls, ["owner:rename", "owner:move", "owner:clear-goal"]);
+});
+
+test("project creation forwards the selected catalog parameters and result", async () => {
+  const f = fixture();
+  const expected = { id: "[\"work\",\"raw-project\"]", title: "Project", workspace: "/project", workspaceRoots: ["/project"] };
+  let received: unknown[] | null = null;
+  f.base.createProject = async (...args) => { received = args; return expected; };
+
+  assert.equal(await f.routed.createProject!("work", "Project", ["/project"], "idempotency-key"), expected);
+  assert.deepEqual(received, ["work", "Project", ["/project"], "idempotency-key"]);
 });
 
 test("goal continuation uses only an owner that can confirm it", async () => {

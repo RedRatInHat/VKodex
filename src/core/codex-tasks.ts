@@ -203,6 +203,8 @@ export interface AccountUsageProvider {
 }
 
 export interface DesktopMetadata {
+  /** Returns the raw native project ID; callers with multi-catalog views must rebind it to a source-qualified catalog ID. */
+  createProject?(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject>;
   queue?(request: SubmitTaskRequest, input: readonly Record<string, unknown>[]): Promise<string>;
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
   /** Bounded read-only native history scan; only done with a turn ID is terminal proof. */
@@ -303,6 +305,7 @@ export interface CodexTasks {
   listTasks(): Promise<readonly DesktopTask[]>;
   listSources?(): readonly DesktopSource[];
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]>;
+  createProject?(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject>;
   catalogWarnings?(): readonly string[];
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
   submit(request: SubmitTaskRequest): Promise<void>;

@@ -2695,6 +2695,48 @@ test("project move requires both visible catalog and native metadata to confirm 
   }
 });
 
+test("project creation returns the selected catalog identity after native metadata returns a raw ID", async () => {
+  for (const [sourceId, rawId, visibleId] of [
+    ["work", "raw-target", JSON.stringify(["work", "raw-target"])],
+    ["", "primary-target", "primary-target"],
+  ] as const) {
+    const metadataCalls: string[] = [];
+    const adapter = new ConnectedDesktopTasks({
+      listTasks: async () => [],
+      listProjects: async requestedSourceId => requestedSourceId === sourceId ? [{
+        id: visibleId, title: "Project", workspace: "/project", workspaceRoots: ["/project"],
+      }] : [],
+    }, () => new DesktopIpcClient(), {
+      rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+      createProject: async actualSourceId => {
+        metadataCalls.push(actualSourceId);
+        return { id: rawId, title: "Project", workspace: "/project", workspaceRoots: ["/project"] };
+      },
+    });
+
+    const created = await adapter.createProject(sourceId, "Project", ["/project"], "fixture-idempotency-key");
+    assert.equal(created.id, visibleId);
+    assert.deepEqual(metadataCalls, [sourceId]);
+  }
+});
+
+test("project creation becomes uncertain when its post-create catalog read fails", async () => {
+  let creates = 0;
+  const adapter = new ConnectedDesktopTasks({
+    listTasks: async () => [],
+    listProjects: async () => { throw new DesktopUnavailableError("fixture catalog unavailable"); },
+  }, () => new DesktopIpcClient(), {
+    rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+    createProject: async () => {
+      creates++;
+      return { id: "raw-target", title: "Project", workspace: "/project", workspaceRoots: ["/project"] };
+    },
+  });
+
+  await assert.rejects(adapter.createProject("work", "Project", ["/project"], "fixture-idempotency-key"), UncertainActionError);
+  assert.equal(creates, 1);
+});
+
 test("compatibility canary confirms stream protocol v11 through an open task", async () => {
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }; const servers: Server[] = [];
   const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {

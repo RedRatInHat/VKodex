@@ -58,6 +58,10 @@ export class RoutedCodexTasks implements CodexTasks {
   listSources(): readonly DesktopSource[] { return this.base.listSources?.() ?? []; }
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]> { return this.base.listProjects(sourceId); }
   catalogWarnings(): readonly string[] { return this.base.catalogWarnings?.() ?? []; }
+  createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject> {
+    if (!this.base.createProject) throw new ActionRejectedError("Создание проекта недоступно в этом подключении.");
+    return this.base.createProject(sourceId, name, roots, idempotencyKey);
+  }
   createTask(request: CreateTaskRequest): Promise<DesktopTask> { return this.base.createTask(request); }
   async submit(request: SubmitTaskRequest): Promise<void> { await this.submitWithReceipt(request); }
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {

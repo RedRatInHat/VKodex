@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { comparablePath } from "../core/paths.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -22,6 +23,9 @@ interface PanelState {
   targetSourceLabel?: string;
   targetProjectId?: string | null;
   targetProjectTitle?: string;
+  sourceProjectId?: string;
+  sourceProjectTitle?: string;
+  sourceProjectRoots?: string[];
   resetSourceId?: string;
   resetSourceLabel?: string;
   resetAccountLabel?: string;
@@ -69,6 +73,14 @@ function validGoalContinuation(value: unknown): value is GoalContinuationState {
 const unknownDetails: TaskDetails = { status: "unavailable", workspace: null, model: null, effort: null, nextModel: null, nextEffort: null, context: null };
 const statuses: Record<TaskDetails["status"], string> = { running: "Выполняется", idle: "Ожидает сообщения", failed: "Ход завершился с ошибкой", interrupted: "Ход остановлен", approval: "Нужен ответ или подтверждение", unavailable: "Нет связи с задачей" };
 const short = (text: string, length = 120): string => text.replace(/\s+/gu, " ").trim().slice(0, length);
+const projectRoots = (project: DesktopProject): string[] => [...(project.workspaceRoots?.length ? project.workspaceRoots : project.workspace ? [project.workspace] : [])];
+const sameProject = (left: DesktopProject, right: DesktopProject): boolean => left.title === right.title
+  && projectRoots(left).length === projectRoots(right).length
+  && projectRoots(left).every((root, index) => comparablePath(root) === comparablePath(projectRoots(right)[index]!));
+function projectCreationKey(sourceId: string, targetSourceId: string, projectId: string): string {
+  const digest = createHash("sha256").update(JSON.stringify([sourceId, targetSourceId, projectId])).digest("hex");
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
 const number = (value: number): string => Math.round(value).toLocaleString("ru-RU");
 const goalStatuses: Record<TaskGoalStatus, string> = {
   active: "Выполняется",
@@ -403,7 +415,19 @@ export class TaskPanels {
         if (state.view !== "moveSource" || action.sourceId === undefined) throw new ActionRejectedError("Выбор каталога устарел.");
         const source = (this.desktop.listSources?.() ?? []).find(item => item.id === action.sourceId);
         if (!source || source.id === (binding.sourceId ?? "")) throw new ActionRejectedError("Целевой каталог недоступен или совпадает с текущим.");
-        await this.renderTransferProjects(binding, source.id, source.label, 0);
+        const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+        if (!current || current.projectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+        if (current.projectId === null) {
+          await this.renderTransferProjects(binding, source.id, source.label, 0);
+          break;
+        }
+        const sourceProject = (await this.desktop.listProjects(binding.sourceId ?? ""))
+          .find(project => project.id === current.projectId || project.legacyIds?.includes(current.projectId!));
+        if (!sourceProject) throw new ActionRejectedError("Проект исходной задачи не найден в её каталоге. Перенос не начат.");
+        const matches = (await this.desktop.listProjects(source.id)).filter(project => sameProject(sourceProject, project));
+        if (matches.length > 1) throw new ActionRejectedError("В каталоге назначения несколько одинаковых проектов. Перенос не начат.");
+        if (!matches.length && !this.desktop.createProject) throw new ActionRejectedError("Соответствующего проекта нет, а создание проекта в каталоге назначения недоступно.");
+        await this.showTransferConfirmation(binding, source.id, source.label, matches[0] ?? null, sourceProject);
         break;
       }
       case "moveSourceProject": {
@@ -417,30 +441,41 @@ export class TaskPanels {
         const projects = await this.desktop.listProjects(state.targetSourceId);
         const project = action.projectId === null ? null : projects.find(item => item.id === action.projectId);
         if (action.projectId !== null && !project) throw new ActionRejectedError("Выбранный проект больше не доступен.");
-        const next = this.newState(input.peerId, binding.id, "moveSourceConfirm");
-        next.targetSourceId = state.targetSourceId; next.targetSourceLabel = state.targetSourceLabel;
-        next.targetProjectId = action.projectId; next.targetProjectTitle = project?.title ?? "Без проекта";
-        const account = await this.targetAccount(next.targetSourceId);
-        this.show(input.peerId, next, {
-          text: `Перенести задачу в «${next.targetSourceLabel}»?\n\nАккаунт назначения: ${account}\nПроект: ${next.targetProjectTitle}\n\nБудет создан новый thread ID с историей по последний завершённый ход. После проверки клиента, названия, проекта и цели эта VK-беседа переключится на него, а исходная задача будет архивирована. Активная цель сохранится на паузе; в новом аккаунте останется только неизрасходованный бюджет. Рабочие файлы не перемещаются. Во время переноса новые запросы в эту задачу не отправляются.`,
-          buttons: [this.button(input.peerId, next, "Перенести", "moveSourceApply", { sourceId: next.targetSourceId, projectId: next.targetProjectId }), this.button(input.peerId, next, "Отмена", "home")],
-        });
+        await this.showTransferConfirmation(binding, state.targetSourceId, state.targetSourceLabel, project ?? null, undefined, action.projectId);
         break;
       }
       case "moveSourceApply": {
-        if (state.view !== "moveSourceConfirm" || state.targetSourceId === undefined || state.targetProjectId === undefined
+        if (state.view !== "moveSourceConfirm" || state.targetSourceId === undefined
+          || (state.targetProjectId === undefined && !state.sourceProjectId)
           || action.sourceId !== state.targetSourceId || action.projectId !== state.targetProjectId) throw new ActionRejectedError("Подтверждение переноса устарело.");
-        this.consume(input);
         const existing = this.store.transfer(binding.id);
         if (existing && !["complete", "cancelled"].includes(existing.phase)
-          && (existing.targetSourceId !== state.targetSourceId || existing.targetProjectId !== state.targetProjectId)) {
+          && (existing.targetSourceId !== state.targetSourceId
+            || (state.sourceProjectId && state.targetProjectId === undefined)
+            || (state.targetProjectId !== undefined && existing.targetProjectId !== state.targetProjectId))) {
           throw new ActionRejectedError("Предыдущий перенос ещё не завершён. /menu покажет этап и причину; новую копию пока не создаю.");
         }
+        if (!state.sourceProjectId) {
+          const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+          if (!current || current.projectId !== null) {
+            throw new ActionRejectedError("Проект исходной задачи изменился после подтверждения. Открой перенос заново.");
+          }
+        }
+        this.consume(input);
+        let targetProjectId = state.targetProjectId;
+        if (!existing || ["complete", "cancelled"].includes(existing.phase)) {
+          if (state.sourceProjectId) targetProjectId = await this.ensureTransferProject(binding, state);
+          else if (targetProjectId !== null) {
+            const target = (await this.desktop.listProjects(state.targetSourceId)).find(project => project.id === targetProjectId);
+            if (!target) throw new ActionRejectedError("Выбранный проект больше не доступен. Перенос не начат.");
+          }
+        } else targetProjectId = existing.targetProjectId;
+        if (targetProjectId === undefined) throw new ActionRejectedError("Проект назначения не подтверждён. Перенос не начат.");
         const record: TaskTransferRecord = existing && !["complete", "cancelled"].includes(existing.phase) ? existing : {
           id: randomUUID(), bindingId: binding.id, startedAt: Date.now(), source: {
             hostId: binding.hostId, threadId: binding.threadId, title: binding.title,
             ...(binding.sourceId ? { sourceId: binding.sourceId } : {}), ...(binding.rolloutPath ? { rolloutPath: binding.rolloutPath } : {}),
-          }, targetSourceId: state.targetSourceId, targetProjectId: state.targetProjectId, phase: "forking",
+          }, targetSourceId: state.targetSourceId, targetProjectId, phase: "forking",
         };
         if (existing && !["complete", "cancelled"].includes(existing.phase)) this.transfers.resume(binding.id);
         else this.transfers.start(record);
@@ -694,6 +729,50 @@ export class TaskPanels {
       text: `Каталог назначения: ${sourceLabel}\nВыбери проект · ${page + 1}/${pageCount}\n\n${visible.map(project => `${short(project.title)}\n${project.workspace}`).join("\n\n") || "В этом каталоге нет проектов."}`,
       buttons,
     });
+  }
+
+  private async showTransferConfirmation(binding: Binding, sourceId: string, sourceLabel: string,
+    targetProject: DesktopProject | null, sourceProject?: DesktopProject, projectlessSelection?: string | null): Promise<void> {
+    const next = this.newState(binding.peerId!, binding.id, "moveSourceConfirm");
+    next.targetSourceId = sourceId; next.targetSourceLabel = sourceLabel;
+    if (sourceProject) {
+      next.sourceProjectId = sourceProject.id;
+      next.sourceProjectTitle = sourceProject.title;
+      next.sourceProjectRoots = projectRoots(sourceProject);
+      if (targetProject) next.targetProjectId = targetProject.id;
+    } else if (projectlessSelection !== undefined) next.targetProjectId = projectlessSelection;
+    next.targetProjectTitle = sourceProject?.title ?? targetProject?.title ?? "Без проекта";
+    const projectNote = sourceProject && !targetProject ? " (будет создан в каталоге назначения)" : "";
+    const account = await this.targetAccount(sourceId);
+    this.show(binding.peerId!, next, {
+      text: `Перенести задачу в «${sourceLabel}»?\n\nАккаунт назначения: ${account}\nПроект: ${next.targetProjectTitle}${projectNote}\n\nБудет создан новый thread ID с историей по последний завершённый ход. После проверки клиента, названия, проекта и цели эта VK-беседа переключится на него, а исходная задача будет архивирована. Активная цель сохранится на паузе; в новом аккаунте останется только неизрасходованный бюджет. Рабочие файлы не перемещаются. Во время переноса новые запросы в эту задачу не отправляются.`,
+      buttons: [this.button(binding.peerId!, next, "Перенести", "moveSourceApply", {
+        sourceId, ...(next.targetProjectId !== undefined ? { projectId: next.targetProjectId } : {}),
+      }), this.button(binding.peerId!, next, "Отмена", "home")],
+    });
+  }
+
+  private async ensureTransferProject(binding: Binding, state: PanelState): Promise<string> {
+    if (!state.sourceProjectId || !state.sourceProjectTitle || !state.sourceProjectRoots || state.targetSourceId === undefined
+      || !this.desktop.createProject) throw new ActionRejectedError("Сведения о проекте назначения недоступны. Перенос не начат.");
+    const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
+    if (!current || current.projectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+    const source = (await this.desktop.listProjects(binding.sourceId ?? ""))
+      .find(project => project.id === current.projectId || project.legacyIds?.includes(current.projectId!));
+    if (!source || source.id !== state.sourceProjectId || source.title !== state.sourceProjectTitle
+      || projectRoots(source).length !== state.sourceProjectRoots.length
+      || projectRoots(source).some((root, index) => comparablePath(root) !== comparablePath(state.sourceProjectRoots![index]!))) {
+      throw new ActionRejectedError("Проект исходной задачи изменился после подтверждения. Открой перенос заново.");
+    }
+    const matches = (await this.desktop.listProjects(state.targetSourceId)).filter(project => sameProject(source, project));
+    if (matches.length > 1) throw new ActionRejectedError("В каталоге назначения несколько одинаковых проектов. Перенос не начат.");
+    if (matches.length === 1) return matches[0]!.id;
+    const created = await this.desktop.createProject(state.targetSourceId, source.title, projectRoots(source),
+      projectCreationKey(binding.sourceId ?? "", state.targetSourceId, source.id));
+    if (!sameProject(source, created)) throw new UncertainActionError();
+    const visible = (await this.desktop.listProjects(state.targetSourceId)).find(project => project.id === created.id);
+    if (!visible || !sameProject(source, visible)) throw new UncertainActionError();
+    return created.id;
   }
 
   private async targetAccount(sourceId: string): Promise<string> {

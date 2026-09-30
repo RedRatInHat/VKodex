@@ -399,6 +399,21 @@ test("native project assignment uses thread metadata and clears with an empty pr
   ]);
 });
 
+test("native project creation sends a stable idempotency key and verifies the returned project", async () => {
+  const calls: { method: string; params: IpcObject }[] = [];
+  const metadata = new NativeDesktopMetadata({ call: async (method, params) => {
+    calls.push({ method, params });
+    return { project: { id: "new-project", name: "Project", roots: [{ path: "C:/work" }] } };
+  } });
+  assert.deepEqual(await metadata.createProject("work", "Project", ["C:/work"], "operation-id"),
+    { id: "new-project", title: "Project", workspace: "C:/work", workspaceRoots: ["C:/work"] });
+  assert.deepEqual(calls, [{ method: "project/create", params: {
+    name: "Project", roots: [{ path: "C:/work" }], idempotencyKey: "operation-id",
+  } }]);
+  const mismatch = new NativeDesktopMetadata({ call: async () => ({ project: { id: "wrong", name: "Other", roots: [] } }) });
+  await assert.rejects(mismatch.createProject("work", "Project", ["C:/work"], "operation-id"), UncertainActionError);
+});
+
 test("partial-migration project move preflights before native or legacy state mutation", async () => {
   const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
   const { default: path } = await import("node:path");

@@ -138,6 +138,8 @@ class Desktop implements DesktopTasks {
   readonly transfers: TransferTaskRequest[] = [];
   readonly opened: TaskRef[] = [];
   readonly moves: { task: TaskRef; projectId: string | null }[] = [];
+  readonly projectCreations: { sourceId: string; name: string; roots: readonly string[]; idempotencyKey: string }[] = [];
+  projectCreateError: Error | null = null;
   goal: TaskGoal | null = null;
   readonly goalUpdates: TaskGoalUpdate[] = [];
   goalClears = 0;
@@ -208,6 +210,15 @@ class Desktop implements DesktopTasks {
   async listTasks() { return this.tasks; }
   listSources() { return this.sources; }
   async listProjects(sourceId?: string) { if (this.projectsError) throw this.projectsError; return sourceId !== undefined && this.sourceProjects ? (this.sourceProjects[sourceId] ?? []) : this.projects; }
+  async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject> {
+    this.projectCreations.push({ sourceId, name, roots, idempotencyKey });
+    const project = { id: `created-${sourceId}-${this.projectCreations.length}`, title: name,
+      workspace: roots[0] ?? "", workspaceRoots: [...roots] };
+    this.sourceProjects ??= {};
+    (this.sourceProjects[sourceId] ??= []).push(project);
+    if (this.projectCreateError) { const error = this.projectCreateError; this.projectCreateError = null; throw error; }
+    return project;
+  }
   async createTask(request: CreateTaskRequest): Promise<DesktopTask> {
     this.creations.push(request);
     if (this.createError) throw this.createError;
@@ -1024,6 +1035,7 @@ test("expired rename draft never leaks the intended title to the agent", async t
 
 test("catalog transfer keeps the VK conversation, retargets streaming and archives the source", async t => {
   const s = setup(t); const original = s.attach();
+  s.desktop.tasks = [{ ...task, projectId: null }];
   // Simulate a legacy marker inherited from an earlier transfer. It is not a
   // pending turn of the current source and must neither block nor reach target.
   s.store.recordOperation("source-operation", { ...original, threadId: "older-source" });
@@ -1072,16 +1084,17 @@ test("automation notifications do not append a task menu", async t => {
   assert.deepEqual(s.chat.sent.map(item => item.view), [{ text: "Needs attention." }]);
 });
 
-test("catalog transfer reapplies the target project after opening its Codex client", async t => {
+test("catalog transfer keeps an existing project without showing a project picker", async t => {
   const s = setup(t); const original = s.attach();
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
-  s.desktop.sourceProjects = { "": s.desktop.projects, work: [{ id: "work-project", title: "Target project", workspace: "/project" }] };
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [{ id: "work-project", title: "Project", workspace: "/project" }] };
   await s.handle("/menu", peerId);
   await clickPanel(s, "Переместить");
   await clickPanel(s, "В другой каталог");
   await clickPanel(s, ".codex-work");
-  await clickPanel(s, "Target project");
+  assert.match(panelView(s).text, /Проект: Project/u);
+  assert.equal(panelView(s).buttons?.some(button => button.label === "Без проекта"), false);
   await clickPanel(s, "Перенести");
 
   assert.equal(s.desktop.opened.length, 1);
@@ -1090,8 +1103,118 @@ test("catalog transfer reapplies the target project after opening its Codex clie
   assert.equal(s.store.transfer(original.id)!.phase, "complete");
 });
 
+test("catalog transfer creates the missing source project through Codex before forking", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог"); await clickPanel(s, ".codex-work");
+  assert.match(panelView(s).text, /Проект: Project \(будет создан в каталоге назначения\)/u);
+  assert.equal(panelView(s).buttons?.some(button => button.label === "Без проекта"), false);
+  assert.equal(s.desktop.projectCreations.length, 0);
+  await clickPanel(s, "Перенести");
+  assert.equal(s.desktop.projectCreations.length, 1);
+  assert.deepEqual({ sourceId: s.desktop.projectCreations[0]!.sourceId, name: s.desktop.projectCreations[0]!.name,
+    roots: s.desktop.projectCreations[0]!.roots }, { sourceId: "work", name: "Project", roots: ["/project"] });
+  assert.match(s.desktop.projectCreations[0]!.idempotencyKey, /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/u);
+  assert.equal(s.store.transfer(original.id)!.targetProjectId, "created-work-1");
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+  assert.equal(s.desktop.archives.length, 1);
+});
+
+test("catalog transfer fails closed when the target has duplicate matching projects", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [
+    { id: "work-project-a", title: "Project", workspace: "/project" },
+    { id: "work-project-b", title: "Project", workspace: "/project" },
+  ] };
+
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+
+  assert.match(s.chat.sent.at(-1)!.view.text, /несколько одинаковых проектов/u);
+  assert.equal(s.desktop.projectCreations.length, 0);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)!.threadId, original.threadId);
+});
+
+test("catalog transfer fails closed when the source project changes after confirmation", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+  s.desktop.sourceProjects[""] = [{ id: "project-a", title: "Project", workspace: "/changed-project" }];
+  await clickPanel(s, "Перенести");
+
+  assert.match(s.chat.sent.at(-1)!.view.text, /Проект исходной задачи изменился после подтверждения/u);
+  assert.equal(s.desktop.projectCreations.length, 0);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)!.threadId, original.threadId);
+});
+
+test("catalog transfer does not fork when project creation returns a mismatching project", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  const createProject = s.desktop.createProject.bind(s.desktop);
+  s.desktop.createProject = async (...args) => ({ ...(await createProject(...args)), title: "Unexpected project" });
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Перенести");
+
+  assert.equal(s.desktop.projectCreations.length, 1);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)!.threadId, original.threadId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Результат операции неизвестен/u);
+});
+
+test("catalog transfer does not fork when the created project is absent from the target catalog", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  s.desktop.createProject = async (sourceId, name, roots, idempotencyKey) => {
+    s.desktop.projectCreations.push({ sourceId, name, roots, idempotencyKey });
+    return { id: "created-but-invisible", title: name, workspace: roots[0] ?? "", workspaceRoots: [...roots] };
+  };
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work"); await clickPanel(s, "Перенести");
+
+  assert.equal(s.desktop.projectCreations.length, 1);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)!.threadId, original.threadId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Результат операции неизвестен/u);
+});
+
+test("a lost project-create reply reuses the created target project without a duplicate fork", async t => {
+  const s = setup(t); const original = s.attach();
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
+  s.desktop.projectCreateError = new UncertainActionError();
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог"); await clickPanel(s, ".codex-work");
+  await clickPanel(s, "Перенести");
+  assert.equal(s.desktop.projectCreations.length, 1);
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.equal(s.store.byPeer(peerId)!.threadId, original.threadId);
+  await s.handle("/menu", peerId);
+  await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог"); await clickPanel(s, ".codex-work");
+  assert.doesNotMatch(panelView(s).text, /будет создан/u);
+  await clickPanel(s, "Перенести");
+  assert.equal(s.desktop.projectCreations.length, 1);
+  assert.equal(s.desktop.transfers.length, 1);
+  assert.equal(s.store.transfer(original.id)!.phase, "complete");
+});
+
 test("a switched transfer retries only source archiving and completes", async t => {
   const s = setup(t); const original = s.attach();
+  s.desktop.tasks = [{ ...task, projectId: null }];
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
   s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
@@ -1122,6 +1245,7 @@ test("a switched transfer retries only source archiving and completes", async t 
 
 test("a reverse transfer cannot overwrite a legacy operation without a saved boundary", async t => {
   const s = setup(t); const current = s.attach();
+  s.desktop.tasks = [{ ...task, projectId: null }];
   s.desktop.capabilities.transferTask = true;
   s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
   s.desktop.sourceProjects = { "": s.desktop.projects, work: [] };
