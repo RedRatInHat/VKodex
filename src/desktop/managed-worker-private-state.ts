@@ -237,24 +237,25 @@ const aclScript = [
   "$ErrorActionPreference='Stop'",
   "$p=[Console]::In.ReadToEnd().Trim()",
   "if(!$p){throw 'path'}",
-  "[IO.Directory]::CreateDirectory($p)|Out-Null",
-  "$d=Get-Item -LiteralPath $p -Force",
-  "if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
   "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User",
-  "$before=Get-Acl -LiteralPath $p",
-  "$beforeOwner=$before.GetOwner([Security.Principal.SecurityIdentifier])",
-  "$actualOwner=$beforeOwner.Value",
-  "$expectedOwner=$sid.Value",
-  "if($actualOwner -ne $expectedOwner){exit 48}",
   "$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
   "$acl=[Security.AccessControl.DirectorySecurity]::new()",
+  "$acl.SetOwner($sid)",
   "$acl.SetAccessRuleProtection($true,$false)",
   "foreach($id in @($sid,$system)){",
   "$rule=[Security.AccessControl.FileSystemAccessRule]::new($id,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)",
   "$acl.AddAccessRule($rule)",
   "}",
-  "Set-Acl -LiteralPath $p -AclObject $acl",
-  "$check=Get-Item -LiteralPath $p -Force",
+  "[IO.Directory]::CreateDirectory($p,$acl)|Out-Null",
+  "$d=[IO.DirectoryInfo]::new($p)",
+  "if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
+  "$before=[IO.Directory]::GetAccessControl($p)",
+  "$beforeOwner=$before.GetOwner([Security.Principal.SecurityIdentifier])",
+  "$actualOwner=$beforeOwner.Value",
+  "$expectedOwner=$sid.Value",
+  "if($actualOwner -ne $expectedOwner){exit 48}",
+  "[IO.Directory]::SetAccessControl($p,$acl)",
+  "$check=[IO.DirectoryInfo]::new($p)",
   "if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
 ].join(";");
 
@@ -313,12 +314,22 @@ async function createUnlinkedDirectory(directory: string): Promise<void> {
 }
 class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
   async ensureProtectedDirectory(directory: string): Promise<void> {
-    try { await createUnlinkedDirectory(directory); await rejectLinked(directory); }
+    try {
+      await createUnlinkedDirectory(path.dirname(directory));
+      await rejectLinked(path.dirname(directory));
+      const leaf = await lstat(directory).catch(error => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (leaf && (!leaf.isDirectory() || leaf.isSymbolicLink())) throw new Error("unsafe");
+    }
     catch { throw new Error("Managed worker private state directory is unsafe"); }
     if (process.platform !== "win32") throw new Error("Managed worker private state requires Windows");
     try { assertWindowsPrivateDirectory(directory); return; }
     catch { /* A new directory needs its private DACL; an unsafe owner still fails below. */ }
     await runPowerShell(aclScript, Buffer.from(directory, "utf8"));
+    try { await rejectLinked(directory); }
+    catch { throw new Error("Managed worker private state directory is unsafe"); }
     assertWindowsPrivateDirectory(directory);
   }
   async writeExclusive(filePath: string, data: Uint8Array): Promise<void> {
