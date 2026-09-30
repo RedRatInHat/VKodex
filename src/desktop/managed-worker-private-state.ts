@@ -200,7 +200,7 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
       if (!message || typeof message !== "object" || !("ok" in message)) return settle();
       if (message.ok !== true) {
         const phase = "phase" in message && typeof message.phase === "string" ? message.phase : "unclassified";
-        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|command-mismatch|input-length|exit-(?:null|\d+)(?:-(?:empty|parser|runtime|other))?)$/u.test(phase)
+        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|command-mismatch|input-length|exit-(?:null|\d+)(?:-(?:empty|parser(?:-l\d{1,4}c\d{1,5})?|runtime|other))?)$/u.test(phase)
           ? phase : "unclassified");
       }
       const output = "output" in message ? message.output : null;
@@ -229,7 +229,7 @@ function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
     !("phase" in error.cause) || typeof error.cause.phase !== "string") return "unclassified";
   const phase = error.cause.phase;
-  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|command-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)(?:-(?:empty|parser|runtime|other))?|helper-exit-\d+)$/u.test(phase)
+  return /^(?:timeout|spawn-throw|process-error|output-limit|invalid-input|input-mismatch|command-mismatch|input-length|stdin-end|output-format|exit-(?:null|\d+)(?:-(?:empty|parser(?:-l\d{1,4}c\d{1,5})?|runtime|other))?|helper-exit-\d+)$/u.test(phase)
     ? phase : "unclassified";
 }
 

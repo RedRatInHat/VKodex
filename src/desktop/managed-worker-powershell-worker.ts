@@ -14,6 +14,26 @@ interface Request {
 }
 
 let replied = false;
+function parserCoordinate(stderr: Buffer): string {
+  const marker = Buffer.from("At line:", "ascii");
+  const offset = stderr.indexOf(marker);
+  if (offset < 0) return "";
+  let index = offset + marker.length;
+  const digits = (maximum: number): number | null => {
+    let value = 0, count = 0;
+    while (index < stderr.byteLength && stderr[index]! >= 48 && stderr[index]! <= 57 && count < 5) {
+      value = value * 10 + stderr[index]! - 48; index++; count++;
+    }
+    return count > 0 && value > 0 && value <= maximum ? value : null;
+  };
+  const line = digits(1_000);
+  while (index < stderr.byteLength && stderr[index] === 32) index++;
+  const charMarker = Buffer.from("char:", "ascii");
+  if (line === null || !stderr.subarray(index, index + charMarker.length).equals(charMarker)) return "";
+  index += charMarker.length;
+  const column = digits(16_384);
+  return column === null ? "" : `-l${line}c${column}`;
+}
 function send(message: { readonly ok: false; readonly phase: string } |
   { readonly ok: true; readonly output: Uint8Array }, after?: () => void): void {
   let released = false;
@@ -83,7 +103,7 @@ process.once("message", (value: unknown) => {
           ? "runtime" : "other";
     }
     const phase = result.error ? "process-error" : result.status === 42 ? "input-length" :
-      `exit-${result.status}-${stderrKind}`;
+      `exit-${result.status}-${stderrKind}${stderrKind === "parser" && Buffer.isBuffer(stderr) ? parserCoordinate(stderr) : ""}`;
     if (Buffer.isBuffer(stdout)) stdout.fill(0);
     if (Buffer.isBuffer(stderr)) stderr.fill(0);
     send({ ok: false, phase });
