@@ -20,29 +20,56 @@ export function turnsFromState(state: IpcObject): IpcObject[] {
   return [...turns.values()].sort((a, b) => Number(a.turnStartedAtMs ?? 0) - Number(b.turnStartedAtMs ?? 0));
 }
 
-function rawTurnsFromState(state: IpcObject): IpcObject[] {
+export function summarizeTurnState(state: IpcObject): {
+  progress: "none" | "live" | "orphaned" | "ambiguous";
+  hasAnyTurn: boolean;
+  hasTerminalTurn: boolean;
+} {
+  let hasAnyTurn = false;
+  let hasTerminalTurn = false;
+  let inProgressCount = 0;
+  let finiteStartedCount = 0;
+  let latestStarted = -Infinity;
+  let latestTerminal = -Infinity;
+  const visit = (value: unknown): void => {
+    hasAnyTurn = true;
+    if (!isObject(value)) return;
+    const status = value.status;
+    if (status === "inProgress") {
+      inProgressCount++;
+      const started = Number(value.turnStartedAtMs);
+      if (Number.isFinite(started)) {
+        finiteStartedCount++;
+        latestStarted = Math.max(latestStarted, started);
+      }
+    }
+    if (["completed", "failed", "interrupted"].includes(String(status))) {
+      hasTerminalTurn = true;
+      const started = Number(value.turnStartedAtMs);
+      if (Number.isFinite(started)) latestTerminal = Math.max(latestTerminal, started);
+    }
+  };
+  if (Array.isArray(state.turns)) for (const turn of state.turns) visit(turn);
   const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
   const entities = isObject(history) ? history.entitiesByKey : undefined;
-  return [...(Array.isArray(state.turns) ? state.turns : []), ...(isObject(entities) ? Object.values(entities) : [])].filter(isObject);
-}
-
-export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" | "ambiguous" {
-  const rawTurns = rawTurnsFromState(state);
-  const inProgress = rawTurns.filter(turn => turn.status === "inProgress");
-  if (!inProgress.length) return "none";
+  if (isObject(entities)) {
+    for (const key in entities) if (Object.hasOwn(entities, key)) visit(entities[key]);
+  }
+  if (inProgressCount === 0) return { progress: "none", hasAnyTurn, hasTerminalTurn };
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
   // A runtime error terminates activity even if restored history still contains
   // an old inProgress entry. It must never route a new prompt as a steer.
-  if (runtimeStatus === "systemError") return "orphaned";
-  const started = inProgress.map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
-  const terminal = rawTurns.filter(turn => ["completed", "failed", "interrupted"].includes(String(turn.status)))
-    .map(turn => Number(turn.turnStartedAtMs)).filter(Number.isFinite);
+  if (runtimeStatus === "systemError") return { progress: "orphaned", hasAnyTurn, hasTerminalTurn };
   // A renderer may keep reporting an active runtime after a newer turn has
   // already failed. Its older in-progress history is no longer a live turn.
-  if (started.length === inProgress.length && terminal.length > 0 && Math.max(...terminal) > Math.max(...started))
-    return "orphaned";
-  if (runtimeStatus === undefined || runtimeStatus === "active") return "live";
-  return "ambiguous";
+  if (finiteStartedCount === inProgressCount && latestTerminal > latestStarted)
+    return { progress: "orphaned", hasAnyTurn, hasTerminalTurn };
+  if (runtimeStatus === undefined || runtimeStatus === "active") return { progress: "live", hasAnyTurn, hasTerminalTurn };
+  return { progress: "ambiguous", hasAnyTurn, hasTerminalTurn };
+}
+
+export function inProgressState(state: IpcObject): "none" | "live" | "orphaned" | "ambiguous" {
+  return summarizeTurnState(state).progress;
 }
 
 /**
@@ -85,7 +112,7 @@ function counts(values: Readonly<Record<string, string>>): Map<string, number> {
 
 export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint | null, now = Date.now(), options: ProjectionOptions = {}): { checkpoint: ProjectionCheckpoint; events: TaskEvent[] } {
   const turns = turnsFromState(state);
-  const activeTurns = activeTurnsFromState(state);
+  const activeTurns = inProgressState(state) === "live" ? turns.filter(turn => turn.status === "inProgress") : [];
   const activeTurnIds = new Set(activeTurns.map(turn => String(turn.turnId)));
   const since = previous?.since ?? now;
   const attachedActive = activeTurns.at(-1);

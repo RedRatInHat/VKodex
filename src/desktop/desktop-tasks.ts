@@ -3,7 +3,7 @@ import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { taskDetails } from "./details.js";
-import { activeTurnsFromState, inProgressState, turnsFromState } from "./projector.js";
+import { activeTurnsFromState, summarizeTurnState, turnsFromState } from "./projector.js";
 import { asyncQuestionReply, pendingCodexQuestions, type CodexQuestions } from "./questions.js";
 import { taskInput, type PreparedTaskInput } from "../core/task-input.js";
 
@@ -14,11 +14,9 @@ class TransientSubmissionStateError extends ActionRejectedError {}
 // to serialize and cross the IPC pipe.
 const TASK_SNAPSHOT_TIMEOUT_MS = 10_000;
 
-function submissionMode(state: IpcObject, allowEmpty = false): "start" | "steer" {
-  const rawTurns: unknown[] = Array.isArray(state.turns) ? [...state.turns] : [];
+export function submissionMode(state: IpcObject, allowEmpty = false): "start" | "steer" {
   const history = isObject(state.turnHistory) ? state.turnHistory.history : undefined;
   const entities = isObject(history) ? history.entitiesByKey : undefined;
-  if (isObject(entities)) rawTurns.push(...Object.values(entities));
   // A steer message does not resolve the desktop's structured question or
   // approval request. Reject it before writing so VK never reports progress
   // for input that leaves the task blocked.
@@ -30,7 +28,8 @@ function submissionMode(state: IpcObject, allowEmpty = false): "start" | "steer"
   }
   // A starting turn can still have a null turnId. The owner can wait for its ID
   // when steering; treating that placeholder as idle would start a second turn.
-  const progressState = inProgressState(state);
+  const turns = summarizeTurnState(state);
+  const progressState = turns.progress;
   if (progressState === "live") return "steer";
   if (progressState === "ambiguous") throw new TransientSubmissionStateError("Codex сообщает противоречивое состояние хода. Открой задачу в Codex и повтори после обновления состояния; сообщение не отправлено.");
   const runtimeStatus = isObject(state.threadRuntimeStatus) ? state.threadRuntimeStatus.type : undefined;
@@ -39,8 +38,8 @@ function submissionMode(state: IpcObject, allowEmpty = false): "start" | "steer"
     throw new TransientSubmissionStateError("Десктоп ещё не подтвердил готовность задачи к следующему ходу. Сообщение не отправлено; повтори после восстановления состояния.");
   }
   const hasTurnContainer = Array.isArray(state.turns) || isObject(entities);
-  if (allowEmpty && !rawTurns.length && hasTurnContainer) return "start";
-  if (!rawTurns.some(turn => isObject(turn) && ["completed", "failed", "interrupted"].includes(String(turn.status)))) {
+  if (allowEmpty && !turns.hasAnyTurn && hasTurnContainer) return "start";
+  if (!turns.hasTerminalTurn) {
     throw new ActionRejectedError("Не удалось определить состояние задачи. Сообщение не отправлено; открой задачу в Codex и повтори.");
   }
   return "start";

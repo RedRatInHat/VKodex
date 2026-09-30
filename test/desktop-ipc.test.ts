@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, ProjectAssignmentUnconfirmedError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
-import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
+import { ConnectedDesktopTasks, submissionMode } from "../src/desktop/desktop-tasks.js";
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
@@ -17,7 +17,7 @@ import { completedHistoryDigest } from "../src/desktop/history-digest.js";
 import { findAcceptedInputTurn, MutableQueuedInputTurnError, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
-import { projectSnapshot } from "../src/desktop/projector.js";
+import { projectSnapshot, summarizeTurnState } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
 import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
@@ -39,6 +39,74 @@ const questionRequest = { id: 42, method: "item/tool/requestUserInput", params: 
 const state = (items: IpcObject[] = [], status = "inProgress"): IpcObject => ({ id: ref.threadId, hostId: ref.hostId, turns: [], turnHistory: { history: { entitiesByKey: {
   tail: { turnId: "fixture-turn", turnStartedAtMs: 100, status, items },
 } } } });
+
+test("turn summary preserves raw duplicate, timestamp, and runtime semantics", () => {
+  const active = { status: "inProgress", turnStartedAtMs: 100 };
+  const completed = { status: "completed", turnStartedAtMs: 200 };
+  const makeState = (turns: unknown[], entitiesByKey: IpcObject = {}, runtimeStatus?: string): IpcObject => ({
+    turns, turnHistory: { history: { entitiesByKey } },
+    ...(runtimeStatus ? { threadRuntimeStatus: { type: runtimeStatus } } : {}),
+  });
+  assert.deepEqual(summarizeTurnState(makeState([])), { progress: "none", hasAnyTurn: false, hasTerminalTurn: false });
+  assert.deepEqual(summarizeTurnState(makeState([null], { malformed: 42 })),
+    { progress: "none", hasAnyTurn: true, hasTerminalTurn: false });
+  assert.deepEqual(summarizeTurnState(makeState([completed])), { progress: "none", hasAnyTurn: true, hasTerminalTurn: true });
+  assert.deepEqual(summarizeTurnState(makeState([active], { duplicate: active, terminal: completed }, "active")),
+    { progress: "orphaned", hasAnyTurn: true, hasTerminalTurn: true });
+  assert.deepEqual(summarizeTurnState(makeState([active], { terminal: { ...completed, turnStartedAtMs: "invalid" } }, "active")),
+    { progress: "live", hasAnyTurn: true, hasTerminalTurn: true });
+  assert.deepEqual(summarizeTurnState(makeState([{ ...active, turnStartedAtMs: "invalid" }], { terminal: completed }, "idle")),
+    { progress: "ambiguous", hasAnyTurn: true, hasTerminalTurn: true });
+  assert.deepEqual(summarizeTurnState(makeState([active], {}, "systemError")),
+    { progress: "orphaned", hasAnyTurn: true, hasTerminalTurn: false });
+  assert.deepEqual(summarizeTurnState(makeState([active], {}, "idle")),
+    { progress: "ambiguous", hasAnyTurn: true, hasTerminalTurn: false });
+});
+
+test("turn summary reads each own enumerable history entity once", () => {
+  let reads = 0;
+  const inherited = Object.create({ inherited: { status: "failed", turnStartedAtMs: 300 } }) as IpcObject;
+  Object.defineProperty(inherited, "hidden", { enumerable: false, value: { status: "completed", turnStartedAtMs: 300 } });
+  Object.defineProperty(inherited, "active", { enumerable: true, get() { reads++; return { status: "inProgress", turnStartedAtMs: 100 }; } });
+  assert.deepEqual(summarizeTurnState({ turns: [], turnHistory: { history: { entitiesByKey: inherited } } }),
+    { progress: "live", hasAnyTurn: true, hasTerminalTurn: false });
+  assert.equal(reads, 1);
+});
+
+test("turn summary handles histories too large for a spread argument list", () => {
+  const turns = Array.from({ length: 150_000 }, (_, turnStartedAtMs) => ({ status: "inProgress", turnStartedAtMs }));
+  const summary = summarizeTurnState({ turns, turnHistory: { history: { entitiesByKey: {
+    latest: { status: "failed", turnStartedAtMs: 150_000 },
+  } } }, threadRuntimeStatus: { type: "active" } });
+  assert.deepEqual(summary, { progress: "orphaned", hasAnyTurn: true, hasTerminalTurn: true });
+});
+
+test("submission can classify a completed task with more history entities than the argument limit", () => {
+  const entitiesByKey: IpcObject = {};
+  for (let index = 0; index < 150_000; index++) entitiesByKey[String(index)] = { status: "completed", turnStartedAtMs: index };
+  assert.equal(submissionMode({ turns: [], turnHistory: { history: { entitiesByKey } },
+    resumeState: "resumed", threadRuntimeStatus: { type: "idle" } }), "start");
+});
+
+test("snapshot projection reuses deduplicated turns for active status", () => {
+  let reads = 0;
+  const entitiesByKey: IpcObject = {};
+  Object.defineProperty(entitiesByKey, "current", { enumerable: true, get() {
+    reads++;
+    return { turnId: "current", turnStartedAtMs: 200, status: "inProgress", items: [] };
+  } });
+  const snapshot = projectSnapshot({
+    turns: [
+      { turnId: "previous", turnStartedAtMs: 100, status: "completed", items: [] },
+      { turnId: "current", turnStartedAtMs: 200, status: "completed", items: [] },
+    ],
+    turnHistory: { history: { entitiesByKey } },
+    threadRuntimeStatus: { type: "active" },
+  }, null, 300);
+  assert.deepEqual(snapshot.checkpoint.active, ["current"]);
+  assert.deepEqual(snapshot.events, [{ type: "status", id: "status:current", turnId: "current", status: "running" }]);
+  assert.equal(reads, 2, "one read for normalized turns and one for the raw progress summary");
+});
 
 class Server extends Duplex {
   readonly received: IpcObject[] = [];
