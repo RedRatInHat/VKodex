@@ -4448,9 +4448,10 @@ test("an ambiguous VK upload is not retried by automatic scan or /files after re
   await assert.rejects(files.collect(binding), /Результат загрузки файла.*неизвестен/u);
   assert.equal(upload.mock.callCount(), 1);
 
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "changed result");
   const restored = new TaskFiles(root, s.store, s.chat, s.gate);
   await restored.tick();
-  await assert.rejects(restored.collect(binding, true), /неизвестным результатом загрузки/u);
+  await assert.rejects(restored.collect(binding, true), /неизвест/u);
   assert.equal(upload.mock.callCount(), 1);
 });
 
@@ -5337,9 +5338,9 @@ test("a pre-save document failure retries staged bytes after the late window and
   assert.equal(upload.mock.callCount(), 3);
 });
 
-test("a crash after staging but before the pre-save retry marker remains unknown", async t => {
+test("a crash before the durable typed pre-save marker remains unknown", async t => {
   const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-marker-crash-test-"));
-  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   const prepared = await files.prepare(binding, "pre-save-marker-crash", []);
   files.finish(binding.id, "pre-save-marker-crash", "accepted", "completed-turn");
   await writeFile(path.join(prepared.outboxDir, "result.txt"), "original bytes");
@@ -5347,21 +5348,176 @@ test("a crash after staging but before the pre-save retry marker remains unknown
   const upload = t.mock.method(s.chat, "uploadFile", async () => { throw new FileUploadPreSaveError("before save"); });
   const setValue = s.store.setValue.bind(s.store);
   const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
-    if (key.endsWith(":pre-save-retries") && value === 1) {
+    if (key.endsWith(":upload-state") && value === "pre-save-confirmed") {
       const scan = s.store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:pre-save-marker-crash`)!;
       assert.equal(s.store.getValue(`${scan["result.txt"]!.key}:upload-state`), "uploading");
-      throw new Error("crash after durable stage");
+      throw new Error("crash before typed pre-save marker");
     }
     return setValue(key, value);
   });
-  await assert.rejects(files.collect(binding), /crash after durable stage/u);
+  await assert.rejects(files.collect(binding), /crash before typed pre-save marker/u);
   crash.mock.restore();
   const staged = s.store.getValue<Record<string, { key: string }>>(`file-stage-index:${binding.id}:pre-save-marker-crash`)!;
   const [receipt] = Object.values(staged);
   assert.equal(s.store.getValue(`${receipt!.key}:upload-state`), "uploading");
-  const restored = new TaskFiles(root, s.store, s.chat, s.gate);
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "changed source bytes");
+  const restored = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
   await assert.rejects(restored.collect(binding), /неизвестным результатом загрузки/u);
   assert.equal(upload.mock.callCount(), 1);
+});
+
+test("a typed pre-save result resumes once from the durable staged bytes after SQLite restart, then an ambiguous save stays blocked", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-real-restart-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const store = new BridgeStore(filename); const chat = new Chat();
+  const bindingId = store.ensureBinding(task).id;
+  store.setChat(bindingId, peerId, 17);
+  const binding = store.getBinding(bindingId)!;
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store));
+  const prepared = await files.prepare(binding, "pre-save-real-restart", []);
+  const indexKey = `file-stage-index:${binding.id}:pre-save-real-restart`;
+  files.finish(binding.id, "pre-save-real-restart", "accepted", "completed-turn");
+  const source = path.join(prepared.outboxDir, "result.txt");
+  await writeFile(source, "original staged bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  let attempts = 0; const uploadedContents: string[] = [];
+  const upload = t.mock.method(chat, "uploadFile", async (_peer: number, _name: string, contents: Buffer) => {
+    attempts++;
+    uploadedContents.push(contents.toString());
+    if (attempts === 1) { crashBeforeMarker = true; throw new FileUploadPreSaveError("VK confirmed failure before docs.save"); }
+    throw new Error("docs.save reply lost");
+  });
+  let crashBeforeMarker = false;
+  const atomic = store.atomic.bind(store);
+  const crash = t.mock.method(store, "atomic", <T>(operation: () => T): T => {
+    const durableStage = store.getValue<Record<string, unknown>>(indexKey);
+    if (crashBeforeMarker && durableStage && Object.keys(durableStage).length > 0) {
+      crashBeforeMarker = false;
+      throw new Error("crash before retry marker");
+    }
+    return atomic(operation);
+  });
+  await assert.rejects(files.collect(binding), /crash before retry marker/u);
+  crash.mock.restore();
+  const stagedBefore = store.getValue<Record<string, { key: string; path: string; sha256: string }>>(indexKey)!;
+  const [receiptKey, receiptBefore] = Object.entries(stagedBefore)[0]!;
+  assert.equal(receiptBefore.key, receiptKey);
+  assert.equal(await readFile(receiptBefore.path, "utf8"), "original staged bytes");
+  assert.equal(store.getValue(`${receiptKey}:upload-state`), "pre-save-confirmed");
+  assert.equal(store.getValue(`${receiptKey}:pre-save-retries`), null, "the deferred retry marker must not have committed");
+  store.close();
+
+  await writeFile(source, "changed source bytes");
+  const recoveredStore = new BridgeStore(filename);
+  t.after(() => recoveredStore.close());
+  const recoveredBinding = recoveredStore.getBinding(binding.id)!;
+  const recoveredFiles = new TaskFiles(root, recoveredStore, chat, new AccessGate(access, recoveredStore));
+  const stagedAfter = recoveredStore.getValue<Record<string, { key: string; path: string; sha256: string }>>(indexKey)!;
+  assert.deepEqual(stagedAfter, stagedBefore, "the staged receipt must survive a real SQLite close/reopen unchanged");
+  assert.equal(recoveredStore.getValue(`${receiptKey}:upload-state`), "pre-save-confirmed", "the typed pre-save result must survive SQLite restart");
+  assert.equal(recoveredStore.getValue(`${receiptKey}:pre-save-retries`), null);
+  await assert.rejects(recoveredFiles.collect(recoveredBinding), /результат загрузки файла.*неизвестен/iu);
+  assert.equal(upload.mock.callCount(), 2, "the typed pre-save failure gets exactly one safe retry");
+  assert.deepEqual(uploadedContents, ["original staged bytes", "original staged bytes"], "recovery must retry from the staged receipt, not the changed source");
+  assert.equal(await readFile(receiptBefore.path, "utf8"), "original staged bytes");
+
+  assert.equal(await recoveredFiles.collect(recoveredBinding), 0, "later scans must leave the ambiguous save untouched");
+  assert.equal(upload.mock.callCount(), 2, "the ambiguous docs.save result must never be retried");
+});
+
+test("a crash after the second typed pre-save result blocks the retry after SQLite restart", async t => {
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-second-pre-save-restart-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const store = new BridgeStore(filename); const chat = new Chat();
+  const bindingId = store.ensureBinding(task).id;
+  store.setChat(bindingId, peerId, 17);
+  const binding = store.getBinding(bindingId)!;
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store));
+  const prepared = await files.prepare(binding, "second-pre-save-restart", []);
+  files.finish(binding.id, "second-pre-save-restart", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "result.txt"), "immutable retry bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const indexKey = `file-stage-index:${binding.id}:second-pre-save-restart`;
+  let attempts = 0; let crashTerminalCommit = false;
+  t.mock.method(chat, "uploadFile", async () => {
+    attempts++;
+    if (attempts === 2) crashTerminalCommit = true;
+    throw new FileUploadPreSaveError("VK confirmed failure before docs.save");
+  });
+  const atomic = store.atomic.bind(store);
+  const crash = t.mock.method(store, "atomic", <T>(operation: () => T): T => {
+    const receipt = Object.values(store.getValue<Record<string, { key: string }>>(indexKey) ?? {})[0];
+    if (crashTerminalCommit && receipt
+      && store.getValue(`${receipt.key}:upload-state`) === "pre-save-confirmed"
+      && store.getValue(`${receipt.key}:pre-save-retries`) === 1) {
+      crashTerminalCommit = false;
+      throw new Error("crash before terminal pre-save block");
+    }
+    return atomic(operation);
+  });
+
+  assert.equal(await files.collect(binding), 0);
+  assert.equal(attempts, 1);
+  const staged = store.getValue<Record<string, { key: string }>>(indexKey)!;
+  const receipt = Object.values(staged)[0]!;
+  assert.equal(store.getValue(`${receipt.key}:pre-save-retries`), 1);
+  now += 48 * 60 * 60_000 + 1;
+  await assert.rejects(files.collect(binding), /crash before terminal pre-save block/u);
+  crash.mock.restore();
+  assert.equal(attempts, 2);
+  assert.equal(store.getValue(`${receipt.key}:upload-state`), "pre-save-confirmed");
+  assert.equal(store.getValue(`${receipt.key}:pre-save-retries`), 1);
+  assert.equal(store.getValue<boolean>(`${receipt.key}:pre-save-blocked`), null);
+  store.close();
+
+  const reopened = new BridgeStore(filename); t.after(() => reopened.close());
+  const restored = new TaskFiles(root, reopened, chat, new AccessGate(access, reopened));
+  const reopenedBinding = reopened.getBinding(binding.id)!;
+  assert.equal(await restored.collect(reopenedBinding), 0);
+  assert.equal(attempts, 2, "the second typed failure must not lead to a third VK upload");
+  assert.equal(reopened.getValue<boolean>(`${receipt.key}:pre-save-blocked`), true);
+  assert.equal(reopened.getValue(`${receipt.key}:upload-state`), null);
+  assert.ok(reopened.pendingDeliveries().some(delivery => delivery.key === `${receipt.key}:pre-save-error`));
+});
+
+test("a crash after durable pre-save confirmation but before staging blocks changed source after restart", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-pre-save-before-stage-restart-test-"));
+  const filename = path.join(root, "bridge.sqlite");
+  const store = new BridgeStore(filename); const chat = new Chat();
+  const bindingId = store.ensureBinding(task).id;
+  store.setChat(bindingId, peerId, 17);
+  const binding = store.getBinding(bindingId)!;
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store));
+  const prepared = await files.prepare(binding, "pre-save-before-stage-restart", []);
+  files.finish(binding.id, "pre-save-before-stage-restart", "accepted", "completed-turn");
+  const source = path.join(prepared.outboxDir, "result.txt");
+  await writeFile(source, "original source bytes");
+  files.observe(binding.id, "idle", "completed-turn");
+  const upload = t.mock.method(chat, "uploadFile", async () => { throw new FileUploadPreSaveError("VK confirmed failure before docs.save"); });
+  const indexKey = `file-stage-index:${binding.id}:pre-save-before-stage-restart`;
+  const setValue = store.setValue.bind(store);
+  const crash = t.mock.method(store, "setValue", (key: string, value: unknown) => {
+    setValue(key, value);
+    if (key.endsWith(":upload-state") && value === "pre-save-confirmed") throw new Error("crash after durable pre-save confirmation");
+  });
+  await assert.rejects(files.collect(binding), /crash after durable pre-save confirmation/u);
+  crash.mock.restore();
+  const scan = store.getValue<Record<string, { key: string }>>(`file-scan:${binding.id}:pre-save-before-stage-restart`)!;
+  const fileKey = scan["result.txt"]!.key;
+  assert.equal(store.getValue(`${fileKey}:upload-state`), "pre-save-confirmed");
+  assert.equal(store.getValue(`${fileKey}:pre-save-retries`), null);
+  assert.equal(store.getValue(indexKey), null, "the crash must occur before any staged receipt is created");
+  store.close();
+
+  await writeFile(source, "changed source bytes");
+  const reopened = new BridgeStore(filename); t.after(() => reopened.close());
+  const restored = new TaskFiles(root, reopened, chat, new AccessGate(access, reopened));
+  const reopenedBinding = reopened.getBinding(binding.id)!;
+  await assert.rejects(restored.collect(reopenedBinding), /Безопасная staged-версия файла не подтверждена/u);
+  assert.equal(upload.mock.callCount(), 1, "changed source bytes must not be uploaded automatically");
+  const blockNotice = reopened.pendingDeliveries().find(delivery => delivery.key === `${fileKey}:stage-error`);
+  assert.match(blockNotice?.view.text ?? "", /исходный файл не будет отправлен вместо неё/iu);
 });
 
 test("a terminal deferred pre-save retry never resumes automatic scanning", async t => {

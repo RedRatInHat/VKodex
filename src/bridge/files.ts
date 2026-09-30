@@ -420,8 +420,9 @@ export class TaskFiles {
       && !this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)
       && !this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)
       && !this.store.getValue<boolean>(`${receipt.key}:rejected`)
-      && this.store.getValue<number>(`${receipt.key}:pre-save-retries`) === 1
-      && !["uploading", "unknown"].includes(this.store.getValue<string>(`${receipt.key}:upload-state`) ?? ""));
+      && (this.store.getValue<number>(`${receipt.key}:pre-save-retries`) === 1
+        && !["uploading", "unknown"].includes(this.store.getValue<string>(`${receipt.key}:upload-state`) ?? "")
+        || this.store.getValue<string>(`${receipt.key}:upload-state`) === "pre-save-confirmed"));
   }
   private async stageDirectory(job: FileJob, bindingId: string): Promise<string> {
     return directory(this.stageRoot(), digest(bindingId), digest(job.operationId));
@@ -853,6 +854,10 @@ export class TaskFiles {
               try { attachment = await uploadFile(binding.peerId!, receipt?.name ?? file.name, uploadBytes, receipt?.kind ?? file.kind); break; }
               catch (error) {
                 if (error instanceof FileUploadPreSaveError) {
+                  // A typed failure proves docs.save was not invoked. Record
+                  // that fact before staging: after a crash an "uploading"
+                  // row alone cannot distinguish this from a lost save reply.
+                  this.store.setValue(`${key}:upload-state`, "pre-save-confirmed");
                   const automaticRetries = this.store.getValue<number>(`${key}:pre-save-retries`) ?? 0;
                   if (!manual && automaticRetries === 0) {
                     // Persist an exact immutable copy before the deferred retry.
@@ -947,6 +952,40 @@ export class TaskFiles {
             this.store.enqueue(`${receipt.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла «${receipt.name}» в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
             continue;
           }
+          if (uploadState === "pre-save-confirmed") {
+            const retries = this.store.getValue<number>(`${receipt.key}:pre-save-retries`);
+            if (retries === 1) {
+              this.store.atomic(() => {
+                this.store.setValue(`${receipt.key}:pre-save-blocked`, true);
+                this.store.setValue(`${receipt.key}:upload-state`, null);
+                this.store.enqueue(`${receipt.key}:pre-save-error`, binding.peerId!, { text:
+                  `Файл «${receipt.name}» не отправлен: VK второй раз не подтвердил загрузку до сохранения документа. Автоматические повторы остановлены; повтори /files вручную.`, silent: true }, binding.id);
+              });
+              continue;
+            }
+            if (retries !== null) {
+              this.store.setValue(`${receipt.key}:upload-state`, "unknown");
+              unknownFiles++;
+              continue;
+            }
+            // Do not clear the typed result until the immutable bytes have
+            // been verified. The retry count is committed before another VK
+            // call, so a crash during the retry stays unknown.
+            try { await this.stagedContents(receipt, job, binding.id); }
+            catch (error) {
+              if (!(error instanceof StageContentUnavailableError)) throw error;
+              this.store.atomic(() => {
+                this.store.setValue(`${receipt.key}:pre-save-blocked`, true);
+                this.store.setValue(`${receipt.key}:upload-state`, null);
+              });
+              stageBlocked(receipt, error);
+              continue;
+            }
+            this.store.atomic(() => {
+              this.store.setValue(`${receipt.key}:pre-save-retries`, 1);
+              this.store.setValue(`${receipt.key}:upload-state`, null);
+            });
+          }
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:rejected`)) continue;
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:quota-blocked`)) continue;
           if (!manual && this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)) continue;
@@ -972,20 +1011,33 @@ export class TaskFiles {
             if (Object.values(this.stageIndex(binding.id, job.operationId)).some(receipt => receipt.relativePath === relativePath
               && !this.store.getValue<boolean>(`${receipt.key}:queued`)
               && (!!this.store.getValue<number>(`${receipt.key}:pre-save-retries`)
-                || !!this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)))) return true;
+                || !!this.store.getValue<boolean>(`${receipt.key}:pre-save-blocked`)
+                || ["uploading", "unknown", "pre-save-confirmed"].includes(
+                  this.store.getValue<string>(`${receipt.key}:upload-state`) ?? "")))) return true;
             const known = scanned[relativePath];
+            const knownUploadState = known ? this.store.getValue<string>(`${known.key}:upload-state`) : null;
+            if (known && (knownUploadState === "uploading" || knownUploadState === "unknown")) {
+              unknownFiles++;
+              this.store.enqueue(`${known.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
+              return true;
+            }
+            if (known && knownUploadState === "pre-save-confirmed") {
+              this.store.atomic(() => {
+                this.store.setValue(`${known.key}:pre-save-blocked`, true);
+                this.store.setValue(`${known.key}:upload-state`, null);
+              });
+              stageFailure ??= new ActionRejectedError("Безопасная staged-версия файла не подтверждена после сбоя; исходный файл не будет загружен вместо неё.");
+              this.store.enqueue(`${known.key}:stage-error`, binding.peerId!, {
+                text: "Загрузка файла после сбоя остановлена: безопасная staged-версия не подтверждена. Исходный файл не будет отправлен вместо неё.", silent: true,
+              }, binding.id);
+              return true;
+            }
             // Staging can itself fail before it creates a receipt. The prior
             // scan key still owns this path, so a later source mutation must
             // not escape its terminal automatic block.
             if (!manual && known && this.store.getValue<boolean>(`${known.key}:pre-save-blocked`)) return true;
             if (!known || known.fingerprint !== fingerprint) return false;
             if (this.store.getValue<boolean>(`${known.key}:queued`)) return true;
-            const uploadState = this.store.getValue<string>(`${known.key}:upload-state`);
-            if (uploadState === "uploading" || uploadState === "unknown") {
-              unknownFiles++;
-              this.store.enqueue(`${known.key}:upload-unknown`, binding.peerId!, { text: `Результат загрузки файла в VK неизвестен. Автоматический повтор остановлен, чтобы не создать дубль.`, silent: true }, binding.id);
-              return true;
-            }
             return !manual && (!!this.store.getValue<boolean>(`${known.key}:rejected`)
               || !!this.store.getValue<boolean>(`${known.key}:quota-blocked`)
               || !!this.store.getValue<boolean>(`${known.key}:pre-save-blocked`));
