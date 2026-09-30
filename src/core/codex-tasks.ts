@@ -290,10 +290,17 @@ export interface DesktopCompatibility {
   readonly message: string;
 }
 
-/** Native evidence for a goal continuation; it is not a claim that the goal completed. */
+/** Turn identity shape; only a same-owner native activation can qualify it as goal evidence. */
 export interface GoalContinuationReceipt {
   readonly mode: "started" | "alreadyRunning";
   readonly turnId: string;
+}
+
+/** One owner's confirmed native goal activation and its resulting goal state.
+ * A normal empty-input turn is never valid evidence for this contract. */
+export interface NativeGoalActivation {
+  readonly receipt: GoalContinuationReceipt;
+  readonly goal: TaskGoal;
 }
 
 /** Transport-neutral Codex task port consumed by the VK bridge core. */
@@ -344,6 +351,8 @@ export interface CodexTasks {
   healthGoal?(task: TaskRef): Promise<TaskGoal | null>;
   setGoal?(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal?(task: TaskRef): Promise<boolean>;
+  activateGoalWithReceipt?(task: TaskRef, operationId: string): Promise<NativeGoalActivation>;
+  /** Legacy ordinary empty-input turn; does not activate a native goal. */
   continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;
   /** Bring the configured Codex client to the foreground after an explicit user action. */
   revealTask?(task: TaskRef): Promise<void>;

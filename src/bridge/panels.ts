@@ -850,14 +850,19 @@ export class TaskPanels {
       : "Статус цели не изменён; следующий ход не запущен";
     const unknownStart = createdPaused ? "Цель сохранена на паузе, но исход запуска хода неизвестен"
       : "Статус цели не изменён, но исход запуска хода неизвестен";
-    if (!this.desktop.continueGoal) {
+    if (!this.desktop.activateGoalWithReceipt) {
       this.markGoalContinuation(binding, attempt, "rejected", goal);
-      return `${noStart}: продолжение недоступно в этом подключении.`;
+      return `${noStart}: нативное продолжение цели недоступно в этом подключении.`;
     }
     let receipt: GoalContinuationReceipt;
+    let updated: TaskGoal;
     try {
-      receipt = await this.desktop.continueGoal(binding, attempt.operationId);
-      if (!validGoalContinuationReceipt(receipt)) throw new UncertainActionError();
+      const activation = await this.desktop.activateGoalWithReceipt(binding, attempt.operationId);
+      receipt = activation.receipt;
+      updated = activation.goal;
+      if (!validGoalContinuationReceipt(receipt) || updated?.threadId !== binding.threadId
+        || updated?.status !== "active" || updated.objective !== goal.objective
+        || updated.createdAt !== goal.createdAt) throw new UncertainActionError();
     } catch (error) {
       if (error instanceof TaskNotOpenError || error instanceof ActionRejectedError) {
         this.markGoalContinuation(binding, attempt, "rejected", goal);
@@ -869,17 +874,6 @@ export class TaskPanels {
       throw error;
     }
     const accepted = { ...attempt, receipt };
-    this.markGoalContinuation(binding, accepted, "activating", goal);
-    let updated: TaskGoal;
-    try {
-      updated = await this.desktop.setGoal!(binding, { status: "active" });
-      if (updated.status !== "active") throw new UncertainActionError();
-    } catch {
-      this.markGoalContinuation(binding, accepted, "uncertain", goal);
-      return receipt.mode === "started"
-        ? "Новый ход запущен, но активный статус цели не подтверждён. Проверь задачу в Codex; запуск не повторяется."
-        : "Ход уже выполняется, но активный статус цели не подтверждён. Проверь задачу в Codex; запуск не повторяется.";
-    }
     this.markGoalContinuation(binding, accepted, "accepted", updated);
     return receipt.mode === "started"
       ? "Цель возобновлена. Новый ход запущен."

@@ -3,7 +3,8 @@ import { ActionRejectedError, TaskOwnedByClientError, type AccountUsage, type Co
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
-  type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome, type GoalContinuationReceipt } from "./codex-tasks.js";
+  type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome, type GoalContinuationReceipt,
+  type NativeGoalActivation } from "./codex-tasks.js";
 
 export interface CodexTaskOwner {
   /** An exclusive claim is independent of transient adapter readiness. */
@@ -22,6 +23,8 @@ export interface CodexTaskOwner {
   getGoal(task: TaskRef): Promise<TaskGoal | null>;
   setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clearGoal(task: TaskRef): Promise<boolean>;
+  /** Same-owner native goal activation with a goal-turn receipt. */
+  activateGoalWithReceipt?(task: TaskRef, operationId: string): Promise<NativeGoalActivation>;
   /** Must confirm a continuation turn or an already running turn. */
   continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]>;
@@ -283,6 +286,16 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async clearGoal(task: TaskRef): Promise<boolean> {
     const owner = this.owner(task); return owner?.clearGoal(task) ?? this.base.clearGoal?.(task) ?? Promise.resolve(false);
+  }
+  async activateGoalWithReceipt(task: TaskRef, operationId: string): Promise<NativeGoalActivation> {
+    const owner = this.owner(task);
+    if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
+    if (owner) {
+      if (!owner.activateGoalWithReceipt) throw new ActionRejectedError("Нативное продолжение цели недоступно для этого владельца задачи.");
+      return owner.activateGoalWithReceipt(task, operationId);
+    }
+    if (!this.base.activateGoalWithReceipt) throw new ActionRejectedError("Нативное продолжение цели недоступно в этом подключении.");
+    return this.base.activateGoalWithReceipt(task, operationId);
   }
   async continueGoal(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt> {
     const owner = this.owner(task);

@@ -77,6 +77,26 @@ test("goal continuation uses only an owner that can confirm it", async () => {
   assert.deepEqual(f.calls, ["owner:continue-goal"]);
 });
 
+test("native goal activation cannot fall back from an owner to a legacy empty turn", async () => {
+  const f = fixture();
+  const base = { ...f.base,
+    activateGoalWithReceipt: async () => {
+      f.calls.push("base:native-goal");
+      return { receipt: { mode: "started" as const, turnId: "base-turn" }, goal: {
+        threadId: "primary", objective: "goal", status: "active" as const, tokenBudget: null,
+        tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+      } };
+    },
+  };
+  const routed = new RoutedCodexTasks(base, [f.owner]);
+  f.owner.continueGoal = async () => { f.calls.push("owner:legacy-empty-turn"); return { mode: "started", turnId: "ordinary-turn" }; };
+  await assert.rejects(routed.activateGoalWithReceipt!(work, "native-goal"), /Нативное продолжение цели недоступно/u);
+  assert.deepEqual(f.calls, []);
+  const accepted = await routed.activateGoalWithReceipt!(primary, "native-goal");
+  assert.equal(accepted.receipt.turnId, "base-turn");
+  assert.deepEqual(f.calls, ["base:native-goal"]);
+});
+
 test("health goal reads are isolated from the long-lived task owner", async () => {
   const f = fixture(); let ownerReads = 0; let healthReads = 0;
   f.owner.getGoal = async () => { ownerReads++; return null; };
