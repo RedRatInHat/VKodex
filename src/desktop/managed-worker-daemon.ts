@@ -130,8 +130,9 @@ export interface NativeCliCanaryEvidence {
   readonly ownerEpoch: string;
   readonly backendGeneration: number;
   readonly nativeState: 'connected';
-  readonly threadStatus: 'idle' | 'active' | 'inProgress' | 'notLoaded';
-  readonly turns: readonly Readonly<{ idSha256: string; status: 'inProgress' | 'completed' | 'failed' | 'interrupted' }>[];
+  readonly threadStatus: 'idle' | 'active' | 'inProgress' | 'notLoaded' | 'systemError';
+  readonly turns: readonly Readonly<{ idSha256: string; status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
+    failureKind?: 'usageLimit' | 'serverOverloaded' | 'unclassified' | 'missing' }>[];
   readonly turnsPageComplete: boolean;
   readonly goalEmpty: boolean;
   readonly queueEmpty: boolean;
@@ -442,7 +443,7 @@ export class ManagedWorkerDaemon {
           !isDeepStrictEqual(initialReceipts, finalReceipts) ||
           !object(thread) || thread.id !== taskId ||
           !object(thread.status) ||
-          !['idle', 'active', 'inProgress', 'notLoaded'].includes(thread.status.type as string) ||
+          !['idle', 'active', 'inProgress', 'notLoaded', 'systemError'].includes(thread.status.type as string) ||
           !Array.isArray(pageData) || pageData.length > 1 ||
           typeof page.nextCursor !== 'string' && page.nextCursor !== null ||
           !Array.isArray(queueData) || queueData.length > 2 ||
@@ -457,12 +458,33 @@ export class ManagedWorkerDaemon {
           return unavailable();
         return { id: value.id, status: value.status };
       });
+      // Summary does not reliably include the native failure discriminator.
+      // Only the controlled single-turn canary may request one full failed
+      // turn; project its fixed category immediately and never expose text.
+      let failureKind: NativeCliCanaryEvidence['turns'][number]['failureKind'];
+      if (listed.length === 1 && listed[0]!.status === 'failed') {
+        const full = await host.ownerRead(key, generation, 'thread/turns/list',
+          { threadId: taskId, limit: 2, sortDirection: 'asc', itemsView: 'full' });
+        current();
+        const fullData = Array.isArray(full.data) ? full.data : unavailable();
+        if (fullData.length !== 1 || full.nextCursor !== null) unavailable();
+        const failedTurn = object(fullData[0]) ? fullData[0] : unavailable();
+        if (failedTurn.id !== listed[0]!.id || failedTurn.status !== 'failed') unavailable();
+        const nativeError = object(failedTurn.error) ? failedTurn.error : null;
+        const info = nativeError?.codexErrorInfo ?? nativeError?.codex_error_info ?? nativeError?.errorInfo;
+        failureKind = !nativeError ? 'missing'
+          : info === 'usageLimitExceeded' ? 'usageLimit'
+          : info === 'serverOverloaded' || info === 'server_overloaded' ? 'serverOverloaded'
+          : 'unclassified';
+      }
       const turns = listed.map(value => Object.freeze({
         idSha256: createHash('sha256').update(value.id as string).digest('hex'),
         status: value.status as NativeCliCanaryEvidence['turns'][number]['status'],
+        ...(value.status === 'failed' ? { failureKind: failureKind ?? 'unclassified' } : {}),
       }));
       current();
-      if (owner.metadata.semanticRevision !== revision) unavailable();
+      if (owner.metadata.semanticRevision !== revision ||
+          !isDeepStrictEqual(initialReceipts, host.acceptedCommandReceipts(key))) unavailable();
       return Object.freeze({ taskId, ownerEpoch: this.#options.epoch,
         backendGeneration: generation, nativeState: 'connected' as const,
         threadStatus: thread.status.type as NativeCliCanaryEvidence['threadStatus'],

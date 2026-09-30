@@ -528,6 +528,33 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
   }
 });
 
+test('controlled native CLI canary classifies a failed turn without exposing its error text', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  try {
+    own.backend.writes = 1;
+    own.backend.readStatusOverride = 'systemError';
+    own.backend.turnFailureError = { codexErrorInfo: 'serverOverloaded',
+      message: 'PRIVATE_NATIVE_ERROR_SENTINEL' };
+    const evidence = await own.daemon.nativeCliCanaryEvidence(capability);
+    assert.equal(evidence.threadStatus, 'systemError');
+    assert.deepEqual(evidence.turns, [{
+      idSha256: createHash('sha256').update('accepted-composer-turn').digest('hex'),
+      status: 'failed', failureKind: 'serverOverloaded',
+    }]);
+    assert.ok(own.backend.frames.some(frame => frame.method === 'thread/turns/list' &&
+      (frame.params as Record<string, unknown> | undefined)?.itemsView === 'full'));
+    assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE_NATIVE_ERROR_SENTINEL/u);
+  } finally {
+    own.backend.readStatusOverride = null;
+    own.backend.turnFailureError = null;
+    own.backend.writes = 0;
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'failed-cli-evidence-stop');
+  }
+});
+
 test('isolated CLI Gateway permits only non-refreshing account bootstrap read', async () => {
   const capability = {};
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
@@ -1503,6 +1530,7 @@ class Backend extends EventEmitter {
   stockCompletedClients: string[] = [];
   queueEntries: Record<string, unknown>[] = [];
   readStatusOverride: string | null = null;
+  turnFailureError: Record<string, unknown> | null = null;
   goalOverride: unknown = null;
   holdEvidenceRead = false; heldEvidenceRead: Record<string, unknown> | null = null;
   holdIdOnlyResume = false;
@@ -1632,8 +1660,9 @@ class Backend extends EventEmitter {
       items: this.terminalQueueClients.map((clientId, index) => ({ id: `queue-user-${index}`,
         type: 'userMessage', clientId, content: [{ type: 'text', text: 'fixture only' }] })) }];
     return this.writes && this.materializeTurn ?
-      [{ id: 'accepted-composer-turn', status: this.activeTurn ? 'inProgress' : 'completed',
-        items: [] }] : [];
+      [{ id: 'accepted-composer-turn',
+        status: this.turnFailureError ? 'failed' : this.activeTurn ? 'inProgress' : 'completed',
+        ...(this.turnFailureError ? { error: this.turnFailureError } : {}), items: [] }] : [];
   }
 }
 class Broker extends Duplex {
