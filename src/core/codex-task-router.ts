@@ -289,7 +289,11 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async prepareGoalRuntime(task: TaskRef): Promise<void> {
     const owner = this.owner(task);
-    if (!owner) return;
+    // The base metadata adapter launches a short-lived App Server. Its
+    // thread/goal/set response can persist `active`, but that process closes
+    // before the best-effort native goal loop can run. Never advertise a
+    // resumable goal without a persistent selected runtime.
+    if (!owner) throw new ActionRejectedError("Для задачи не назначен постоянный исполнитель цели; продолжи её в открытом Codex.");
     if (owner.routingPolicy === "exclusive") this.unsupportedExclusive();
     if (!owner.ensureOpen) throw new ActionRejectedError("Нативный исполнитель цели недоступен в этом подключении.");
     try { await owner.ensureOpen(task); }
@@ -303,13 +307,10 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async activateGoalWithReceipt(task: TaskRef, operationId: string): Promise<NativeGoalActivation> {
     const owner = this.owner(task);
+    if (!owner) throw new ActionRejectedError("Для задачи не назначен постоянный исполнитель цели; продолжи её в открытом Codex.");
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
-    if (owner) {
-      if (!owner.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
-      return owner.activateGoalWithReceipt(task, operationId);
-    }
-    if (!this.base.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
-    return this.base.activateGoalWithReceipt(task, operationId);
+    if (!owner.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
+    return owner.activateGoalWithReceipt(task, operationId);
   }
   async continueGoal(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt> {
     const owner = this.owner(task);

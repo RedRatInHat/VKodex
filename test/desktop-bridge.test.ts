@@ -579,6 +579,107 @@ test("task goals can be inspected, budgeted, paused, resumed and cleared without
   assert.equal(s.desktop.submissions.length, 0);
 });
 
+test("goal pause refuses a replacement between the menu read and status write", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  const original = { threadId: task.threadId, objective: "Original", status: "active" as const,
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.goal = original;
+  await s.handle("/goal", peerId);
+  let first = true;
+  s.desktop.getGoal = async () => {
+    if (first) {
+      first = false;
+      s.desktop.goal = { ...original, objective: "Replacement", createdAt: 2, updatedAt: 2 };
+      return original;
+    }
+    return s.desktop.goal;
+  };
+  await clickPanel(s, "Пауза");
+  assert.equal(s.desktop.goal?.objective, "Replacement");
+  assert.equal(s.desktop.goal?.status, "active");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
+test("stale goal panel cannot pause or resume a different goal", async t => {
+  for (const status of ["active", "paused"] as const) {
+    const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+    s.desktop.goal = { threadId: task.threadId, objective: "Original", status,
+      tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+    await s.handle("/goal", peerId);
+    s.desktop.goal = { ...s.desktop.goal, objective: "Replacement", createdAt: 2, updatedAt: 2 };
+    await clickPanel(s, status === "active" ? "Пауза" : "Возобновить");
+    assert.equal(s.desktop.goal?.objective, "Replacement");
+    assert.equal(s.desktop.goal?.status, status);
+    assert.deepEqual(s.desktop.goalUpdates, []);
+    assert.equal(s.desktop.goalContinuations, 0);
+  }
+});
+
+test("goal usage progress alone does not invalidate a pause", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  const original = { threadId: task.threadId, objective: "Original", status: "active" as const,
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.goal = original;
+  await s.handle("/goal", peerId);
+  let first = true;
+  s.desktop.getGoal = async () => {
+    if (first) {
+      first = false;
+      s.desktop.goal = { ...original, tokensUsed: 10, timeUsedSeconds: 5, updatedAt: 2 };
+      return original;
+    }
+    return s.desktop.goal;
+  };
+  await clickPanel(s, "Пауза");
+  assert.equal(s.desktop.goal?.status, "paused");
+  assert.deepEqual(s.desktop.goalUpdates, [{ status: "paused" }]);
+});
+
+test("goal clear refuses a replacement made after its confirmation panel", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Original", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Снять цель");
+  s.desktop.goal = { ...s.desktop.goal!, objective: "Replacement", createdAt: 2, updatedAt: 2 };
+  await clickPanel(s, "Снять цель");
+  assert.equal(s.desktop.goal?.objective, "Replacement");
+  assert.equal(s.desktop.goalClears, 0);
+});
+
+test("new goal creation refuses a concurrent goal before its paused write", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Задать цель");
+  await s.handle("Requested goal", peerId);
+  let first = true;
+  s.desktop.getGoal = async () => {
+    if (first) {
+      first = false;
+      s.desktop.goal = { threadId: task.threadId, objective: "Other client's goal", status: "paused",
+        tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 2, updatedAt: 2 };
+      return null;
+    }
+    return s.desktop.goal;
+  };
+  await clickPanel(s, "Без лимита");
+  assert.equal(s.desktop.goal?.objective, "Other client's goal");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
+test("goal edit flow cannot overwrite a replacement created after the objective prompt", async t => {
+  const s = setup(t); s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Original", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Изменить");
+  await s.handle("Requested edit", peerId);
+  s.desktop.goal = { ...s.desktop.goal!, objective: "Replacement", createdAt: 2, updatedAt: 2 };
+  await clickPanel(s, "Без лимита");
+  assert.equal(s.desktop.goal?.objective, "Replacement");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+});
+
 test("new goal apply saves a paused goal before continuation and never publishes active without a receipt", async t => {
   for (const error of [new TaskNotOpenError(), new ActionRejectedError("Continuation rejected"), new UncertainActionError()]) {
     const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
@@ -715,6 +816,35 @@ test("goal runtime refusal does not activate the goal or write through another o
     tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
   s.desktop.activateGoalWithReceipt = undefined as never;
   s.desktop.prepareGoalRuntime = async () => { throw new ActionRejectedError("Owner unavailable"); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(s.desktop.goal?.status, "paused");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "rejected");
+});
+
+test("goal activation refuses a replacement that appeared while loading its runtime", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Original goal", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  s.desktop.prepareGoalRuntime = async () => {
+    s.desktop.goal = { ...s.desktop.goal!, objective: "Replacement goal", createdAt: 2, updatedAt: 2 };
+  };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(s.desktop.goal?.objective, "Replacement goal");
+  assert.equal(s.desktop.goal?.status, "paused");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "rejected");
+});
+
+test("goal activation refuses an adapter with no persistent runtime preparation", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Paused goal", status: "paused",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  s.desktop.prepareGoalRuntime = undefined as never;
   await s.handle("/goal", peerId);
   await clickPanel(s, "Возобновить");
   assert.equal(s.desktop.goal?.status, "paused");

@@ -92,16 +92,15 @@ test("native goal activation cannot fall back from an owner to a legacy empty tu
   f.owner.continueGoal = async () => { f.calls.push("owner:legacy-empty-turn"); return { mode: "started", turnId: "ordinary-turn" }; };
   await assert.rejects(routed.activateGoalWithReceipt!(work, "native-goal"), /Подтверждение нативного хода цели недоступно/u);
   assert.deepEqual(f.calls, []);
-  const accepted = await routed.activateGoalWithReceipt!(primary, "native-goal");
-  assert.equal(accepted.receipt.turnId, "base-turn");
-  assert.deepEqual(f.calls, ["base:native-goal"]);
+  await assert.rejects(routed.activateGoalWithReceipt!(primary, "native-goal"), /постоянный исполнитель цели/u);
+  assert.deepEqual(f.calls, []);
 });
 
-test("goal runtime preparation loads only its selected owner and never launches the base client", async () => {
+test("goal runtime preparation loads only its selected owner and refuses a transient base client", async () => {
   const f = fixture();
   await f.routed.prepareGoalRuntime!(work);
   assert.deepEqual(f.calls, ["owner:open"]);
-  await f.routed.prepareGoalRuntime!(primary);
+  await assert.rejects(f.routed.prepareGoalRuntime!(primary), /постоянный исполнитель цели/u);
   assert.deepEqual(f.calls, ["owner:open"]);
   f.owner.ensureOpen = async () => { throw new TaskOwnedByClientError(); };
   await assert.rejects(f.routed.prepareGoalRuntime!(work), /другом клиенте Codex/u);

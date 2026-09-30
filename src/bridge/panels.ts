@@ -19,6 +19,8 @@ interface PanelState {
   title?: string;
   goalObjective?: string;
   goalTokenBudget?: number | null;
+  /** Stable goal identity and editable fields, captured when this panel was shown. */
+  goalBaselineKey?: string | null;
   targetSourceId?: string;
   targetSourceLabel?: string;
   targetProjectId?: string | null;
@@ -91,6 +93,11 @@ const goalStatuses: Record<TaskGoalStatus, string> = {
   budgetLimited: "Исчерпан бюджет цели",
   complete: "Завершена",
 };
+function goalIntentKey(goal: TaskGoal | null): string | null {
+  if (!goal) return null;
+  return createHash("sha256").update(JSON.stringify([goal.threadId, goal.objective, goal.status,
+    goal.tokenBudget, goal.createdAt])).digest("hex");
+}
 const elapsed = (seconds: number): string => {
   if (seconds < 60) return `${seconds} сек.`;
   if (seconds < 3_600) return `${Math.floor(seconds / 60)} мин.`;
@@ -267,8 +274,11 @@ export class TaskPanels {
     if (state.view === "goalObjective") {
       if (!text || text.length > 8_000 || /\x00/u.test(text)) throw new ActionRejectedError("Цель должна содержать от 1 до 8000 символов. /cancel — отмена.");
       const current = await this.goal(binding);
+      if (state.goalBaselineKey === undefined || goalIntentKey(current) !== state.goalBaselineKey)
+        throw new ActionRejectedError("Цель изменилась во время ввода. Обнови /goal и проверь её состояние.");
       const next = this.newState(input.peerId, binding.id, "goalBudget");
       next.goalObjective = text.trim(); next.goalTokenBudget = current?.tokenBudget ?? null;
+      next.goalBaselineKey = state.goalBaselineKey;
       this.showGoalBudget(binding, next);
       return true;
     }
@@ -277,8 +287,8 @@ export class TaskPanels {
       if (!/^\d+$/u.test(raw)) throw new ActionRejectedError("Пришли целое число токенов от 1 до 100 000 000. /cancel — отмена.");
       const tokenBudget = Number(raw);
       if (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0 || tokenBudget > 100_000_000) throw new ActionRejectedError("Лимит цели должен быть от 1 до 100 000 000 токенов. /cancel — отмена.");
-      if (!state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
-      await this.applyGoal(binding, state.goalObjective, tokenBudget);
+      if (!state.goalObjective || state.goalBaselineKey === undefined) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+      await this.applyGoal(binding, state.goalObjective, tokenBudget, state.goalBaselineKey);
       return true;
     }
     if (state.view === "renameConfirm") throw new ActionRejectedError("Подтверди название кнопкой или отправь /cancel. Текст не отправлен агенту.");
@@ -530,10 +540,13 @@ export class TaskPanels {
         break;
       }
       case "goalObjective": {
-        if (!this.desktop.capabilities.goals || !this.desktop.getGoal) throw new ActionRejectedError("Цели недоступны в текущем подключении.");
+        if (!this.desktop.capabilities.goals || !this.desktop.getGoal || state.goalBaselineKey === undefined) throw new ActionRejectedError("Цели недоступны в текущем подключении.");
         const current = await this.goal(binding);
+        if (goalIntentKey(current) !== state.goalBaselineKey)
+          throw new ActionRejectedError("Цель изменилась после открытия меню. Обнови /goal.");
         const next = this.newState(input.peerId, binding.id, "goalObjective");
         next.goalTokenBudget = current?.tokenBudget ?? null;
+        next.goalBaselineKey = state.goalBaselineKey;
         this.show(input.peerId, next, {
           text: `${current ? "Изменение цели" : "Новая цель Codex"}\n\nПришли формулировку цели одним сообщением (до 8000 символов). Она станет явной долгосрочной задачей агента и не будет отправлена как обычный промпт.\n\n/cancel — отмена.`,
           buttons: [this.button(input.peerId, next, "Отмена", "goal")],
@@ -541,40 +554,52 @@ export class TaskPanels {
         break;
       }
       case "goalBudget": {
-        if (!["goalBudget", "goalBudgetInput"].includes(state.view) || !state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+        if (!["goalBudget", "goalBudgetInput"].includes(state.view) || !state.goalObjective || state.goalBaselineKey === undefined) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
         const next = state.view === "goalBudget" ? state : this.newState(input.peerId, binding.id, "goalBudget");
         next.goalObjective = state.goalObjective; if (state.goalTokenBudget !== undefined) next.goalTokenBudget = state.goalTokenBudget;
+        next.goalBaselineKey = state.goalBaselineKey;
         this.showGoalBudget(binding, next);
         break;
       }
       case "goalBudgetInput": {
-        if (state.view !== "goalBudget" || !state.goalObjective) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
+        if (state.view !== "goalBudget" || !state.goalObjective || state.goalBaselineKey === undefined) throw new ActionRejectedError("Формулировка цели потеряна. Открой /goal и начни заново.");
         const next = this.newState(input.peerId, binding.id, "goalBudgetInput");
         next.goalObjective = state.goalObjective; if (state.goalTokenBudget !== undefined) next.goalTokenBudget = state.goalTokenBudget;
+        next.goalBaselineKey = state.goalBaselineKey;
         this.show(input.peerId, next, { text: "Пришли целое число токенов от 1 до 100 000 000. Этот текст не будет передан агенту.\n\n/cancel — отмена.", buttons: [this.button(input.peerId, next, "Назад", "goalBudget")] });
         break;
       }
       case "goalApply": {
-        if (state.view !== "goalBudget" || !state.goalObjective || action.tokenBudget === undefined) throw new ActionRejectedError("Настройка цели устарела. Открой /goal и повтори.");
+        if (state.view !== "goalBudget" || !state.goalObjective || action.tokenBudget === undefined || state.goalBaselineKey === undefined) throw new ActionRejectedError("Настройка цели устарела. Открой /goal и повтори.");
         this.consume(input);
-        await this.applyGoal(binding, state.goalObjective, action.tokenBudget);
+        await this.applyGoal(binding, state.goalObjective, action.tokenBudget, state.goalBaselineKey);
         break;
       }
       case "goalPause": {
-        if (state.view !== "goal") throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
+        if (state.view !== "goal" || !state.goalBaselineKey) throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
         const current = await this.goal(binding);
         if (!current || current.status !== "active") throw new ActionRejectedError("Активной цели нет. Обнови /goal.");
+        if (goalIntentKey(current) !== state.goalBaselineKey || goalIntentKey(await this.goal(binding)) !== state.goalBaselineKey)
+          throw new ActionRejectedError("Цель изменилась до постановки на паузу. Обнови /goal.");
         this.consume(input);
         const updated = await this.desktop.setGoal!(binding, { status: "paused" });
-        if (updated.status !== "paused") throw new UncertainActionError();
+        if (updated.status !== "paused" || updated.threadId !== current.threadId
+          || updated.objective !== current.objective || updated.createdAt !== current.createdAt
+          || updated.tokenBudget !== current.tokenBudget) throw new UncertainActionError();
+        const confirmed = await this.goal(binding);
+        if (!confirmed || confirmed.status !== "paused" || confirmed.threadId !== current.threadId
+          || confirmed.objective !== current.objective || confirmed.createdAt !== current.createdAt
+          || confirmed.tokenBudget !== current.tokenBudget) throw new UncertainActionError();
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, "Автоматическое продолжение приостановлено. Уже начатый ход может закончиться самостоятельно; /stop останавливает и его.");
         break;
       }
       case "goalResume": {
-        if (state.view !== "goal") throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
+        if (state.view !== "goal" || !state.goalBaselineKey) throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
         const current = await this.goal(binding);
         if (!current || !["paused", "blocked", "usageLimited", "budgetLimited"].includes(current.status)) throw new ActionRejectedError("Эту цель сейчас нельзя возобновить. Обнови /goal.");
+        if (goalIntentKey(current) !== state.goalBaselineKey)
+          throw new ActionRejectedError("Цель изменилась после открытия меню. Обнови /goal.");
         const attempt = this.beginGoalContinuation(binding, current);
         this.consume(input);
         const note = await this.goalContinuationNote(binding, current, attempt);
@@ -583,17 +608,26 @@ export class TaskPanels {
         break;
       }
       case "goalClear": {
-        if (state.view !== "goal" || !await this.goal(binding)) throw new ActionRejectedError("Цель уже отсутствует. Обнови /goal.");
+        if (state.view !== "goal" || !state.goalBaselineKey) throw new ActionRejectedError("Меню цели устарело. Открой /goal заново.");
+        const current = await this.goal(binding);
+        if (!current) throw new ActionRejectedError("Цель уже отсутствует. Обнови /goal.");
+        if (goalIntentKey(current) !== state.goalBaselineKey)
+          throw new ActionRejectedError("Цель изменилась после открытия меню. Обнови /goal.");
         const next = this.newState(input.peerId, binding.id, "goalClear");
+        next.goalBaselineKey = state.goalBaselineKey;
         this.show(input.peerId, next, { text: "Снять цель с этой задачи Codex?\n\nУчёт цели будет удалён. История задачи, файлы и VK-беседа сохранятся. Текущий ход сначала нужно завершить или остановить.", buttons: [this.button(input.peerId, next, "Снять цель", "goalClearApply"), this.button(input.peerId, next, "Отмена", "goal")] });
         break;
       }
       case "goalClearApply": {
-        if (state.view !== "goalClear") throw new ActionRejectedError("Подтверждение снятия цели устарело.");
+        if (state.view !== "goalClear" || !state.goalBaselineKey) throw new ActionRejectedError("Подтверждение снятия цели устарело.");
         await this.refresh(binding);
         if (["running", "approval"].includes(this.details(binding.id).status)) throw new ActionRejectedError("Сначала дождись завершения хода или отправь /stop, затем сними цель.");
+        const current = await this.goal(binding);
+        if (!current || goalIntentKey(current) !== state.goalBaselineKey)
+          throw new ActionRejectedError("Цель изменилась после подтверждения. Обнови /goal; цель не снята.");
         this.consume(input);
         if (!await this.desktop.clearGoal!(binding)) throw new ActionRejectedError("Цель уже была снята. Обнови /goal.");
+        if (await this.goal(binding) !== null) throw new UncertainActionError();
         const continuation = this.goalContinuationMarker(binding);
         if (!continuation || continuation !== "malformed" && ["accepted", "statusOnlyActive", "rejected"].includes(continuation.phase))
           this.store.setValue(`goal-continuation:${binding.id}`, null);
@@ -684,6 +718,7 @@ export class TaskPanels {
 
   private async renderGoal(binding: Binding, state: PanelState, note?: string): Promise<void> {
     const goal = await this.goal(binding);
+    state.goalBaselineKey = goalIntentKey(goal);
     const buttons: Button[] = [];
     if (!goal || goal.status === "complete") buttons.push(this.button(binding.peerId!, state, goal ? "Новая цель" : "Задать цель", "goalObjective"));
     else {
@@ -794,8 +829,12 @@ export class TaskPanels {
     this.show(binding.peerId!, state, { text: `Цель:\n${state.goalObjective.slice(0, 2_500)}${state.goalObjective.length > 2_500 ? "\n…" : ""}\n\nВыбери общий бюджет токенов. Он относится ко всей цели, а не к одному ходу.`, buttons: unique.slice(0, 10) });
   }
 
-  private async applyGoal(binding: Binding, objective: string, tokenBudget: number | null): Promise<void> {
+  private async applyGoal(binding: Binding, objective: string, tokenBudget: number | null,
+    expectedGoalKey: string | null): Promise<void> {
     const current = await this.goal(binding);
+    const latest = await this.goal(binding);
+    if (goalIntentKey(current) !== expectedGoalKey || goalIntentKey(latest) !== expectedGoalKey)
+      throw new ActionRejectedError("Цель изменилась до сохранения. Обнови /goal и проверь её состояние.");
     const activating = !current || current.status === "complete";
     // A new objective must exist before an empty-input continuation, but an
     // unconfirmed continuation must never leave it advertised as active.
@@ -856,6 +895,8 @@ export class TaskPanels {
     let receipt: GoalContinuationReceipt;
     let updated: TaskGoal;
     try {
+      if (goalIntentKey(await this.goal(binding)) !== goalIntentKey(goal))
+        throw new ActionRejectedError("Цель изменилась до нативного запуска. Обнови /goal.");
       const activation = await this.desktop.activateGoalWithReceipt(binding, attempt.operationId);
       receipt = activation.receipt;
       updated = activation.goal;
@@ -888,7 +929,13 @@ export class TaskPanels {
     try {
       // The native goal loop runs only in a loaded thread. This preparation
       // stays on the selected owner and never launches a visible UI client.
-      await this.desktop.prepareGoalRuntime?.(binding);
+      if (!this.desktop.prepareGoalRuntime)
+        throw new ActionRejectedError("Для задачи не подтверждён постоянный исполнитель цели.");
+      await this.desktop.prepareGoalRuntime(binding);
+      // Loading the runtime can take minutes. A stale menu must not activate
+      // a different goal created while the owner was being prepared.
+      if (goalIntentKey(goal) !== goalIntentKey(await this.goal(binding)))
+        throw new ActionRejectedError("Цель изменилась во время подключения. Обнови /goal и проверь её состояние.");
       const updated = await this.desktop.setGoal!(binding, { status: "active" });
       if (updated.threadId !== binding.threadId || updated.status !== "active"
         || updated.objective !== goal.objective || updated.createdAt !== goal.createdAt)
