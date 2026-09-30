@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, symlink } from "node:fs/promises";
 import os from "node:os";
@@ -15,6 +16,21 @@ const manifest = (): ManagedWorkerPrivateManifest => ({
   initializeRequest: { clientInfo: { name: "Codex", version: "1" }, capabilities: {} },
   resumeParams: { threadId: "task-1", settings: { model: "gpt-5.6-sol" } }, registryPath: fixturePath("private", "registry.sqlite"),
 });
+
+function currentUserDpapiAvailable(): boolean {
+  const root = process.env.SystemRoot;
+  if (!root || !path.win32.isAbsolute(root)) return false;
+  const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$plain=[byte[]](112,114,111,98,101);" +
+    "$cipher=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);" +
+    "$roundtrip=[Security.Cryptography.ProtectedData]::Unprotect($cipher,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);" +
+    "if($roundtrip.Length -ne $plain.Length){exit 1};for($i=0;$i -lt $plain.Length;$i++){if($roundtrip[$i] -ne $plain[$i]){exit 1}}";
+  const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    encoding: "utf8", windowsHide: true, timeout: 10_000,
+    env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
+  });
+  return !result.error && result.status === 0;
+}
 
 class IdentityProtector implements ManagedWorkerPrivateStateProtector {
   async protect(value: Uint8Array): Promise<Uint8Array> { return Uint8Array.from(value); }
@@ -127,7 +143,8 @@ test("private state rejects tampering, mismatched scope, and noncanonical secret
   await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch: "33333333-3333-4333-8333-333333333333" }), /missing/u);
 });
 
-test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { skip: process.platform !== "win32" }, async () => {
+test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { skip: process.platform !== "win32" }, async t => {
+  if (!currentUserDpapiAvailable()) { t.skip("CurrentUser DPAPI is unavailable in this Windows execution context"); return; }
   const baseDirectory = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-private-state-"));
   const sentinel = randomUUID(); const input = { ...manifest(), taskId: sentinel, familyRoot: sentinel,
     resumeParams: { threadId: sentinel, settings: { model: "gpt-5.6-sol" } } };

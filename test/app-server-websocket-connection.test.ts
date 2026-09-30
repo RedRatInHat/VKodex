@@ -8,7 +8,7 @@ import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
 import { canonicalDetachedProfileHome, createDetachedProfileConnection,
-  detachedProfileKey } from "../src/codex/detached-profile-capability.js";
+  detachedProfileKey, inspectDetachedProfileBackend } from "../src/codex/detached-profile-capability.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -222,4 +222,49 @@ test("detached profile refuses a capability beneath an unprotected parent", asyn
   });
   try { await assert.rejects(client.start(), AppServerUnavailableError); }
   finally { await client.close(); }
+});
+
+test("detached backend diagnostic distinguishes exact death from reuse, uncertainty, and an epoch change", () => {
+  const directory = path.resolve("test-detached-profile-diagnostic");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const record = { schemaVersion: 1, epoch, profileKey: detachedProfileKey(home), home,
+    url: "ws://127.0.0.1:32123", backend: { pid: 1234, birthTicks: "12345678" } };
+  let descriptor = JSON.stringify(record);
+  let identity: "live" | "dead" | "reused" | "unknown" | "change" = "live";
+  const result = () => inspectDetachedProfileBackend(directory, home, {
+    readFile: file => file.endsWith("ready.json") ? descriptor : "isolated-test-capability",
+    identity: pid => {
+      assert.equal(pid, 1234);
+      if (identity === "unknown") throw new Error("probe unavailable");
+      if (identity === "change") descriptor = JSON.stringify({ ...record, epoch: "00000000-0000-4000-8000-000000000002" });
+      return identity === "dead" ? null : { pid, birthTicks: identity === "reused" ? "87654321" : "12345678" };
+    },
+  });
+  assert.equal(result().state, "live");
+  identity = "dead"; assert.equal(result().state, "dead-exact");
+  identity = "reused"; assert.equal(result().state, "pid-reused-or-changed");
+  identity = "unknown"; assert.equal(result().state, "unknown");
+  identity = "change"; assert.equal(result().state, "changed");
+});
+
+test("detached backend diagnostic requires the protected epoch token without exposing it", () => {
+  const directory = path.resolve("test-detached-profile-diagnostic-token");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const epoch = "00000000-0000-4000-8000-000000000001";
+  const record = { schemaVersion: 1, epoch, profileKey: detachedProfileKey(home), home,
+    url: "ws://127.0.0.1:32123", backend: { pid: 1234, birthTicks: "12345678" } };
+  const diagnose = (token: string | null, failAcl = false) => inspectDetachedProfileBackend(directory, home, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(record) : (() => {
+      if (token === null) throw new Error("missing token");
+      return token;
+    })(),
+    identity: pid => ({ pid, birthTicks: "12345678" }),
+    assertPrivateDirectory: target => { if (failAcl && target === path.join(directory, epoch)) throw new Error("unsafe ACL"); },
+  });
+  assert.equal(diagnose(null).state, "invalid");
+  assert.equal(diagnose("bad token\n").state, "invalid");
+  assert.equal(diagnose("A".repeat(513)).state, "invalid");
+  assert.equal(diagnose("isolated-test-capability", true).state, "invalid");
+  assert.equal(diagnose("isolated-test-capability").state, "live");
 });

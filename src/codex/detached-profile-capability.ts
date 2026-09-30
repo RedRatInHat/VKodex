@@ -110,6 +110,61 @@ function descriptorEquals(a: DetachedProfileDescriptor, b: DetachedProfileDescri
     a.backend.pid === b.backend.pid && a.backend.birthTicks === b.backend.birthTicks;
 }
 
+/** Read-only recovery evidence. `dead-exact` is deliberately diagnostic only:
+ * it never authorizes descriptor replacement or another server launch. */
+export type DetachedProfileBackendDiagnostic = Readonly<{ state:
+  "live" | "dead-exact" | "pid-reused-or-changed" | "unknown" | "changed" | "invalid" }>;
+
+/** Inspect one protected ready record without connecting, launching, or
+ * changing it. The second descriptor read fences a concurrent epoch change
+ * across the bounded Windows PID/birth probe. */
+export function inspectDetachedProfileBackend(privateDirectory: string,
+  home: string, dependencies: DetachedProfileCapabilityDependencies = {}): DetachedProfileBackendDiagnostic {
+  if (!path.isAbsolute(privateDirectory) || !path.isAbsolute(home) ||
+    /[\x00-\x1f]/u.test(home)) throw new TypeError("Invalid detached profile scope");
+  const read = dependencies.readFile ?? boundedRead;
+  const identity = dependencies.identity ?? ((pid: number) => readWindowsProcessIdentity(pid, 2_000));
+  const assertPrivate = dependencies.assertPrivateDirectory ??
+    (dependencies.readFile ? () => {} : assertWindowsPrivateDirectory);
+  const protectedDirectories = [path.dirname(path.dirname(privateDirectory)),
+    path.dirname(privateDirectory), privateDirectory];
+  const assertBase = (): void => { for (const directory of protectedDirectories) assertPrivate(directory); };
+  const load = (): DetachedProfileDescriptor | null => {
+    try {
+      const raw = read(path.join(privateDirectory, "ready.json"), MAX_DESCRIPTOR_BYTES);
+      if (Buffer.byteLength(raw, "utf8") > MAX_DESCRIPTOR_BYTES) return null;
+      return exactDescriptor(JSON.parse(raw) as unknown, home);
+    } catch { return null; }
+  };
+  let original: DetachedProfileDescriptor | null;
+  try { assertBase(); original = load(); } catch { return { state: "invalid" }; }
+  if (!original) return { state: "invalid" };
+  const tokenFile = path.join(privateDirectory, original.epoch, "token");
+  const loadToken = (): string | null => {
+    try {
+      const token = read(tokenFile, 512);
+      return Buffer.byteLength(token, "utf8") <= 512 && TOKEN.test(token) ? token : null;
+    } catch { return null; }
+  };
+  let token: string | null;
+  try { assertPrivate(path.dirname(tokenFile)); token = loadToken(); } catch { return { state: "invalid" }; }
+  if (!token) return { state: "invalid" };
+  let result: DetachedProfileBackendDiagnostic["state"];
+  try {
+    const observed = identity(original.backend.pid);
+    result = !observed ? "dead-exact" : observed.pid === original.backend.pid &&
+      observed.birthTicks === original.backend.birthTicks ? "live" : "pid-reused-or-changed";
+  } catch { result = "unknown"; }
+  let after: DetachedProfileDescriptor | null;
+  let afterToken: string | null;
+  try { assertBase(); assertPrivate(path.dirname(tokenFile)); after = load(); afterToken = loadToken(); }
+  catch { return { state: "invalid" }; }
+  if (!after) return { state: "invalid" };
+  if (!afterToken) return { state: "invalid" };
+  if (!descriptorEquals(original, after) || token !== afterToken) return { state: "changed" };
+  return { state: result };
+}
+
 /** The caller supplies a trusted private directory, never a path from VK. The
  * epoch-specific token is deliberately absent from the public ready record. */
 function openDetachedProfileConnection(privateDirectory: string,
