@@ -7,6 +7,7 @@ import { lstat, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { WebSocketServer, type WebSocket } from 'ws';
+import DatabaseConstructor from 'better-sqlite3';
 import { AppServerUnavailableError } from '../../src/codex/app-server-connection.js';
 import { compileControlledNativeStartParams } from '../../src/desktop/controlled-native-task-creator.js';
 import { captureAuthenticatedProfileSourcePreflight } from
@@ -232,12 +233,59 @@ test('Windows production-pinned authenticated source permits one fenced first th
     assert.equal(nativeMethods().filter(method => method === 'thread/start').length, 1);
     assert.equal(nativeMethods().some(method => method === 'turn/start' || method === 'model/turn/start'), false);
 
+    queueHasPendingItem = false;
+    const ingressJournal = journal;
+    const ingressScope = await journal.qualifyFirstTurnIngressLeaseScope(scope.operationId, client, preflight);
+    const pendingQueueMethods = [...qualifiedMethods, 'thread/read', 'thread/turns/list',
+      'thread/goal/get', 'thread/queue/list'];
+    const leaseQualifiedMethods = [...pendingQueueMethods,
+      'thread/read', 'thread/turns/list', 'thread/goal/get', 'thread/queue/list', 'thread/read'];
+    assert.deepEqual(nativeMethods(), leaseQualifiedMethods);
+    journal.acquireFirstTurnIngressLease(ingressScope);
+    journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
+    assert.throws(() => ingressJournal.assertFirstTurnIngressLeaseCurrent({ ...ingressScope }), /ingress/u,
+      'copying the public scalar scope cannot copy its in-memory admission authority');
+    const reopenedForIngress = new NativeFirstTurnBootstrapJournal(journalPath);
+    try {
+      reopenedForIngress.assertFirstTurnIngressLeaseCurrent(ingressScope);
+      assert.throws(() => reopenedForIngress.acquireFirstTurnIngressLease(ingressScope), /lease|conflict|ingress/u,
+        'a separate SQLite handle cannot acquire the already-held singleton slot');
+      assert.throws(() => reopenedForIngress.acquireFirstTurnIngressLease({ ...ingressScope }), /ingress/u,
+        'a copied scope cannot acquire through a separate SQLite handle');
+    } finally { reopenedForIngress.close(); }
+    assert.deepEqual(nativeMethods(), leaseQualifiedMethods,
+      'lease contention and copied-scope checks use only the durable journal');
+
     const beforeReservation = nativeMethods();
     journal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
       clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64) });
+    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
+    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed');
     await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),
       /Native first-turn candidate unqualified/u);
     assert.deepEqual(nativeMethods(), beforeReservation);
+    assert.throws(() => ingressJournal.markFirstTurnWriteFencePassed(scope.operationId), /lease|ingress|conflict/u,
+      'the legacy unscoped marker cannot bypass the ingress lease');
+    const fault = new DatabaseConstructor(journalPath);
+    try {
+      fault.exec(`CREATE TRIGGER reject_ingress_uncertain BEFORE UPDATE ON native_first_turn_ingress_leases
+        BEGIN SELECT RAISE(ABORT, 'simulated ingress persistence failure'); END`);
+    } finally { fault.close(); }
+    assert.throws(() => ingressJournal.markFirstTurnWriteFencePassedWithIngressLease(ingressScope), /ingress/u);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed',
+      'a failed lease update rolls the fence update back in the same transaction');
+    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
+    journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
+    const removeFault = new DatabaseConstructor(journalPath);
+    try { removeFault.exec('DROP TRIGGER reject_ingress_uncertain'); }
+    finally { removeFault.close(); }
+    journal.markFirstTurnWriteFencePassedWithIngressLease(ingressScope);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'passed');
+    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
+    assert.throws(() => ingressJournal.assertFirstTurnIngressLeaseCurrent(ingressScope), /lease|uncertain|current|ingress/u,
+      'the atomic boundary retires the held scope into an uncertain write state');
+    assert.deepEqual(nativeMethods(), beforeReservation,
+      'the atomic lease/fence transition does not perform an additional native write or read');
   } finally {
     await client?.close();
     journal?.close();

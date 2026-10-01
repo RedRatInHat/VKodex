@@ -1,5 +1,12 @@
 import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import DatabaseConstructor, { type Database } from 'better-sqlite3';
+import { pinnedDetachedProfileBackendHome, pinnedDetachedProfileBackendIdentity,
+  type PinnedDetachedProfileRpc } from '../codex/detached-profile-capability.js';
+import { assertAuthenticatedProfileSourcePreflightForWrite,
+  assertAuthenticatedProfileSourceReceiptForWrite,
+  type AuthenticatedProfileSourcePreflight } from './controlled-native-source-proof.js';
+import { readAndQualifyFreshFirstTurnIdleState } from './native-first-turn-idle-state.js';
 
 type State = 'thread-reserved' | 'thread-accepted' | 'turn-reserved' | 'turn-unknown' | 'turn-accepted';
 interface Row {
@@ -8,6 +15,36 @@ interface Row {
   backend_identity: string; state: State; revision: number; thread_id: string | null;
   client_user_message_id: string | null; keyed_fingerprint: string | null; turn_id: string | null;
 }
+interface IngressRow {
+  operation_id: string; thread_id: string; source_id: string; source_generation: string;
+  owner_epoch: string; backend_identity: string; backend_generation: number;
+  profile_identity: string; lease_id: string; status: 'held' | 'uncertain' | 'revoked';
+}
+/** Durable admission for VKodex's one isolated first-turn path. This only
+ * excludes a second VKodex ingress through the same private journal. It is
+ * NOT an exclusive lease over external Desktop, VS Code or CLI native writers. */
+export interface NativeFirstTurnIngressLeaseScope {
+  readonly operationId: string;
+  readonly threadId: string;
+  readonly sourceId: string;
+  readonly sourceGeneration: string;
+  readonly ownerEpoch: string;
+  readonly backendIdentity: string;
+  readonly backendGeneration: number;
+  /** SHA-256 of the verified physical profile identity; never a raw path. */
+  readonly profileIdentity: string;
+  readonly leaseId: string;
+}
+interface IngressAuthority {
+  readonly filePath: string;
+  readonly rpc: PinnedDetachedProfileRpc;
+  readonly preflight: AuthenticatedProfileSourcePreflight;
+  readonly backendGeneration: number;
+  readonly threadStartFingerprint: string;
+}
+// Object identity matters: copying the public scalar fields cannot mint a
+// dispatch authority, even if the copied values match a durable SQLite row.
+const ingressAuthorities = new WeakMap<NativeFirstTurnIngressLeaseScope, IngressAuthority>();
 export interface NativeFirstTurnBootstrapRecord {
   readonly operationId: string;
   readonly sourceId: string;
@@ -42,6 +79,22 @@ const FINGERPRINT = /^[a-f0-9]{64}$/u;
 const identifier = (value: unknown, limit = 256): value is string =>
   typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\x00-\x1f\x7f]/u.test(value);
 const fail = (): never => { throw new Error('First-turn bootstrap journal conflict or invalid record'); };
+const ingressFail = (): never => { throw new Error('First-turn ingress lease conflict or invalid scope'); };
+function validIngressScope(scope: NativeFirstTurnIngressLeaseScope): void {
+  if (!scope || !UUID.test(scope.operationId) || !UUID.test(scope.threadId) ||
+      !identifier(scope.sourceId) || !UUID.test(scope.sourceGeneration) ||
+      !UUID.test(scope.ownerEpoch) || !FINGERPRINT.test(scope.backendIdentity) ||
+      !Number.isSafeInteger(scope.backendGeneration) || scope.backendGeneration < 1 ||
+      !FINGERPRINT.test(scope.profileIdentity) || !UUID.test(scope.leaseId)) ingressFail();
+}
+function physicalProfileIdentity(preflight: AuthenticatedProfileSourcePreflight): string {
+  const pin = preflight.sourceHomeIdentity, work = preflight.workspaceIdentity;
+  if (!work) return ingressFail();
+  return createHash('sha256').update('vkodex-first-turn-physical-profile-v1\0')
+    .update(JSON.stringify([preflight.sourceHome, pin.dev.toString(), pin.ino.toString(),
+      pin.birthtimeMs.toString(), preflight.workspace, work.dev.toString(),
+      work.ino.toString(), work.birthtimeMs.toString()])).digest('hex');
+}
 function validIdentity(value: NativeFirstTurnBootstrapIdentity): void {
   if (!UUID.test(value.operationId) || !identifier(value.sourceId) || !UUID.test(value.sourceGeneration) ||
   !UUID.test(value.ownerEpoch) || !FINGERPRINT.test(value.threadStartFingerprint) ||
@@ -108,6 +161,13 @@ export class NativeFirstTurnBootstrapJournal {
       this.#db.exec(`CREATE TABLE IF NOT EXISTS native_first_turn_write_fences (
         operation_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('not-passed','passed'))
       )`);
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS native_first_turn_ingress_leases (
+        slot INTEGER PRIMARY KEY CHECK(slot=1), operation_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+        source_id TEXT NOT NULL, source_generation TEXT NOT NULL, owner_epoch TEXT NOT NULL,
+        backend_identity TEXT NOT NULL, backend_generation INTEGER NOT NULL CHECK(backend_generation>=1),
+        profile_identity TEXT NOT NULL, lease_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('held','uncertain','revoked'))
+      )`);
     } catch (error) { this.#db.close(); throw error; }
   }
   close(): void { if (!this.#closed) { this.#closed = true; this.#db.close(); } }
@@ -139,6 +199,133 @@ export class NativeFirstTurnBootstrapJournal {
     if (!row) return 'legacy-unknown';
     if (row.status === 'not-passed' || row.status === 'passed') return row.status;
     return fail();
+  }
+  #ingressRow(): IngressRow | undefined {
+    return this.#db.prepare('SELECT * FROM native_first_turn_ingress_leases WHERE slot=1').get() as IngressRow | undefined;
+  }
+  #assertIngressAuthority(scope: NativeFirstTurnIngressLeaseScope): void {
+    validIngressScope(scope);
+    const authority = ingressAuthorities.get(scope);
+    if (!authority || authority.filePath !== this.#filePath) return ingressFail();
+    try {
+      if (pinnedDetachedProfileBackendIdentity(authority.rpc, authority.backendGeneration) !== scope.backendIdentity ||
+          pinnedDetachedProfileBackendHome(authority.rpc, authority.backendGeneration) !== authority.preflight.sourceHome ||
+          authority.backendGeneration !== scope.backendGeneration) ingressFail();
+      const source = { operationId: scope.operationId, sourceId: scope.sourceId,
+        sourceGeneration: scope.sourceGeneration };
+      assertAuthenticatedProfileSourcePreflightForWrite(authority.preflight, source,
+        pinnedDetachedProfileBackendHome(authority.rpc, authority.backendGeneration),
+        authority.preflight.workspace);
+      assertAuthenticatedProfileSourceReceiptForWrite(path.join(this.#directory, 'source-preflight.json'),
+        authority.preflight);
+      if (physicalProfileIdentity(authority.preflight) !== scope.profileIdentity) ingressFail();
+      const record = this.get(scope.operationId);
+      if (!record || record.threadId !== scope.threadId || record.sourceId !== scope.sourceId ||
+          record.sourceGeneration !== scope.sourceGeneration || record.ownerEpoch !== scope.ownerEpoch ||
+          record.backendIdentity !== scope.backendIdentity ||
+          record.threadStartFingerprint !== authority.threadStartFingerprint ||
+          this.getThreadStartFenceStatus(scope.operationId) !== 'passed') ingressFail();
+    } catch { ingressFail(); }
+  }
+  /** Mint admission only from fresh, read-only evidence on a production-pinned
+   * connection and a physically authenticated source. This is not proof that
+   * another native client cannot concurrently write to the same profile. */
+  async qualifyFirstTurnIngressLeaseScope(operationId: string, rpc: PinnedDetachedProfileRpc,
+    preflight: AuthenticatedProfileSourcePreflight): Promise<NativeFirstTurnIngressLeaseScope> {
+    this.#open();
+    const record = this.get(operationId);
+    if (!record || record.state !== 'thread-accepted' || record.revision !== 2 || !record.threadId ||
+        this.getThreadStartFenceStatus(operationId) !== 'passed') return ingressFail();
+    const session = await rpc.initializedSession().catch(() => ingressFail());
+    const generation = session.generation;
+    const scope: NativeFirstTurnIngressLeaseScope = Object.freeze({ operationId, threadId: record.threadId,
+      sourceId: record.sourceId, sourceGeneration: record.sourceGeneration, ownerEpoch: record.ownerEpoch,
+      backendIdentity: record.backendIdentity, backendGeneration: generation,
+      profileIdentity: physicalProfileIdentity(preflight), leaseId: randomUUID() });
+    ingressAuthorities.set(scope, { filePath: this.#filePath, rpc, preflight, backendGeneration: generation,
+      threadStartFingerprint: record.threadStartFingerprint });
+    this.#assertIngressAuthority(scope);
+    const current = (): void => {
+      this.#assertIngressAuthority(scope);
+      const now = this.get(operationId);
+      if (now?.state !== 'thread-accepted' || now.revision !== 2) ingressFail();
+    };
+    try {
+      const observed = await readAndQualifyFreshFirstTurnIdleState(rpc, record.threadId, current);
+      current();
+      if (observed.backendGeneration !== generation) ingressFail();
+      return scope;
+    } catch { ingressAuthorities.delete(scope); return ingressFail(); }
+  }
+  #assertIngress(scope: NativeFirstTurnIngressLeaseScope): NativeFirstTurnBootstrapRecord {
+    this.#assertIngressAuthority(scope);
+    const record = this.get(scope.operationId);
+    const lease = this.#ingressRow();
+    if (!record) return ingressFail();
+    if (!lease || lease.status !== 'held' ||
+        record.threadId !== scope.threadId || record.sourceId !== scope.sourceId ||
+        record.sourceGeneration !== scope.sourceGeneration || record.ownerEpoch !== scope.ownerEpoch ||
+        record.backendIdentity !== scope.backendIdentity ||
+        lease.operation_id !== scope.operationId || lease.thread_id !== scope.threadId ||
+        lease.source_id !== scope.sourceId || lease.source_generation !== scope.sourceGeneration ||
+        lease.owner_epoch !== scope.ownerEpoch || lease.backend_identity !== scope.backendIdentity ||
+        lease.backend_generation !== scope.backendGeneration ||
+        lease.profile_identity !== scope.profileIdentity || lease.lease_id !== scope.leaseId ||
+        this.getThreadStartFenceStatus(scope.operationId) !== 'passed' ||
+        !(record.state === 'thread-accepted' && record.revision === 2 ||
+          record.state === 'turn-reserved' && record.revision === 3 &&
+            this.getFirstTurnWriteFenceStatus(scope.operationId) === 'not-passed')) ingressFail();
+    return record;
+  }
+  /** One durable, no-reacquire VKodex ingress slot for the accepted empty
+   * thread. Qualification checks source/backend/idle state. A caller that
+   * plans a native write must ALSO establish a closed-world profile: this
+   * slot cannot exclude external Desktop, VS Code or CLI writers. */
+  acquireFirstTurnIngressLease(scope: NativeFirstTurnIngressLeaseScope): void {
+    this.#open(); this.#assertIngressAuthority(scope);
+    try { this.#db.transaction(() => {
+      const record = this.get(scope.operationId);
+      if (!record || record.state !== 'thread-accepted' || record.revision !== 2 ||
+          record.threadId !== scope.threadId || record.sourceId !== scope.sourceId ||
+          record.sourceGeneration !== scope.sourceGeneration || record.ownerEpoch !== scope.ownerEpoch ||
+          record.backendIdentity !== scope.backendIdentity ||
+          this.getThreadStartFenceStatus(scope.operationId) !== 'passed' || this.#ingressRow()) ingressFail();
+      this.#db.prepare(`INSERT INTO native_first_turn_ingress_leases
+        (slot,operation_id,thread_id,source_id,source_generation,owner_epoch,backend_identity,
+          backend_generation,profile_identity,lease_id,status)
+        VALUES (1,?,?,?,?,?,?,?,?,?,'held')`).run(scope.operationId, scope.threadId, scope.sourceId,
+        scope.sourceGeneration, scope.ownerEpoch, scope.backendIdentity, scope.backendGeneration,
+        scope.profileIdentity, scope.leaseId);
+    }).immediate(); } catch { ingressFail(); }
+  }
+  assertFirstTurnIngressLeaseCurrent(scope: NativeFirstTurnIngressLeaseScope): void {
+    this.#open(); this.#assertIngress(scope);
+  }
+  /** A caller can withdraw a pre-write admission. Revocation is durable and
+   * irreversible in this one-operation journal; it never proves non-write. */
+  revokeFirstTurnIngressLease(scope: NativeFirstTurnIngressLeaseScope): void {
+    this.#open();
+    try { this.#db.transaction(() => {
+      this.#assertIngress(scope);
+      const changed = this.#db.prepare(`UPDATE native_first_turn_ingress_leases SET status='revoked'
+        WHERE slot=1 AND lease_id=? AND status='held'`).run(scope.leaseId);
+      if (changed.changes !== 1) ingressFail();
+    }).immediate(); } catch { ingressFail(); }
+  }
+  /** The lease and write fence transition in one SQLite transaction. A
+   * committed uncertain state means a native write MAY follow or have happened;
+   * it does not authorize replay after timeout or process loss. */
+  markFirstTurnWriteFencePassedWithIngressLease(scope: NativeFirstTurnIngressLeaseScope): void {
+    this.#open();
+    try { this.#db.transaction(() => {
+      const record = this.#assertIngress(scope);
+      if (record.state !== 'turn-reserved' || record.revision !== 3) ingressFail();
+      const fence = this.#db.prepare(`UPDATE native_first_turn_write_fences SET status='passed'
+        WHERE operation_id=? AND status='not-passed'`).run(scope.operationId);
+      const lease = this.#db.prepare(`UPDATE native_first_turn_ingress_leases SET status='uncertain'
+        WHERE slot=1 AND lease_id=? AND status='held'`).run(scope.leaseId);
+      if (fence.changes !== 1 || lease.changes !== 1) ingressFail();
+    }).immediate(); } catch { ingressFail(); }
   }
   persistThreadStartIntent(intent: NativeFirstTurnBootstrapIdentity): void {
     this.#open(); validIdentity(intent);
@@ -191,6 +378,9 @@ export class NativeFirstTurnBootstrapJournal {
   markFirstTurnWriteFencePassed(operationId: string): void {
     this.#open(); if (!UUID.test(operationId)) fail();
     try { this.#db.transaction(() => {
+      // Once a scoped ingress slot exists, the legacy unscoped path cannot
+      // bypass its identity check, even after the slot becomes uncertain.
+      if (this.#ingressRow()) ingressFail();
       const current = this.get(operationId);
       if (!current || current.state !== 'turn-reserved' || current.revision !== 3) fail();
       const changed = this.#db.prepare(`UPDATE native_first_turn_write_fences SET status='passed'

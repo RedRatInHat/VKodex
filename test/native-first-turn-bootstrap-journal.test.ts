@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import DatabaseConstructor from 'better-sqlite3';
-import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
+import { NativeFirstTurnBootstrapJournal, type NativeFirstTurnIngressLeaseScope } from
+  '../src/desktop/native-first-turn-bootstrap-journal.js';
 import { createPrivateKeyWithDependencies, loadPrivateKeyWithDependencies } from
   '../src/desktop/native-first-turn-private-key-core.js';
 import { createNativeFirstTurnPrivateKey } from '../src/desktop/native-first-turn-private-key.js';
@@ -22,6 +23,23 @@ const identity = () => ({ sourceId: 'profile-a', sourceGeneration: randomUUID(),
 const fingerprint = (_value: string) => 'a'.repeat(64);
 const open = (filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite')) =>
   new NativeFirstTurnBootstrapJournal(filePath);
+
+function reservedIngressFixture(filePath?: string): {
+  journal: NativeFirstTurnBootstrapJournal;
+  scope: NativeFirstTurnIngressLeaseScope;
+} {
+  const journal = open(filePath);
+  const operationId = randomUUID();
+  const source = identity();
+  const threadId = randomUUID();
+  journal.persistThreadStartIntent({ operationId, ...source });
+  journal.markThreadStartWriteFencePassed(operationId);
+  journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId });
+  return { journal, scope: { operationId, threadId, sourceId: source.sourceId,
+    sourceGeneration: source.sourceGeneration, ownerEpoch: source.ownerEpoch,
+    backendIdentity: source.backendIdentity, backendGeneration: 1,
+    profileIdentity: 'e'.repeat(64), leaseId: randomUUID() } };
+}
 
 test('bootstrap journal never creates a missing unprotected parent', () => {
   const directory = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'missing');
@@ -126,6 +144,44 @@ test('first-turn write fence is atomic with reservation and an absent legacy mar
   assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'legacy-unknown');
   assert.throws(() => journal.markFirstTurnWriteFencePassed(operationId), /conflict/u);
   journal.close();
+});
+
+test('a caller-constructed scope cannot mint first-turn ingress authority', () => {
+  const { journal, scope } = reservedIngressFixture();
+  try {
+    assert.throws(() => journal.acquireFirstTurnIngressLease({ ...scope }), /ingress/u);
+    assert.equal(journal.get(scope.operationId)?.state, 'thread-accepted');
+  } finally { journal.close(); }
+});
+
+test('caller-constructed scope cannot acquire ingress before the thread/start write fence', () => {
+  const journal = open();
+  try {
+    const operationId = randomUUID(); const source = identity(); const threadId = randomUUID();
+    const scope = { operationId, threadId, sourceId: source.sourceId,
+      sourceGeneration: source.sourceGeneration, ownerEpoch: source.ownerEpoch,
+      backendIdentity: source.backendIdentity, backendGeneration: 1,
+      profileIdentity: 'e'.repeat(64), leaseId: randomUUID() };
+    journal.persistThreadStartIntent({ operationId, ...source });
+    assert.throws(() => journal.acquireFirstTurnIngressLease(scope), /ingress/u);
+    journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId });
+    assert.throws(() => journal.acquireFirstTurnIngressLease(scope), /ingress/u,
+      'thread/start without a passed write fence is not qualified');
+  } finally { journal.close(); }
+});
+
+test('caller-constructed scope cannot operate an ingress lease or block the legacy fence', () => {
+  const { journal, scope } = reservedIngressFixture();
+  try {
+    journal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
+      clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first') });
+    assert.throws(() => journal.assertFirstTurnIngressLeaseCurrent(scope), /ingress/u);
+    assert.throws(() => journal.revokeFirstTurnIngressLease(scope), /ingress/u);
+    assert.throws(() => journal.markFirstTurnWriteFencePassedWithIngressLease(scope), /ingress/u);
+    // Rejection of a raw object does not leave a durable lease behind.
+    journal.markFirstTurnWriteFencePassed(scope.operationId);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'passed');
+  } finally { journal.close(); }
 });
 
 test('first-turn reservation rolls back when its durable fence insert fails', () => {
