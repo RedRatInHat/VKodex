@@ -41,6 +41,27 @@ export interface PinnedDetachedProfileRpc extends AppServerRpc {
   onDisconnect(listener: (error: Error) => void): () => void;
 }
 
+// Only the dependency-free production factory grants a backend identity to a
+// future native writer. Injected readers used by tests cannot mint one.
+const productionPinnedBackends = new WeakMap<object, string>();
+function backendIdentityOf(descriptor: DetachedProfileDescriptor): string {
+  return createHash("sha256").update("vkodex-pinned-detached-backend-v1\0")
+    .update(JSON.stringify([descriptor.epoch, descriptor.profileKey,
+      comparablePath(descriptor.home), descriptor.url, descriptor.backend.pid,
+      descriptor.backend.birthTicks])).digest("hex");
+}
+
+/** A non-secret identity for the exact production-pinned backend. The live
+ * generation check prevents a disconnected or uninitialized connector from
+ * supplying identity to an intent. This is not source or owner authority. */
+export function pinnedDetachedProfileBackendIdentity(rpc: PinnedDetachedProfileRpc,
+  generation: number): string {
+  const identity = productionPinnedBackends.get(rpc);
+  if (!identity || !Number.isSafeInteger(generation) || generation < 1 ||
+      !rpc.isSessionCurrent(generation)) return unavailable();
+  return identity;
+}
+
 /** Stable private locator; never use a VK-supplied name as a path segment. */
 export function detachedProfileDirectory(dataDirectory: string, home: string): string {
   if (!path.isAbsolute(dataDirectory) || !path.isAbsolute(home)) throw new TypeError("Invalid detached profile directory");
@@ -304,5 +325,10 @@ export function createPinnedDetachedProfileConnection(privateDirectory: string,
   home: string, expected: DetachedProfileDescriptor,
   dependencies: DetachedProfileCapabilityDependencies = {}): PinnedDetachedProfileRpc {
   const pin = exactDescriptor(expected, home);
-  return createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
+  const rpc = createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
+  if (arguments.length === 3) {
+    Object.freeze(rpc);
+    productionPinnedBackends.set(rpc, backendIdentityOf(pin));
+  }
+  return rpc;
 }

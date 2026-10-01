@@ -8,8 +8,10 @@ import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js
 import { prepareNativeFirstTurnBootstrapCommand, NATIVE_FIRST_TURN_TEXT_MAX_BYTES } from
   '../src/desktop/native-first-turn-input-fingerprint.js';
 import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
-import { dispatchPreparedNativeFirstTurn, reserveNativeFirstTurnWithKey } from
+import { reserveNativeFirstTurnWithKey } from
   '../src/desktop/native-first-turn-bootstrap-preparation.js';
+import { dispatchPreparedNativeFirstTurnForOfflineTest } from
+  './support/native-first-turn-dispatch-harness.js';
 import { ManagedNativeCliStartAdmission, NativeCliStartNotSubmittedError } from
   '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
@@ -169,10 +171,10 @@ test('first-turn dispatch records only a positive native ACK and sends once', as
       return { turn: { id: turnId, status: 'inProgress' } };
     } };
   try {
-    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
     assert.equal(result.state, 'turn-accepted'); assert.equal(result.turnId, turnId);
     assert.equal(writes, 1);
-    await assert.rejects(dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true), /unqualified/u);
+    await assert.rejects(dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true), /unqualified/u);
     assert.equal(writes, 1);
   } finally { journal.close(); }
 });
@@ -192,7 +194,7 @@ test('first-turn timeout stays unknown; late positive ACK may reconcile without 
       throw new Error('timeout');
     } };
   try {
-    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
     assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
   } finally { journal.close(); }
   late?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
@@ -216,12 +218,12 @@ test('first-turn prewrite authority refusal and malformed ACK never create accep
       options.onResponseEnvelope?.({ result: { turn: { id: 'wrong', status: 'inProgress' } } });
       return { turn: { id: 'wrong', status: 'inProgress' } }; } };
   try {
-    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
     assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
   } finally { journal.close(); }
   const refused = firstTurnDispatchFixture();
   try {
-    const result = await dispatchPreparedNativeFirstTurn(refused.journal, refused.prepared,
+    const result = await dispatchPreparedNativeFirstTurnForOfflineTest(refused.journal, refused.prepared,
       rpc, () => false);
     assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
   } finally { refused.journal.close(); }
@@ -244,7 +246,7 @@ test('first-turn ACK before the final write fence cannot claim a refused write',
       return { turn: { id: turnId, status: 'inProgress' } };
     } };
   try {
-    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => authorized);
+    const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => authorized);
     assert.equal(result.state, 'turn-unknown'); assert.equal(result.turnId, null);
     assert.equal(writes, 0);
   } finally { journal.close(); }
@@ -263,7 +265,7 @@ test('first-turn positive ACK survives closing the initiating journal during the
       options.onResponseEnvelope?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
       return { turn: { id: turnId, status: 'inProgress' } };
     } };
-  const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+  const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
   assert.equal(result.state, 'turn-accepted');
   const reopened = new NativeFirstTurnBootstrapJournal(filePath);
   try { assert.equal(reopened.get(prepared.operationId)?.turnId, turnId); }

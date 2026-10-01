@@ -12,6 +12,12 @@ import { compileControlledNativeStartParams, createControlledNativeTask,
   type ControlledCreationIntent, type ControlledCreationStarted,
   type ControlledCreationReceipt, type ControlledNativeTaskCreatorOptions } from '../src/desktop/controlled-native-task-creator.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
+import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
+import { prepareNativeFirstThreadStart, prepareNativeFirstThreadStartWithKey } from
+  '../src/desktop/native-first-turn-thread-start.js';
+import { dispatchPreparedNativeFirstThreadStartForOfflineTest } from
+  './support/native-first-thread-start-harness.js';
+import type { PinnedDetachedProfileRpc } from '../src/codex/detached-profile-capability.js';
 import { reconcileControlledNativeCreation } from '../src/desktop/controlled-native-creation-reconciler.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 
@@ -29,6 +35,169 @@ const startResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
   approvalPolicy: template.approvalPolicy, approvalsReviewer: template.approvalsReviewer,
   activePermissionProfile: template.activePermissionProfile, sandbox: template.sandbox,
   serviceTier: 'default' };
+
+const firstTurnReadOnlyPolicy = { ...template,
+  activePermissionProfile: { id: ':read-only', extends: null },
+  sandbox: { type: 'readOnly', networkAccess: false } } as const;
+const firstTurnReadOnlyResult = { ...startResult,
+  activePermissionProfile: firstTurnReadOnlyPolicy.activePermissionProfile,
+  sandbox: firstTurnReadOnlyPolicy.sandbox };
+function firstTurnStartFixture() {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-thread-')), 'journal.sqlite');
+  const journal = new NativeFirstTurnBootstrapJournal(filePath);
+  const identity = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch: randomUUID(), backendIdentity: 'b'.repeat(64) };
+  const key = Buffer.alloc(32, 7);
+  const prepared = prepareNativeFirstThreadStartWithKey(journal, identity,
+    firstTurnReadOnlyPolicy, key);
+  key.fill(0);
+  return { filePath, journal, identity, prepared };
+}
+
+test('one-shot first thread/start persists keyed intent before a policy-qualified ACK', async () => {
+  const { journal, prepared } = firstTurnStartFixture();
+  let writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(method: string, params: Record<string, unknown>, options: {
+      mutating?: boolean; expectedGeneration?: number; assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) {
+      assert.equal(journal.get(prepared.identity.operationId)?.state, 'thread-reserved');
+      assert.equal(method, 'thread/start'); assert.equal(options.mutating, true);
+      assert.equal(options.expectedGeneration, 5);
+      assert.deepEqual(params, compileControlledNativeStartParams(firstTurnReadOnlyPolicy));
+      options.assertBeforeWrite?.(); writes++;
+      options.onResponseEnvelope?.({ result: firstTurnReadOnlyResult });
+      return firstTurnReadOnlyResult;
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
+      expected => expected);
+    assert.equal(result.state, 'thread-accepted'); assert.equal(result.threadId, taskId);
+    assert.equal(writes, 1);
+    await assert.rejects(dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
+      expected => expected), /unqualified/u);
+    assert.equal(writes, 1);
+    assert.throws(() => prepareNativeFirstThreadStartWithKey(journal, { ...prepared.identity,
+      operationId: randomUUID() }, firstTurnReadOnlyPolicy, Buffer.alloc(32, 7)), /conflict/u);
+  } finally { journal.close(); }
+});
+
+test('production first thread preparation refuses an unpinned RPC before reserving an intent', async () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-thread-')),
+    'journal.sqlite');
+  const journal = new NativeFirstTurnBootstrapJournal(filePath);
+  const scope = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch: randomUUID() };
+  const fake = { async initializedSession() { return { generation: 1 }; },
+    isSessionCurrent: () => true } as unknown as PinnedDetachedProfileRpc;
+  try {
+    await assert.rejects(prepareNativeFirstThreadStart(journal, scope,
+      firstTurnReadOnlyPolicy, fake), /unavailable/iu);
+    assert.equal(journal.get(scope.operationId), null);
+  } finally { journal.close(); }
+});
+
+test('production first-turn preparation modules expose no raw-RPC native mutation helper', async () => {
+  const [threadStart, firstTurn] = await Promise.all([
+    import('../src/desktop/native-first-turn-thread-start.js'),
+    import('../src/desktop/native-first-turn-bootstrap-preparation.js'),
+  ]);
+  assert.equal(Object.keys(threadStart).some(name => name.startsWith('dispatch')), false);
+  assert.equal(Object.keys(firstTurn).some(name => name.startsWith('dispatch')), false);
+});
+
+test('first thread/start timeout cannot replay but a late matching ACK can persist', async () => {
+  const { filePath, journal, prepared } = firstTurnStartFixture();
+  let writes = 0;
+  let late: ((value: { result: Record<string, unknown> }) => void) | undefined;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onLateResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }): Promise<unknown> {
+      options.assertBeforeWrite?.(); writes++; late = options.onLateResponseEnvelope;
+      throw new Error('timeout');
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
+      expected => expected);
+    assert.equal(result.state, 'thread-reserved'); assert.equal(writes, 1);
+  } finally { journal.close(); }
+  late?.({ result: firstTurnReadOnlyResult });
+  const reopened = new NativeFirstTurnBootstrapJournal(filePath);
+  try { assert.equal(reopened.get(prepared.identity.operationId)?.state, 'thread-accepted');
+    assert.equal(reopened.get(prepared.identity.operationId)?.threadId, taskId); }
+  finally { reopened.close(); }
+});
+
+test('first thread/start refuses full access and a response before its final write fence', async () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-thread-')), 'journal.sqlite');
+  const journal = new NativeFirstTurnBootstrapJournal(filePath);
+  const identity = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch: randomUUID(), backendIdentity: 'b'.repeat(64) };
+  try {
+    assert.throws(() => prepareNativeFirstThreadStartWithKey(journal, identity,
+      template, Buffer.alloc(32, 7)), /unqualified/u);
+    assert.equal(journal.get(identity.operationId), null);
+  } finally { journal.close(); }
+  const fixture = firstTurnStartFixture();
+  let authority = true, writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) {
+      options.onResponseEnvelope?.({ result: firstTurnReadOnlyResult });
+      authority = false; options.assertBeforeWrite?.(); writes++;
+      return firstTurnReadOnlyResult;
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(fixture.journal,
+      fixture.prepared, rpc, expected => authority ? expected : null);
+    assert.equal(result.state, 'thread-reserved'); assert.equal(writes, 0);
+  } finally { fixture.journal.close(); }
+});
+
+test('first thread/start refuses a replacement backend identity before wire write', async () => {
+  const { journal, prepared } = firstTurnStartFixture();
+  let writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request() { writes++; return firstTurnReadOnlyResult; } };
+  try {
+    const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
+      expected => ({ ...expected, backendIdentity: 'a'.repeat(64) }));
+    assert.equal(result.state, 'thread-reserved'); assert.equal(writes, 0);
+  } finally { journal.close(); }
+});
+
+test('first thread/start HMAC binds exact policy and source without persisting model or key', () => {
+  const identity = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch: randomUUID(), backendIdentity: 'b'.repeat(64) };
+  const key = Buffer.alloc(32, 7);
+  const prepare = (sourceGeneration: string, model: string) => {
+    const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-thread-')),
+      'journal.sqlite');
+    const journal = new NativeFirstTurnBootstrapJournal(filePath);
+    try {
+      const prepared = prepareNativeFirstThreadStartWithKey(journal,
+        { ...identity, sourceGeneration }, { ...firstTurnReadOnlyPolicy, model }, key);
+      assert.equal(journal.get(identity.operationId)?.state, 'thread-reserved');
+      assert.equal(JSON.stringify(journal.get(identity.operationId)).includes(model), false);
+      return prepared.identity.threadStartFingerprint;
+    } finally { journal.close(); }
+  };
+  try {
+    const base = prepare(identity.sourceGeneration, 'gpt-5.6-sol');
+    assert.match(base, /^[a-f0-9]{64}$/u);
+    assert.notEqual(prepare(identity.sourceGeneration, 'gpt-6-sol'), base);
+    assert.notEqual(prepare(randomUUID(), 'gpt-5.6-sol'), base);
+  } finally { key.fill(0); }
+});
 
 test('native start selection projects policy before the first model turn without claiming source or ownership', () => {
   const selected = projectControlledNativeStartPolicy(startResult, template);

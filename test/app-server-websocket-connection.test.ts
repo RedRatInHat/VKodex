@@ -8,7 +8,8 @@ import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
 import { canonicalDetachedProfileHome, createDetachedProfileConnection, createPinnedDetachedProfileConnection,
-  detachedProfileKey, inspectDetachedProfileBackend } from "../src/codex/detached-profile-capability.js";
+  detachedProfileKey, inspectDetachedProfileBackend, pinnedDetachedProfileBackendIdentity } from
+  "../src/codex/detached-profile-capability.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -182,6 +183,42 @@ test("pinned detached profile refuses a different live epoch before its first so
     await assert.rejects(client.start(), AppServerUnavailableError);
     assert.equal(native.connections, 0);
   } finally { await client.close(); await native.close(); }
+});
+
+test("a generic or dependency-injected connector cannot mint a production backend identity", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-no-production-pin");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const expected = { schemaVersion: 1 as const, epoch: "00000000-0000-4000-8000-000000000001",
+    profileKey: detachedProfileKey(home), home, url: native.url,
+    backend: { pid: 1234, birthTicks: "12345678" } };
+  const injected = createPinnedDetachedProfileConnection(directory, home, expected, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(expected) : native.token,
+    identity: pid => ({ pid, birthTicks: expected.backend.birthTicks }),
+  });
+  try {
+    const session = await injected.initializedSession();
+    assert.equal(injected.isSessionCurrent(session.generation), true);
+    assert.throws(() => pinnedDetachedProfileBackendIdentity(injected, session.generation),
+      AppServerUnavailableError);
+    assert.throws(() => pinnedDetachedProfileBackendIdentity({ ...injected }, session.generation),
+      AppServerUnavailableError);
+    const explicitEmptyDependencies = createPinnedDetachedProfileConnection(directory,
+      home, expected, {});
+    assert.throws(() => pinnedDetachedProfileBackendIdentity(explicitEmptyDependencies,
+      session.generation), AppServerUnavailableError);
+    await explicitEmptyDependencies.close();
+    const explicitUndefined = createPinnedDetachedProfileConnection(directory,
+      home, expected, undefined);
+    assert.throws(() => pinnedDetachedProfileBackendIdentity(explicitUndefined,
+      session.generation), AppServerUnavailableError);
+    await explicitUndefined.close();
+    const production = createPinnedDetachedProfileConnection(directory, home, expected);
+    assert.equal(Object.isFrozen(production), true);
+    assert.throws(() => pinnedDetachedProfileBackendIdentity(production, session.generation),
+      AppServerUnavailableError, "another connection's generation does not authorize this pin");
+    await production.close();
+  } finally { await injected.close(); await native.close(); }
 });
 
 test("pinned detached profile accepts only its exact backend and fences replacement", async () => {
