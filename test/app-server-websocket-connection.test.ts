@@ -8,7 +8,8 @@ import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
 import { canonicalDetachedProfileHome, createDetachedProfileConnection, createPinnedDetachedProfileConnection,
-  detachedProfileKey, inspectDetachedProfileBackend, pinnedDetachedProfileBackendIdentity } from
+  detachedProfileKey, inspectDetachedProfileBackend, pinnedDetachedProfileBackendHome,
+  pinnedDetachedProfileBackendIdentity } from
   "../src/codex/detached-profile-capability.js";
 
 type JsonObject = Record<string, unknown>;
@@ -200,6 +201,8 @@ test("a generic or dependency-injected connector cannot mint a production backen
     const session = await injected.initializedSession();
     assert.equal(injected.isSessionCurrent(session.generation), true);
     assert.throws(() => pinnedDetachedProfileBackendIdentity(injected, session.generation),
+      AppServerUnavailableError);
+    assert.throws(() => pinnedDetachedProfileBackendHome(injected, session.generation),
       AppServerUnavailableError);
     assert.throws(() => pinnedDetachedProfileBackendIdentity({ ...injected }, session.generation),
       AppServerUnavailableError);

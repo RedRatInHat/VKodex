@@ -33,6 +33,7 @@ export interface NativeFirstTurnBootstrapIdentity {
   readonly threadStartFingerprint: string;
   readonly backendIdentity: string;
 }
+export type NativeFirstThreadStartFenceStatus = 'not-passed' | 'passed' | 'legacy-unknown';
 
 // Codex thread IDs may be UUIDv7; creator/owner IDs are currently UUIDv4.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -96,6 +97,11 @@ export class NativeFirstTurnBootstrapJournal {
           OR (state IN ('turn-reserved','turn-unknown') AND revision IN (3,4) AND thread_id IS NOT NULL AND client_user_message_id IS NOT NULL AND keyed_fingerprint IS NOT NULL AND turn_id IS NULL)
           OR (state='turn-accepted' AND revision IN (4,5) AND thread_id IS NOT NULL AND client_user_message_id IS NOT NULL AND keyed_fingerprint IS NOT NULL AND turn_id IS NOT NULL))
       )`);
+      // Rows created before this table existed have unknown write history. A
+      // missing marker must never be interpreted as proof of no socket write.
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS native_first_thread_start_fences (
+        operation_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('not-passed','passed'))
+      )`);
     } catch (error) { this.#db.close(); throw error; }
   }
   close(): void { if (!this.#closed) { this.#closed = true; this.#db.close(); } }
@@ -109,6 +115,15 @@ export class NativeFirstTurnBootstrapJournal {
     const row = this.#db.prepare('SELECT * FROM native_first_turn_bootstraps WHERE operation_id=?').get(operationId) as Row | undefined;
     return row ? validRow(row) : null;
   }
+  getThreadStartFenceStatus(operationId: string): NativeFirstThreadStartFenceStatus {
+    this.#open(); if (!UUID.test(operationId) || !this.get(operationId)) fail();
+    const row = this.#db.prepare('SELECT status FROM native_first_thread_start_fences WHERE operation_id=?')
+      .get(operationId) as { status: string } | undefined;
+    if (!row) return 'legacy-unknown';
+    const status = row.status;
+    if (status === 'not-passed' || status === 'passed') return status;
+    return fail();
+  }
   persistThreadStartIntent(intent: NativeFirstTurnBootstrapIdentity): void {
     this.#open(); validIdentity(intent);
     try { this.#db.transaction(() => {
@@ -119,6 +134,20 @@ export class NativeFirstTurnBootstrapJournal {
         (operation_id,source_id,source_generation,owner_epoch,start_fingerprint,backend_identity,state,revision)
         VALUES (?,?,?,?,?,?,'thread-reserved',1)`).run(intent.operationId, intent.sourceId,
         intent.sourceGeneration, intent.ownerEpoch, intent.threadStartFingerprint, intent.backendIdentity);
+      this.#db.prepare(`INSERT INTO native_first_thread_start_fences (operation_id,status)
+        VALUES (?,'not-passed')`).run(intent.operationId);
+    }).immediate(); } catch { fail(); }
+  }
+  /** Durable boundary immediately before the native socket write. A passed
+   * marker means a write MAY have happened, never that a write or ACK did. */
+  markThreadStartWriteFencePassed(operationId: string): void {
+    this.#open(); if (!UUID.test(operationId)) fail();
+    try { this.#db.transaction(() => {
+      const current = this.get(operationId);
+      if (!current || current.state !== 'thread-reserved' || current.revision !== 1) fail();
+      const changed = this.#db.prepare(`UPDATE native_first_thread_start_fences SET status='passed'
+        WHERE operation_id=? AND status='not-passed'`).run(operationId);
+      if (changed.changes !== 1) fail();
     }).immediate(); } catch { fail(); }
   }
   persistThreadAccepted({ operationId, expectedRevision, threadId }: {

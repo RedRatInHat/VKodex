@@ -40,7 +40,6 @@ export async function dispatchPreparedNativeFirstThreadStartForOfflineTest(
       record.backendIdentity !== prepared.identity.backendIdentity ||
       record.threadStartFingerprint !== prepared.identity.threadStartFingerprint) return fail();
   const filePath = journal.filePath();
-  let writeFencePassed = false;
   const authorized = (generation: number): boolean => {
     const expected = Object.freeze({ backendIdentity: prepared.identity.backendIdentity,
       sourceId: prepared.identity.sourceId, sourceGeneration: prepared.identity.sourceGeneration,
@@ -53,7 +52,7 @@ export async function dispatchPreparedNativeFirstThreadStartForOfflineTest(
       observed.backendGeneration === expected.backendGeneration;
   };
   const positiveAck = (envelope: AppServerResponseEnvelope): void => {
-    if (!writeFencePassed || !('result' in envelope)) return;
+    if (!('result' in envelope)) return;
     let threadId: string;
     try { threadId = projectControlledNativeStartPolicy(envelope.result,
       prepared.requestedPolicy).threadId; }
@@ -61,6 +60,7 @@ export async function dispatchPreparedNativeFirstThreadStartForOfflineTest(
     try {
       const reopened = new NativeFirstTurnBootstrapJournal(filePath);
       try {
+        if (reopened.getThreadStartFenceStatus(prepared.identity.operationId) !== 'passed') return;
         const current = reopened.get(prepared.identity.operationId);
         if (current?.state === 'thread-reserved' && current.revision === 1 &&
             current.sourceId === prepared.identity.sourceId &&
@@ -81,7 +81,7 @@ export async function dispatchPreparedNativeFirstThreadStartForOfflineTest(
       mutating: true, expectedGeneration: session.generation,
       assertBeforeWrite: () => {
         if (!rpc.isSessionCurrent(session.generation) || !authorized(session.generation)) fail();
-        writeFencePassed = true;
+        journal.markThreadStartWriteFencePassed(prepared.identity.operationId);
       },
       onResponseEnvelope: positiveAck, onLateResponseEnvelope: positiveAck,
     });

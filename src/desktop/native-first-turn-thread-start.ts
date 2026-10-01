@@ -1,15 +1,21 @@
 import { createHmac } from 'node:crypto';
-import { pinnedDetachedProfileBackendIdentity,
+import path from 'node:path';
+import { pinnedDetachedProfileBackendHome, pinnedDetachedProfileBackendIdentity,
   type PinnedDetachedProfileRpc } from '../codex/detached-profile-capability.js';
 import { compileControlledNativeStartParams,
   type PolicyTemplate } from './controlled-native-task-creator.js';
 import { NativeFirstTurnBootstrapJournal, type NativeFirstTurnBootstrapIdentity } from
   './native-first-turn-bootstrap-journal.js';
 import { loadNativeFirstTurnPrivateKey } from './native-first-turn-private-key.js';
+import { assertAuthenticatedProfileSourcePreflightForWrite,
+  assertAuthenticatedProfileSourceReceiptForWrite,
+  persistAuthenticatedProfileSourcePreflightReceipt,
+  type AuthenticatedProfileSourcePreflight } from './controlled-native-source-proof.js';
 
 type StartIdentity = Omit<NativeFirstTurnBootstrapIdentity, 'threadStartFingerprint'>;
 type StartParams = ReturnType<typeof compileControlledNativeStartParams>;
 const issued = new WeakSet<object>();
+const production = new WeakMap<object, NativeFirstThreadProductionAuthority>();
 const fail = (): never => { throw new Error('Native first thread/start unqualified'); };
 function freezeTree<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
@@ -34,9 +40,27 @@ export interface NativeFirstThreadStartPrepared {
   readonly params: StartParams;
   readonly requestedPolicy: PolicyTemplate;
 }
+export interface NativeFirstThreadProductionAuthority {
+  readonly journal: NativeFirstTurnBootstrapJournal;
+  readonly rpc: PinnedDetachedProfileRpc;
+  readonly preflight: AuthenticatedProfileSourcePreflight;
+  readonly backendGeneration: number;
+  readonly sourceHome: string;
+  readonly workspace: string;
+  readonly preflightReceiptPath: string;
+}
 /** Consuming a preparation only retires its in-process token. No native RPC. */
 export function consumePreparedNativeFirstThreadStart(prepared: NativeFirstThreadStartPrepared): boolean {
   return !!prepared && issued.delete(prepared);
+}
+
+/** Production-only canary claim. An offline key or injected RPC cannot mint it. */
+export function consumeProductionPreparedNativeFirstThreadStart(
+  prepared: NativeFirstThreadStartPrepared): NativeFirstThreadProductionAuthority | null {
+  const authority = production.get(prepared);
+  if (!authority || !consumePreparedNativeFirstThreadStart(prepared)) return null;
+  production.delete(prepared);
+  return authority;
 }
 
 /** A separate durable intent precedes the only possible native thread/start.
@@ -60,20 +84,36 @@ export function prepareNativeFirstThreadStartWithKey(journal: NativeFirstTurnBoo
 
 /** Production preparation accepts no caller-provided backend digest. It
  * derives one from a live, dependency-free production-pinned connector,
- * then loads only the existing DPAPI key from this operation's directory.
- * This stage proves neither source nor owner and makes no native mutation. */
+ * verifies the v3 physical source, then loads the existing DPAPI key and
+ * persists the exact source receipt. It makes no native mutation and does
+ * not confer authority over an existing task or a model turn. */
 export async function prepareNativeFirstThreadStart(journal: NativeFirstTurnBootstrapJournal,
   scope: Omit<StartIdentity, 'backendIdentity'>, requestedPolicy: PolicyTemplate,
-  rpc: PinnedDetachedProfileRpc): Promise<NativeFirstThreadStartPrepared> {
+  rpc: PinnedDetachedProfileRpc,
+  preflight: AuthenticatedProfileSourcePreflight): Promise<NativeFirstThreadStartPrepared> {
   const session = await rpc.initializedSession();
   const backendIdentity = pinnedDetachedProfileBackendIdentity(rpc, session.generation);
+  const sourceHome = pinnedDetachedProfileBackendHome(rpc, session.generation);
+  const sourceIdentity = { operationId: scope.operationId, sourceId: scope.sourceId,
+    sourceGeneration: scope.sourceGeneration };
+  assertAuthenticatedProfileSourcePreflightForWrite(preflight, sourceIdentity,
+    sourceHome, requestedPolicy.cwd);
   const key = await loadNativeFirstTurnPrivateKey(journal.directory());
   try {
+    const preflightReceiptPath = path.join(journal.directory(), 'source-preflight.json');
+    await persistAuthenticatedProfileSourcePreflightReceipt(preflightReceiptPath, preflight);
     // DPAPI loading is asynchronous. A disconnect during it must not strand a
     // freshly persisted one-shot intent for a session that no longer exists.
     if (pinnedDetachedProfileBackendIdentity(rpc, session.generation) !== backendIdentity) fail();
-    return prepareNativeFirstThreadStartWithKey(journal,
+    assertAuthenticatedProfileSourcePreflightForWrite(preflight, sourceIdentity,
+      sourceHome, requestedPolicy.cwd);
+    assertAuthenticatedProfileSourceReceiptForWrite(preflightReceiptPath, preflight);
+    const prepared = prepareNativeFirstThreadStartWithKey(journal,
       { ...scope, backendIdentity }, requestedPolicy, key);
+    production.set(prepared, Object.freeze({ journal, rpc, preflight,
+      backendGeneration: session.generation, sourceHome, workspace: requestedPolicy.cwd,
+      preflightReceiptPath }));
+    return prepared;
   }
   finally { key.fill(0); }
 }

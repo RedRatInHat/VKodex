@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync,
+  realpathSync, statSync } from 'node:fs';
 import { lstat, open, realpath, readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { comparablePath } from '../core/paths.js';
@@ -426,6 +427,35 @@ function profileReceipt(preflight: AuthenticatedProfileSourcePreflight): string 
     sourceHomeBirthtimeMs: preflight.sourceHomeIdentity.birthtimeMs.toString(),
     workspaceDev: workspacePin.dev.toString(), workspaceIno: workspacePin.ino.toString(),
     workspaceBirthtimeMs: workspacePin.birthtimeMs.toString() });
+}
+
+/** Synchronous final fence for the v3 pre-write source receipt. A valid
+ * in-memory preflight alone is not enough to reconcile a lost thread/start
+ * after process death; its exact durable receipt must survive the write. */
+export function assertAuthenticatedProfileSourceReceiptForWrite(filePath: string,
+  preflight: AuthenticatedProfileSourcePreflight): void {
+  try {
+    if (!absolute(filePath) || !validProfilePreflight(preflight) ||
+        lstatSync(filePath).isSymbolicLink()) refuse();
+    const expected = Buffer.from(profileReceipt(preflight), 'utf8');
+    if (expected.byteLength < 1 || expected.byteLength > MAX_RECEIPT_BYTES) refuse();
+    const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const before = fstatSync(fd, { bigint: true });
+      if (!before.isFile() || before.size !== BigInt(expected.byteLength)) refuse();
+      const actual = Buffer.alloc(expected.byteLength);
+      let offset = 0;
+      while (offset < actual.byteLength) {
+        const received = readSync(fd, actual, offset, actual.byteLength - offset, offset);
+        if (received <= 0) refuse();
+        offset += received;
+      }
+      const after = fstatSync(fd, { bigint: true });
+      if (after.dev !== before.dev || after.ino !== before.ino ||
+          after.birthtimeMs !== before.birthtimeMs || after.size !== before.size ||
+          !actual.equals(expected)) refuse();
+    } finally { closeSync(fd); }
+  } catch { refuse(); }
 }
 
 /** Persists a versioned receipt for the candidate-only authenticated-profile variant. */

@@ -43,7 +43,7 @@ export interface PinnedDetachedProfileRpc extends AppServerRpc {
 
 // Only the dependency-free production factory grants a backend identity to a
 // future native writer. Injected readers used by tests cannot mint one.
-const productionPinnedBackends = new WeakMap<object, string>();
+const productionPinnedBackends = new WeakMap<object, Readonly<{ identity: string; home: string }>>();
 function backendIdentityOf(descriptor: DetachedProfileDescriptor): string {
   return createHash("sha256").update("vkodex-pinned-detached-backend-v1\0")
     .update(JSON.stringify([descriptor.epoch, descriptor.profileKey,
@@ -56,10 +56,18 @@ function backendIdentityOf(descriptor: DetachedProfileDescriptor): string {
  * supplying identity to an intent. This is not source or owner authority. */
 export function pinnedDetachedProfileBackendIdentity(rpc: PinnedDetachedProfileRpc,
   generation: number): string {
-  const identity = productionPinnedBackends.get(rpc);
-  if (!identity || !Number.isSafeInteger(generation) || generation < 1 ||
+  const pinned = productionPinnedBackends.get(rpc);
+  if (!pinned || !Number.isSafeInteger(generation) || generation < 1 ||
       !rpc.isSessionCurrent(generation)) return unavailable();
-  return identity;
+  return pinned.identity;
+}
+
+/** Physical profile source of this exact production-pinned backend. A caller
+ * still needs a separate source preflight and owner/queue admission. */
+export function pinnedDetachedProfileBackendHome(rpc: PinnedDetachedProfileRpc,
+  generation: number): string {
+  pinnedDetachedProfileBackendIdentity(rpc, generation);
+  return productionPinnedBackends.get(rpc)!.home;
 }
 
 /** Stable private locator; never use a VK-supplied name as a path segment. */
@@ -328,7 +336,7 @@ export function createPinnedDetachedProfileConnection(privateDirectory: string,
   const rpc = createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
   if (arguments.length === 3) {
     Object.freeze(rpc);
-    productionPinnedBackends.set(rpc, backendIdentityOf(pin));
+    productionPinnedBackends.set(rpc, Object.freeze({ identity: backendIdentityOf(pin), home: pin.home }));
   }
   return rpc;
 }

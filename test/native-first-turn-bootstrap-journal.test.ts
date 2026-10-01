@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import DatabaseConstructor from 'better-sqlite3';
 import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
 import { createPrivateKeyWithDependencies, loadPrivateKeyWithDependencies } from
   '../src/desktop/native-first-turn-private-key-core.js';
@@ -31,6 +32,7 @@ test('durably sequences thread creation before a first-turn reservation without 
   const operationId = randomUUID();
   const source = identity();
   journal.persistThreadStartIntent({ operationId, ...source });
+  assert.equal(journal.getThreadStartFenceStatus(operationId), 'not-passed');
   assert.deepEqual(journal.get(operationId), { operationId, ...source, state: 'thread-reserved', revision: 1,
     threadId: null, clientUserMessageId: null, keyedFingerprint: null, turnId: null });
   journal.close();
@@ -38,6 +40,9 @@ test('durably sequences thread creation before a first-turn reservation without 
   assert.equal(journal.get(operationId)?.state, 'thread-reserved');
   assert.throws(() => journal.persistThreadStartIntent({ operationId, ...source }), /conflict/u);
   assert.throws(() => journal.persistThreadStartIntent({ operationId: randomUUID(), ...identity() }), /conflict/u);
+  journal.markThreadStartWriteFencePassed(operationId);
+  assert.equal(journal.getThreadStartFenceStatus(operationId), 'passed');
+  assert.throws(() => journal.markThreadStartWriteFencePassed(operationId), /conflict/u);
 
   const threadId = '01a0f511-86e7-7942-8067-91d169eb18c7'; // Native UUIDv7, not randomUUID() v4.
   journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId });
@@ -45,6 +50,35 @@ test('durably sequences thread creation before a first-turn reservation without 
     keyedFingerprint: fingerprint('first') });
   assert.deepEqual(journal.get(operationId), { operationId, ...source, state: 'turn-reserved', revision: 3,
     threadId, clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first'), turnId: null });
+  journal.close();
+});
+
+test('write fence is durable, CAS-bound, and absent legacy markers remain unknown', () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite');
+  const operationId = randomUUID();
+  let journal = open(filePath);
+  assert.throws(() => journal.getThreadStartFenceStatus(operationId), /conflict/u);
+  journal.persistThreadStartIntent({ operationId, ...identity() });
+  journal.close();
+  journal = open(filePath);
+  assert.equal(journal.getThreadStartFenceStatus(operationId), 'not-passed');
+  assert.throws(() => journal.markThreadStartWriteFencePassed(randomUUID()), /conflict/u);
+  journal.markThreadStartWriteFencePassed(operationId);
+  journal.close();
+  journal = open(filePath);
+  assert.equal(journal.getThreadStartFenceStatus(operationId), 'passed');
+  journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId: randomUUID() });
+  assert.throws(() => journal.markThreadStartWriteFencePassed(operationId), /conflict/u);
+  journal.close();
+
+  // Simulate a database written by the earlier journal version, which did not
+  // have this table. Recreating its schema cannot reconstruct a past write.
+  const old = new DatabaseConstructor(filePath);
+  old.exec('DROP TABLE native_first_thread_start_fences');
+  old.close();
+  journal = open(filePath);
+  assert.equal(journal.getThreadStartFenceStatus(operationId), 'legacy-unknown');
+  assert.throws(() => journal.markThreadStartWriteFencePassed(operationId), /conflict/u);
   journal.close();
 });
 

@@ -10,6 +10,7 @@ import type { ControlledCreationIntent, ControlledCreationStarted,
   ControlledCreationReceipt } from '../src/desktop/controlled-native-task-creator.js';
 import { captureControlledNativeSourcePreflight, ControlledNativeSourceUnqualifiedError,
   assertAuthenticatedProfileSourcePreflightForWrite,
+  assertAuthenticatedProfileSourceReceiptForWrite,
   captureAuthenticatedProfileSourcePreflight,
   loadAuthenticatedProfileSourcePreflightReceipt,
   loadControlledNativeSourcePreflightReceipt, persistControlledNativeSourcePreflightReceipt,
@@ -376,6 +377,20 @@ test('authenticated-profile durable receipt recovers candidate-only proof after 
   const restored = await loadAuthenticatedProfileSourcePreflightReceipt(receipt, identity, f.home, f.workspace);
   assert.equal((await proveAuthenticatedProfileSource(restored, candidate, threadA)).rolloutPath,
     await import('node:fs/promises').then(({ realpath }) => realpath(candidate)));
+});
+
+test('authenticated-profile write fence requires the exact durable v3 receipt', async () => {
+  const f = await setup(), receipt = path.join(f.root, 'source-preflight.json');
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  assert.throws(() => assertAuthenticatedProfileSourceReceiptForWrite(receipt, preflight));
+  await persistAuthenticatedProfileSourcePreflightReceipt(receipt, preflight);
+  assert.doesNotThrow(() => assertAuthenticatedProfileSourceReceiptForWrite(receipt, preflight));
+  const { readFile } = await import('node:fs/promises');
+  const changed = JSON.parse(await readFile(receipt, 'utf8')) as Record<string, unknown>;
+  changed.capturedAtMs = (changed.capturedAtMs as number) + 1;
+  await writeFile(receipt, JSON.stringify(changed));
+  assert.throws(() => assertAuthenticatedProfileSourceReceiptForWrite(receipt, preflight),
+    ControlledNativeSourceUnqualifiedError);
 });
 
 test('legacy authenticated-profile v2 receipt remains read-only reconcilable but cannot authorize a write', async () => {

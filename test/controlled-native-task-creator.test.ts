@@ -15,6 +15,8 @@ import { ControlledNativeCreationJournal } from '../src/desktop/controlled-nativ
 import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
 import { prepareNativeFirstThreadStart, prepareNativeFirstThreadStartWithKey } from
   '../src/desktop/native-first-turn-thread-start.js';
+import { dispatchPreparedNativeFirstThreadStartCanary } from
+  '../src/desktop/native-first-thread-start-canary.js';
 import { dispatchPreparedNativeFirstThreadStartForOfflineTest } from
   './support/native-first-thread-start-harness.js';
 import type { PinnedDetachedProfileRpc } from '../src/codex/detached-profile-capability.js';
@@ -67,7 +69,10 @@ test('one-shot first thread/start persists keyed intent before a policy-qualifie
       assert.equal(method, 'thread/start'); assert.equal(options.mutating, true);
       assert.equal(options.expectedGeneration, 5);
       assert.deepEqual(params, compileControlledNativeStartParams(firstTurnReadOnlyPolicy));
-      options.assertBeforeWrite?.(); writes++;
+      assert.equal(journal.getThreadStartFenceStatus(prepared.identity.operationId), 'not-passed');
+      options.assertBeforeWrite?.();
+      assert.equal(journal.getThreadStartFenceStatus(prepared.identity.operationId), 'passed');
+      writes++;
       options.onResponseEnvelope?.({ result: firstTurnReadOnlyResult });
       return firstTurnReadOnlyResult;
     } };
@@ -76,6 +81,7 @@ test('one-shot first thread/start persists keyed intent before a policy-qualifie
       expected => expected);
     assert.equal(result.state, 'thread-accepted'); assert.equal(result.threadId, taskId);
     assert.equal(writes, 1);
+    assert.equal(journal.getThreadStartFenceStatus(prepared.identity.operationId), 'passed');
     await assert.rejects(dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
       expected => expected), /unqualified/u);
     assert.equal(writes, 1);
@@ -94,8 +100,17 @@ test('production first thread preparation refuses an unpinned RPC before reservi
     isSessionCurrent: () => true } as unknown as PinnedDetachedProfileRpc;
   try {
     await assert.rejects(prepareNativeFirstThreadStart(journal, scope,
-      firstTurnReadOnlyPolicy, fake), /unavailable/iu);
+      firstTurnReadOnlyPolicy, fake, {} as never), /unavailable/iu);
     assert.equal(journal.get(scope.operationId), null);
+  } finally { journal.close(); }
+});
+
+test('production first-thread canary refuses an offline-key preparation without a native write', async () => {
+  const { journal, prepared } = firstTurnStartFixture();
+  try {
+    await assert.rejects(dispatchPreparedNativeFirstThreadStartCanary(journal, prepared),
+      /canary unqualified/u);
+    assert.equal(journal.get(prepared.identity.operationId)?.state, 'thread-reserved');
   } finally { journal.close(); }
 });
 
@@ -125,6 +140,7 @@ test('first thread/start timeout cannot replay but a late matching ACK can persi
     const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(journal, prepared, rpc,
       expected => expected);
     assert.equal(result.state, 'thread-reserved'); assert.equal(writes, 1);
+    assert.equal(journal.getThreadStartFenceStatus(prepared.identity.operationId), 'passed');
   } finally { journal.close(); }
   late?.({ result: firstTurnReadOnlyResult });
   const reopened = new NativeFirstTurnBootstrapJournal(filePath);
@@ -159,6 +175,8 @@ test('first thread/start refuses full access and a response before its final wri
     const result = await dispatchPreparedNativeFirstThreadStartForOfflineTest(fixture.journal,
       fixture.prepared, rpc, expected => authority ? expected : null);
     assert.equal(result.state, 'thread-reserved'); assert.equal(writes, 0);
+    assert.equal(fixture.journal.getThreadStartFenceStatus(fixture.prepared.identity.operationId),
+      'not-passed');
   } finally { fixture.journal.close(); }
 });
 
