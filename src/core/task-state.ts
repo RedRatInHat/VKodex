@@ -139,7 +139,7 @@ interface TaskStateConnection {
 export class TaskStateConnections {
   private readonly connections = new Map<string, TaskStateConnection>();
   private readonly lastFailures = new Map<string, { key: string; at: number; diagnostic: TaskStateRouteDiagnostic }>();
-  private readonly retryAfter = new Map<string, number>();
+  private readonly retryAfter = new Map<string, { since: number; until: number }>();
   private generation = 0;
 
   constructor(private readonly transport: TaskStateTransport, private readonly now: () => number = Date.now) {}
@@ -167,10 +167,23 @@ export class TaskStateConnections {
   }
   connected(id: string, freshnessMs = 45_000): boolean {
     const connection = this.connections.get(id);
-    return !!connection?.ready && connection.lastVerifiedAt !== null && this.now() - connection.lastVerifiedAt <= freshnessMs;
+    if (!connection?.ready || connection.lastVerifiedAt === null) return false;
+    const age = this.now() - connection.lastVerifiedAt;
+    return age >= 0 && age <= freshnessMs;
   }
-  canAttempt(id: string): boolean { return this.now() >= (this.retryAfter.get(id) ?? 0); }
-  postpone(id: string, delayMs: number): void { this.retryAfter.set(id, this.now() + delayMs); }
+  canAttempt(id: string): boolean {
+    const gate = this.retryAfter.get(id);
+    if (!gate) return true;
+    const now = this.now();
+    if (now >= gate.since && now < gate.until) return false;
+    // A backwards clock adjustment invalidates the old wall-clock deadline.
+    this.retryAfter.delete(id);
+    return true;
+  }
+  postpone(id: string, delayMs: number): void {
+    const since = this.now();
+    this.retryAfter.set(id, { since, until: since + delayMs });
+  }
 
   close(id: string): void {
     const connection = this.connections.get(id);
@@ -222,8 +235,9 @@ export class TaskStateConnections {
 
   maintain(id: string, intervalMs = 30_000): void {
     const connection = this.connections.get(id);
-    if (!connection || connection.verifying || connection.lastVerifiedAt !== null
-      && this.now() - connection.lastVerifiedAt < intervalMs) return;
+    if (!connection || connection.verifying) return;
+    const age = connection.lastVerifiedAt === null ? null : this.now() - connection.lastVerifiedAt;
+    if (age !== null && age >= 0 && age < intervalMs) return;
     const check = connection.stream.verifyOwner().then(() => {
       if (this.connections.get(id) === connection) connection.lastVerifiedAt = this.now();
     }, error => this.fail(id, connection.stream, error)).finally(() => {

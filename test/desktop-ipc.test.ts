@@ -4906,6 +4906,43 @@ test("task state diagnostics distinguish explicit route evidence from unknown an
   await connections.stop();
 });
 
+test("task state owner evidence is reverified after the wall clock moves backwards", async () => {
+  let now = 1_000;
+  let verifications = 0;
+  const transport: TaskStateTransport = {
+    subscribe(task) {
+      return { task, start: async () => {}, verifyOwner: async () => { verifications++; },
+        diagnostic: () => ({ kind: "native-observer" }), close: () => {} };
+    }, close() {},
+  };
+  const connections = new TaskStateConnections(transport, () => now);
+  await connections.connect("binding", ref, () => {}, () => {});
+  assert.equal(connections.connected("binding"), true);
+  now = 999;
+  assert.equal(connections.connected("binding"), false);
+  assert.deepEqual(connections.diagnostic("binding"), { kind: "unknown", routeGeneration: 1 });
+  connections.maintain("binding");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(verifications, 1);
+  assert.equal(connections.connected("binding"), true);
+  await connections.stop();
+});
+
+test("task state reconnect gate does not remain delayed after the wall clock moves backwards", () => {
+  let now = 1_000;
+  const transport: TaskStateTransport = { subscribe: () => { throw new Error("unused"); }, close() {} };
+  const connections = new TaskStateConnections(transport, () => now);
+  connections.postpone("binding", 30_000);
+  assert.equal(connections.canAttempt("binding"), false);
+  now = 999;
+  assert.equal(connections.canAttempt("binding"), true);
+  connections.postpone("binding", 30_000);
+  now = 30_998;
+  assert.equal(connections.canAttempt("binding"), false);
+  now = 30_999;
+  assert.equal(connections.canAttempt("binding"), true);
+});
+
 test("Desktop state stream reports native observer route and only its discovered native owner id", async t => {
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100); t.after(() => client.close());
   const transport = new DesktopTaskStateTransport(client); t.after(() => transport.close());
