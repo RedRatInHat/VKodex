@@ -200,9 +200,8 @@ export class TaskSubscription {
     this.cancelStart?.(error); this.cancelStart = null;
     this.unsubscribe?.(); this.unsubscribe = null;
     this.disconnect?.(); this.disconnect = null;
-    // The desktop owner currently treats following as task-wide rather than
-    // follower-scoped. A short-lived command subscription must therefore leave
-    // following enabled, otherwise closing it also silences the durable mirror.
+    // Current Desktop scopes following by IPC client. This opt-in notification
+    // preserves compatibility with older owners whose scope was not qualified.
     if (this.notifyOwnerOnClose) {
       try { this.follow(false); } catch { /* The socket may already be closed. */ }
     }

@@ -5,6 +5,7 @@ import { lstat, mkdir, readdir, realpath, rename, stat } from "node:fs/promises"
 import { once } from "node:events";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import type { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { promisify } from "node:util";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
@@ -167,18 +168,36 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-export async function readTransferContext(rolloutPath: string, lastTurnId: string): Promise<TransferContext> {
+async function closeRolloutReader(input: Readable, lines: ReturnType<typeof createInterface>, bodyFailed = false): Promise<void> {
+  const closed = finished(input, { cleanup: true });
+  lines.close();
+  input.destroy();
+  // On Windows a destroyed stream can still hold its file handle until close.
+  try { await closed; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ERR_STREAM_PREMATURE_CLOSE" && code !== "ABORT_ERR" && !bodyFailed) throw error;
+  }
+}
+
+export async function readTransferContext(rolloutPath: string, lastTurnId: string,
+  openInput: (rolloutPath: string) => Readable = path => createReadStream(path, { encoding: "utf8" })): Promise<TransferContext> {
   let matching: IpcObject | null = null; let latest: IpcObject | null = null;
   try {
-    const lines = createInterface({ input: createReadStream(rolloutPath, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of lines) {
-      if (!line.includes('"turn_context"')) continue;
-      let record: unknown;
-      try { record = JSON.parse(line); } catch { throw new TransferConflictError("Журнал задачи повреждён; настройки переноса не подтверждены."); }
-      if (!isObject(record) || record.type !== "turn_context" || !isObject(record.payload)) continue;
-      latest = record.payload;
-      if (record.payload.turn_id === lastTurnId) matching = record.payload;
-    }
+    const input = openInput(rolloutPath);
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    let bodyFailed = false;
+    try {
+      for await (const line of lines) {
+        if (!line.includes('"turn_context"')) continue;
+        let record: unknown;
+        try { record = JSON.parse(line); } catch { throw new TransferConflictError("Журнал задачи повреждён; настройки переноса не подтверждены."); }
+        if (!isObject(record) || record.type !== "turn_context" || !isObject(record.payload)) continue;
+        latest = record.payload;
+        if (record.payload.turn_id === lastTurnId) matching = record.payload;
+      }
+    } catch (error) { bodyFailed = true; throw error; }
+    finally { await closeRolloutReader(input, lines, bodyFailed); }
   } catch (error) {
     if (error instanceof TransferConflictError) throw error;
     throw new DesktopUnavailableError("Не удалось прочитать настройки из истории задачи.");
@@ -243,8 +262,10 @@ async function portableRolloutDigest(rolloutPath: string, home: string, lastTurn
   const events = new Set(["user_message", "agent_message", "task_complete", "task_failed", "task_aborted"]);
   for (const slice of await transferRolloutSlices(rolloutPath, home)) {
     const input = createReadStream(slice.path, { encoding: "utf8" });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    let bodyFailed = false;
     try {
-      for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+      for await (const line of lines) {
         if (!line.includes('"event_msg"') && !line.includes('"turn_context"')) continue;
         let record: unknown;
         try { record = transferCompatibleRecord(JSON.parse(line)); }
@@ -273,7 +294,8 @@ async function portableRolloutDigest(rolloutPath: string, home: string, lastTurn
           if (boundarySeen) return hash.digest("hex");
         }
       }
-    } finally { input.destroy(); }
+    } catch (error) { bodyFailed = true; throw error; }
+    finally { await closeRolloutReader(input, lines, bodyFailed); }
   }
   if (!boundarySeen || messages === 0 || terminalTurns === 0) {
     throw new TransferConflictError("Граница или сообщения истории отсутствуют в одном из журналов. Переключение VK остановлено.");
@@ -292,7 +314,7 @@ async function rolloutHistoryMode(rolloutPath: string): Promise<string | null> {
         && typeof record.payload.history_mode === "string" ? record.payload.history_mode : null;
     }
   } catch { return null; }
-  finally { lines.close(); input.destroy(); }
+  finally { await closeRolloutReader(input, lines); }
   return null;
 }
 
@@ -357,8 +379,9 @@ export async function stageTransferRollout(sourcePath: string, sourceHome: strin
     let boundarySeen = false;
     for (const slice of slices) {
       const input = createReadStream(slice.path, { encoding: "utf8", signal: controller.signal });
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      let bodyFailed = false;
       try {
-        const lines = createInterface({ input, crlfDelay: Infinity });
         for await (const line of lines) {
           if (!line.trim()) continue;
           let record: unknown;
@@ -377,7 +400,8 @@ export async function stageTransferRollout(sourcePath: string, sourceHome: strin
           }
           if (!writer.write(`${JSON.stringify(transferCompatibleRecord(record))}\n`)) await once(writer, "drain");
         }
-      } finally { input.destroy(); }
+      } catch (error) { bodyFailed = true; throw error; }
+      finally { await closeRolloutReader(input, lines, bodyFailed); }
       if (nextOrdinal !== undefined && nextOrdinal < slice.until && Number.isFinite(slice.until)) {
         throw new TransferConflictError("Сегмент истории Codex обрывается до следующего журнала. Копия не создана.");
       }
@@ -405,18 +429,22 @@ export async function stageTransferRollout(sourcePath: string, sourceHome: strin
   };
 }
 
-export async function rolloutContainsThread(rolloutPath: string, threadId: string): Promise<boolean> {
+export async function rolloutContainsThread(rolloutPath: string, threadId: string,
+  openInput: (rolloutPath: string) => Readable = path => createReadStream(path, { encoding: "utf8" })): Promise<boolean> {
   try {
-    const lines = createInterface({ input: createReadStream(rolloutPath, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of lines) {
-      // A fork of a fork appends its parent session metadata after inherited
-      // history. Limiting this scan to the header misses return transfers.
-      if (!line.includes('"session_meta"')) continue;
-      let record: unknown;
-      try { record = JSON.parse(line); } catch { return false; }
-      if (isObject(record) && record.type === "session_meta" && isObject(record.payload)
-        && (record.payload.id === threadId || record.payload.session_id === threadId)) return true;
-    }
+    const input = openInput(rolloutPath);
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        // A fork of a fork appends its parent session metadata after inherited
+        // history. Limiting this scan to the header misses return transfers.
+        if (!line.includes('"session_meta"')) continue;
+        let record: unknown;
+        try { record = JSON.parse(line); } catch { return false; }
+        if (isObject(record) && record.type === "session_meta" && isObject(record.payload)
+          && (record.payload.id === threadId || record.payload.session_id === threadId)) return true;
+      }
+    } finally { await closeRolloutReader(input, lines); }
   } catch { return false; }
   return false;
 }
@@ -427,15 +455,18 @@ async function lastInheritedThread(rolloutPath: string, targetThreadId: string):
   // session header identifies the actual source of the copied branch.
   let inherited: string | null = null;
   try {
-    const lines = createInterface({ input: createReadStream(rolloutPath, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of lines) {
-      if (!line.includes('"session_meta"')) continue;
-      let record: unknown;
-      try { record = JSON.parse(line); } catch { return null; }
-      if (!isObject(record) || record.type !== "session_meta" || !isObject(record.payload)) continue;
-      const id = record.payload.id ?? record.payload.session_id;
-      if (typeof id === "string" && id !== targetThreadId) inherited = id;
-    }
+    const input = createReadStream(rolloutPath, { encoding: "utf8" });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (!line.includes('"session_meta"')) continue;
+        let record: unknown;
+        try { record = JSON.parse(line); } catch { return null; }
+        if (!isObject(record) || record.type !== "session_meta" || !isObject(record.payload)) continue;
+        const id = record.payload.id ?? record.payload.session_id;
+        if (typeof id === "string" && id !== targetThreadId) inherited = id;
+      }
+    } finally { await closeRolloutReader(input, lines); }
   } catch { return null; }
   return inherited;
 }

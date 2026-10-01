@@ -183,8 +183,9 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   private async connect(task: TaskRef, timeoutMs = TASK_SNAPSHOT_TIMEOUT_MS): Promise<{ readonly subscription: TaskSubscription; readonly client: DesktopIpcClient }> {
     const attempt = async (timeoutMs: number) => {
       const client = this.createClient();
-      // Command clients are ephemeral. Sending `following: false` when they
-      // close disables the task-wide stream used by the persistent mirror.
+      // Command clients are ephemeral. Keep their close notification disabled
+      // for compatibility with older owners; current Desktop scopes followers
+      // by IPC client, but that has not been qualified for every supported owner.
       const subscription = new TaskSubscription(client, task, () => {}, () => {}, false);
       try { await subscription.start(timeoutMs); return { subscription, client }; }
       catch (error) { subscription.close(); client.close(); throw error; }
@@ -582,8 +583,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     }
     const task = (await this.listTasks()).find(task => sameTask(task, request.task));
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
-    // Subscription ownership is per IPC client. Closing a temporary follower on the
-    // shared event client would also unsubscribe the long-lived mirror.
+    // A temporary subscription must not close the shared event client's follower.
     if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
     return this.submitLive(request, task, prepared);
   }
