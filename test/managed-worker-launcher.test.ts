@@ -208,7 +208,17 @@ test('opt-in launch snapshots explicit policy and rejects changed resume before 
   }), /effective resume differs/i);
   const db = new ManagedWorkerRegistry(options.registryPath);
   try { assert.equal(db.get(options.home, taskId), null); } finally { db.close(); }
+  await assert.rejects(launchManagedWorker(input, {
+    protectState: async () => { throw new Error('must not protect'); },
+  }), /claim/i);
+  await assert.rejects(launchManagedWorker(input, {
+    claimReservation: true as never,
+    protectState: async () => { throw new Error('must not protect'); },
+  }), /claim/i);
+  const unclaimed = new ManagedWorkerRegistry(options.registryPath);
+  try { assert.equal(unclaimed.get(options.home, taskId), null); } finally { unclaimed.close(); }
   await launchManagedWorker(input, { protectState: async manifest => { protectedManifest = manifest; },
+    claimReservation: async () => {},
     spawn: () => { const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
       queueMicrotask(() => child.emit('spawn')); return child; } });
   assert.deepEqual((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy, policy);
