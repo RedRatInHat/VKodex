@@ -9,6 +9,7 @@ import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { launchManagedWorker, ManagedWorkerLaunchError } from '../src/desktop/managed-worker-launcher.js';
 import { buildManagedWorkerEnvironment, buildDetachedWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
+import { BridgeStore } from '../src/bridge/store.js';
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), 'vkodex-launcher-'));
@@ -74,6 +75,97 @@ test('launch reserves before protecting state and detaches without secret argume
   assert.deepEqual(order, ['protect', 'spawn', 'unref']);
   assert.deepEqual(result, { epoch, state: 'dispatched', pid: 1234 });
   await assert.rejects(launchManagedWorker(options, { protectState: async () => { throw new Error('should not run'); } }), /already reserved/);
+});
+
+test('durable claim is recorded before private state or detached spawn', async () => {
+  const { options } = fixture(); const order: string[] = [];
+  let claimedEpoch = '';
+  await launchManagedWorker(options, {
+    claimReservation: async attempt => {
+      order.push('claim'); claimedEpoch = attempt.epoch;
+      assert.equal(attempt.state, 'reserved');
+    },
+    protectState: async manifest => {
+      order.push('protect'); assert.equal(manifest.epoch, claimedEpoch);
+    },
+    spawn: () => {
+      order.push('spawn');
+      const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
+      queueMicrotask(() => child.emit('spawn')); return child;
+    },
+  });
+  assert.deepEqual(order, ['claim', 'protect', 'spawn']);
+});
+
+test('failed durable claim retains reservation and never protects state or spawns', async () => {
+  const { options } = fixture(); let protects = 0, spawns = 0;
+  await assert.rejects(launchManagedWorker(options, {
+    claimReservation: async () => { throw new Error('SECRET-CONTENT'); },
+    protectState: async () => { protects++; },
+    spawn: () => { spawns++; throw new Error('unexpected'); },
+  }), (error: unknown) => {
+    assert.ok(error instanceof ManagedWorkerLaunchError);
+    assert.equal(error.phase, 'claim');
+    assert.equal(error.outcome, 'not-dispatched');
+    assert.equal(error.message.includes('SECRET'), false);
+    return true;
+  });
+  assert.equal(protects, 0); assert.equal(spawns, 0);
+  const db = new ManagedWorkerRegistry(options.registryPath);
+  try { assert.equal(db.get(options.home, options.familyRoot)?.state, 'reserved'); }
+  finally { db.close(); }
+});
+
+test('bridge claim is persisted for the exact task before worker dispatch, without marking it ready', async () => {
+  const { root, options } = fixture();
+  const store = new BridgeStore();
+  const binding = store.ensureBinding({ hostId: 'local', threadId: options.taskId,
+    sourceId: 'test-source', title: 'Isolated fixture', workspace: root, updatedAt: 1 });
+  try {
+    const dispatched = await launchManagedWorker(options, {
+      claimReservation: async attempt => {
+        const claim = store.claimManagedOwner(binding.id, { ownerEpoch: attempt.epoch,
+          canonicalHome: attempt.canonicalHome, familyRoot: attempt.familyRoot });
+        assert.equal(claim.state, 'registering');
+      },
+      protectState: async manifest => {
+        assert.equal(store.managedOwner(binding)?.ownerEpoch, manifest.epoch);
+      },
+      spawn: () => {
+        assert.equal(store.managedOwner(binding)?.state, 'registering');
+        const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
+        queueMicrotask(() => child.emit('spawn')); return child;
+      },
+    });
+    assert.equal(store.managedOwner(binding)?.ownerEpoch, dispatched.epoch);
+    assert.equal(store.managedOwner(binding)?.state, 'registering');
+    assert.equal(store.managedOwner({ ...binding, sourceId: 'other-source' }), null);
+  } finally { store.close(); }
+});
+
+test('a claim committed before callback failure remains fenced with an explicit unknown claim state', async () => {
+  const { root, options } = fixture(); let spawns = 0;
+  const store = new BridgeStore();
+  const binding = store.ensureBinding({ hostId: 'local', threadId: options.taskId,
+    sourceId: 'test-source', title: 'Isolated fixture', workspace: root, updatedAt: 1 });
+  try {
+    await assert.rejects(launchManagedWorker(options, {
+      claimReservation: async attempt => {
+        store.claimManagedOwner(binding.id, { ownerEpoch: attempt.epoch,
+          canonicalHome: attempt.canonicalHome, familyRoot: attempt.familyRoot });
+        throw new Error('post-commit readback failed');
+      },
+      protectState: async () => { throw new Error('must not protect'); },
+      spawn: () => { spawns++; throw new Error('must not spawn'); },
+    }), (error: unknown) => error instanceof ManagedWorkerLaunchError &&
+      error.phase === 'claim' && error.outcome === 'not-dispatched' &&
+      error.claimState === 'unknown');
+    assert.equal(spawns, 0);
+    assert.equal(store.managedOwner(binding)?.state, 'registering');
+    const db = new ManagedWorkerRegistry(options.registryPath);
+    try { assert.equal(db.get(root, options.familyRoot)?.state, 'reserved'); }
+    finally { db.close(); }
+  } finally { store.close(); }
 });
 
 test('read-only task-state launch opt-in reaches only the exact worker argument', async () => {
