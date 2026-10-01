@@ -406,9 +406,11 @@ export function assertAuthenticatedProfileSourcePreflightForWrite(preflight: Aut
   const workspace = checkedDirectoryIdentitySync(preflight.workspace);
   const expectedHome = checkedDirectoryIdentitySync(expectedSourceHome);
   const expectedWork = checkedDirectoryIdentitySync(expectedWorkspace);
-  if (!sameIdentity(preflight.identity, expectedIdentity) || !equalPath(home.path, preflight.sourceHome) ||
-    !equalPath(workspace.path, preflight.workspace) || !equalPath(home.path, expectedHome.path) ||
-    !equalPath(workspace.path, expectedWork.path) || !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity) ||
+  // Windows may return an 8.3 spelling from realpathSync where the async
+  // capture returned a long spelling. Directory identity, not text, pins the
+  // same physical source and catches a replacement at the original path.
+  if (!sameIdentity(preflight.identity, expectedIdentity) ||
+    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity) ||
     !sameFileSystemIdentity(home.identity, expectedHome.identity) ||
     !sameFileSystemIdentity(workspace.identity, workspacePin) ||
     !sameFileSystemIdentity(workspace.identity, expectedWork.identity)) refuse();
