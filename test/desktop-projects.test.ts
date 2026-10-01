@@ -174,6 +174,18 @@ test("empty native tables keep legacy projects only before Codex finishes migrat
   assert.equal(assignTaskProjects([{ ...task, projectId: null }], native)[0]!.projectId, null);
 });
 
+test("unreadable legacy state keeps native project names but not unverified thread membership", t => {
+  const db = new Database(":memory:"); t.after(() => db.close());
+  db.exec(`CREATE TABLE projects (id TEXT, name TEXT, position INTEGER);
+    CREATE TABLE project_roots (project_id TEXT, path TEXT, position INTEGER);
+    INSERT INTO projects VALUES ('native-project', 'Native', 0);
+    INSERT INTO project_roots VALUES ('native-project', 'D:/Fixture/First', 0);`);
+  const unknown = readDesktopProjectState(db, null, "D:/Fixture/Home")!;
+  assert.equal(desktopProjects(unknown)[0]!.id, "native-project");
+  assert.equal(assignTaskProjects([{ ...task, projectId: "native-project" }], unknown)[0]!.projectId, undefined);
+  assert.equal(assignTaskProjects([{ ...task, projectId: null }], unknown)[0]!.projectId, undefined);
+});
+
 test("desktop project catalog preserves all roots and includes projects without folders", () => {
   assert.deepEqual(desktopProjects(state)[0], { id: "first", title: "First", workspace: "D:/Fixture/First", workspaceRoots: ["D:/Fixture/First", "D:/Fixture/Shared"] });
   assert.equal(desktopProjects({ "local-projects": [{ id: "empty", name: "Empty", rootPaths: [] }] })[0]!.workspace, "");
