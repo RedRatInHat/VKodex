@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import test from 'node:test';
 import { readAndQualifyNativeFirstTurnHistory,
   readAndQualifyUnknownNativeFirstTurnHistory } from '../src/desktop/native-first-turn-history.js';
+import { readAndQualifyFreshFirstTurnIdleState } from
+  '../src/desktop/native-first-turn-idle-state.js';
 import { fingerprintNativeFirstTurnInput, fingerprintNativeFirstTurnUserItem } from
   '../src/desktop/native-first-turn-input-fingerprint.js';
 
@@ -39,6 +41,117 @@ const read = (value: unknown, onRequest?: () => void) => {
   return readAndQualifyNativeFirstTurnHistory(rpc,
     { ...expected, expectedInputFingerprint, fingerprintKey: key });
 };
+
+test('fresh first-turn idle observation is read-only, generation-bound and content-free', async () => {
+  const calls: string[] = [];
+  const rpc = { async initializedSession() { return { generation: 7 }; },
+    isSessionCurrent: (generation: number) => generation === 7,
+    async request(method: string, params: Record<string, unknown>, options?: {
+      expectedGeneration?: number; mutating?: boolean;
+    }) {
+      calls.push(method);
+      assert.equal(params.threadId, expected.threadId);
+      assert.equal(options?.expectedGeneration, 7);
+      assert.notEqual(options?.mutating, true);
+      if (method === 'thread/read') {
+        assert.equal(params.includeTurns, false);
+        return { thread: { id: expected.threadId, status: { type: 'idle' }, turns: [],
+          privateText: 'PRIVATE_SENTINEL' } };
+      }
+      if (method === 'thread/turns/list') return { backwardsCursor: null,
+        data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'thread/queue/list') return { data: [], nextCursor: null };
+      throw new Error('unexpected method');
+    } };
+  const evidence = await readAndQualifyFreshFirstTurnIdleState(rpc, expected.threadId);
+  assert.deepEqual(calls, ['thread/read', 'thread/turns/list', 'thread/goal/get',
+    'thread/queue/list', 'thread/read']);
+  assert.deepEqual(evidence, { threadId: expected.threadId, backendGeneration: 7,
+    status: 'idle', turnsEmpty: true, goalEmpty: true, queueEmpty: true });
+  assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE_SENTINEL/u);
+});
+
+test('fresh first-turn idle observation rejects native activity, incomplete pages and generation drift', async () => {
+  const base = { read: { thread: { id: expected.threadId,
+    status: { type: 'idle' }, turns: [] } },
+  turns: { backwardsCursor: null, data: [], nextCursor: null },
+  goal: { goal: null }, queue: { data: [], nextCursor: null } };
+  const cases = [
+    { read: { thread: { ...base.read.thread, status: { type: 'notLoaded' } } } },
+    { read: { thread: { ...base.read.thread, turns: [{}] } } },
+    { read: { thread: { ...base.read.thread, id: 'foreign' } } },
+    { turns: { ...base.turns, nextCursor: 'later' } },
+    { turns: { ...base.turns, backwardsCursor: 'older' } },
+    { turns: { ...base.turns, data: [{}] } },
+    { goal: { goal: { status: 'active' } } },
+    { queue: { ...base.queue, data: [{}] } },
+    { queue: { ...base.queue, nextCursor: 'later' } },
+  ];
+  for (const change of cases) {
+    const input = { ...base, ...change };
+    const rpc = { initializedSession: async () => ({ generation: 7 }),
+      isSessionCurrent: (generation: number) => generation === 7,
+      request: async (method: string) => method === 'thread/read' ? input.read :
+        method === 'thread/turns/list' ? input.turns :
+        method === 'thread/goal/get' ? input.goal : input.queue };
+    await assert.rejects(readAndQualifyFreshFirstTurnIdleState(rpc,
+      expected.threadId), /first-turn idle state unqualified/u);
+  }
+  const absentBackwardsCursor = { data: [], nextCursor: null };
+  const optionalCursorRpc = { initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: (generation: number) => generation === 7,
+    request: async (method: string) => method === 'thread/read' ? base.read :
+      method === 'thread/turns/list' ? absentBackwardsCursor :
+      method === 'thread/goal/get' ? base.goal : base.queue };
+  assert.equal((await readAndQualifyFreshFirstTurnIdleState(optionalCursorRpc,
+    expected.threadId)).turnsEmpty, true);
+  let current = true;
+  await assert.rejects(readAndQualifyFreshFirstTurnIdleState({
+    initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: (generation: number) => current && generation === 7,
+    request: async (method: string) => {
+      if (method === 'thread/queue/list') current = false;
+      return method === 'thread/read' ? base.read :
+        method === 'thread/turns/list' ? base.turns :
+        method === 'thread/goal/get' ? base.goal : base.queue;
+    },
+  }, expected.threadId), /first-turn idle state unqualified/u);
+  let readCount = 0;
+  await assert.rejects(readAndQualifyFreshFirstTurnIdleState({
+    initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: generation => generation === 7,
+    request: async (method: string) => method === 'thread/read' ?
+      ++readCount === 1 ? base.read : { thread: { ...base.read.thread,
+        status: { type: 'active' } } } :
+      method === 'thread/turns/list' ? base.turns :
+      method === 'thread/goal/get' ? base.goal : base.queue,
+  }, expected.threadId), /first-turn idle state unqualified/u);
+  assert.equal(readCount, 2);
+  const fencedCalls: string[] = [];
+  let allowed = true;
+  await assert.rejects(readAndQualifyFreshFirstTurnIdleState({
+    initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: generation => generation === 7,
+    request: async (method: string) => {
+      fencedCalls.push(method);
+      allowed = false;
+      return base.read;
+    },
+  }, expected.threadId, () => { if (!allowed) throw new Error('source changed'); }),
+  /first-turn idle state unqualified/u);
+  assert.deepEqual(fencedCalls, ['thread/read']);
+  let failedCalls = 0;
+  await assert.rejects(readAndQualifyFreshFirstTurnIdleState({
+    initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: generation => generation === 7,
+    request: async () => { failedCalls++; throw new Error('PRIVATE_BACKEND_ERROR'); },
+  }, expected.threadId), error => {
+    assert.doesNotMatch(String(error), /PRIVATE_BACKEND_ERROR/u);
+    return /first-turn idle state unqualified/u.test(String(error));
+  });
+  assert.equal(failedCalls, 1, 'a failed read must not be retried');
+});
 
 test('one completed full native turn binds the exact client input without exposing content', async () => {
   const evidence = await read(page());
