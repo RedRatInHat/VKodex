@@ -205,18 +205,54 @@ test("no-live-legacy catalog mode never imports live sidebar assignments", async
     INSERT INTO projects VALUES ('native-first', 'First', 0), ('native-second', 'Second', 1);
     INSERT INTO project_roots VALUES ('native-first', 'D:/Fixture/First', 0), ('native-second', 'D:/Fixture/Second', 0);`);
   db.close();
-  await writeFile(path.join(home, ".codex-global-state.json"), JSON.stringify({
+  const stateFile = path.join(home, ".codex-global-state.json");
+  await writeFile(stateFile, JSON.stringify({
     "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } },
     "thread-project-assignments": { fixture: { projectKind: "local", projectId: "native-first" } },
   }));
   const live = new LocalDesktopCatalog(home);
   assert.equal((await live.listTasks())[0]!.projectId, "native-first");
+  const snapshot = await live.listSnapshot();
+  assert.equal(snapshot.tasks.status, "fulfilled");
+  assert.equal(snapshot.projects.status, "fulfilled");
+  if (snapshot.tasks.status === "fulfilled" && snapshot.projects.status === "fulfilled") {
+    assert.equal(snapshot.tasks.value[0]!.projectId, snapshot.projects.value[0]!.id);
+  }
+  await writeFile(stateFile, "not-json");
+  const unreadable = await live.listSnapshot();
+  assert.equal(unreadable.tasks.status, "fulfilled");
+  assert.equal(unreadable.projects.status, "fulfilled");
+  if (unreadable.tasks.status === "fulfilled" && unreadable.projects.status === "fulfilled") {
+    assert.equal(unreadable.tasks.value[0]!.projectId, undefined);
+    assert.deepEqual(unreadable.projects.value.map(project => project.id), ["native-first", "native-second"]);
+  }
   const detached = new LocalDesktopCatalog(home, "no-live-legacy");
   assert.equal((await detached.listTasks())[0]!.projectId, undefined);
   assert.deepEqual((await detached.listProjects()).map(project => project.id), ["native-first", "native-second"]);
   const combined = new MultiDesktopCatalog([home], () => detached);
   await combined.listTasks();
   assert.match(combined.catalogWarnings()[0]!, /назначения проектов задач неизвестны/u);
+});
+
+test("multi-source refresh uses one source snapshot for tasks and projects", async () => {
+  let splitReads = 0; let snapshotReads = 0;
+  const source = {
+    listTasks: async () => { splitReads++; throw new Error("split task read"); },
+    listProjects: async () => { splitReads++; throw new Error("split project read"); },
+    listModels: async () => [],
+    listSnapshot: async () => {
+      snapshotReads++;
+      return {
+        tasks: { status: "fulfilled", value: [{ ...task, projectId: "first" }] },
+        projects: { status: "fulfilled", value: desktopProjects(state) },
+      };
+    },
+  } as unknown as LocalDesktopCatalog;
+  const combined = new MultiDesktopCatalog(["D:/Fixture/Home"], () => source);
+  const tasks = await combined.listTasks();
+  assert.equal(tasks[0]!.projectId, "first");
+  assert.equal(snapshotReads, 1);
+  assert.equal(splitReads, 0);
 });
 
 test("desktop project catalog preserves all roots and includes projects without folders", () => {

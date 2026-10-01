@@ -4,7 +4,8 @@ import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type D
 import { LocalDesktopCatalog } from "./catalog.js";
 import { comparablePath } from "./paths.js";
 
-type Catalog = Pick<LocalDesktopCatalog, "listTasks" | "listProjects" | "listModels">;
+type Catalog = Pick<LocalDesktopCatalog, "listTasks" | "listProjects" | "listModels"> &
+  Partial<Pick<LocalDesktopCatalog, "listSnapshot">>;
 interface Source { readonly id: string; readonly label: string; readonly home: string; readonly catalog: Catalog }
 interface SourceSnapshot {
   readonly source: Source;
@@ -70,6 +71,12 @@ export class MultiDesktopCatalog {
 
   private async snapshot(): Promise<readonly SourceSnapshot[]> {
     return Promise.all(this.sources.map(async source => {
+      if (source.catalog.listSnapshot) {
+        try { return { source, ...await source.catalog.listSnapshot() }; }
+        catch (reason) {
+          return { source, tasks: { status: "rejected" as const, reason }, projects: { status: "rejected" as const, reason } };
+        }
+      }
       const [tasks, projects] = await Promise.allSettled([source.catalog.listTasks(), source.catalog.listProjects()]);
       return { source, tasks, projects };
     }));

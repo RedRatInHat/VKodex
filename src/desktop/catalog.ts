@@ -51,6 +51,11 @@ export function readTaskCatalog(database: Database, limit: number | null = 100, 
  * effective owner-side metadata source is qualified. */
 export type ProjectCatalogMode = "legacy-file" | "no-live-legacy";
 
+export interface LocalCatalogSnapshot {
+  readonly tasks: PromiseSettledResult<readonly DesktopTask[]>;
+  readonly projects: PromiseSettledResult<readonly DesktopProject[]>;
+}
+
 export class LocalDesktopCatalog {
   constructor(private readonly codexHome: string, readonly projectCatalogMode: ProjectCatalogMode = "legacy-file") {}
 
@@ -104,18 +109,63 @@ export class LocalDesktopCatalog {
     return desktopProjects(state);
   }
 
-  private async projectState(database?: Database): Promise<IpcObject | null> {
-    let legacy: IpcObject | null = null;
-    if (this.projectCatalogMode === "legacy-file") {
-      try {
-        const value: unknown = JSON.parse(await readFile(path.join(this.codexHome, ".codex-global-state.json"), "utf8"));
-        legacy = isObject(value) ? value : null;
-      } catch (error) {
-        // A CLI-only home has no desktop project settings. An unreadable existing
-        // file leaves membership unknown, while its tasks remain available in All.
-        legacy = isObject(error) && error.code === "ENOENT" ? {} : null;
-      }
+  /** Build both catalog views from one legacy-state read. A source may still
+   * return tasks when its project view is unavailable (or vice versa). This is
+   * not an atomic snapshot across Desktop's JSON file and SQLite. */
+  async listSnapshot(): Promise<LocalCatalogSnapshot> {
+    let titles: ReadonlyMap<string, string> = new Map();
+    let titlesError: Error | null = null;
+    try { titles = parseTaskTitles(await readFile(path.join(this.codexHome, "session_index.jsonl"), "utf8")); }
+    catch (error) {
+      if (!isObject(error) || error.code !== "ENOENT")
+        titlesError = new DesktopUnavailableError("Не удалось прочитать локальный каталог Codex.");
     }
+    const legacy = await this.legacyState();
+    let database: Database | undefined;
+    try {
+      database = new DatabaseConstructor(path.join(this.codexHome, "state_5.sqlite"), { readonly: true, fileMustExist: true });
+      database.pragma("query_only = ON");
+      let state: IpcObject | null = null;
+      try { state = readDesktopProjectState(database, legacy, this.codexHome); }
+      catch { /* Tasks remain available with unknown project membership. */ }
+      let projects: LocalCatalogSnapshot["projects"];
+      try {
+        if (state === null) throw new DesktopUnavailableError("Не удалось прочитать проекты десктопа Codex.");
+        projects = { status: "fulfilled", value: desktopProjects(state) };
+      } catch (error) { projects = { status: "rejected", reason: error }; }
+      let tasks: LocalCatalogSnapshot["tasks"];
+      try {
+        if (titlesError) throw titlesError;
+        const raw = readTaskCatalog(database, null, titles);
+        try { tasks = { status: "fulfilled", value: assignTaskProjects(raw, state) }; }
+        catch { tasks = { status: "fulfilled", value: assignTaskProjects(raw, null) }; }
+      } catch (error) {
+        tasks = { status: "rejected", reason: error instanceof DesktopUnavailableError
+          ? error : new DesktopUnavailableError("Не удалось прочитать локальный каталог Codex.") };
+      }
+      return { tasks, projects };
+    } catch {
+      return {
+        tasks: { status: "rejected", reason: new DesktopUnavailableError("Не удалось прочитать локальный каталог Codex.") },
+        projects: { status: "rejected", reason: new DesktopUnavailableError("Не удалось прочитать проекты десктопа Codex.") },
+      };
+    } finally { database?.close(); }
+  }
+
+  private async legacyState(): Promise<IpcObject | null> {
+    if (this.projectCatalogMode !== "legacy-file") return null;
+    try {
+      const value: unknown = JSON.parse(await readFile(path.join(this.codexHome, ".codex-global-state.json"), "utf8"));
+      return isObject(value) ? value : null;
+    } catch (error) {
+      // A CLI-only home has no desktop project settings. An unreadable existing
+      // file leaves membership unknown, while its tasks remain available in All.
+      return isObject(error) && error.code === "ENOENT" ? {} : null;
+    }
+  }
+
+  private async projectState(database?: Database): Promise<IpcObject | null> {
+    const legacy = await this.legacyState();
     let opened: Database | undefined;
     try {
       const db = database ?? (opened = new DatabaseConstructor(path.join(this.codexHome, "state_5.sqlite"), { readonly: true, fileMustExist: true }));
