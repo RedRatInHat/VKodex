@@ -281,8 +281,25 @@ test('Windows production-pinned authenticated source permits one fenced first th
       'lease contention and copied-scope checks use only the durable journal');
 
     const beforeReservation = nativeMethods();
-    journal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
-      clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64) });
+    assert.throws(() => ingressJournal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
+      clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64) }), /lease|ingress|conflict/u,
+      'legacy reservation cannot bypass the held ingress lease');
+    assert.equal(ingressJournal.get(scope.operationId)?.state, 'thread-accepted');
+    assert.equal(ingressJournal.get(scope.operationId)?.revision, 2);
+    const reservationFenceCheck = new DatabaseConstructor(journalPath, { readonly: true });
+    try {
+      assert.equal(reservationFenceCheck.prepare(`SELECT 1 AS present FROM native_first_turn_write_fences
+        WHERE operation_id=?`).get(scope.operationId), undefined,
+      'rejected legacy reservation leaves no first-turn write fence');
+    } finally { reservationFenceCheck.close(); }
+    const reserveFirstTurnWithIngressLease = (ingressJournal as NativeFirstTurnBootstrapJournal & {
+      reserveFirstTurnWithIngressLease(lease: typeof ingressScope, input: {
+        readonly clientUserMessageId: string; readonly keyedFingerprint: string;
+      }): void;
+    }).reserveFirstTurnWithIngressLease.bind(ingressJournal);
+    reserveFirstTurnWithIngressLease(ingressScope, {
+      clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64),
+    });
     assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
     assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed');
     await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),

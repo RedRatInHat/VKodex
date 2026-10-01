@@ -1,6 +1,7 @@
 import type { NativeCliTurnStartScope } from '../codex/native-cli-turn-start.js';
 import type { WorkerCommand } from '../codex/managed-worker-command-dispatcher.js';
-import { NativeFirstTurnBootstrapJournal, type NativeFirstTurnBootstrapIdentity } from
+import { NativeFirstTurnBootstrapJournal, type NativeFirstTurnBootstrapIdentity,
+  type NativeFirstTurnIngressLeaseScope } from
   './native-first-turn-bootstrap-journal.js';
 import { prepareNativeFirstTurnBootstrapCommand } from './native-first-turn-input-fingerprint.js';
 import { loadNativeFirstTurnPrivateKey } from './native-first-turn-private-key.js';
@@ -25,7 +26,8 @@ export function consumeNativeFirstTurnReservation(prepared: NativeFirstTurnPrepa
  * dispatcher immediately before its one and only native write. */
 export function reserveNativeFirstTurnWithKey(journal: NativeFirstTurnBootstrapJournal,
   identity: NativeFirstTurnBootstrapIdentity, nativeParams: unknown,
-  cliScope: NativeCliTurnStartScope, key: Uint8Array): NativeFirstTurnPreparedReservation {
+  cliScope: NativeCliTurnStartScope, key: Uint8Array,
+  ingressScope?: NativeFirstTurnIngressLeaseScope): NativeFirstTurnPreparedReservation {
   if (!journal || typeof journal.get !== 'function' ||
       typeof journal.reserveFirstTurn !== 'function' || !identity) fail();
   const record = journal.get(identity.operationId);
@@ -44,7 +46,9 @@ export function reserveNativeFirstTurnWithKey(journal: NativeFirstTurnBootstrapJ
   });
   const clientUserMessageId = compiled.command.params.clientUserMessageId;
   if (typeof clientUserMessageId !== 'string') return fail();
-  journal.reserveFirstTurn({ operationId: identity.operationId, expectedRevision: 2,
+  if (ingressScope) journal.reserveFirstTurnWithIngressLease(ingressScope,
+    { clientUserMessageId, keyedFingerprint: compiled.keyedFingerprint });
+  else journal.reserveFirstTurn({ operationId: identity.operationId, expectedRevision: 2,
     clientUserMessageId, keyedFingerprint: compiled.keyedFingerprint });
   const prepared = Object.freeze({ command: compiled.command, operationId: identity.operationId,
     revision: 3 as const, keyedFingerprint: compiled.keyedFingerprint });
@@ -52,15 +56,17 @@ export function reserveNativeFirstTurnWithKey(journal: NativeFirstTurnBootstrapJ
   return prepared;
 }
 
-/** Production zero-RPC phase: require an existing private key. No auto-create,
- * native request or replay is possible through this entrypoint. The returned
- * command stays in memory; the journal holds only its keyed text fingerprint. */
+/** Production zero-RPC phase: require an existing private key and a current,
+ * opaque ingress scope. No auto-create, native request or replay is possible
+ * here. The command stays in memory; the journal holds only its keyed digest. */
 export async function prepareAndReserveNativeFirstTurn(journal: NativeFirstTurnBootstrapJournal,
   identity: NativeFirstTurnBootstrapIdentity,
-  nativeParams: unknown, cliScope: NativeCliTurnStartScope): Promise<NativeFirstTurnPreparedReservation> {
+  nativeParams: unknown, cliScope: NativeCliTurnStartScope,
+  ingressScope: NativeFirstTurnIngressLeaseScope): Promise<NativeFirstTurnPreparedReservation> {
+  journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
   // The directory comes from this one-operation journal, never from a wire
   // request or an independent routing argument.
   const key = await loadNativeFirstTurnPrivateKey(journal.directory());
-  try { return reserveNativeFirstTurnWithKey(journal, identity, nativeParams, cliScope, key); }
+  try { return reserveNativeFirstTurnWithKey(journal, identity, nativeParams, cliScope, key, ingressScope); }
   finally { key.fill(0); }
 }

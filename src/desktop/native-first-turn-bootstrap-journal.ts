@@ -369,10 +369,27 @@ export class NativeFirstTurnBootstrapJournal {
   reserveFirstTurn({ operationId, expectedRevision, clientUserMessageId, keyedFingerprint }: {
     readonly operationId: string; readonly expectedRevision: number; readonly clientUserMessageId: string; readonly keyedFingerprint: string;
   }): void {
+    this.#reserveFirstTurn(operationId, expectedRevision, clientUserMessageId, keyedFingerprint);
+  }
+  /** A held ingress slot changes r2 -> r3 only through its opaque, current
+   * authority. The reservation and not-passed fence commit in one transaction. */
+  reserveFirstTurnWithIngressLease(scope: NativeFirstTurnIngressLeaseScope, { clientUserMessageId, keyedFingerprint }: {
+    readonly clientUserMessageId: string; readonly keyedFingerprint: string;
+  }): void {
+    this.#reserveFirstTurn(scope.operationId, 2, clientUserMessageId, keyedFingerprint, scope);
+  }
+  #reserveFirstTurn(operationId: string, expectedRevision: number,
+    clientUserMessageId: string, keyedFingerprint: string,
+    ingressScope?: NativeFirstTurnIngressLeaseScope): void {
     this.#open();
     if (!UUID.test(operationId) || expectedRevision !== 2 ||
         !identifier(clientUserMessageId) || !FINGERPRINT.test(keyedFingerprint)) fail();
     try { this.#db.transaction(() => {
+      if (ingressScope) {
+        if (ingressScope.operationId !== operationId) ingressFail();
+        const record = this.#assertIngress(ingressScope);
+        if (record.state !== 'thread-accepted' || record.revision !== 2) ingressFail();
+      } else if (this.#ingressRow()) ingressFail();
       const changed = this.#db.prepare(`UPDATE native_first_turn_bootstraps
         SET state='turn-reserved', revision=3, client_user_message_id=?, keyed_fingerprint=?
         WHERE operation_id=? AND state='thread-accepted' AND revision=2`)
