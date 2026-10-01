@@ -210,7 +210,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   // Serialize the whole native admission lifetime, including baseline reads
   // before the stock journal reserves an operation. The dispatcher serializes
   // wire writes, but it cannot order reservations made in other journals.
-  #nativeAdmissionTail: Promise<void> = Promise.resolve();
+  #nativeAdmissionTail: Promise<void> | null = null;
   #eventTail: Promise<void> = Promise.resolve();
   #pendingEvents = 0;
   #everAdmittedNativeMutation = false;
@@ -893,10 +893,56 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   async #serialNativeAdmission<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.#nativeAdmissionTail;
     let release!: () => void;
-    this.#nativeAdmissionTail = new Promise<void>(resolve => { release = resolve; });
-    await previous;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    this.#nativeAdmissionTail = current;
+    // The first admitted operation must start synchronously. Yielding even a
+    // resolved promise here lets an immediate frontend EOF revoke it before
+    // its immutable intent reaches the worker journal.
+    if (previous) await previous;
     try { return await operation(); }
-    finally { release(); }
+    finally {
+      release();
+      if (this.#nativeAdmissionTail === current) this.#nativeAdmissionTail = null;
+    }
+  }
+
+  /** Fail closed for a new direct start until every prior accepted local start
+   * is terminal in the loaded projection. The worker ledger itself fences an
+   * in-flight/unknown write; this check also prevents an intent-only record
+   * from being created behind such a write. */
+  #directStartAdmissionCurrent(request: IpcIncomingRequest,
+    handler: ManagedWorkerNativeStartHandler): boolean {
+    try {
+      const start = object(request.params.turnStart) ? request.params.turnStart : null;
+      const input = object(start?.request) ? start.request : null;
+      const clientId = input?.clientUserMessageId;
+      if (typeof clientId !== 'string' || !clientId || clientId.length > 128 ||
+          !this.#followerCurrent(request.sourceClientId) || !this.#ownerCurrent() ||
+          !['connected', 'disconnected'].includes(this.#state)) return false;
+      if (handler.hasKnownWorkerOperation(clientId)) return true;
+      const projection = this.#projection, host = this.#options.host;
+      if (!projection || !host.commandQuiescence || !host.requestQuiescence ||
+          !host.acceptedCommandReceipts || !host.acceptedQueueInputs ||
+          this.#pendingEvents !== 0 || this.#deferredBroadcasts.length !== 0 ||
+          projection.threadRuntimeStatus.type !== 'idle' || projection.requests.length !== 0 ||
+          !object(projection.turnsPagination) || projection.turnsPagination.hasLoadedOldest !== true ||
+          projection.turnsPagination.olderCursor !== null ||
+          projection.turns.some(turn => !['completed', 'interrupted', 'failed'].includes(turn.status)) ||
+          projection.nativeQueue !== undefined &&
+            (!Array.isArray(projection.nativeQueue) || projection.nativeQueue.length !== 0) ||
+          projection.queuedFollowUps !== undefined &&
+            (!Array.isArray(projection.queuedFollowUps) || projection.queuedFollowUps.length !== 0)) return false;
+      const commands = host.commandQuiescence(this.#options.controlKey);
+      const requests = host.requestQuiescence(this.#options.controlKey);
+      const terminal = new Set(projection.turns.map(turn => turn.turnId));
+      const accepted = host.acceptedCommandReceipts(this.#options.controlKey);
+      return host.metadata.state === 'running' && host.metadata.taskId === this.#options.taskId &&
+        host.metadata.backendGeneration === this.#generation &&
+        commands.inFlight === 0 && !commands.unconfirmed &&
+        requests.generation === this.#generation && requests.unresolved === 0 &&
+        host.acceptedQueueInputs(this.#options.controlKey).length === 0 &&
+        accepted.every(receipt => receipt.method === 'turn/start' && terminal.has(receipt.receiptId));
+    } catch { return false; }
   }
 
   async handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject> {
@@ -932,7 +978,8 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     // Stock repeated admission owns command ordering for this opt-in route.
     // A direct start would bypass its homogeneous settings and queue journal.
     if (this.#queueAdapter) throw new Error('Native stock queue refuses direct start');
-    if (!this.#followerCurrent(request.sourceClientId) || !this.#startHandler ||
+    const handler = this.#startHandler;
+    if (!this.#followerCurrent(request.sourceClientId) || !handler ||
         this.#grants.size + this.#queueGrants.size >= 128 ||
         this.#grants.has(request.requestId) || this.#queueGrants.has(request.requestId)) throw refuse();
     const grant: Grant = Object.freeze({ requestId: request.requestId,
@@ -942,7 +989,10 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     try {
       // The incoming IPC signal controls response delivery only. Once admitted,
       // EOF cannot revoke a native write; owner/projection revocation still can.
-      return await this.#startHandler.handle(request, new AbortController().signal);
+      return await this.#serialNativeAdmission(async () => {
+        if (!this.#directStartAdmissionCurrent(request, handler)) throw refuse();
+        return handler.handle(request, new AbortController().signal);
+      });
     } finally { if (this.#grants.get(request.requestId) === grant) this.#grants.delete(request.requestId); }
   }
 
