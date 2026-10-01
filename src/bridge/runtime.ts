@@ -38,6 +38,8 @@ interface MaintenanceJob {
 
 /** Cold rollout reads can each parse up to 16 MiB; keep their aggregate burst bounded. */
 const MAX_CONCURRENT_ROLLOUT_FALLBACK_POLLS = 4;
+const intervalElapsed = (now: number, previous: number, intervalMs: number): boolean =>
+  now < previous || now - previous >= intervalMs;
 
 export class BridgeRuntime {
   private readonly gate: AccessGate;
@@ -229,7 +231,7 @@ export class BridgeRuntime {
   private reconcileUncertainOperation(): void {
     if (this.stopped || (!this.desktop.findAcceptedInput && !this.desktop.findQueuedSubmission &&
       !this.desktop.findQueuedSubmissionOutcome) || this.operationReconciliation
-      || this.now() - this.lastOperationReconciliationAt < 30_000) return;
+      || !intervalElapsed(this.now(), this.lastOperationReconciliationAt, 30_000)) return;
     this.lastOperationReconciliationAt = this.now();
     const operation = this.store.uncertainPromptOperations(this.now(), 1)[0];
     if (!operation) return;
@@ -275,7 +277,7 @@ export class BridgeRuntime {
 
   private reconcileHistoricalQueuedInput(): void {
     if (this.stopped || !this.desktop.scanTerminalQueuedInput || this.queueReconciliation ||
-      this.now() - this.lastQueueReconciliationAt < 30_000) return;
+      !intervalElapsed(this.now(), this.lastQueueReconciliationAt, 30_000)) return;
     const pending = this.store.bindings().filter(candidate => candidate.attached && candidate.peerId !== null)
       .flatMap(candidate => this.store.queuedInputs(candidate.id).map(operation => {
         const key = `queue-history:${candidate.id}:${operation.operationId}`;
@@ -286,7 +288,8 @@ export class BridgeRuntime {
           && Number.isSafeInteger(saved.nextAt) && saved.nextAt >= 0 ? saved : null;
         return { binding: candidate, operation, checkpointKey: key,
           checkpoint };
-      })).filter(item => !item.checkpoint || item.checkpoint.nextAt <= this.now());
+      })).filter(item => !item.checkpoint || item.checkpoint.nextAt <= this.now() ||
+        Number.isSafeInteger(item.checkpoint.lastAttemptAt) && item.checkpoint.lastAttemptAt > this.now());
     if (!pending.length) return;
     const { binding, operation, checkpointKey, checkpoint } = pending[this.queueReconciliationCursor % pending.length]!;
     this.queueReconciliationCursor++;
@@ -654,7 +657,7 @@ export class BridgeRuntime {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
     const now = this.now();
-    if (!this.stopped && (now < this.lastHealthAt || now - this.lastHealthAt >= this.healthIntervalMs))
+    if (!this.stopped && intervalElapsed(now, this.lastHealthAt, this.healthIntervalMs))
       void this.checkHealth().catch(() => {});
     if (this.stopped) return Promise.resolve();
     this.updateStartedAt = this.now();
@@ -676,7 +679,7 @@ export class BridgeRuntime {
    * Recycle Bin moves remain off until pathname substitution is eliminated. */
   private scheduleStageMaintenance(): void {
     if (this.stopped || !this.files || this.stageMaintenance
-      || this.now() - this.lastStageMaintenanceAt < 5 * 60_000) return;
+      || !intervalElapsed(this.now(), this.lastStageMaintenanceAt, 5 * 60_000)) return;
     this.lastStageMaintenanceAt = this.now();
     this.stageMaintenanceStartedAt = this.now();
     this.stageMaintenanceLastAttemptAt = this.now();

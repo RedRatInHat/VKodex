@@ -1166,8 +1166,9 @@ export class BridgeStore {
   uncertainPromptOperations(now = Date.now(), limit = 10): readonly { id: string; taskKey: string; bindingId: string; inboxKey: string }[] {
     return this.db.prepare(`SELECT op.id AS id, op.task_key AS taskKey, input.binding_id AS bindingId, input.inbox_key AS inboxKey
       FROM bridge_operations AS op JOIN bridge_operation_inputs AS input ON input.operation_id = op.id
-      WHERE op.state = 'uncertain' AND (input.last_checked_at IS NULL OR input.last_checked_at <= ?)
-      ORDER BY op.rowid DESC LIMIT ?`).all(now - 5 * 60_000, limit) as { id: string; taskKey: string; bindingId: string; inboxKey: string }[];
+      WHERE op.state = 'uncertain' AND (input.last_checked_at IS NULL OR
+        input.last_checked_at > ? OR input.last_checked_at <= ?)
+      ORDER BY op.rowid DESC LIMIT ?`).all(now, now - 5 * 60_000, limit) as { id: string; taskKey: string; bindingId: string; inboxKey: string }[];
   }
   uncertainPromptStats(): { count: number; oldestAt: number | null } {
     const row = this.db.prepare(`SELECT COUNT(*) AS count, MIN(input.created_at) AS oldestAt

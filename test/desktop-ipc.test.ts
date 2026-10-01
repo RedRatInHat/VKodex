@@ -894,6 +894,30 @@ test("runtime reconciles an uncertain prompt from Codex history after restart", 
   assert.match(s.store.pendingDeliveries().at(-1)!.view.text, /Codex подтвердил ранее неопределённый запрос/u);
 });
 
+test("runtime rechecks an uncertain prompt when the clock moves behind its last reconciliation", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "clock-rollback-uncertain";
+  const inboxKey = JSON.stringify([s.peerId, "message:rollback"]);
+  s.store.claimInput(inboxKey);
+  s.store.recordOperation(operationId, s.binding, inboxKey, s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.desktop.findAcceptedInput = async () => "native-turn-after-rollback";
+  (s.runtime as unknown as { lastOperationReconciliationAt: number }).lastOperationReconciliationAt = 100_001;
+  (s.runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+  for (let i = 0; i < 100 && s.store.operationState(operationId) !== "accepted"; i++)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.store.operationState(operationId), "accepted");
+});
+
+test("durable uncertain input becomes due when its last check is in the future", t => {
+  const s = runtimeSetup(t);
+  const operationId = "rollback-durable-check";
+  s.store.recordOperation(operationId, s.binding, "rollback-durable-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "uncertain");
+  s.store.markOperationChecked(operationId, 100_001);
+  assert.deepEqual(s.store.uncertainPromptOperations(100_000, 1).map(item => item.id), [operationId]);
+});
+
 test("late uncertain input reconciliation does not reopen a turn with an already recorded final", async t => {
   const s = runtimeSetup(t);
   const operationId = "late-recovered-vk-operation";
@@ -1084,6 +1108,26 @@ test("historical queue scan persists partial progress without settling its ACK",
   assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
 });
 
+test("historical queue reconciliation resumes after clock rollback despite a future checkpoint", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "rollback-queue-operation";
+  s.store.recordOperation(operationId, s.binding, "rollback-queue-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "rollback-queue-id");
+  s.store.setValue(`queue-history:${s.binding.id}:${operationId}`, {
+    taskKey: taskKey(s.binding), cursor: null, pages: 0, lastAttemptAt: 100_001,
+    lastFailure: null, lastCompletedNoTerminalProofAt: null, nextAt: 130_001,
+  });
+  let calls = 0;
+  s.desktop.scanTerminalQueuedInput = async () => { calls++; return { done: true, turnId: "rollback-terminal" }; };
+  (s.runtime as unknown as { lastQueueReconciliationAt: number }).lastQueueReconciliationAt = 100_001;
+  (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  for (let i = 0; i < 100 && s.store.queuedInputs(s.binding.id).length; i++)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(calls, 1);
+  assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
+});
+
 test("historical queue scan restarts read-only verification after a malformed checkpoint", async t => {
   const s = runtimeSetup(t);
   const operationId = "malformed-history-checkpoint";
@@ -1239,6 +1283,12 @@ test("runtime audits abandoned staging without scheduling unqualified pathname r
   assert.deepEqual(abandonedLimits, [8]);
   assert.deepEqual(auditCalls, [[400_000, 8]], "maintenance records bounded read-only ledger evidence");
   assert.deepEqual(recycleCalls, [], "automatic Recycle Bin moves remain off until a handle-bound deletion path is qualified");
+  s.advance(-1);
+  tick.callback();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(abandonedLimits, [8, 8], "clock rollback schedules another bounded stage audit");
+  assert.deepEqual(auditCalls, [[400_000, 8], [399_999, 8]]);
+  assert.deepEqual(recycleCalls, []);
 });
 
 test("health keeps checking while the initial task subscription is still pending", async t => {
