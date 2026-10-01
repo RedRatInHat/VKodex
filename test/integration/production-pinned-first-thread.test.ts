@@ -25,20 +25,14 @@ import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT
   '../../src/desktop/windows-private-directory.js';
 
 type AclPhase = 'ok' | 'acl-exit' | 'output-invalid' | 'timeout' | 'helper-error';
-function aclPhase(directory: string, inheritedEnvironment = false): AclPhase {
+function aclPhase(directory: string): AclPhase {
   const root = process.env.SystemRoot ?? '';
   if (!path.win32.isAbsolute(root)) return 'helper-error';
   const executable = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const modulePath = path.win32.join(path.dirname(executable), 'Modules');
   const command = "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$p=[Console]::In.ReadToEnd().Trim();" +
     privateDirectoryAclVerificationScript;
-  const environment: NodeJS.ProcessEnv = inheritedEnvironment ? { ...process.env } : {};
-  for (const key of ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE',
-    'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USERDOMAIN',
-    'ComSpec', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)']) {
-    const value = process.env[key];
-    if (value) environment[key] = value;
-  }
+  const environment: NodeJS.ProcessEnv = { ...process.env };
   environment.PSModulePath = modulePath;
   const encoded = Buffer.from(command, 'utf16le').toString('base64');
   const result = spawnSync(executable,
@@ -171,8 +165,7 @@ test('Windows production-pinned authenticated source permits one fenced first th
     } catch (error) {
       if (error instanceof AppServerUnavailableError)
         assert.fail(`Pinned connection unavailable (class=AppServerUnavailableError); ` +
-          aclFailureSummary(aclPhasesBeforeConnection) +
-          `; inherited-env-probe=${aclPhase(serverRoot, true)}`);
+          aclFailureSummary(aclPhasesBeforeConnection));
       throw error;
     }
     if (serverError !== undefined)
