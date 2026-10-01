@@ -142,14 +142,17 @@ test("post-ACL directory verification retries only a direct helper spawn error a
   await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
     directCheck: () => "invalid",
     createWorker: () => { workers++; return new WorkerHarness(); },
-  }), /Private capability directory unavailable/u);
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "direct-acl-invalid" }); return true;
+  });
   assert.equal(workers, 0, "an invalid ACL or helper result must not retry");
 
   let directCalls = 0; let workerCalls = 0;
   const success = new WorkerHarness();
   await assertWindowsPrivateDirectoryAfterAcl(directory, {
     directCheck: () => { directCalls++; return "helper-error"; },
-    createWorker: () => { workerCalls++; queueMicrotask(() => success.emit("message", true)); return success; },
+    createWorker: () => { workerCalls++; queueMicrotask(() => success.emit("message", "ok")); return success; },
   });
   assert.equal(directCalls, 1); assert.equal(workerCalls, 1); assert.equal(success.terminated, 1);
 
@@ -157,19 +160,46 @@ test("post-ACL directory verification retries only a direct helper spawn error a
   await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
     directCheck: () => "helper-error",
     createWorker: () => { queueMicrotask(() => failed.emit("error", new Error("fixture"))); return failed; },
-  }), /Private capability directory unavailable/u);
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "worker-error", direct: "helper-error" }); return true;
+  });
 
   const timedOut = new WorkerHarness();
   await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
     directCheck: () => "helper-error", workerTimeoutMs: 1,
     createWorker: () => timedOut,
-  }), /Private capability directory unavailable/u);
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "worker-timeout", direct: "helper-error" }); return true;
+  });
   assert.equal(timedOut.terminated, 1);
 
   await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
     directCheck: () => "helper-error",
     createWorker: () => { throw new Error("fixture"); },
-  }), /Private capability directory unavailable/u);
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "worker-start-failed", direct: "helper-error" }); return true;
+  });
+
+  const invalidAcl = new WorkerHarness();
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "helper-error",
+    createWorker: () => { queueMicrotask(() => invalidAcl.emit("message", "acl-owner")); return invalidAcl; },
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "acl-owner", direct: "helper-error" }); return true;
+  });
+
+  const timedOutHelper = new WorkerHarness();
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "helper-error",
+    createWorker: () => { queueMicrotask(() => timedOutHelper.emit("message", "helper-timeout")); return timedOutHelper; },
+  }), error => {
+    assert.ok(error instanceof Error); assert.equal(error.message, "Private capability directory unavailable");
+    assert.deepEqual(error.cause, { diagnostic: "helper-timeout", direct: "helper-error" }); return true;
+  });
 });
 
 test("protector failure and malformed or oversized strict JSON never reach filesystem writes", async () => {
@@ -251,6 +281,13 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   let created;
   try { created = await createManagedWorkerPrivateState(input, { baseDirectory }); }
   catch (error) {
+    if (error instanceof Error && error.message === "Private capability directory unavailable") {
+      const cause = error.cause;
+      const safeLabel = (value: unknown): string => typeof value === "string" && /^[a-z-]+$/u.test(value) ? value : "unclassified";
+      const details = cause && typeof cause === "object" && "diagnostic" in cause
+        ? `; retry ${safeLabel(cause.diagnostic)}${"direct" in cause ? `; direct ${safeLabel(cause.direct)}` : ""}` : "";
+      assert.fail(`Windows private directory verification failed${details}`);
+    }
     if (!(error instanceof Error) || error.message !== "Managed worker private state protection failed") throw error;
     // Compare the production compiled helper with source/tsx under the same
     // synthetic payload. Only fixed phase labels are reported; no outputs.
