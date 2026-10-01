@@ -8,7 +8,8 @@ import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js
 import { prepareNativeFirstTurnBootstrapCommand, NATIVE_FIRST_TURN_TEXT_MAX_BYTES } from
   '../src/desktop/native-first-turn-input-fingerprint.js';
 import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
-import { reserveNativeFirstTurnWithKey } from '../src/desktop/native-first-turn-bootstrap-preparation.js';
+import { dispatchPreparedNativeFirstTurn, reserveNativeFirstTurnWithKey } from
+  '../src/desktop/native-first-turn-bootstrap-preparation.js';
 import { ManagedNativeCliStartAdmission, NativeCliStartNotSubmittedError } from
   '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
@@ -134,6 +135,139 @@ test('first-turn preparation reserves one durable fingerprint before any native 
     assert.throws(() => reserveNativeFirstTurnWithKey(reopened, identity, start(), cliScope,
       Buffer.alloc(32, 7)), /unqualified/u);
   } finally { reopened.close(); }
+});
+
+function firstTurnDispatchFixture() {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite');
+  const journal = new NativeFirstTurnBootstrapJournal(filePath);
+  const identity = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch,
+    threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64) };
+  journal.persistThreadStartIntent(identity);
+  journal.persistThreadAccepted({ operationId: identity.operationId,
+    expectedRevision: 1, threadId: taskId });
+  const prepared = reserveNativeFirstTurnWithKey(journal, identity, start(),
+    { taskId, ownerEpoch, effectiveSettings: settings }, Buffer.alloc(32, 7));
+  return { journal, filePath, prepared };
+}
+
+test('first-turn dispatch records only a positive native ACK and sends once', async () => {
+  const { journal, prepared } = firstTurnDispatchFixture();
+  const turnId = '01a0f511-86e7-7942-8067-91d169eb18c7';
+  let writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(method: string, params: Record<string, unknown>, options: {
+      mutating?: boolean; expectedGeneration?: number; assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) {
+      writes++;
+      assert.equal(method, 'turn/start'); assert.equal(params.threadId, taskId);
+      assert.equal(options.mutating, true); assert.equal(options.expectedGeneration, 5);
+      options.assertBeforeWrite?.();
+      options.onResponseEnvelope?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
+      return { turn: { id: turnId, status: 'inProgress' } };
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    assert.equal(result.state, 'turn-accepted'); assert.equal(result.turnId, turnId);
+    assert.equal(writes, 1);
+    await assert.rejects(dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true), /unqualified/u);
+    assert.equal(writes, 1);
+  } finally { journal.close(); }
+});
+
+test('first-turn timeout stays unknown; late positive ACK may reconcile without replay', async () => {
+  const { journal, filePath, prepared } = firstTurnDispatchFixture();
+  const turnId = '01a0f511-86e7-7942-8067-91d169eb18c7';
+  let writes = 0;
+  let late: ((value: { result: Record<string, unknown> }) => void) | undefined;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onLateResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }): Promise<unknown> {
+      writes++; options.assertBeforeWrite?.(); late = options.onLateResponseEnvelope;
+      throw new Error('timeout');
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
+  } finally { journal.close(); }
+  late?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
+  const reopened = new NativeFirstTurnBootstrapJournal(filePath);
+  try {
+    assert.equal(reopened.get(prepared.operationId)?.state, 'turn-accepted');
+    assert.equal(reopened.get(prepared.operationId)?.revision, 5);
+    assert.equal(writes, 1);
+  } finally { reopened.close(); }
+});
+
+test('first-turn prewrite authority refusal and malformed ACK never create acceptance', async () => {
+  const { journal, prepared } = firstTurnDispatchFixture();
+  let writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) { options.assertBeforeWrite?.(); writes++;
+      options.onResponseEnvelope?.({ result: { turn: { id: 'wrong', status: 'inProgress' } } });
+      return { turn: { id: 'wrong', status: 'inProgress' } }; } };
+  try {
+    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+    assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
+  } finally { journal.close(); }
+  const refused = firstTurnDispatchFixture();
+  try {
+    const result = await dispatchPreparedNativeFirstTurn(refused.journal, refused.prepared,
+      rpc, () => false);
+    assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
+  } finally { refused.journal.close(); }
+});
+
+test('first-turn ACK before the final write fence cannot claim a refused write', async () => {
+  const { journal, prepared } = firstTurnDispatchFixture();
+  const turnId = '01a0f511-86e7-7942-8067-91d169eb18c7';
+  let authorized = true, writes = 0;
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) {
+      options.onResponseEnvelope?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
+      authorized = false;
+      options.assertBeforeWrite?.();
+      writes++;
+      return { turn: { id: turnId, status: 'inProgress' } };
+    } };
+  try {
+    const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => authorized);
+    assert.equal(result.state, 'turn-unknown'); assert.equal(result.turnId, null);
+    assert.equal(writes, 0);
+  } finally { journal.close(); }
+});
+
+test('first-turn positive ACK survives closing the initiating journal during the RPC', async () => {
+  const { journal, filePath, prepared } = firstTurnDispatchFixture();
+  const turnId = '01a0f511-86e7-7942-8067-91d169eb18c7';
+  const rpc = { async initializedSession() { return { generation: 5 }; },
+    isSessionCurrent: (generation: number) => generation === 5,
+    async request(_method: string, _params: Record<string, unknown>, options: {
+      assertBeforeWrite?: () => void;
+      onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
+    }) {
+      options.assertBeforeWrite?.(); journal.close();
+      options.onResponseEnvelope?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
+      return { turn: { id: turnId, status: 'inProgress' } };
+    } };
+  const result = await dispatchPreparedNativeFirstTurn(journal, prepared, rpc, () => true);
+  assert.equal(result.state, 'turn-accepted');
+  const reopened = new NativeFirstTurnBootstrapJournal(filePath);
+  try { assert.equal(reopened.get(prepared.operationId)?.turnId, turnId); }
+  finally { reopened.close(); }
 });
 
 test('native CLI start rejects source, settings, context, and input drift', () => {

@@ -73,10 +73,12 @@ function validRow(row: Row): NativeFirstTurnBootstrapRecord {
  * controlled zero-turn journal: an unknown start blocks replay after reopen. */
 export class NativeFirstTurnBootstrapJournal {
   readonly #db: Database;
+  readonly #filePath: string;
   readonly #directory: string;
   #closed = false;
   constructor(filePath: string) {
     if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) fail();
+    this.#filePath = filePath;
     this.#directory = path.dirname(filePath);
     // The caller must establish the private directory/key before opening the
     // journal. Never create an unprotected bootstrap parent as a side effect.
@@ -97,6 +99,7 @@ export class NativeFirstTurnBootstrapJournal {
     } catch (error) { this.#db.close(); throw error; }
   }
   close(): void { if (!this.#closed) { this.#closed = true; this.#db.close(); } }
+  filePath(): string { this.#open(); return this.#filePath; }
   /** The key and one-operation database share a caller-owned private directory. */
   directory(): string { this.#open(); return this.#directory; }
   synchronousMode(): number { this.#open(); return this.#db.pragma('synchronous', { simple: true }) as number; }
