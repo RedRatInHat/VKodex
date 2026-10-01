@@ -77,6 +77,8 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   }
   if (approvedTaskPolicy)
     assertApprovedResumeIntent(approvedTaskPolicy, input.resumeParams, input.taskId, input.cwd);
+  if (approvedTaskPolicy && typeof dependencies.claimReservation !== 'function')
+    throw new TypeError('Managed worker policy launch requires durable claim hook');
   if (path.extname(input.runtime.entrypoint).toLowerCase() !== '.js')
     throw new TypeError('Managed worker entrypoint must be compiled JavaScript');
   await verifyPinnedFiles(input);
