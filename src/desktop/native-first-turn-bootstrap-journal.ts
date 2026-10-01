@@ -310,6 +310,13 @@ export class NativeFirstTurnBootstrapJournal {
   assertFirstTurnIngressLeaseCurrent(scope: NativeFirstTurnIngressLeaseScope): void {
     this.#open(); this.#assertIngress(scope);
   }
+  /** The write connector must be the identical pinned object that performed
+   * fresh qualification, not another connection with matching scalar fields. */
+  assertFirstTurnIngressRpc(scope: NativeFirstTurnIngressLeaseScope,
+    rpc: PinnedDetachedProfileRpc): void {
+    this.assertFirstTurnIngressLeaseCurrent(scope);
+    if (ingressAuthorities.get(scope)?.rpc !== rpc) ingressFail();
+  }
   /** A caller can withdraw a pre-write admission. Revocation is durable and
    * irreversible in this one-operation journal; it never proves non-write. */
   revokeFirstTurnIngressLease(scope: NativeFirstTurnIngressLeaseScope): void {

@@ -23,6 +23,10 @@ import { dispatchPreparedNativeFirstThreadStartCanary } from
   '../../src/desktop/native-first-thread-start-canary.js';
 import { observeNativeFirstTurnCandidate } from
   '../../src/desktop/native-first-turn-candidate-observation.js';
+import { prepareAndReserveNativeFirstTurn } from
+  '../../src/desktop/native-first-turn-bootstrap-preparation.js';
+import { dispatchPreparedNativeFirstTurnCanary } from
+  '../../src/desktop/native-first-turn-canary.js';
 import { readWindowsProcessIdentity } from '../../src/desktop/windows-process-identity.js';
 import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS } from
   '../../src/desktop/windows-private-directory.js';
@@ -71,6 +75,7 @@ test('Windows production-pinned authenticated source permits one fenced first th
   const serverListening = new Promise<void>(resolve => server.once('listening', resolve));
   let serverError: unknown;
   let startRequests = 0;
+  let turnStartRequests = 0;
   let queueHasPendingItem = false;
   const methods: string[] = [];
   const sockets = new Set<WebSocket>();
@@ -166,6 +171,18 @@ test('Windows production-pinned authenticated source permits one fenced first th
               } }));
               return;
             }
+            if (message.method === 'turn/start') {
+              turnStartRequests++;
+              const reopened = new NativeFirstTurnBootstrapJournal(journalPath);
+              try {
+                assert.equal(reopened.getFirstTurnWriteFenceStatus(scope.operationId), 'passed');
+                assert.equal(reopened.get(scope.operationId)?.state, 'turn-reserved');
+              } finally { reopened.close(); }
+              socket.send(JSON.stringify({ id: message.id, result: { turn: {
+                id: randomUUID(), status: 'inProgress',
+              } } }));
+              return;
+            }
             if (message.method === 'thread/turns/list') {
               assert.deepEqual(message.params, { threadId, limit: 2,
                 sortDirection: 'asc', itemsView: 'summary' });
@@ -258,16 +275,15 @@ test('Windows production-pinned authenticated source permits one fenced first th
     assert.equal(nativeMethods().some(method => method === 'turn/start' || method === 'model/turn/start'), false);
 
     queueHasPendingItem = false;
-    const ingressJournal = journal;
-    const ingressScope = await journal.qualifyFirstTurnIngressLeaseScope(scope.operationId, client, preflight);
+    const ingressScope = await bootstrapJournal.qualifyFirstTurnIngressLeaseScope(scope.operationId, client, preflight);
     const pendingQueueMethods = [...qualifiedMethods, 'thread/read', 'thread/turns/list',
       'thread/goal/get', 'thread/queue/list'];
     const leaseQualifiedMethods = [...pendingQueueMethods,
       'thread/read', 'thread/turns/list', 'thread/goal/get', 'thread/queue/list', 'thread/read'];
     assert.deepEqual(nativeMethods(), leaseQualifiedMethods);
-    journal.acquireFirstTurnIngressLease(ingressScope);
-    journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
-    assert.throws(() => ingressJournal.assertFirstTurnIngressLeaseCurrent({ ...ingressScope }), /ingress/u,
+    bootstrapJournal.acquireFirstTurnIngressLease(ingressScope);
+    bootstrapJournal.assertFirstTurnIngressLeaseCurrent(ingressScope);
+    assert.throws(() => bootstrapJournal.assertFirstTurnIngressLeaseCurrent({ ...ingressScope }), /ingress/u,
       'copying the public scalar scope cannot copy its in-memory admission authority');
     const reopenedForIngress = new NativeFirstTurnBootstrapJournal(journalPath);
     try {
@@ -279,54 +295,69 @@ test('Windows production-pinned authenticated source permits one fenced first th
     } finally { reopenedForIngress.close(); }
     assert.deepEqual(nativeMethods(), leaseQualifiedMethods,
       'lease contention and copied-scope checks use only the durable journal');
-
     const beforeReservation = nativeMethods();
-    assert.throws(() => ingressJournal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
+    assert.throws(() => bootstrapJournal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
       clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64) }), /lease|ingress|conflict/u,
       'legacy reservation cannot bypass the held ingress lease');
-    assert.equal(ingressJournal.get(scope.operationId)?.state, 'thread-accepted');
-    assert.equal(ingressJournal.get(scope.operationId)?.revision, 2);
+    assert.equal(bootstrapJournal.get(scope.operationId)?.state, 'thread-accepted');
+    assert.equal(bootstrapJournal.get(scope.operationId)?.revision, 2);
     const reservationFenceCheck = new DatabaseConstructor(journalPath, { readonly: true });
     try {
       assert.equal(reservationFenceCheck.prepare(`SELECT 1 AS present FROM native_first_turn_write_fences
         WHERE operation_id=?`).get(scope.operationId), undefined,
       'rejected legacy reservation leaves no first-turn write fence');
     } finally { reservationFenceCheck.close(); }
-    const reserveFirstTurnWithIngressLease = (ingressJournal as NativeFirstTurnBootstrapJournal & {
-      reserveFirstTurnWithIngressLease(lease: typeof ingressScope, input: {
-        readonly clientUserMessageId: string; readonly keyedFingerprint: string;
-      }): void;
-    }).reserveFirstTurnWithIngressLease.bind(ingressJournal);
-    reserveFirstTurnWithIngressLease(ingressScope, {
-      clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64),
-    });
-    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
-    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed');
-    await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),
+    const firstTurnSettings = { cwd: workspace, runtimeWorkspaceRoots: [workspace], approvalPolicy: 'never',
+      approvalsReviewer: 'user', permissions: ':read-only', sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      model: policy.model, serviceTier: 'default', effort: 'medium', summary: null,
+      collaborationMode: null, personality: null } as const;
+    const firstTurnParams = { threadId, clientUserMessageId: 'canary-first-turn',
+      input: [{ type: 'text', text: 'isolated canary input' }], turnTrigger: null, toolOutput: null,
+      responsesapiClientMetadata: null, additionalContext: null, environments: null, cwd: workspace,
+      runtimeWorkspaceRoots: [workspace], approvalPolicy: 'never', approvalsReviewer: 'user', sandboxPolicy: null,
+      permissions: ':read-only', model: policy.model, serviceTier: 'default', serviceTierForTurn: null,
+      effort: 'medium', summary: null, personality: null, outputSchema: null, collaborationMode: null,
+      multiAgentMode: null, cyberAccessProgram: null } as const;
+    const firstTurnIdentity = { operationId: acceptedRecord.operationId, sourceId: acceptedRecord.sourceId,
+      sourceGeneration: acceptedRecord.sourceGeneration, ownerEpoch: acceptedRecord.ownerEpoch,
+      threadStartFingerprint: acceptedRecord.threadStartFingerprint, backendIdentity: acceptedRecord.backendIdentity };
+    const prepared = await prepareAndReserveNativeFirstTurn(bootstrapJournal, firstTurnIdentity, firstTurnParams,
+      { taskId: threadId, ownerEpoch: acceptedRecord.ownerEpoch, effectiveSettings: firstTurnSettings }, ingressScope, client);
+    assert.equal(bootstrapJournal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed');
+    assert.equal(bootstrapJournal.get(scope.operationId)?.state, 'turn-reserved');
+    await assert.rejects(observeNativeFirstTurnCandidate(bootstrapJournal, scope.operationId, client, preflight),
       /Native first-turn candidate unqualified/u);
-    assert.deepEqual(nativeMethods(), beforeReservation);
-    assert.throws(() => ingressJournal.markFirstTurnWriteFencePassed(scope.operationId), /lease|ingress|conflict/u,
+    assert.deepEqual(nativeMethods(), beforeReservation,
+      'reservation remains local until the protected production dispatcher writes');
+    assert.throws(() => bootstrapJournal.markFirstTurnWriteFencePassed(scope.operationId), /lease|ingress|conflict/u,
       'the legacy unscoped marker cannot bypass the ingress lease');
     const fault = new DatabaseConstructor(journalPath);
     try {
       fault.exec(`CREATE TRIGGER reject_ingress_uncertain BEFORE UPDATE ON native_first_turn_ingress_leases
         BEGIN SELECT RAISE(ABORT, 'simulated ingress persistence failure'); END`);
     } finally { fault.close(); }
-    assert.throws(() => ingressJournal.markFirstTurnWriteFencePassedWithIngressLease(ingressScope), /ingress/u);
-    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed',
+    assert.throws(() => bootstrapJournal.markFirstTurnWriteFencePassedWithIngressLease(ingressScope), /ingress/u);
+    assert.equal(bootstrapJournal.getFirstTurnWriteFenceStatus(scope.operationId), 'not-passed',
       'a failed lease update rolls the fence update back in the same transaction');
-    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
-    journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
+    assert.equal(bootstrapJournal.get(scope.operationId)?.state, 'turn-reserved');
+    bootstrapJournal.assertFirstTurnIngressLeaseCurrent(ingressScope);
     const removeFault = new DatabaseConstructor(journalPath);
     try { removeFault.exec('DROP TRIGGER reject_ingress_uncertain'); }
     finally { removeFault.close(); }
-    journal.markFirstTurnWriteFencePassedWithIngressLease(ingressScope);
-    assert.equal(journal.getFirstTurnWriteFenceStatus(scope.operationId), 'passed');
-    assert.equal(journal.get(scope.operationId)?.state, 'turn-reserved');
-    assert.throws(() => ingressJournal.assertFirstTurnIngressLeaseCurrent(ingressScope), /lease|uncertain|current|ingress/u,
+    await assert.rejects(dispatchPreparedNativeFirstTurnCanary(bootstrapJournal, structuredClone(prepared)), /unqualified/u,
+      'a copied preparation cannot consume the opaque production authority');
+    const firstTurnOutcome = await dispatchPreparedNativeFirstTurnCanary(bootstrapJournal, prepared);
+    assert.equal(firstTurnOutcome.kind, 'accepted');
+    assert.equal(firstTurnOutcome.diagnostic, 'accepted');
+    assert.equal(firstTurnOutcome.writeFence, 'passed');
+    assert.equal(firstTurnOutcome.record.state, 'turn-accepted');
+    assert.throws(() => bootstrapJournal.assertFirstTurnIngressLeaseCurrent(ingressScope), /lease|uncertain|current|ingress/u,
       'the atomic boundary retires the held scope into an uncertain write state');
-    assert.deepEqual(nativeMethods(), beforeReservation,
-      'the atomic lease/fence transition does not perform an additional native write or read');
+    assert.equal(turnStartRequests, 1);
+    await assert.rejects(dispatchPreparedNativeFirstTurnCanary(bootstrapJournal, prepared), /unqualified/u,
+      'a consumed preparation cannot dispatch a second native turn');
+    assert.equal(turnStartRequests, 1);
+    assert.equal(serverError, undefined);
   } finally {
     await client?.close();
     journal?.close();

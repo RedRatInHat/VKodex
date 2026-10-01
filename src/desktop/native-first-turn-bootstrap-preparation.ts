@@ -1,5 +1,6 @@
 import type { NativeCliTurnStartScope } from '../codex/native-cli-turn-start.js';
 import type { WorkerCommand } from '../codex/managed-worker-command-dispatcher.js';
+import type { PinnedDetachedProfileRpc } from '../codex/detached-profile-capability.js';
 import { NativeFirstTurnBootstrapJournal, type NativeFirstTurnBootstrapIdentity,
   type NativeFirstTurnIngressLeaseScope } from
   './native-first-turn-bootstrap-journal.js';
@@ -8,6 +9,11 @@ import { loadNativeFirstTurnPrivateKey } from './native-first-turn-private-key.j
 
 const fail = (): never => { throw new Error('Native first-turn reservation unqualified'); };
 const issued = new WeakSet<object>();
+const productionIssued = new WeakMap<object, Readonly<{
+  journal: NativeFirstTurnBootstrapJournal;
+  ingressScope: NativeFirstTurnIngressLeaseScope;
+  rpc: PinnedDetachedProfileRpc;
+}>>();
 export interface NativeFirstTurnPreparedReservation {
   readonly command: WorkerCommand;
   readonly operationId: string;
@@ -18,6 +24,18 @@ export interface NativeFirstTurnPreparedReservation {
 /** Retires only the in-process preparation token; never sends a native RPC. */
 export function consumeNativeFirstTurnReservation(prepared: NativeFirstTurnPreparedReservation): boolean {
   return !!prepared && issued.delete(prepared);
+}
+
+/** Only the private-key preparation path can give the production dispatcher
+ * the exact journal and opaque ingress object. A scalar copy or offline test
+ * preparation cannot become native write authority. Consumption is one-shot. */
+export function consumeProductionNativeFirstTurnReservation(prepared: NativeFirstTurnPreparedReservation):
+  Readonly<{ journal: NativeFirstTurnBootstrapJournal; ingressScope: NativeFirstTurnIngressLeaseScope;
+    rpc: PinnedDetachedProfileRpc }> | null {
+  const authority = prepared && productionIssued.get(prepared);
+  if (!authority || !issued.delete(prepared)) return null;
+  productionIssued.delete(prepared);
+  return authority;
 }
 
 /** Testable zero-RPC phase: the caller supplies the already loaded key. This
@@ -62,11 +80,16 @@ export function reserveNativeFirstTurnWithKey(journal: NativeFirstTurnBootstrapJ
 export async function prepareAndReserveNativeFirstTurn(journal: NativeFirstTurnBootstrapJournal,
   identity: NativeFirstTurnBootstrapIdentity,
   nativeParams: unknown, cliScope: NativeCliTurnStartScope,
-  ingressScope: NativeFirstTurnIngressLeaseScope): Promise<NativeFirstTurnPreparedReservation> {
-  journal.assertFirstTurnIngressLeaseCurrent(ingressScope);
+  ingressScope: NativeFirstTurnIngressLeaseScope,
+  rpc: PinnedDetachedProfileRpc): Promise<NativeFirstTurnPreparedReservation> {
+  journal.assertFirstTurnIngressRpc(ingressScope, rpc);
   // The directory comes from this one-operation journal, never from a wire
   // request or an independent routing argument.
   const key = await loadNativeFirstTurnPrivateKey(journal.directory());
-  try { return reserveNativeFirstTurnWithKey(journal, identity, nativeParams, cliScope, key, ingressScope); }
+  try {
+    const prepared = reserveNativeFirstTurnWithKey(journal, identity, nativeParams, cliScope, key, ingressScope);
+    productionIssued.set(prepared, { journal, ingressScope, rpc });
+    return prepared;
+  }
   finally { key.fill(0); }
 }
