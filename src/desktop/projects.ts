@@ -88,6 +88,10 @@ export function readDesktopProjectState(database: Database, legacy: IpcObject | 
   return {
     ...legacy,
     "native-projects": true,
+    // The native project catalog does not establish thread membership when
+    // Desktop's legacy assignment state could not be read. In particular,
+    // a non-null native project_id may conflict with an unmigrated override.
+    ...(legacy === null ? { "project-assignment-provenance": "unknown" } : {}),
     "native-project-assignments": isObject(migration) && migration.threadAssignmentsMigrated === true,
     "legacy-project-assignments": isObject(migration) && migration.projectsMigrated === true && migration.threadAssignmentsMigrated !== true,
     "local-projects": Object.fromEntries(projects.map(project => [project.id, {
@@ -120,6 +124,7 @@ export function desktopProjects(state: IpcObject): DesktopProject[] {
 /** Desktop assignments override workspace inference, including explicit projectless tasks. */
 export function assignTaskProjects(tasks: readonly DesktopTask[], state: IpcObject | null): DesktopTask[] {
   if (state === null) return tasks.map(({ projectId: _projectId, ...task }) => task);
+  if (state["project-assignment-provenance"] === "unknown") return tasks.map(({ projectId: _projectId, ...task }) => task);
   const projects = desktopProjects(state);
   const assignments = state["thread-project-assignments"] ?? {};
   const projectless = state["projectless-thread-ids"] ?? [];
