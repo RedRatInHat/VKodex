@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
-import { ActionRejectedError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
-import { RoutedTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
+import { RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
 const work = { hostId: "local", threadId: "work", sourceId: "work" };
@@ -250,6 +250,147 @@ test("state router follows a discovered UI owner before resuming the profile wri
     async task => { used.push(`discover:${task.threadId}`); return true; });
   const stream = routed.subscribe(work, () => {}, () => {}); await stream.start(); stream.close();
   assert.deepEqual(used, [`discover:${work.threadId}`, "native:close", "client:start", "client:close"]);
+});
+
+test("state route diagnostics identify discovered native observation without exposing task or error data", async () => {
+  const calls: string[] = [];
+  const transport = (label: string, kind: "native-observer" | "app-server"): TaskStateTransport => ({
+    subscribe: task => ({ task, start: async () => { calls.push(`${label}:start`); }, verifyOwner: async () => {},
+      diagnostic: () => ({ kind, ...(kind === "native-observer" ? { nativeOwnerClientId: "native-client" } : {}) }),
+      close: () => calls.push(`${label}:close`) }), close: () => {},
+  });
+  const native = transport("native", "native-observer");
+  const appServer = transport("app-server", "app-server");
+  const routed = new RoutedTaskStateTransport(native, [{ owns: task => task.sourceId === "work", states: appServer }], async () => true);
+  const stream = routed.subscribe(work, () => {}, () => {});
+  await stream.start();
+  assert.deepEqual(stream.diagnostic?.(), { kind: "native-observer", nativeOwnerClientId: "native-client", selection: "native-discovered" });
+  assert.equal(JSON.stringify(stream.diagnostic?.()).includes(work.threadId), false);
+  assert.equal(JSON.stringify(stream.diagnostic?.()).includes("exception"), false);
+  assert.deepEqual(calls, ["app-server:close", "native:start"]);
+  stream.close();
+});
+
+test("state route diagnostics retain owner rejection evidence when native fallback starts", async () => {
+  const native: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new TaskOwnedByClientError(); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "app-server" }), close: () => {} }), close: () => {} };
+  const fallback: TaskStateTransport = { subscribe: task => ({ task, start: async () => {}, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "native-observer", nativeOwnerClientId: "native-client" }), close: () => {} }), close: () => {} };
+  const routed = new RoutedTaskStateTransport(fallback, [{ owns: task => task.sourceId === "work", states: native }]);
+  const stream = routed.subscribe(work, () => {}, () => {});
+  await stream.start();
+  assert.deepEqual(stream.diagnostic?.(), { kind: "native-observer", nativeOwnerClientId: "native-client",
+    selection: "native-after-owner-rejection" });
+  assert.equal(JSON.stringify(stream.diagnostic?.()).includes("private owner rejection detail"), false);
+  stream.close();
+});
+
+test("failed state fallback is removed but leaves fixed privacy-safe route evidence", async () => {
+  const native: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new TaskOwnedByClientError(); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "app-server" }), close: () => {} }), close: () => {} };
+  const fallback: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new Error("private fallback detail: secret/token/task path"); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "unknown" }), close: () => {} }), close: () => {} };
+  const routed = new RoutedTaskStateTransport(fallback, [{ owns: task => task.sourceId === "work", states: native }]);
+  const connections = new TaskStateConnections(routed, () => 123);
+  await assert.rejects(connections.connect("binding-private-id", work, () => {}, () => {}), /private fallback detail/);
+  assert.equal(connections.diagnostic("binding-private-id"), null);
+  const failure = connections.lastFailureDiagnostic("binding-private-id");
+  assert.deepEqual(failure, { kind: "unknown", selection: "native-after-owner-rejection", failureClass: "other", routeGeneration: 1 });
+  assert.equal(JSON.stringify(failure).includes("private"), false);
+  assert.equal(JSON.stringify(failure).includes("secret"), false);
+});
+
+test("owner discovery failure does not start either stream and records only a fixed failure class", async () => {
+  const calls: string[] = [];
+  const transport = (label: string): TaskStateTransport => ({ subscribe: task => ({ task,
+    start: async () => { calls.push(`${label}:start`); }, verifyOwner: async () => {}, diagnostic: () => ({ kind: "unknown" }),
+    close: () => calls.push(`${label}:close`) }), close: () => {} });
+  const native = transport("native"); const appServer = transport("app-server");
+  const routed = new RoutedTaskStateTransport(appServer, [{ owns: task => task.sourceId === "work", states: native }],
+    async () => { throw new Error("private discovery exception text"); });
+  const connections = new TaskStateConnections(routed, () => 456);
+  await assert.rejects(connections.connect("binding", work, () => {}, () => {}), /private discovery exception text/);
+  assert.equal(calls.some(call => call.endsWith(":start")), false);
+  assert.equal(connections.diagnostic("binding"), null);
+  assert.deepEqual(connections.lastFailureDiagnostic("binding"), {
+    kind: "unknown", selection: "owner-discovery-failed", failureClass: "other", routeGeneration: 1,
+  });
+  assert.equal(JSON.stringify(connections.lastFailureDiagnostic("binding")).includes("private"), false);
+});
+
+test("a successful reconnect clears prior failed route evidence", async () => {
+  let attempt = 0;
+  const native: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new TaskOwnedByClientError(); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "app-server" }), close: () => {} }), close: () => {} };
+  const fallback: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { if (attempt++ === 0) throw new Error("private first attempt failure"); },
+    verifyOwner: async () => {}, diagnostic: () => ({ kind: "native-observer" }), close: () => {} }), close: () => {} };
+  const connections = new TaskStateConnections(new RoutedTaskStateTransport(fallback,
+    [{ owns: task => task.sourceId === "work", states: native }]));
+  await assert.rejects(connections.connect("binding", work, () => {}, () => {}), /private first attempt failure/);
+  assert.ok(connections.lastFailureDiagnostic("binding"));
+  await connections.connect("binding", work, () => {}, () => {});
+  assert.equal(connections.lastFailureDiagnostic("binding"), null);
+  assert.deepEqual(connections.diagnostic("binding"), {
+    kind: "native-observer", selection: "native-after-owner-rejection", routeGeneration: 2,
+  });
+  await connections.stop();
+});
+
+test("explicit close clears prior failed route evidence", async () => {
+  const native: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new TaskOwnedByClientError(); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "app-server" }), close: () => {} }), close: () => {} };
+  const fallback: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new Error("private fallback failure"); }, verifyOwner: async () => {},
+    diagnostic: () => ({ kind: "unknown" }), close: () => {} }), close: () => {} };
+  const connections = new TaskStateConnections(new RoutedTaskStateTransport(fallback,
+    [{ owns: task => task.sourceId === "work", states: native }]));
+  await assert.rejects(connections.connect("binding", work, () => {}, () => {}));
+  assert.ok(connections.lastFailureDiagnostic("binding"));
+  connections.close("binding");
+  assert.equal(connections.lastFailureDiagnostic("binding"), null);
+});
+
+test("failed route evidence expires instead of making an obsolete owner error look current", async () => {
+  let now = 1_000;
+  const transport: TaskStateTransport = { subscribe: task => ({ task,
+    start: async () => { throw new DesktopUnavailableError("private transport detail"); },
+    verifyOwner: async () => {}, close: () => {} }), close: () => {} };
+  const connections = new TaskStateConnections(transport, () => now);
+  await assert.rejects(connections.connect("binding", work, () => {}, () => {}));
+  assert.equal(connections.lastFailureDiagnostic("binding")?.failureClass, "desktop-unavailable");
+  now += 5 * 60_000 + 1;
+  assert.equal(connections.lastFailureDiagnostic("binding"), null);
+});
+
+test("post-start onError retains fixed route evidence before closing the connection", async () => {
+  const reportError: { current?: (error: Error) => void } = {};
+  const native: TaskStateTransport = { subscribe: (task, _onState, onError) => {
+    reportError.current = onError;
+    return { task, start: async () => {}, verifyOwner: async () => {},
+      diagnostic: () => ({ kind: "native-observer", nativeOwnerClientId: "native-client" }), close: () => {} };
+  }, close: () => {} };
+  const appServer: TaskStateTransport = { subscribe: task => {
+    return { task, start: async () => {}, verifyOwner: async () => {}, diagnostic: () => ({ kind: "app-server" }), close: () => {} };
+  }, close: () => {} };
+  const connections = new TaskStateConnections(new RoutedTaskStateTransport(native,
+    [{ owns: task => task.sourceId === "work", states: appServer }], async () => true), () => 789);
+  const failures: Error[] = [];
+  await connections.connect("binding-private", work, () => {}, failure => failures.push(failure.error));
+  assert.ok(reportError.current);
+  reportError.current(new DesktopUnavailableError("private native path and token detail"));
+  assert.equal(connections.has("binding-private"), false);
+  assert.equal(connections.diagnostic("binding-private"), null);
+  assert.equal(failures.length, 1);
+  assert.deepEqual(connections.lastFailureDiagnostic("binding-private"), {
+    kind: "unknown", selection: "native-discovered", failureClass: "desktop-unavailable", routeGeneration: 1,
+  });
+  assert.equal(JSON.stringify(connections.lastFailureDiagnostic("binding-private")).includes("private"), false);
 });
 
 test("exclusive claim wins before legacy and never falls back after an owner error", async () => {

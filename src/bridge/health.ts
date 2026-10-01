@@ -279,6 +279,19 @@ export class BridgeHealthMonitor {
         checks.push({ name: `codex_route_evidence:${binding.id}`, state: "ok",
           detail: `«${binding.title.slice(0, 120)}»: маршрут ${label}; локальное поколение маршрута процесса ${route.routeGeneration ?? "неизвестно"}${route.nativeOwnerClientId ? `; native owner client ${route.nativeOwnerClientId}` : ""}. Это доказательство маршрута, а не физического writer.` });
       }
+      if (!binding.connected && binding.route?.failureClass) {
+        const route = binding.route;
+        const selection = route.selection === "native-discovered" ? "native после обнаружения клиента"
+          : route.selection === "native-after-owner-rejection" ? "native после отказа профильного владельца"
+            : route.selection === "owner-discovery-failed" ? "обнаружение native владельца"
+              : "первичный профильный канал";
+        const failure = route.failureClass === "owner-busy" ? "профиль занят другим клиентом"
+          : route.failureClass === "task-not-open" ? "задача не открыта в клиенте"
+            : route.failureClass === "desktop-unavailable" ? "клиент Codex недоступен"
+              : "неизвестный отказ";
+        checks.push({ name: `codex_route_attempt:${binding.id}`, state: "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: маршрут ${selection}; класс отказа: ${failure}; локальное поколение попытки ${route.routeGeneration ?? "неизвестно"}. Причина очищена от деталей транспорта; это не доказательство физического writer.` });
+      }
       const routeFailure = this.store.getValue<{ at: number; kind: "no-active-owner" }>(`route-failure:${binding.id}`);
       if (routeFailure?.kind === "no-active-owner") {
         const at = Number.isSafeInteger(routeFailure.at) && Math.abs(routeFailure.at) <= 8.64e15

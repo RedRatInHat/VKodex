@@ -1,12 +1,30 @@
-import { ActionRejectedError, TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, TaskOwnedByClientError, taskKey, type TaskRef } from "./codex-tasks.js";
 
 export type TaskState = Record<string, unknown>;
+const LAST_ROUTE_FAILURE_FRESH_MS = 5 * 60_000;
 
 /** Route evidence only. It never asserts physical native writer ownership. */
 export interface TaskStateRouteDiagnostic {
   readonly kind: "native-observer" | "app-server" | "unknown";
   readonly nativeOwnerClientId?: string;
   readonly routeGeneration?: number;
+  readonly selection?: "profile-primary" | "native-discovered" | "native-after-owner-rejection" | "owner-discovery-failed";
+  readonly failureClass?: "owner-busy" | "task-not-open" | "desktop-unavailable" | "other";
+}
+
+function failureClass(error: unknown): NonNullable<TaskStateRouteDiagnostic["failureClass"]> {
+  if (error instanceof TaskOwnedByClientError) return "owner-busy";
+  if (error instanceof TaskNotOpenError) return "task-not-open";
+  if (error instanceof DesktopUnavailableError) return "desktop-unavailable";
+  return "other";
+}
+
+/** Never persist raw exception text, task paths, or client identifiers on failure. */
+function failedRouteDiagnostic(stream: TaskStateStream, error: unknown, routeGeneration: number): TaskStateRouteDiagnostic {
+  let route: TaskStateRouteDiagnostic | undefined;
+  try { route = stream.diagnostic?.(); } catch { /* Diagnostics must not mask the connection error. */ }
+  return { kind: "unknown", ...(route?.selection ? { selection: route.selection } : {}),
+    failureClass: route?.failureClass ?? failureClass(error), routeGeneration };
 }
 
 /** A task-scoped state stream owned by one Codex execution adapter. */
@@ -35,27 +53,46 @@ class RoutedTaskStateStream implements TaskStateStream {
   private active: TaskStateStream;
   private closed = false;
   private primaryClosed = false;
+  private selection: NonNullable<TaskStateRouteDiagnostic["selection"]> = "profile-primary";
+  private failedWith: TaskStateRouteDiagnostic["failureClass"];
   constructor(readonly task: TaskRef, private readonly primary: TaskStateStream,
     private readonly fallback: () => TaskStateStream,
     private readonly preferFallback?: (task: TaskRef) => Promise<boolean>) { this.active = primary; }
   async start(timeoutMs?: number): Promise<void> {
     // A live Desktop/VS Code owner can keep thread/resume pending for minutes
     // on a large task. Discover that owner before touching the profile writer.
-    if (this.preferFallback && await this.preferFallback(this.task)) {
+    let nativeDiscovered = false;
+    try { nativeDiscovered = await this.preferFallback?.(this.task) ?? false; }
+    catch (error) {
+      this.selection = "owner-discovery-failed";
+      this.failedWith = failureClass(error);
+      throw error;
+    }
+    if (nativeDiscovered) {
       if (this.closed) throw new Error("Task subscription was closed before owner discovery finished.");
+      this.selection = "native-discovered";
       this.primary.close(); this.primaryClosed = true; this.active = this.fallback();
-      await this.active.start(timeoutMs);
+      try { await this.active.start(timeoutMs); }
+      catch (error) { this.failedWith = failureClass(error); throw error; }
       return;
     }
     try { await this.primary.start(timeoutMs); }
     catch (error) {
-      if (!(error instanceof TaskOwnedByClientError) || this.closed) throw error;
+      if (!(error instanceof TaskOwnedByClientError) || this.closed) {
+        this.failedWith = failureClass(error);
+        throw error;
+      }
+      this.selection = "native-after-owner-rejection";
       this.primary.close(); this.primaryClosed = true; this.active = this.fallback();
-      await this.active.start(timeoutMs);
+      try { await this.active.start(timeoutMs); }
+      catch (fallbackError) { this.failedWith = failureClass(fallbackError); throw fallbackError; }
     }
   }
   verifyOwner(timeoutMs?: number): Promise<void> { return this.active.verifyOwner(timeoutMs); }
-  diagnostic(): TaskStateRouteDiagnostic { return this.active.diagnostic?.() ?? { kind: "unknown" }; }
+  diagnostic(): TaskStateRouteDiagnostic {
+    if (this.failedWith) return { kind: "unknown", selection: this.selection, failureClass: this.failedWith };
+    return { ...(this.active.diagnostic?.() ?? { kind: "unknown" }), selection: this.selection };
+  }
   close(): void {
     this.closed = true; this.active.close();
     if (this.active !== this.primary && !this.primaryClosed) this.primary.close();
@@ -101,6 +138,7 @@ interface TaskStateConnection {
 /** Owns task stream identity, retry gates and periodic owner verification. */
 export class TaskStateConnections {
   private readonly connections = new Map<string, TaskStateConnection>();
+  private readonly lastFailures = new Map<string, { key: string; at: number; diagnostic: TaskStateRouteDiagnostic }>();
   private readonly retryAfter = new Map<string, number>();
   private generation = 0;
 
@@ -117,6 +155,16 @@ export class TaskStateConnections {
     const diagnostic = connection.stream.diagnostic?.() ?? { kind: "unknown" as const };
     return { ...diagnostic, routeGeneration: connection.generation };
   }
+  lastFailureDiagnostic(id: string): TaskStateRouteDiagnostic | null {
+    const failure = this.lastFailures.get(id);
+    if (!failure) return null;
+    const age = this.now() - failure.at;
+    if (age < 0 || age > LAST_ROUTE_FAILURE_FRESH_MS) {
+      this.lastFailures.delete(id);
+      return null;
+    }
+    return failure.diagnostic;
+  }
   connected(id: string, freshnessMs = 45_000): boolean {
     const connection = this.connections.get(id);
     return !!connection?.ready && connection.lastVerifiedAt !== null && this.now() - connection.lastVerifiedAt <= freshnessMs;
@@ -129,19 +177,29 @@ export class TaskStateConnections {
     connection?.stream.close();
     this.connections.delete(id);
     this.retryAfter.delete(id);
+    this.lastFailures.delete(id);
   }
 
   async connect(id: string, task: TaskRef, onState: (state: TaskState, initial: boolean) => void,
     onFailure: (failure: TaskStateConnectionFailure) => void, timeoutMs?: number): Promise<void> {
+    this.lastFailureDiagnostic(id);
+    const previousFailure = this.lastFailures.get(id);
     this.close(id);
-    let stream!: TaskStateStream;
-    stream = this.transport.subscribe(task, (state, initial) => {
-      const connection = this.connections.get(id);
-      if (connection?.stream !== stream) return;
-      connection.ready = true;
-      onState(state, initial);
-    }, error => this.fail(id, stream, error));
+    if (previousFailure?.key === taskKey(task)) this.lastFailures.set(id, previousFailure);
     const generation = ++this.generation;
+    let stream!: TaskStateStream;
+    try {
+      stream = this.transport.subscribe(task, (state, initial) => {
+        const connection = this.connections.get(id);
+        if (connection?.stream !== stream) return;
+        connection.ready = true;
+        onState(state, initial);
+      }, error => this.fail(id, stream, error));
+    } catch (error) {
+      this.lastFailures.set(id, { key: taskKey(task), at: this.now(),
+        diagnostic: { kind: "unknown", failureClass: failureClass(error), routeGeneration: generation } });
+      throw error;
+    }
     const connection: TaskStateConnection = {
       task, key: taskKey(task), stream, onFailure, ready: false, lastVerifiedAt: null, verifying: null, generation,
     };
@@ -152,9 +210,12 @@ export class TaskStateConnections {
       connection.ready = true;
       connection.lastVerifiedAt = this.now();
       this.retryAfter.delete(id);
+      this.lastFailures.delete(id);
     } catch (error) {
       if (this.connections.get(id)?.stream !== stream) return;
+      const diagnostic = failedRouteDiagnostic(stream, error, generation);
       this.close(id);
+      this.lastFailures.set(id, { key: connection.key, at: this.now(), diagnostic });
       throw error;
     }
   }
@@ -175,7 +236,9 @@ export class TaskStateConnections {
     const connection = this.connections.get(id);
     if (connection?.stream !== stream) return;
     const failure = { task: connection.task, error, lastVerifiedAt: connection.lastVerifiedAt } satisfies TaskStateConnectionFailure;
+    const diagnostic = failedRouteDiagnostic(stream, error, connection.generation);
     this.close(id);
+    this.lastFailures.set(id, { key: connection.key, at: this.now(), diagnostic });
     connection.onFailure(failure);
   }
 

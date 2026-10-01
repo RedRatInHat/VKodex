@@ -713,3 +713,20 @@ test("health labels route evidence without equating it to physical native writer
   assert.match(route.detail, /не физического writer/u);
   assert.match(report.checks.find(check => check.name === "codex_streams")!.detail, /локальных аренд потока VKodex.*не подтверждает физического native writer/u);
 });
+
+test("health explains a failed route attempt without exposing transport exception text", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 0,
+    requiredBindings: 1, connectedRequiredBindings: 0, bindings: [{ id: "route", title: "Route", source: ".codex-work",
+      status: "running", connected: false, lastConfirmedAt: null, failure: null,
+      route: { kind: "unknown" as const, selection: "native-after-owner-rejection" as const,
+        failureClass: "desktop-unavailable" as const, routeGeneration: 7 } }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  const route = report.checks.find(check => check.name === "codex_route_attempt:route")!;
+  assert.equal(route.state, "degraded");
+  assert.match(route.detail, /native.*отказа профильного владельца.*недоступен.*7/u);
+  assert.doesNotMatch(route.detail, /token|pipe|exception/u);
+});
