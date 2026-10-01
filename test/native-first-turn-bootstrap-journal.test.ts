@@ -8,6 +8,9 @@ import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-tur
 import { createPrivateKeyWithDependencies, loadPrivateKeyWithDependencies } from
   '../src/desktop/native-first-turn-private-key-core.js';
 import { createNativeFirstTurnPrivateKey } from '../src/desktop/native-first-turn-private-key.js';
+import { reconcileUnknownNativeFirstTurnFromPinnedHistory } from
+  '../src/desktop/native-first-turn-unknown-reconciler.js';
+import type { PinnedDetachedProfileRpc } from '../src/codex/detached-profile-capability.js';
 
 const identity = () => ({ sourceId: 'profile-a', sourceGeneration: randomUUID(),
   ownerEpoch: randomUUID(), threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64) });
@@ -64,6 +67,27 @@ test('first-turn terminal transitions are CAS-bound and an unknown reservation n
     clientUserMessageId: 'second-message', keyedFingerprint: fingerprint('second') }), /conflict/u);
   assert.throws(() => reopened.markFirstTurnAccepted({ operationId, expectedRevision: 3, turnId: 'turn-1' }), /conflict/u);
   reopened.close();
+});
+
+test('unknown-turn reconciliation refuses an unbranded backend without reading or changing the journal', async () => {
+  const journal = open(); const operationId = randomUUID();
+  journal.persistThreadStartIntent({ operationId, ...identity() });
+  journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId: randomUUID() });
+  journal.reserveFirstTurn({ operationId, expectedRevision: 2,
+    clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first') });
+  journal.markFirstTurnUnknown({ operationId, expectedRevision: 3 });
+  const before = journal.get(operationId);
+  let reads = 0;
+  const fake = {
+    initializedSession: async () => ({ generation: 7 }),
+    isSessionCurrent: () => true,
+    request: async () => { reads++; return {}; },
+  } as unknown as PinnedDetachedProfileRpc;
+  await assert.rejects(reconcileUnknownNativeFirstTurnFromPinnedHistory(
+    journal, operationId, fake));
+  assert.equal(reads, 0);
+  assert.deepEqual(journal.get(operationId), before);
+  journal.close();
 });
 
 test('one-shot database refuses a fresh operation ID and invalid fingerprint', () => {

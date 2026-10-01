@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
-import { readAndQualifyNativeFirstTurnHistory } from '../src/desktop/native-first-turn-history.js';
+import { readAndQualifyNativeFirstTurnHistory,
+  readAndQualifyUnknownNativeFirstTurnHistory } from '../src/desktop/native-first-turn-history.js';
 import { fingerprintNativeFirstTurnInput, fingerprintNativeFirstTurnUserItem } from
   '../src/desktop/native-first-turn-input-fingerprint.js';
 
@@ -111,6 +112,37 @@ test('history read refuses a changed backend generation rather than rebinding to
     isSessionCurrent: generation => current && generation === 7,
     request: async () => { current = false; return page(); },
   }, { ...expected, expectedInputFingerprint, fingerprintKey: key }), /first-turn history unqualified/u);
+});
+
+test('unknown first-turn ACK is resolved only by exact completed history', async () => {
+  const scope = { ...identity, threadId: expected.threadId,
+    clientUserMessageId: expected.clientUserMessageId,
+    expectedInputFingerprint, fingerprintKey: key };
+  const unknownRead = (value: unknown, onRequest?: () => void) =>
+    readAndQualifyUnknownNativeFirstTurnHistory({
+      initializedSession: async () => ({ generation: 7 }),
+      isSessionCurrent: generation => generation === 7,
+      request: async (method, params, options) => {
+        assert.equal(method, 'thread/turns/list');
+        assert.deepEqual(params, { threadId: expected.threadId, limit: 2,
+          sortDirection: 'asc', itemsView: 'full' });
+        assert.equal(options?.expectedGeneration, 7);
+        onRequest?.();
+        return value;
+      },
+    }, scope);
+  const evidence = await unknownRead(page());
+  assert.equal(evidence.turnId, expected.turnId);
+  assert.equal(evidence.clientUserMessageId, expected.clientUserMessageId);
+  assert.equal(JSON.stringify(evidence).includes('canary'), false);
+  for (const value of [
+    { ...page(), data: [] },
+    { ...page(), data: [turn(), { ...turn(), id: 'turn-b' }] },
+    { ...page(), nextCursor: 'later' },
+    page({ ...turn(), status: 'inProgress' }),
+    page({ ...turn(), items: [{ ...turn().items[0], content: [
+      { type: 'text', text: 'other', text_elements: [] }] }, ...turn().items.slice(1)] }),
+  ]) await assert.rejects(unknownRead(value), /first-turn history unqualified/u);
 });
 
 test('durable first-turn input fingerprint round-trips exact native text without storing it', () => {

@@ -8,6 +8,7 @@ export interface NativeFirstTurnHistoryScope extends NativeFirstTurnInputScope {
   /** The durable keyedFingerprint from the one-shot bootstrap journal. */
   readonly expectedInputFingerprint: string;
 }
+export type NativeFirstTurnUnknownHistoryScope = Omit<NativeFirstTurnHistoryScope, 'turnId'>;
 export interface NativeFirstTurnHistoryReader {
   initializedSession(): Promise<{ readonly generation: number }>;
   isSessionCurrent(generation: number): boolean;
@@ -148,21 +149,43 @@ function qualifyNativeFirstTurnHistory(page: unknown,
 /** Request the first ascending full native page ourselves, pinned to one
  * initialized backend generation. This still proves only history content;
  * source, owner, queue and post-read idle state require separate checks. */
-export async function readAndQualifyNativeFirstTurnHistory(rpc: NativeFirstTurnHistoryReader,
-  scope: NativeFirstTurnHistoryScope): Promise<NativeFirstTurnHistoryEvidence> {
+async function readNativeFirstTurnPage(rpc: NativeFirstTurnHistoryReader,
+  threadId: string): Promise<unknown> {
   if (!rpc || typeof rpc.initializedSession !== 'function' ||
       typeof rpc.isSessionCurrent !== 'function' || typeof rpc.request !== 'function' ||
-      !scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
+      !identifier(threadId)) fail();
+  const session = await rpc.initializedSession();
+  if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
+      !rpc.isSessionCurrent(session.generation)) fail();
+  const page = await rpc.request('thread/turns/list', { threadId,
+    limit: 2, sortDirection: 'asc', itemsView: 'full' },
+  { expectedGeneration: session.generation, timeoutMs: 30_000 });
+  if (!rpc.isSessionCurrent(session.generation)) fail();
+  return page;
+}
+
+export async function readAndQualifyNativeFirstTurnHistory(rpc: NativeFirstTurnHistoryReader,
+  scope: NativeFirstTurnHistoryScope): Promise<NativeFirstTurnHistoryEvidence> {
+  if (!scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
       !identifier(scope.clientUserMessageId) ||
       !/^[a-f0-9]{64}$/u.test(scope.expectedInputFingerprint) ||
       !(scope.fingerprintKey instanceof Uint8Array) ||
       scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) fail();
-  const session = await rpc.initializedSession();
-  if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
-      !rpc.isSessionCurrent(session.generation)) fail();
-  const page = await rpc.request('thread/turns/list', { threadId: scope.threadId,
-    limit: 2, sortDirection: 'asc', itemsView: 'full' },
-  { expectedGeneration: session.generation, timeoutMs: 30_000 });
-  if (!rpc.isSessionCurrent(session.generation)) fail();
-  return qualifyNativeFirstTurnHistory(page, scope);
+  return qualifyNativeFirstTurnHistory(await readNativeFirstTurnPage(rpc, scope.threadId), scope);
+}
+
+/** Resolve an unknown ACK from one exact persisted first turn. This is only
+ * read-only outcome evidence, not source/owner/queue admission or a retry. */
+export async function readAndQualifyUnknownNativeFirstTurnHistory(rpc: NativeFirstTurnHistoryReader,
+  scope: NativeFirstTurnUnknownHistoryScope): Promise<NativeFirstTurnHistoryEvidence> {
+  if (!scope || !identifier(scope.threadId) ||
+      !identifier(scope.clientUserMessageId) ||
+      !/^[a-f0-9]{64}$/u.test(scope.expectedInputFingerprint) ||
+      !(scope.fingerprintKey instanceof Uint8Array) ||
+      scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) fail();
+  const page = await readNativeFirstTurnPage(rpc, scope.threadId);
+  if (!object(page) || !Array.isArray(page.data) || page.data.length !== 1) return fail();
+  const turn = page.data[0];
+  if (!object(turn) || !identifier(turn.id)) return fail();
+  return qualifyNativeFirstTurnHistory(page, { ...scope, turnId: turn.id });
 }
