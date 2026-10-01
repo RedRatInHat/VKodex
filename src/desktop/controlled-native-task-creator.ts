@@ -7,8 +7,10 @@ import type { AppServerRpc } from '../codex/app-server-connection.js';
 import { approveTaskPolicy, assertEffectiveResume, type ApprovedTaskPolicy } from
   '../codex/managed-task-policy.js';
 import { comparablePath } from '../core/paths.js';
-import { captureControlledNativeSourcePreflight, loadControlledNativeSourcePreflightReceipt,
-  persistControlledNativeSourcePreflightReceipt, proveControlledNativeSource,
+import { captureAuthenticatedProfileSourcePreflight, captureControlledNativeSourcePreflight,
+  loadAuthenticatedProfileSourcePreflightReceipt, loadControlledNativeSourcePreflightReceipt,
+  persistAuthenticatedProfileSourcePreflightReceipt, persistControlledNativeSourcePreflightReceipt,
+  proveAuthenticatedProfileSource, proveControlledNativeSource,
   type ControlledNativeSourceIdentity } from './controlled-native-source-proof.js';
 
 type Row = Record<string, unknown>;
@@ -64,6 +66,8 @@ export interface ControlledCreationIntent {
   readonly sourceId: string;
   /** Requires the opt-in source proof protocol during creation and reconciliation. */
   readonly sourceProofRequired?: true;
+  /** Explicit candidate-only proof for a populated profile; absent means exclusive empty home. */
+  readonly sourceProofMode?: 'authenticated-profile-new-task';
   readonly requestedPolicy: PolicyTemplate;
 }
 export interface ControlledCreationStarted extends ControlledCreationIntent {
@@ -106,10 +110,12 @@ export interface ControlledNativeTaskCreatorOptions {
   /** Optional new, owned, independent read-only session after the original first read RPC is exhausted.
    * The factory must not return a shared connection. The creator closes a validated returned session. */
   readonly freshReadRpc?: () => Promise<Readonly<{ rpc: CreatorRpc; close(): Promise<void> }>>;
-  /** Opt-in exclusive source proof. The durable receipt must be saved before thread/start. */
+  /** Opt-in source proof. The default requires an empty exclusive home; the
+   * explicit authenticated-profile mode proves only the returned candidate.
+   * Its durable preflight receipt must precede thread/start. */
   readonly sourceProof?: ControlledNativeSourceProofOptions;
   /** Independent trusted source mapping; cannot be synthesized from empty history. */
-  /** Independently verifies the observed native path in an exclusive source.
+  /** Independently verifies the observed native path under the chosen source proof.
    * The optional path argument preserves existing one-argument resolvers. */
   readonly resolveSource: (threadId: string, observedNativePath?: string) =>
     Promise<Readonly<{ sourceId: string; rolloutPath: string }>>;
@@ -118,6 +124,7 @@ export interface ControlledNativeTaskCreatorOptions {
 export interface ControlledNativeSourceProofOptions {
   readonly sourceHome: string;
   readonly preflightReceiptPath: string;
+  readonly mode?: 'authenticated-profile-new-task';
 }
 
 /** Binds the observed native path to a pre-start receipt and the durable intent. */
@@ -128,9 +135,14 @@ export function controlledNativeSourceProofResolver(intent: ControlledCreationIn
   return async (threadId, observedNativePath) => {
     if (typeof observedNativePath !== 'string') refuse();
     const nativePath = observedNativePath as string;
-    const preflight = await loadControlledNativeSourcePreflightReceipt(options.preflightReceiptPath,
-      identity, options.sourceHome, intent.requestedPolicy.cwd);
-    const proof = await proveControlledNativeSource(preflight, nativePath, threadId);
+    if (intent.sourceProofMode !== options.mode) refuse();
+    const proof = options.mode === 'authenticated-profile-new-task'
+      ? await proveAuthenticatedProfileSource(
+        await loadAuthenticatedProfileSourcePreflightReceipt(options.preflightReceiptPath,
+          identity, options.sourceHome, intent.requestedPolicy.cwd), nativePath, threadId)
+      : await proveControlledNativeSource(
+        await loadControlledNativeSourcePreflightReceipt(options.preflightReceiptPath,
+          identity, options.sourceHome, intent.requestedPolicy.cwd), nativePath, threadId);
     return { sourceId: identity.sourceId, rolloutPath: proof.rolloutPath };
   };
 }
@@ -339,12 +351,15 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
     !UUID.test(options.operationId) || typeof options.sourceId !== 'string' ||
     !options.sourceId || options.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(options.sourceId) ||
     options.freshReadRpc !== undefined && typeof options.freshReadRpc !== 'function' ||
+    options.sourceProof?.mode !== undefined &&
+      options.sourceProof.mode !== 'authenticated-profile-new-task' ||
     ![options.persistIntent, options.persistStarted, options.persistQualified,
       options.resolveSource].every(callback => typeof callback === 'function')) refuse();
   const requestedPolicy = policyTemplate(options.requestedPolicy);
   const intent = Object.freeze({ operationId: options.operationId,
     creatorNonce: randomUUID(), sourceGeneration: randomUUID(), sourceId: options.sourceId,
     ...(options.sourceProof ? { sourceProofRequired: true as const } : {}),
+    ...(options.sourceProof?.mode ? { sourceProofMode: options.sourceProof.mode } : {}),
     requestedPolicy }) satisfies ControlledCreationIntent;
   const reservation = await options.persistIntent(intent);
   if (!reservation || typeof reservation.isCurrent !== 'function' ||
@@ -352,10 +367,17 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
   if (options.sourceProof) {
     const identity: ControlledNativeSourceIdentity = { operationId: intent.operationId,
       sourceId: intent.sourceId, sourceGeneration: intent.sourceGeneration };
-    const preflight = await captureControlledNativeSourcePreflight(identity,
-      options.sourceProof.sourceHome, requestedPolicy.cwd);
-    if (reservation.isCurrent() !== true) refuse();
-    await persistControlledNativeSourcePreflightReceipt(options.sourceProof.preflightReceiptPath, preflight);
+    if (options.sourceProof.mode === 'authenticated-profile-new-task') {
+      const preflight = await captureAuthenticatedProfileSourcePreflight(identity,
+        options.sourceProof.sourceHome, requestedPolicy.cwd);
+      if (reservation.isCurrent() !== true) refuse();
+      await persistAuthenticatedProfileSourcePreflightReceipt(options.sourceProof.preflightReceiptPath, preflight);
+    } else {
+      const preflight = await captureControlledNativeSourcePreflight(identity,
+        options.sourceProof.sourceHome, requestedPolicy.cwd);
+      if (reservation.isCurrent() !== true) refuse();
+      await persistControlledNativeSourcePreflightReceipt(options.sourceProof.preflightReceiptPath, preflight);
+    }
     if (reservation.isCurrent() !== true) refuse();
   }
   const resolveSource = options.sourceProof

@@ -57,8 +57,11 @@ function strictJson<T>(value: T): { snapshot: T; json: string } {
   } catch { return fail(); }
 }
 function validIntent(value: ControlledCreationIntent): void {
-  if (!(keys(value, intentKeys) || keys(value, [...intentKeys, 'sourceProofRequired'])) ||
+  if (!(keys(value, intentKeys) || keys(value, [...intentKeys, 'sourceProofRequired']) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'sourceProofMode'])) ||
     Object.hasOwn(value, 'sourceProofRequired') && value.sourceProofRequired !== true ||
+    Object.hasOwn(value, 'sourceProofMode') &&
+      (value.sourceProofRequired !== true || value.sourceProofMode !== 'authenticated-profile-new-task') ||
     !uuid.test(value.operationId) || !uuid.test(value.creatorNonce) ||
     !uuid.test(value.sourceGeneration) || typeof value.sourceId !== 'string' ||
     !value.sourceId || value.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(value.sourceId) ||
@@ -82,6 +85,8 @@ function intentOf(value: ControlledCreationStarted): ControlledCreationIntent {
     sourceGeneration: value.sourceGeneration, sourceId: value.sourceId,
     ...(Object.hasOwn(value, 'sourceProofRequired')
       ? { sourceProofRequired: value.sourceProofRequired } : {}),
+    ...(Object.hasOwn(value, 'sourceProofMode')
+      ? { sourceProofMode: value.sourceProofMode } : {}),
     requestedPolicy: value.requestedPolicy };
 }
 function startedOf(value: ControlledCreationReceipt): ControlledCreationStarted {
@@ -89,7 +94,8 @@ function startedOf(value: ControlledCreationReceipt): ControlledCreationStarted 
 }
 function validStarted(value: ControlledCreationStarted): void {
   if (!(keys(value, [...intentKeys, 'threadId', 'selectedEffective']) ||
-    keys(value, [...intentKeys, 'sourceProofRequired', 'threadId', 'selectedEffective'])) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'threadId', 'selectedEffective']) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'sourceProofMode', 'threadId', 'selectedEffective'])) ||
     !uuid.test(value.threadId) ||
     !keys(value.selectedEffective, legacySelectedKeys) &&
     !keys(value.selectedEffective, fullSelectedKeys) &&
@@ -104,7 +110,10 @@ function validQualified(value: ControlledCreationReceipt): void {
   if (!(keys(value, [...intentKeys, 'threadId', 'selectedEffective', 'effectivePolicy',
     'rolloutPath', 'status']) ||
     keys(value, [...intentKeys, 'sourceProofRequired', 'threadId', 'selectedEffective',
-      'effectivePolicy', 'rolloutPath', 'status'])) || value.status !== 'qualified-zero-turn' ||
+      'effectivePolicy', 'rolloutPath', 'status']) ||
+    keys(value, [...intentKeys, 'sourceProofRequired', 'sourceProofMode', 'threadId',
+      'selectedEffective', 'effectivePolicy', 'rolloutPath', 'status'])) ||
+    value.status !== 'qualified-zero-turn' ||
     typeof value.rolloutPath !== 'string' || !path.win32.isAbsolute(value.rolloutPath) ||
     /[\x00-\x1f\x7f]/u.test(value.rolloutPath) || value.rolloutPath.length > 4096) fail();
   validStarted(startedOf(value));

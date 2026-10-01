@@ -4,12 +4,14 @@ import { comparablePath } from '../core/paths.js';
 import type { ApprovedTaskPolicy } from '../codex/managed-task-policy.js';
 import { ControlledNativeCreationJournal, type ControlledCreationJournalRecord } from
   './controlled-native-creation-journal.js';
-import { loadControlledNativeSourcePreflightReceipt, proveControlledNativeSource } from
+import { loadAuthenticatedProfileSourcePreflightReceipt, loadControlledNativeSourcePreflightReceipt,
+  proveAuthenticatedProfileSource, proveControlledNativeSource } from
   './controlled-native-source-proof.js';
 
 const internal = new WeakMap<object, Readonly<{
   journal: ControlledNativeCreationJournal; operationId: string; record: ControlledCreationJournalRecord;
   preflightReceiptPath: string; sourceHome: string; workspace: string;
+  allowAuthenticatedProfile: boolean;
 }>>();
 const refuse = (category = 'invalid'): never => {
   throw new Error(`Controlled native CLI source scope unqualified (${category})`);
@@ -29,7 +31,7 @@ export function assertControlledNativeCliSourceScope(value: unknown): asserts va
 }
 
 /** Re-read the durable journal and immutable preflight receipt, then prove the
- * exact single native rollout. The journal remains the trust root. */
+ * exact native candidate under the explicitly selected mode. The journal remains the trust root. */
 export async function verifyControlledNativeCliSourceScope(scope: ControlledNativeCliSourceScope,
   manifest?: Readonly<{ taskId: string; home: string; cwd: string;
     approvedTaskPolicy?: ApprovedTaskPolicy }>): Promise<void> {
@@ -48,13 +50,25 @@ export async function verifyControlledNativeCliSourceScope(scope: ControlledNati
       !isDeepStrictEqual(qualified.effectivePolicy, scope.policy)) refuse('identity-drift');
   const identity = { operationId: current.intent.operationId, sourceId: current.intent.sourceId,
     sourceGeneration: current.intent.sourceGeneration };
-  const preflight = await loadControlledNativeSourcePreflightReceipt(state.preflightReceiptPath,
-    identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
-  const proof = await proveControlledNativeSource(preflight, qualified.rolloutPath, qualified.threadId)
-    .catch(() => refuse('rollout'));
+  const mode = current.intent.sourceProofMode;
+  if (mode === 'authenticated-profile-new-task' && !state.allowAuthenticatedProfile) refuse('profile-opt-in');
+  const { preflight, proof } = await (async () => {
+    if (mode === 'authenticated-profile-new-task') {
+      const preflight = await loadAuthenticatedProfileSourcePreflightReceipt(state.preflightReceiptPath,
+        identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
+      const proof = await proveAuthenticatedProfileSource(preflight, qualified.rolloutPath, qualified.threadId)
+        .catch(() => refuse('rollout'));
+      return { preflight, proof };
+    }
+    const preflight = await loadControlledNativeSourcePreflightReceipt(state.preflightReceiptPath,
+      identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
+    const proof = await proveControlledNativeSource(preflight, qualified.rolloutPath, qualified.threadId)
+      .catch(() => refuse('rollout'));
+    return { preflight, proof };
+  })();
   // The qualified path may traverse a Windows junction (notably on CI).
-  // proveControlledNativeSource already checked the actual file and sole rollout;
-  // compare its canonical target, not the lexical spelling in the journal.
+  // The selected proof checked the actual file; compare its canonical target,
+  // not the lexical spelling in the journal.
   const qualifiedRollout = await realpath(qualified.rolloutPath).catch(() => refuse('rollout-path'));
   const policyWorkspace = await realpath(qualified.effectivePolicy.cwd).catch(() => refuse('policy-cwd'));
   if (comparablePath(proof.rolloutPath) !== comparablePath(qualifiedRollout)) refuse('rollout-path');
@@ -75,6 +89,8 @@ export async function verifyControlledNativeCliSourceScope(scope: ControlledNati
 export async function deriveControlledNativeCliSourceScope(options: Readonly<{
   journal: ControlledNativeCreationJournal; operationId: string;
   preflightReceiptPath: string; sourceHome: string; workspace: string;
+  /** Required to accept a candidate-only authenticated profile proof. */
+  allowAuthenticatedProfile?: true;
 }>): Promise<ControlledNativeCliSourceScope> {
   if (!options || !(options.journal instanceof ControlledNativeCreationJournal)) refuse();
   let record: ControlledCreationJournalRecord | null;
@@ -83,6 +99,8 @@ export async function deriveControlledNativeCliSourceScope(options: Readonly<{
   if (record.state !== 'qualified' || !record.qualified ||
       record.intent.sourceProofRequired !== true || record.started?.sourceProofRequired !== true ||
       record.qualified.sourceProofRequired !== true) refuse();
+  if (record.intent.sourceProofMode === 'authenticated-profile-new-task' &&
+    options.allowAuthenticatedProfile !== true) refuse('profile-opt-in');
   const qualified = record.qualified;
   if (!qualified) return refuse();
   let sourceHome: string, workspace: string;
@@ -94,7 +112,8 @@ export async function deriveControlledNativeCliSourceScope(options: Readonly<{
     workspace, policy: qualified.effectivePolicy });
   internal.set(scope, Object.freeze({ journal: options.journal, operationId: options.operationId,
     record, preflightReceiptPath: options.preflightReceiptPath,
-    sourceHome: options.sourceHome, workspace: options.workspace }));
+    sourceHome: options.sourceHome, workspace: options.workspace,
+    allowAuthenticatedProfile: options.allowAuthenticatedProfile === true }));
   try { await verifyControlledNativeCliSourceScope(scope); }
   catch (error) {
     internal.delete(scope);

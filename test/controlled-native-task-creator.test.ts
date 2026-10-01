@@ -328,16 +328,18 @@ test('reservation loss during fresh reader close leaves started uncertain', asyn
   assert.equal(f.calls.filter(method => method === 'thread/start').length, 1);
 });
 
-for (const loseRead of [false, true]) test(`opt-in source proof qualifies the only rollout${loseRead ? ' after restart' : ''}`, async () => {
+for (const mode of [undefined, 'authenticated-profile-new-task'] as const)
+for (const loseRead of [false, true]) test(`${mode ?? 'exclusive'} source proof qualifies exact rollout${loseRead ? ' after restart' : ''}`, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-source-'));
   const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
   const aliasHome = path.join(root, 'home-alias');
   const preflightReceiptPath = path.join(root, 'preflight.json');
   mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true });
+  if (mode) writeFileSync(path.join(sourceHome, 'sessions', 'preexisting.jsonl'), '{"legacy":true}\n');
   symlinkSync(sourceHome, aliasHome, process.platform === 'win32' ? 'junction' : 'dir');
   mkdirSync(workspace);
   const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
-  const nativeReadPath = path.toNamespacedPath(path.join(aliasHome, 'sessions', `${taskId}.jsonl`));
+  const nativeReadPath = mode ? nativePath : path.toNamespacedPath(path.join(aliasHome, 'sessions', `${taskId}.jsonl`));
   const policy = { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] };
   const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
     thread: { ...startResult.thread, cwd: workspace } };
@@ -371,7 +373,7 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
       persistStarted: started => journal.persistStarted(started),
       persistQualified: receipt => journal.persistQualified(receipt),
       resolveSource: async () => { throw new Error('legacy resolver must not run'); },
-      sourceProof: { sourceHome, preflightReceiptPath } };
+      sourceProof: { sourceHome, preflightReceiptPath, ...(mode ? { mode } : {}) } };
     if (loseRead) {
       await assert.rejects(createControlledNativeTask(options), ControlledNativeCreationUncertainError);
       assert.equal(journal.get(options.operationId)?.state, 'started');
@@ -383,15 +385,19 @@ for (const loseRead of [false, true]) test(`opt-in source proof qualifies the on
       await assert.rejects(reconcileControlledNativeCreation({ journal,
         operationId: options.operationId, rpc,
         resolveSource: async () => ({ sourceId: 'isolated', rolloutPath: nativePath }) }));
+      if (mode) await assert.rejects(reconcileControlledNativeCreation({ journal,
+        operationId: options.operationId, rpc, resolveSource: options.resolveSource,
+        sourceProof: { sourceHome, preflightReceiptPath } }));
       assert.equal(calls.length, beforeBypass);
       assert.equal(journal.get(options.operationId)?.state, 'started');
       rejectRead = false;
     }
     const result = loseRead ? await reconcileControlledNativeCreation({ journal,
       operationId: options.operationId, rpc, resolveSource: options.resolveSource,
-      sourceProof: { sourceHome, preflightReceiptPath } }) : await createControlledNativeTask(options);
+      sourceProof: { sourceHome, preflightReceiptPath, ...(mode ? { mode } : {}) } }) : await createControlledNativeTask(options);
     assert.equal(await realpath(result.rolloutPath), await realpath(nativePath));
     assert.equal(result.sourceProofRequired, true);
+    assert.equal(result.sourceProofMode, mode);
     assert.equal(journal.get(options.operationId)?.qualified?.sourceProofRequired, true);
     assert.deepEqual(calls, [...(loseRead ? ['thread/start', 'thread/read', 'thread/read',
       'thread/read'] : ['thread/start']),
@@ -413,6 +419,64 @@ test('opt-in source preflight refuses occupied home before thread/start', async 
     sourceProof: { sourceHome, preflightReceiptPath: path.join(root, 'preflight.json') } }));
   assert.deepEqual(f.calls, []);
   assert.deepEqual(f.persisted, ['intent']);
+});
+
+test('authenticated-profile opt-in selects the exact returned task from a populated home and survives journal reload', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-auth-profile-'));
+  const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  const sessions = path.join(sourceHome, 'sessions');
+  const preflightReceiptPath = path.join(root, 'authenticated-profile-preflight.json');
+  const journalPath = path.join(root, 'creation.sqlite');
+  mkdirSync(sessions, { recursive: true }); mkdirSync(workspace);
+  for (let index = 0; index < 3; index++)
+    writeFileSync(path.join(sessions, `legacy-${index}.jsonl`), '{"legacy":true}\n');
+  const nativePath = path.join(sessions, `${taskId}.jsonl`);
+  const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
+    thread: { ...startResult.thread, cwd: workspace } };
+  const calls: string[] = [];
+  const rpc = {
+    async initializedSession() { return { generation: 1 }; },
+    isSessionCurrent(generation: number) { return generation === 1; },
+    async request(method: string) {
+      calls.push(method);
+      if (method === 'thread/start') {
+        assert.equal(existsSync(preflightReceiptPath), true);
+        writeFileSync(nativePath, `${JSON.stringify({ type: 'session_meta',
+          payload: { id: taskId, session_id: taskId, cwd: workspace } })}\n`);
+        return native;
+      }
+      if (method === 'thread/read') return { thread: { ...native.thread, path: nativePath } };
+      if (method === 'thread/turns/list' || method === 'thread/queue/list')
+        return { data: [], nextCursor: null };
+      if (method === 'thread/goal/get') return { goal: null };
+      throw new Error(`Unexpected ${method}`);
+    },
+  } as unknown as ControlledNativeTaskCreatorOptions['rpc'];
+  let journal = new ControlledNativeCreationJournal(journalPath);
+  const operationId = randomUUID();
+  try {
+    const receipt = await createControlledNativeTask({ rpc, operationId, sourceId: 'authenticated-profile',
+      requestedPolicy: { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] },
+      persistIntent: intent => journal.persistIntent(intent),
+      persistStarted: started => journal.persistStarted(started),
+      persistQualified: qualified => journal.persistQualified(qualified),
+      resolveSource: async () => { throw new Error('uncontrolled resolver'); },
+      sourceProof: { mode: 'authenticated-profile-new-task', sourceHome, preflightReceiptPath } });
+    assert.equal(receipt.threadId, taskId);
+    assert.equal(await realpath(receipt.rolloutPath), await realpath(nativePath));
+    assert.equal(receipt.sourceProofMode, 'authenticated-profile-new-task');
+    assert.equal(journal.get(operationId)?.state, 'qualified');
+    assert.equal(journal.get(operationId)?.intent.sourceProofMode, 'authenticated-profile-new-task');
+    assert.deepEqual(calls, ['thread/start', 'thread/read', 'thread/turns/list',
+      'thread/goal/get', 'thread/queue/list', 'thread/read']);
+    journal.close();
+    journal = new ControlledNativeCreationJournal(journalPath);
+    const restored = journal.get(operationId);
+    assert.equal(restored?.state, 'qualified');
+    assert.equal(restored?.intent.sourceProofMode, 'authenticated-profile-new-task');
+    assert.equal(restored?.qualified?.threadId, taskId);
+    assert.equal(await realpath(restored!.qualified!.rolloutPath), await realpath(nativePath));
+  } finally { journal.close(); }
 });
 
 test('selected effective policy remains authoritative when readback is notLoaded', async () => {
@@ -560,6 +624,25 @@ test('journal preserves source proof requirement across stages and rejects downg
   await assert.rejects(journal.persistQualified(f.qualified));
   await journal.persistQualified({ ...f.qualified, sourceProofRequired: true });
   assert.equal(journal.get(f.intent.operationId)?.qualified?.sourceProofRequired, true);
+  journal.close();
+});
+
+test('journal preserves authenticated-profile mode and refuses silent downgrade or unsupported mode', async () => {
+  const f = journalFixture();
+  const journal = new ControlledNativeCreationJournal(f.filePath);
+  const mode = 'authenticated-profile-new-task' as const;
+  const intent = { ...f.intent, sourceProofRequired: true as const, sourceProofMode: mode };
+  const started = { ...f.started, sourceProofRequired: true as const, sourceProofMode: mode };
+  await assert.rejects(journal.persistIntent({ ...f.intent,
+    sourceProofMode: mode } as ControlledCreationIntent));
+  await assert.rejects(journal.persistIntent({ ...f.intent, sourceProofRequired: true,
+    sourceProofMode: 'unexpected-mode' } as unknown as ControlledCreationIntent));
+  await journal.persistIntent(intent);
+  await assert.rejects(journal.persistStarted({ ...f.started, sourceProofRequired: true }));
+  await journal.persistStarted(started);
+  await assert.rejects(journal.persistQualified({ ...f.qualified, sourceProofRequired: true }));
+  await journal.persistQualified({ ...f.qualified, sourceProofRequired: true, sourceProofMode: mode });
+  assert.equal(journal.get(f.intent.operationId)?.qualified?.sourceProofMode, mode);
   journal.close();
 });
 

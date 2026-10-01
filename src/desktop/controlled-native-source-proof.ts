@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { lstat, open, realpath, readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { comparablePath } from '../core/paths.js';
@@ -8,7 +9,19 @@ const MAX_ROLLOUT_FILES = 128;
 const MAX_SOURCE_ENTRIES = 1024;
 const MAX_SOURCE_DEPTH = 16;
 const MAX_RECEIPT_BYTES = 16 * 1024;
+const AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION = 2;
+const AUTHENTICATED_PROFILE_BIRTHTIME_TOLERANCE_MS = 5_000;
+/** This proof is deliberately single-candidate, never an inventory claim. */
+const MAX_AUTHENTICATED_PROFILE_CLAIMS = 1;
 const brand = new WeakSet<object>();
+interface AuthenticatedProfileClaim {
+  readonly path: string;
+  readonly threadId: string;
+  readonly identity: FileSystemIdentity;
+  readonly header: RolloutHeader;
+  readonly headerSha256: string;
+}
+const authenticatedProfileClaims = new WeakMap<object, AuthenticatedProfileClaim>();
 
 interface RolloutHeader {
   readonly id: string;
@@ -31,6 +44,29 @@ export interface ControlledNativeSourceIdentity {
 }
 
 export interface ControlledSourceProof {
+  readonly rolloutPath: string;
+  readonly threadId: string;
+}
+
+interface FileSystemIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly birthtimeMs: bigint;
+}
+
+/**
+ * An opt-in proof for a populated authenticated native profile. Unlike the
+ * empty-source preflight, it makes no assertion about any other rollout.
+ */
+export interface AuthenticatedProfileSourcePreflight {
+  readonly identity: ControlledNativeSourceIdentity;
+  readonly sourceHome: string;
+  readonly workspace: string;
+  readonly capturedAtMs: number;
+  readonly sourceHomeIdentity: FileSystemIdentity;
+}
+
+export interface AuthenticatedProfileSourceProof {
   readonly rolloutPath: string;
   readonly threadId: string;
 }
@@ -73,6 +109,61 @@ async function checkedRealDirectory(value: string): Promise<string> {
   const metadata = await lstat(value).catch(() => refuse());
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) refuse();
   return realpath(value).catch(() => refuse());
+}
+
+function identityOf(metadata: { dev: bigint; ino: bigint; birthtimeMs: bigint }): FileSystemIdentity {
+  return Object.freeze({ dev: metadata.dev, ino: metadata.ino, birthtimeMs: metadata.birthtimeMs });
+}
+
+function sameFileSystemIdentity(left: FileSystemIdentity, right: FileSystemIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
+}
+
+async function checkedDirectoryIdentity(value: string): Promise<Readonly<{ path: string; identity: FileSystemIdentity }>> {
+  const resolved = await checkedRealDirectory(value);
+  const metadata = await stat(resolved, { bigint: true }).catch(() => refuse());
+  if (!metadata.isDirectory()) refuse();
+  return Object.freeze({ path: resolved, identity: identityOf(metadata) });
+}
+
+async function checkedProfileCandidate(root: string, value: string): Promise<Readonly<{
+  path: string; identity: FileSystemIdentity; header: RolloutHeader; headerSha256: string;
+}>> {
+  if (typeof value !== 'string' || !absolute(value)) refuse();
+  const lexical = path.resolve(value);
+  const lexicalMetadata = await lstat(lexical).catch(() => refuse());
+  if (!lexicalMetadata.isFile() || lexicalMetadata.isSymbolicLink()) refuse();
+  const resolved = await realpath(lexical).catch(() => refuse());
+  if (!inRolloutTree(root, resolved)) refuse();
+  if (!equalPath(path.resolve(value), resolved)) refuse();
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(resolved, 'r');
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size < 1n) refuse();
+    const headerBytes = Buffer.allocUnsafe(MAX_HEADER_BYTES);
+    let used = 0, newline = -1;
+    while (used < headerBytes.length && newline < 0) {
+      const { bytesRead } = await handle.read(headerBytes, used,
+        Math.min(64 * 1024, headerBytes.length - used), used);
+      if (bytesRead === 0) break;
+      const withinChunk = headerBytes.subarray(used, used + bytesRead).indexOf(0x0a);
+      if (withinChunk >= 0) newline = used + withinChunk;
+      used += bytesRead;
+    }
+    if (newline < 0) refuse();
+    const firstLine = headerBytes.subarray(0, newline + 1);
+    const header = headerOf(firstLine.toString('utf8'));
+    const headerSha256 = createHash('sha256').update(firstLine).digest('hex');
+    const afterHandle = await handle.stat({ bigint: true });
+    const afterPath = await lstat(resolved, { bigint: true });
+    const beforeIdentity = identityOf(before), afterIdentity = identityOf(afterHandle), pathIdentity = identityOf(afterPath);
+    const reResolved = await realpath(lexical);
+    if (!afterHandle.isFile() || !afterPath.isFile() || afterPath.isSymbolicLink() || !equalPath(reResolved, resolved) ||
+      !sameFileSystemIdentity(beforeIdentity, afterIdentity) || !sameFileSystemIdentity(beforeIdentity, pathIdentity)) refuse();
+    return Object.freeze({ path: resolved, identity: afterIdentity, header, headerSha256 });
+  } catch { return refuse(); }
+  finally { await handle?.close(); }
 }
 
 async function checkedFile(root: string, value: string): Promise<string> {
@@ -252,4 +343,134 @@ export async function proveControlledNativeSource(preflight: ControlledSourcePre
   if (sameId.length !== 1 || !equalPath(sameId[0]!.path, observed.path)) refuse();
   if (current.length !== 1) refuse();
   return Object.freeze({ rolloutPath: observed.path, threadId });
+}
+
+/** Captures an opt-in, candidate-only preflight for a nonempty authenticated profile. */
+export async function captureAuthenticatedProfileSourcePreflight(identity: ControlledNativeSourceIdentity,
+  sourceHome: string, workspace: string): Promise<AuthenticatedProfileSourcePreflight> {
+  if (!validIdentity(identity)) refuse();
+  const [home, work] = await Promise.all([checkedDirectoryIdentity(sourceHome), checkedRealDirectory(workspace)]);
+  const preflight = Object.freeze({ identity: Object.freeze({ ...identity }), sourceHome: home.path, workspace: work,
+    capturedAtMs: Date.now(), sourceHomeIdentity: home.identity });
+  brand.add(preflight);
+  return preflight;
+}
+
+function validProfilePreflight(preflight: AuthenticatedProfileSourcePreflight): boolean {
+  const pin = preflight.sourceHomeIdentity;
+  return brand.has(preflight) && validIdentity(preflight.identity) && typeof preflight.sourceHome === 'string' &&
+    typeof preflight.workspace === 'string' && Number.isSafeInteger(preflight.capturedAtMs) && preflight.capturedAtMs >= 0 &&
+    pin !== null && typeof pin === 'object' && typeof pin.dev === 'bigint' && typeof pin.ino === 'bigint' &&
+    typeof pin.birthtimeMs === 'bigint' && pin.birthtimeMs >= 0n;
+}
+
+function profileReceipt(preflight: AuthenticatedProfileSourcePreflight): string {
+  return JSON.stringify({ schemaVersion: AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION,
+    operationId: preflight.identity.operationId, sourceId: preflight.identity.sourceId,
+    sourceGeneration: preflight.identity.sourceGeneration, sourceHome: preflight.sourceHome,
+    workspace: preflight.workspace, capturedAtMs: preflight.capturedAtMs,
+    sourceHomeDev: preflight.sourceHomeIdentity.dev.toString(), sourceHomeIno: preflight.sourceHomeIdentity.ino.toString(),
+    sourceHomeBirthtimeMs: preflight.sourceHomeIdentity.birthtimeMs.toString() });
+}
+
+/** Persists a versioned receipt for the candidate-only authenticated-profile variant. */
+export async function persistAuthenticatedProfileSourcePreflightReceipt(filePath: string,
+  preflight: AuthenticatedProfileSourcePreflight): Promise<void> {
+  if (!validProfilePreflight(preflight) || !absolute(filePath)) refuse();
+  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedRealDirectory(preflight.workspace)]);
+  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace, preflight.workspace) ||
+    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity)) refuse();
+  const lexical = path.resolve(filePath), parent = await checkedRealDirectory(path.dirname(lexical));
+  const name = path.basename(lexical);
+  if (!name || name === '.' || name === '..') refuse();
+  const data = profileReceipt(preflight);
+  if (Buffer.byteLength(data, 'utf8') > MAX_RECEIPT_BYTES) refuse();
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path.join(parent, name), 'wx', 0o600);
+    await handle.writeFile(data, 'utf8');
+    await handle.sync();
+  } catch { refuse(); }
+  finally { await handle?.close(); }
+}
+
+function decimalBigInt(value: unknown): bigint | undefined {
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return undefined;
+  try { return BigInt(value); } catch { return undefined; }
+}
+
+/** Loads an authenticated-profile receipt and rejects any home replacement or path drift. */
+export async function loadAuthenticatedProfileSourcePreflightReceipt(filePath: string,
+  expectedIdentity: ControlledNativeSourceIdentity, expectedSourceHome: string,
+  expectedWorkspace: string): Promise<AuthenticatedProfileSourcePreflight> {
+  if (!validIdentity(expectedIdentity) || !absolute(filePath) || !absolute(expectedSourceHome) || !absolute(expectedWorkspace)) refuse();
+  const metadata = await lstat(filePath).catch(() => refuse());
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 1 || metadata.size > MAX_RECEIPT_BYTES) refuse();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(filePath, 'utf8'));
+  } catch { refuse(); }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) refuse();
+  const item = parsed as Record<string, unknown>;
+  const keys = ['schemaVersion', 'operationId', 'sourceId', 'sourceGeneration', 'sourceHome', 'workspace', 'capturedAtMs',
+    'sourceHomeDev', 'sourceHomeIno', 'sourceHomeBirthtimeMs'];
+  const pin = { dev: decimalBigInt(item.sourceHomeDev), ino: decimalBigInt(item.sourceHomeIno),
+    birthtimeMs: decimalBigInt(item.sourceHomeBirthtimeMs) };
+  if (Reflect.ownKeys(item).length !== keys.length || !keys.every(key => Object.hasOwn(item, key)) ||
+    item.schemaVersion !== AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION || typeof item.sourceHome !== 'string' ||
+    typeof item.workspace !== 'string' || typeof item.capturedAtMs !== 'number' || !Number.isSafeInteger(item.capturedAtMs) ||
+    item.capturedAtMs < 0 || pin.dev === undefined || pin.ino === undefined || pin.birthtimeMs === undefined || pin.birthtimeMs < 0n ||
+    !validIdentity({ operationId: item.operationId, sourceId: item.sourceId, sourceGeneration: item.sourceGeneration }) ||
+    !sameIdentity({ operationId: item.operationId as string, sourceId: item.sourceId as string,
+      sourceGeneration: item.sourceGeneration as string }, expectedIdentity)) refuse();
+  const receiptHome = item.sourceHome as string, receiptWorkspace = item.workspace as string,
+    receiptCapturedAtMs = item.capturedAtMs as number,
+    receiptPin = { dev: pin.dev as bigint, ino: pin.ino as bigint, birthtimeMs: pin.birthtimeMs as bigint };
+  const [home, work, expectedHome, expectedWork] = await Promise.all([checkedDirectoryIdentity(receiptHome),
+    checkedRealDirectory(receiptWorkspace), checkedDirectoryIdentity(expectedSourceHome), checkedRealDirectory(expectedWorkspace)]);
+  if (!equalPath(home.path, expectedHome.path) || !equalPath(work, expectedWork) ||
+    !sameFileSystemIdentity(home.identity, expectedHome.identity) ||
+    !sameFileSystemIdentity(home.identity, receiptPin)) refuse();
+  const preflight = Object.freeze({ identity: Object.freeze({ ...expectedIdentity }), sourceHome: home.path, workspace: work,
+    capturedAtMs: receiptCapturedAtMs, sourceHomeIdentity: Object.freeze(receiptPin) });
+  brand.add(preflight);
+  return preflight;
+}
+
+/**
+ * Proves exactly one returned native candidate. It does not enumerate legacy
+ * rollout files and does not make a global uniqueness or exclusivity claim.
+ */
+export async function proveAuthenticatedProfileSource(preflight: AuthenticatedProfileSourcePreflight,
+  observedNativePath: string, threadId: string): Promise<AuthenticatedProfileSourceProof> {
+  if (!validProfilePreflight(preflight) || typeof observedNativePath !== 'string' || !absolute(observedNativePath) ||
+    typeof threadId !== 'string' || !UUID.test(threadId)) refuse();
+  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedRealDirectory(preflight.workspace)]);
+  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace, preflight.workspace) ||
+    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity)) refuse();
+  const candidate = await checkedProfileCandidate(home.path, observedNativePath);
+  const earliestAllowedBirthtime = BigInt(Math.max(0, preflight.capturedAtMs - AUTHENTICATED_PROFILE_BIRTHTIME_TOLERANCE_MS));
+  if (candidate.header.id !== threadId || candidate.identity.birthtimeMs < earliestAllowedBirthtime) refuse();
+  const candidateWorkspace = await checkedRealDirectory(candidate.header.cwd);
+  if (!equalPath(candidateWorkspace, workspace)) refuse();
+  const [recheckedHome, recheckedWorkspace, recheckedCandidate] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome),
+    checkedRealDirectory(preflight.workspace), checkedProfileCandidate(home.path, observedNativePath)]);
+  if (!sameFileSystemIdentity(recheckedHome.identity, preflight.sourceHomeIdentity) ||
+    !sameFileSystemIdentity(recheckedCandidate.identity, candidate.identity) ||
+    recheckedCandidate.headerSha256 !== candidate.headerSha256 || recheckedCandidate.header.id !== candidate.header.id ||
+    !equalPath(recheckedWorkspace, workspace) || !equalPath(recheckedCandidate.header.cwd, candidate.header.cwd) ||
+    !equalPath(recheckedCandidate.path, candidate.path)) refuse();
+  const claim = authenticatedProfileClaims.get(preflight);
+  if (claim !== undefined && (claim.threadId !== threadId || !equalPath(claim.path, candidate.path) ||
+    !sameFileSystemIdentity(claim.identity, candidate.identity) || claim.headerSha256 !== candidate.headerSha256 ||
+    claim.header.id !== candidate.header.id ||
+    !equalPath(claim.header.cwd, candidate.header.cwd))) refuse();
+  if (claim === undefined) {
+    // The explicit one-slot state limit permits only idempotent reproofs.
+    if (MAX_AUTHENTICATED_PROFILE_CLAIMS !== 1) refuse();
+    authenticatedProfileClaims.set(preflight, Object.freeze({ path: candidate.path, threadId, identity: candidate.identity,
+      headerSha256: candidate.headerSha256,
+      header: Object.freeze({ ...candidate.header }) }));
+  }
+  return Object.freeze({ rolloutPath: candidate.path, threadId });
 }
