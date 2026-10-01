@@ -19,6 +19,7 @@ import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-d
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
 import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError } from
   '../src/desktop/managed-worker-control-client.js';
+import { ManagedWorkerStateTransport } from '../src/codex/managed-worker-state-transport.js';
 import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
@@ -761,6 +762,101 @@ test('active CLI turn survives native Gateway reconnect without a second worker 
     try {
       stopResult = await controlStop(own.privateDirectory, own.reserved.epoch,
         'active-cli-reconnect-stop');
+    } finally {
+      if (own.backend.exitCode === null) own.backend.stdin.end();
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+    }
+  }
+  assert.deepEqual(stopResult?.result, { stopped: true });
+});
+
+test('active accepted CLI turn reaches a fresh managed state subscriber once after the prior subscriber closes', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, true, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  const client = await nativeCliClient(own.daemon.nativeCliWebSocketCapability(capability));
+  let first: ReturnType<ManagedWorkerStateTransport['subscribe']> | null = null;
+  let fresh: ReturnType<ManagedWorkerStateTransport['subscribe']> | null = null;
+  let firstTransport: ManagedWorkerStateTransport | null = null;
+  let freshTransport: ManagedWorkerStateTransport | null = null;
+  let stopResult: Record<string, unknown> | undefined;
+  try {
+    await client.request('initialize', 'initialize',
+      { clientInfo: { name: 'fixture' }, capabilities: {} });
+    client.socket.send(JSON.stringify({ method: 'initialized', params: {} }));
+    await client.request('resume', 'thread/resume', { threadId: own.taskId });
+    const resumesBeforeSubscribers = own.backend.methods.filter(method => method === 'thread/resume').length;
+    const params = { threadId: own.taskId, clientUserMessageId: randomUUID(),
+      input: [{ type: 'text', text: 'one observed active CLI turn' }], turnTrigger: null,
+      toolOutput: null, responsesapiClientMetadata: null, additionalContext: null,
+      environments: null, cwd: own.home, runtimeWorkspaceRoots: [own.home],
+      approvalPolicy: 'never', approvalsReviewer: 'user', sandboxPolicy: null,
+      permissions: ':read-only', model: 'gpt-5.6-sol', serviceTier: null,
+      serviceTierForTurn: null, effort: 'low', summary: null, personality: null,
+      outputSchema: null, collaborationMode: { mode: 'default', settings: {
+        model: 'gpt-5.6-sol', reasoning_effort: 'low', developer_instructions: null } },
+      multiAgentMode: null, cyberAccessProgram: null };
+    const accepted = await client.request('accepted-observed', 'turn/start', params);
+    assert.equal((accepted.result as { turn: { status: string } }).turn.status, 'inProgress');
+    own.backend.activeTurn = true;
+    own.backend.readStatusOverride = 'inProgress';
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started', params: {
+      threadId: own.taskId, turn: { id: 'accepted-composer-turn', status: 'inProgress',
+        startedAt: 1780000000, items: [] } } }) + '\n');
+
+    const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'endpoint.v1.json'), 'utf8')) as { taskState: { port: number } };
+    const ownerEpoch = own.reserved.epoch, backendGeneration = own.daemon.metadata.generation!;
+    const token = createHmac('sha256', Buffer.alloc(32, 3))
+      .update('vkodex-managed-task-state-v1\0').update(ownerEpoch).update('\0').update(own.taskId)
+      .update('\0').update(String(backendGeneration)).digest('base64url');
+    const scope = { hostId: 'local' as const, taskId: own.taskId, ownerEpoch, backendGeneration,
+      port: endpoint.taskState.port, token };
+    const firstStates: Array<{ turns: Array<{ status: string }> }> = [], firstErrors: Error[] = [];
+    firstTransport = new ManagedWorkerStateTransport(scope);
+    first = firstTransport.subscribe({ hostId: 'local', threadId: own.taskId }, state => {
+      firstStates.push(state as { turns: Array<{ status: string }> });
+    }, error => firstErrors.push(error));
+    await first.start();
+    assert.equal(firstStates.length, 1);
+    assert.equal(firstStates[0]?.turns[0]?.status, 'inProgress');
+    first.close(); firstTransport.close();
+
+    const freshStates: Array<{ turns: Array<{ status: string }> }> = [], freshErrors: Error[] = [];
+    freshTransport = new ManagedWorkerStateTransport(scope);
+    fresh = freshTransport.subscribe({ hostId: 'local', threadId: own.taskId }, state => {
+      freshStates.push(state as { turns: Array<{ status: string }> });
+    }, error => freshErrors.push(error));
+    await fresh.start();
+    assert.equal(freshStates.length, 1);
+    assert.equal(freshStates[0]?.turns[0]?.status, 'inProgress');
+
+    own.backend.activeTurn = false;
+    own.backend.readStatusOverride = null;
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/completed', params: {
+      threadId: own.taskId, turn: { id: 'accepted-composer-turn', status: 'completed',
+        startedAt: 1780000000, completedAt: 1780000001, items: [] } } }) + '\n');
+    await waitFor(() => freshStates.length === 2);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(firstStates.length, 1, 'detached subscriber receives no terminal update');
+    assert.equal(freshStates.length, 2, 'fresh subscriber receives terminal state exactly once');
+    assert.equal(freshStates[1]?.turns[0]?.status, 'completed');
+    assert.deepEqual(firstErrors, []);
+    assert.deepEqual(freshErrors, []);
+    assert.equal(own.daemon.metadata.epoch, ownerEpoch);
+    assert.equal(own.daemon.metadata.generation, backendGeneration);
+    assert.equal(own.launches, 1);
+    assert.equal(own.backend.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length,
+      resumesBeforeSubscribers);
+  } finally {
+    first?.close(); fresh?.close();
+    firstTransport?.close(); freshTransport?.close();
+    client.socket.terminate();
+    try {
+      stopResult = await controlStop(own.privateDirectory, own.reserved.epoch,
+        'managed-state-subscriber-reconnect-stop');
     } finally {
       if (own.backend.exitCode === null) own.backend.stdin.end();
       await (own.control as ManagedWorkerControlServer | null)?.close();
