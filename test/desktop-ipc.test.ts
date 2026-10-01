@@ -14,7 +14,7 @@ import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
 import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
-import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, MutableQueuedInputTurnError, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
+import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, MutableQueuedInputTurnError, QueueHistoryReadError, readQueuedHistoryPage, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
 import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-queue-adapter.js";
 import { projectSnapshot, summarizeTurnState } from "../src/desktop/projector.js";
@@ -1074,6 +1074,40 @@ test("runtime settles a historical queue ACK only after exact terminal native pr
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(s.store.queuedInputs(s.binding.id), []);
   assert.equal(calls, 2);
+});
+
+test("historical queue RPC refusal is diagnosed without retaining its raw error", async t => {
+  const s = runtimeSetup(t);
+  const operationId = "refused-history-operation";
+  s.store.recordOperation(operationId, s.binding, "refused-history-inbox", s.binding.id);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "native-queue-id");
+  s.desktop.scanTerminalQueuedInput = async () => {
+    await readQueuedHistoryPage(async () => {
+      throw new ActionRejectedError("private native rejection sentinel");
+    }, {});
+    return { done: true, turnId: null };
+  };
+  (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  await new Promise(resolve => setImmediate(resolve));
+  const progress = s.store.getValue<Record<string, unknown>>(`queue-history:${s.binding.id}:${operationId}`)!;
+  assert.equal(progress.lastFailure, "history_read_rejected");
+  assert.equal(JSON.stringify(progress).includes("private native rejection sentinel"), false);
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "a read failure must retain the ACK");
+});
+
+test("queued history page failures expose fixed categories without native content", async () => {
+  for (const [error, reason] of [
+    [new ActionRejectedError("private rejected sentinel"), "read_rejected"],
+    [new DesktopUnavailableError("private transport sentinel"), "read_unavailable"],
+    [new TransferPageTooLargeError(), "read_too_large"],
+  ] as const) {
+    await assert.rejects(readQueuedHistoryPage(async () => { throw error; }, {}), failure =>
+      failure instanceof QueueHistoryReadError && failure.reason === reason &&
+      !failure.message.includes("sentinel") && !Object.hasOwn(failure, "cause"));
+  }
+  const unexpected = new Error("programmer error");
+  await assert.rejects(readQueuedHistoryPage(async () => { throw unexpected; }, {}), unexpected);
 });
 
 test("historical queue scan persists partial progress without settling its ACK", async t => {

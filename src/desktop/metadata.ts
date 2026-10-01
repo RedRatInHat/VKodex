@@ -13,7 +13,7 @@ import { closeAppServer } from "./app-server-process.js";
 import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
-import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
+import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, readQueuedHistoryPage, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
 import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from "../core/codex-tasks.js";
 import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
@@ -363,7 +363,8 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
     if (task.hostId !== "local" || !task.threadId) throw new ActionRejectedError("История доступна только для локальной задачи.");
     const rpc = new MetadataRpc(this.sourceHome(task), undefined, 30_000);
-    const list = (params: IpcObject) => rpc.call("thread/turns/list", params);
+    const list = (params: IpcObject) => readQueuedHistoryPage(
+      request => rpc.call("thread/turns/list", request), params);
     // An App Server metadata read starts a short-lived process. Probe the tail
     // on the first few passes and then sparsely while the durable full scan
     // advances; a later queue start can still be recognized without doubling
