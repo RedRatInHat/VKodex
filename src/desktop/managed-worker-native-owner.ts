@@ -207,6 +207,10 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #client: DesktopIpcClient | null = null;
   #startHandler: ManagedWorkerNativeStartHandler | null = null;
   #queueAdapter: ManagedNativeStockQueueAdapter | null = null;
+  // Serialize the whole native admission lifetime, including baseline reads
+  // before the stock journal reserves an operation. The dispatcher serializes
+  // wire writes, but it cannot order reservations made in other journals.
+  #nativeAdmissionTail: Promise<void> = Promise.resolve();
   #eventTail: Promise<void> = Promise.resolve();
   #pendingEvents = 0;
   #everAdmittedNativeMutation = false;
@@ -886,6 +890,15 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     return this.#state === 'connected' && this.#route(request);
   }
 
+  async #serialNativeAdmission<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#nativeAdmissionTail;
+    let release!: () => void;
+    this.#nativeAdmissionTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try { return await operation(); }
+    finally { release(); }
+  }
+
   async handle(request: IpcIncomingRequest, signal: AbortSignal): Promise<IpcObject> {
     if (signal.aborted) throw refuse();
     if (!this.#route(request) || this.#state !== 'connected' || !this.#ownerCurrent()) throw refuse();
@@ -911,7 +924,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       const current = () => this.#queueAdapter === adapter &&
         this.#queueGrants.get(request.requestId) === grant && !grant.revoked &&
         this.#ownerCurrent() && ['connected', 'disconnected'].includes(this.#state);
-      try { return await adapter.accept(request, current); }
+      try { return await this.#serialNativeAdmission(() => adapter.accept(request, current)); }
       finally { if (this.#queueGrants.get(request.requestId) === grant)
         this.#queueGrants.delete(request.requestId); }
     }

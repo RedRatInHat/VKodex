@@ -570,6 +570,51 @@ test('opt-in native queue v1 durably adds on the same worker before acknowledgem
     await f.host.stop('test-cleanup'); }
 });
 
+test('stock native ingress serializes the pre-reservation baseline for overlapping requests', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let block = false, baselineCalls = 0;
+  const f = await fixture(async () => state(), () => false, () => true,
+    false, undefined, () => true, true,
+    { baseline: () => {
+      if (!block) return true;
+      baselineCalls++;
+      if (baselineCalls === 1) { entered(); return waiting.then(() => true); }
+      return true;
+    } });
+  try {
+    f.child.onFrame = frame => {
+      if (frame.method === 'thread/queue/add') queueMicrotask(() => f.child.reply(frame.id,
+        { queuedSubmission: { id: 'stock-receipt',
+          clientUserMessageId: (frame.params as IpcObject).clientUserMessageId,
+          input: (frame.params as IpcObject).input } }));
+    };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    block = true;
+    const entry = stockEntry();
+    submitQueue(f.broker, entry, 'queue-overlap-one');
+    await started;
+    submitQueue(f.broker, entry, 'queue-overlap-two');
+    const end = Date.now() + 2000;
+    while (f.owner.metadata.pendingNativeOperations !== 2 && Date.now() < end)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(f.owner.metadata.pendingNativeOperations, 2);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(baselineCalls, 1, 'second ingress must not qualify before the first settles');
+    release();
+    for (const requestId of ['queue-overlap-one', 'queue-overlap-two']) {
+      const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+        frame.requestId === requestId);
+      assert.equal(reply.resultType, 'success');
+    }
+    assert.equal(f.child.frames.filter(frame => frame.method === 'thread/queue/add').length, 1);
+  } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
+});
+
 test('stock queue backend event during qualification invalidates the pending actual write', async () => {
   let release!: () => void;
   let entered!: () => void;
