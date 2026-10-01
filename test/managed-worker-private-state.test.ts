@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createManagedWorkerPrivateState, loadManagedWorkerPrivateState, type ManagedWorkerPrivateManifest, type ManagedWorkerPrivateStateFilesystem, type ManagedWorkerPrivateStateProtector, type ManagedWorkerPrivateStatePowerShellRunner } from "../src/desktop/managed-worker-private-state.js";
+import { assertWindowsPrivateDirectoryAfterAcl } from "../src/desktop/windows-private-directory.js";
 import { approveTaskPolicy } from "../src/codex/managed-task-policy.js";
 
 const epoch = "11111111-1111-4111-8111-111111111111";
@@ -62,6 +63,14 @@ class MemoryFilesystem implements ManagedWorkerPrivateStateFilesystem {
   async readProtectedFile(filePath: string): Promise<Uint8Array> {
     this.actions.push(`read:${filePath}`); const value = this.values.get(filePath); if (!value) throw new Error("missing"); return Uint8Array.from(value);
   }
+}
+
+class WorkerHarness {
+  readonly listeners = new Map<string, (value: unknown) => void>();
+  terminated = 0;
+  once(event: "message" | "error" | "exit", listener: (value: unknown) => void): void { this.listeners.set(event, listener); }
+  terminate(): Promise<number> { this.terminated++; return Promise.resolve(0); }
+  emit(event: "message" | "error" | "exit", value: unknown): void { this.listeners.get(event)?.(value); }
 }
 
 const options = (filesystem: MemoryFilesystem) => ({ baseDirectory: fixturePath("private", "managed"), protector: new IdentityProtector(), filesystem });
@@ -125,6 +134,42 @@ test("injectable PowerShell runner keeps DPAPI payloads in memory", { skip: proc
   const created = await createManagedWorkerPrivateState(manifest(), { baseDirectory: fixturePath("private", "managed"), filesystem, powerShellRunner: runner });
   const loaded = await loadManagedWorkerPrivateState({ baseDirectory: fixturePath("private", "managed"), epoch, filesystem, powerShellRunner: runner });
   assert.equal(calls, 2); assert.deepEqual(loaded.keys, created.keys);
+});
+
+test("post-ACL directory verification retries only a direct helper spawn error and fails closed", { skip: process.platform !== "win32" }, async () => {
+  const directory = "C:\\fixture";
+  let workers = 0;
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "invalid",
+    createWorker: () => { workers++; return new WorkerHarness(); },
+  }), /Private capability directory unavailable/u);
+  assert.equal(workers, 0, "an invalid ACL or helper result must not retry");
+
+  let directCalls = 0; let workerCalls = 0;
+  const success = new WorkerHarness();
+  await assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => { directCalls++; return "helper-error"; },
+    createWorker: () => { workerCalls++; queueMicrotask(() => success.emit("message", true)); return success; },
+  });
+  assert.equal(directCalls, 1); assert.equal(workerCalls, 1); assert.equal(success.terminated, 1);
+
+  const failed = new WorkerHarness();
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "helper-error",
+    createWorker: () => { queueMicrotask(() => failed.emit("error", new Error("fixture"))); return failed; },
+  }), /Private capability directory unavailable/u);
+
+  const timedOut = new WorkerHarness();
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "helper-error", workerTimeoutMs: 1,
+    createWorker: () => timedOut,
+  }), /Private capability directory unavailable/u);
+  assert.equal(timedOut.terminated, 1);
+
+  await assert.rejects(assertWindowsPrivateDirectoryAfterAcl(directory, {
+    directCheck: () => "helper-error",
+    createWorker: () => { throw new Error("fixture"); },
+  }), /Private capability directory unavailable/u);
 });
 
 test("protector failure and malformed or oversized strict JSON never reach filesystem writes", async () => {

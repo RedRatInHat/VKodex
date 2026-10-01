@@ -6,7 +6,7 @@ import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
-import { assertWindowsPrivateDirectory } from "./windows-private-directory.js";
+import { assertWindowsPrivateDirectory, assertWindowsPrivateDirectoryAfterAcl } from "./windows-private-directory.js";
 
 
 
@@ -330,7 +330,7 @@ class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
     await runPowerShell(aclScript, Buffer.from(directory, "utf8"));
     try { await rejectLinked(directory); }
     catch { throw new Error("Managed worker private state directory is unsafe"); }
-    assertWindowsPrivateDirectory(directory);
+    await assertWindowsPrivateDirectoryAfterAcl(directory);
   }
   async writeExclusive(filePath: string, data: Uint8Array): Promise<void> {
     try {
