@@ -3,7 +3,7 @@ import type { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ManagedWorkerRegistry } from '../codex/managed-worker-registry.js';
+import { ManagedWorkerRegistry, type WorkerAttempt } from '../codex/managed-worker-registry.js';
 import { createManagedWorkerPrivateState, type ManagedWorkerPrivateManifest } from './managed-worker-private-state.js';
 import { buildDetachedWorkerSpawnOptions } from './managed-worker-environment.js';
 import { approveTaskPolicy, assertApprovedResumeIntent } from '../codex/managed-task-policy.js';
@@ -18,16 +18,24 @@ export interface ManagedWorkerLaunchOptions extends Omit<ManagedWorkerPrivateMan
   readonly runtime: Readonly<{ executable: string; sha256: string; entrypoint: string; entrypointSha256: string }>;
 }
 type DetachedChild = Pick<EventEmitter, 'once'> & { readonly pid?: number; unref(): void };
-/** Dependency injection for tests, never selected by an untrusted launch payload. */
+/** Trusted orchestration hooks and test seams, never selected by an untrusted launch payload. */
 export interface ManagedWorkerLaunchDependencies {
+  /** Trusted caller persists an exclusive bridge claim for this reservation.
+   * A rejection leaves the reservation for explicit reconciliation; no worker is spawned.
+   * This ordering does not prove a native Desktop/VS Code writer lease. */
+  readonly claimReservation?: (attempt: WorkerAttempt) => Promise<void>;
   readonly protectState?: (manifest: ManagedWorkerPrivateManifest, baseDirectory: string) => Promise<void>;
   readonly spawn?: (executable: string, args: string[], options: SpawnOptions) => DetachedChild;
 }
 export class ManagedWorkerLaunchError extends Error {
-  constructor(readonly epoch: string, readonly phase: 'private-state' | 'spawn',
+  /** A claim hook may have committed before it threw. Reconcile the bridge
+   * ledger; worker dispatch is still known not to have happened. */
+  readonly claimState: 'unknown' | null;
+  constructor(readonly epoch: string, readonly phase: 'claim' | 'private-state' | 'spawn',
     readonly outcome: 'not-dispatched' | 'unknown') {
     super(`Managed worker launch ${phase}: ${outcome}; reservation retained`);
     this.name = 'ManagedWorkerLaunchError';
+    this.claimState = phase === 'claim' ? 'unknown' : null;
   }
 }
 function absolute(value: string): void {
@@ -73,9 +81,14 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     throw new TypeError('Managed worker entrypoint must be compiled JavaScript');
   await verifyPinnedFiles(input);
   const registry = new ManagedWorkerRegistry(input.registryPath);
-  let epoch: string;
-  try { epoch = registry.reserve(input.home, input.familyRoot).epoch; }
+  let reservation: WorkerAttempt;
+  try { reservation = registry.reserve(input.home, input.familyRoot); }
   finally { registry.close(); }
+  const epoch = reservation.epoch;
+  if (dependencies.claimReservation) {
+    try { await dependencies.claimReservation(reservation); }
+    catch { throw new ManagedWorkerLaunchError(epoch, 'claim', 'not-dispatched'); }
+  }
   const manifest: ManagedWorkerPrivateManifest = {
     schemaVersion: 1, epoch, taskId: input.taskId, familyRoot: input.familyRoot,
     home: input.home, cwd: input.cwd, registryPath: input.registryPath,
