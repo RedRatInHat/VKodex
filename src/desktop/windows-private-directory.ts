@@ -94,7 +94,12 @@ function helperArguments(directory: string): { executable: string; script: strin
     !path.win32.isAbsolute(directory) || Buffer.byteLength(directory, "utf8") > MAX_WORKER_IO_BYTES) return null;
   const executable = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const environment: NodeJS.ProcessEnv = {};
-  for (const key of ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]) {
+  // Windows PowerShell's first-use module analysis on hosted accounts also
+  // needs the profile/cache and process-launch locations. Keep the child env
+  // to OS plumbing; never pass application tokens or arbitrary inherited vars.
+  for (const key of ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN",
+    "ComSpec", "ProgramData", "ProgramFiles", "ProgramFiles(x86)"]) {
     const value = process.env[key];
     if (value) environment[key] = value;
   }

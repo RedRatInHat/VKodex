@@ -25,15 +25,17 @@ import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT
   '../../src/desktop/windows-private-directory.js';
 
 type AclPhase = 'ok' | 'acl-exit' | 'output-invalid' | 'timeout' | 'helper-error';
-function aclPhase(directory: string): AclPhase {
+function aclPhase(directory: string, inheritedEnvironment = false): AclPhase {
   const root = process.env.SystemRoot ?? '';
   if (!path.win32.isAbsolute(root)) return 'helper-error';
   const executable = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const modulePath = path.win32.join(path.dirname(executable), 'Modules');
   const command = "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$p=[Console]::In.ReadToEnd().Trim();" +
     privateDirectoryAclVerificationScript;
-  const environment: NodeJS.ProcessEnv = {};
-  for (const key of ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE']) {
+  const environment: NodeJS.ProcessEnv = inheritedEnvironment ? { ...process.env } : {};
+  for (const key of ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE',
+    'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USERDOMAIN',
+    'ComSpec', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)']) {
     const value = process.env[key];
     if (value) environment[key] = value;
   }
@@ -125,7 +127,7 @@ test('Windows production-pinned authenticated source permits one fenced first th
       sourceGeneration: scope.sourceGeneration,
     }, canonicalHome, workspace);
     const protectedDirectories = [serverRoot, profileRoot, privateDirectory, epochDirectory] as const;
-    const aclPhasesBeforeConnection = protectedDirectories.map(aclPhase) as unknown as AclPhases;
+    const aclPhasesBeforeConnection = protectedDirectories.map(directory => aclPhase(directory)) as unknown as AclPhases;
     client = createPinnedDetachedProfileConnection(privateDirectory, canonicalHome, descriptor);
     const response = { thread: { id: threadId, status: { type: 'idle' }, turns: [], model: policy.model,
       modelProvider: policy.modelProvider, reasoningEffort: policy.effort, cwd: workspace, environments: [] },
@@ -169,7 +171,8 @@ test('Windows production-pinned authenticated source permits one fenced first th
     } catch (error) {
       if (error instanceof AppServerUnavailableError)
         assert.fail(`Pinned connection unavailable (class=AppServerUnavailableError); ` +
-          aclFailureSummary(aclPhasesBeforeConnection));
+          aclFailureSummary(aclPhasesBeforeConnection) +
+          `; inherited-env-probe=${aclPhase(serverRoot, true)}`);
       throw error;
     }
     if (serverError !== undefined)
