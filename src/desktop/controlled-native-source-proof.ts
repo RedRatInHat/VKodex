@@ -135,7 +135,8 @@ async function checkedProfileCandidate(root: string, value: string): Promise<Rea
   if (!lexicalMetadata.isFile() || lexicalMetadata.isSymbolicLink()) refuse();
   const resolved = await realpath(lexical).catch(() => refuse());
   if (!inRolloutTree(root, resolved)) refuse();
-  if (!equalPath(path.resolve(value), resolved)) refuse();
+  // A Windows workspace or temp root may have a junction ancestor. Pin the
+  // canonical target under the profile; only a link at the file itself is refused.
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(resolved, 'r');

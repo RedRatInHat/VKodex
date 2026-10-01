@@ -244,6 +244,18 @@ test('authenticated-profile proof reads only a bounded header from a large rollo
   assert.equal((await proveAuthenticatedProfileSource(preflight, candidate, threadA)).threadId, threadA);
 });
 
+test('authenticated-profile proof accepts a junction ancestor but pins the canonical rollout', async () => {
+  const f = await setup();
+  const alias = path.join(f.root, 'home-alias');
+  await symlink(f.home, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  const candidate = await rollout(f.home, threadA, f.workspace);
+  const observed = path.toNamespacedPath(path.join(alias, 'sessions', `${threadA}.jsonl`));
+  const proof = await proveAuthenticatedProfileSource(preflight, observed, threadA);
+  assert.equal(proof.rolloutPath,
+    await import('node:fs/promises').then(({ realpath }) => realpath(candidate)));
+});
+
 test('authenticated-profile proof rejects a wrong returned ID, path, link, or cwd', async () => {
   const f = await setup();
   const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);

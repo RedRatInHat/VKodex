@@ -339,7 +339,7 @@ for (const loseRead of [false, true]) test(`${mode ?? 'exclusive'} source proof 
   symlinkSync(sourceHome, aliasHome, process.platform === 'win32' ? 'junction' : 'dir');
   mkdirSync(workspace);
   const nativePath = path.join(sourceHome, 'sessions', `${taskId}.jsonl`);
-  const nativeReadPath = mode ? nativePath : path.toNamespacedPath(path.join(aliasHome, 'sessions', `${taskId}.jsonl`));
+  const nativeReadPath = path.toNamespacedPath(path.join(aliasHome, 'sessions', `${taskId}.jsonl`));
   const policy = { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] };
   const native = { ...startResult, cwd: workspace, runtimeWorkspaceRoots: [workspace],
     thread: { ...startResult.thread, cwd: workspace } };
