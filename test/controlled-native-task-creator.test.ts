@@ -7,7 +7,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import test from 'node:test';
 import type { AppServerRpc } from '../src/codex/app-server-connection.js';
-import { createControlledNativeTask, ControlledNativeCreationUncertainError,
+import { compileControlledNativeStartParams, createControlledNativeTask,
+  ControlledNativeCreationUncertainError, projectControlledNativeStartPolicy,
   type ControlledCreationIntent, type ControlledCreationStarted,
   type ControlledCreationReceipt, type ControlledNativeTaskCreatorOptions } from '../src/desktop/controlled-native-task-creator.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
@@ -28,6 +29,29 @@ const startResult = { thread: { id: taskId, status: { type: 'idle' }, turns: [],
   approvalPolicy: template.approvalPolicy, approvalsReviewer: template.approvalsReviewer,
   activePermissionProfile: template.activePermissionProfile, sandbox: template.sandbox,
   serviceTier: 'default' };
+
+test('native start selection projects policy before the first model turn without claiming source or ownership', () => {
+  const selected = projectControlledNativeStartPolicy(startResult, template);
+  assert.equal(selected.threadId, taskId);
+  assert.equal(selected.effectivePolicy.serviceTier, 'default');
+  assert.deepEqual(selected.effectivePolicy.environments, []);
+  for (const response of [
+    { ...startResult, serviceTier: 'unapproved' },
+    { ...startResult, thread: { ...startResult.thread, turns: [{ id: 'other' }] } },
+    { ...startResult, thread: { ...startResult.thread, status: { type: 'active' } } },
+    { ...startResult, activePermissionProfile: { ...startResult.activePermissionProfile, extra: true } },
+  ]) assert.throws(() => projectControlledNativeStartPolicy(response, template), /unqualified/u);
+});
+
+test('controlled thread/start params compile from the validated policy template', () => {
+  assert.deepEqual(compileControlledNativeStartParams(template), {
+    cwd, model: template.model, config: { model_reasoning_effort: template.effort },
+    permissions: template.activePermissionProfile.id,
+    approvalPolicy: template.approvalPolicy, runtimeWorkspaceRoots: [cwd], ephemeral: false,
+  });
+  assert.throws(() => compileControlledNativeStartParams({ ...template,
+    allowedServiceTiers: [] as const }), /unqualified/u);
+});
 
 function fixture(failure: 'none' | 'unknown' | 'invalid-start-response' | 'started-persist' |
   'qualified-persist' | 'source-mismatch' |

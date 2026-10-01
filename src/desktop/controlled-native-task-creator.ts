@@ -164,6 +164,23 @@ function policyTemplate(value: unknown): PolicyTemplate {
     allowedEnvironments: environments.map(item => structuredClone(item)) }) as unknown as PolicyTemplate;
 }
 
+/** The sole thread/start request schema for controlled native creation. This
+ * compiles policy only; durable intent, live generation and source proof are
+ * separate requirements before using the request. */
+export function compileControlledNativeStartParams(requestedPolicy: PolicyTemplate): Readonly<{
+  cwd: string; model: string; config: Readonly<{ model_reasoning_effort: string | null }>;
+  permissions: string; approvalPolicy: string; runtimeWorkspaceRoots: readonly string[];
+  ephemeral: false;
+}> {
+  const policy = policyTemplate(requestedPolicy);
+  return Object.freeze({ cwd: policy.cwd, model: policy.model,
+    config: Object.freeze({ model_reasoning_effort: policy.effort }),
+    permissions: policy.activePermissionProfile.id,
+    approvalPolicy: policy.approvalPolicy,
+    runtimeWorkspaceRoots: Object.freeze([...policy.runtimeWorkspaceRoots]),
+    ephemeral: false });
+}
+
 const bounded = (value: unknown, max = 128): string | null =>
   typeof value === 'string' && value.length <= max && !/[\x00-\x1f\x7f]/u.test(value) ? value : null;
 const boundedPaths = (value: unknown): readonly string[] | null =>
@@ -229,7 +246,8 @@ function selectedEffective(start: Row): ControlledCreationStarted['selectedEffec
 
 /** A persisted full native start selection can qualify policy after a crash.
  * Legacy partial selections cannot, even when current history looks empty. */
-export function policyFromControlledStarted(started: ControlledCreationStarted): ApprovedTaskPolicy {
+export function policyFromControlledStarted(started: Pick<ControlledCreationStarted,
+  'threadId' | 'requestedPolicy' | 'selectedEffective'>): ApprovedTaskPolicy {
   const selected = started.selectedEffective;
   if (!Object.hasOwn(selected, 'runtimeWorkspaceRoots') ||
     !Object.hasOwn(selected, 'approvalsReviewer') ||
@@ -264,6 +282,25 @@ export function policyFromControlledStarted(started: ControlledCreationStarted):
     activePermissionProfile: selected.activePermissionProfile, sandbox: selected.sandbox,
     serviceTier: selected.serviceTier });
   return policy;
+}
+
+/** Project policy from a native start-shaped response. This is not an
+ * operation-bound receipt: source, owner, generation and durable intent must
+ * be independently fenced before it contributes to writer admission. */
+export function projectControlledNativeStartPolicy(start: unknown,
+  requestedPolicy: PolicyTemplate): Readonly<{ threadId: string; effectivePolicy: ApprovedTaskPolicy }> {
+  if (!row(start)) refuse();
+  const selected = start as Row;
+  const thread = selected.thread as Row;
+  if (!row(thread) || typeof thread.id !== 'string' || !UUID.test(thread.id)) refuse();
+  const threadId = thread.id as string;
+  const effectivePolicy = policyFromControlledStarted({ threadId, requestedPolicy,
+    selectedEffective: selectedEffective(selected) });
+  if (!requestedPolicy.allowedServiceTiers.some(tier => tier === selected.serviceTier) ||
+    !requestedPolicy.allowedEnvironments.some(allowed =>
+      isDeepStrictEqual(allowed, thread.environments))) refuse();
+  assertEffectiveResume(effectivePolicy, selected);
+  return Object.freeze({ threadId, effectivePolicy });
 }
 
 async function qualifyRead(read: Row, threadId: string, rolloutPath: string,
@@ -388,11 +425,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
     const session = await options.rpc.initializedSession();
     if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
       !options.rpc.isSessionCurrent(session.generation) || reservation.isCurrent() !== true) refuse();
-    const startParams = { cwd: requestedPolicy.cwd, model: requestedPolicy.model,
-      config: { model_reasoning_effort: requestedPolicy.effort },
-      permissions: requestedPolicy.activePermissionProfile.id,
-      approvalPolicy: requestedPolicy.approvalPolicy,
-      runtimeWorkspaceRoots: [...requestedPolicy.runtimeWorkspaceRoots], ephemeral: false };
+    const startParams = compileControlledNativeStartParams(requestedPolicy);
     // Mark before invoking request: if transport outcome is unknown, the durable
     // intent remains the sole reconciliation key and no second start is sent.
     dispatched = true;

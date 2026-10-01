@@ -8,6 +8,13 @@ export interface NativeFirstTurnHistoryScope {
   /** Protected, caller-owned key; never saved with the digest. */
   readonly fingerprintKey: Uint8Array;
 }
+export interface NativeFirstTurnHistoryReader {
+  initializedSession(): Promise<{ readonly generation: number }>;
+  isSessionCurrent(generation: number): boolean;
+  request(method: string, params: Record<string, unknown>, options?: Readonly<{
+    expectedGeneration?: number; timeoutMs?: number;
+  }>): Promise<unknown>;
+}
 export interface NativeFirstTurnHistoryEvidence {
   readonly threadId: string;
   readonly turnId: string;
@@ -19,6 +26,8 @@ export interface NativeFirstTurnHistoryEvidence {
 const fail = (): never => { throw new Error('Native first-turn history unqualified'); };
 const identifier = (value: unknown): value is string => typeof value === 'string' &&
   value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/u.test(value);
+const cursor = (value: unknown): value is string => typeof value === 'string' &&
+  value.length > 0 && value.length <= 512 && !/[\x00-\x1f\x7f]/u.test(value);
 const object = (value: unknown): value is JsonObject => value !== null &&
   typeof value === 'object' && !Array.isArray(value) &&
   Object.getPrototypeOf(value) === Object.prototype;
@@ -47,27 +56,49 @@ function strictJson(value: unknown, seen = new Set<object>(), depth = 0): void {
   } finally { seen.delete(value); }
 }
 
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (object(value)) return Object.fromEntries(Object.keys(value).sort()
+    .map(key => [key, canonical(value[key])]));
+  return value;
+}
+
 /** Classify only the initial, tool-free read-only canary subset. This is one
  * history witness, not proof of a durable rollout, idle queue, source or owner.
  * Those must be checked separately on a fresh connection before cutover. */
-export function qualifyNativeFirstTurnHistory(page: unknown,
+function qualifyNativeFirstTurnHistory(page: unknown,
   scope: NativeFirstTurnHistoryScope): NativeFirstTurnHistoryEvidence {
   if (!scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
       !identifier(scope.clientUserMessageId) ||
       !(scope.fingerprintKey instanceof Uint8Array) ||
       scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) return fail();
   if (!object(page)) return fail();
-  if (!exactKeys(page, ['data', 'nextCursor']) || page.nextCursor !== null) return fail();
+  // Native CLI 0.155.1 includes backwardsCursor even for a one-turn page;
+  // it is an opaque page anchor, not evidence of an earlier turn. The reader
+  // below issues the first ascending full page itself, with no cursor.
+  if (!exactKeys(page, ['backwardsCursor', 'data', 'nextCursor']) ||
+      page.nextCursor !== null ||
+      page.backwardsCursor !== null && !cursor(page.backwardsCursor)) return fail();
   if (!Array.isArray(page.data) || page.data.length !== 1) return fail();
   strictJson(page);
   const encoded = JSON.stringify(page);
   if (Buffer.byteLength(encoded, 'utf8') > 1024 * 1024) fail();
   const turn = page.data[0];
-  if (!object(turn) || turn.id !== scope.turnId || turn.status !== 'completed' ||
-      turn.itemsView !== 'full' || !Array.isArray(turn.items)) fail();
+  if (!object(turn) || !exactKeys(turn, ['id', 'startedAt', 'completedAt',
+    'durationMs', 'status', 'error', 'itemsView', 'items']) ||
+      turn.id !== scope.turnId || turn.status !== 'completed' ||
+      turn.itemsView !== 'full' || !Array.isArray(turn.items) ||
+      turn.startedAt !== null &&
+        !(typeof turn.startedAt === 'number' && Number.isFinite(turn.startedAt)) ||
+      typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt) ||
+      typeof turn.durationMs !== 'number' || !Number.isFinite(turn.durationMs) ||
+      turn.durationMs < 0 || turn.error !== null) fail();
   let userCount = 0, assistantCount = 0;
+  const itemIds = new Set<string>();
   for (const item of turn.items) {
-    if (!object(item) || !identifier(item.id) || typeof item.type !== 'string') fail();
+    if (!object(item) || !identifier(item.id) || typeof item.type !== 'string' ||
+        itemIds.has(item.id)) fail();
+    itemIds.add(item.id as string);
     switch (item.type) {
       case 'userMessage':
         if (!exactKeys(item, ['id', 'type', 'clientId', 'content']) ||
@@ -75,12 +106,19 @@ export function qualifyNativeFirstTurnHistory(page: unknown,
         userCount++;
         break;
       case 'agentMessage':
-        if (!exactKeys(item, ['id', 'type', 'text']) ||
-            typeof item.text !== 'string' || !item.text.trim()) fail();
+        // The observed 0.155.1 one-turn full-history response has four null
+        // auxiliary fields. A changed final-message shape needs a new canary,
+        // not a permissive default that could accept an interactive question.
+        if (!exactKeys(item, ['id', 'type', 'text', 'delivery', 'memoryCitation',
+          'phase', 'questions']) ||
+            typeof item.text !== 'string' || !item.text.trim() ||
+            item.delivery !== null || item.memoryCitation !== null ||
+            item.phase !== null || item.questions !== null) fail();
         assistantCount++;
         break;
       case 'reasoning':
-        if (!exactKeys(item, ['id', 'type', 'summary']) || !Array.isArray(item.summary)) fail();
+        if (!exactKeys(item, ['id', 'type', 'summary', 'content']) ||
+            !Array.isArray(item.summary) || !Array.isArray(item.content)) fail();
         break;
       case 'plan':
         if (!exactKeys(item, ['id', 'type', 'steps']) || !Array.isArray(item.steps)) fail();
@@ -92,7 +130,29 @@ export function qualifyNativeFirstTurnHistory(page: unknown,
   const digest = createHmac('sha256', scope.fingerprintKey)
     .update('vkodex-native-first-turn-history-v1\0')
     .update(JSON.stringify([scope.threadId, scope.turnId, scope.clientUserMessageId]))
-    .update('\0').update(encoded).digest('hex');
+    .update('\0').update(JSON.stringify(canonical(turn))).digest('hex');
   return Object.freeze({ threadId: scope.threadId, turnId: scope.turnId,
     clientUserMessageId: scope.clientUserMessageId, historyHmac: digest });
+}
+
+
+/** Request the first ascending full native page ourselves, pinned to one
+ * initialized backend generation. This still proves only history content;
+ * source, owner, queue and post-read idle state require separate checks. */
+export async function readAndQualifyNativeFirstTurnHistory(rpc: NativeFirstTurnHistoryReader,
+  scope: NativeFirstTurnHistoryScope): Promise<NativeFirstTurnHistoryEvidence> {
+  if (!rpc || typeof rpc.initializedSession !== 'function' ||
+      typeof rpc.isSessionCurrent !== 'function' || typeof rpc.request !== 'function' ||
+      !scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
+      !identifier(scope.clientUserMessageId) ||
+      !(scope.fingerprintKey instanceof Uint8Array) ||
+      scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) fail();
+  const session = await rpc.initializedSession();
+  if (!Number.isSafeInteger(session.generation) || session.generation < 1 ||
+      !rpc.isSessionCurrent(session.generation)) fail();
+  const page = await rpc.request('thread/turns/list', { threadId: scope.threadId,
+    limit: 2, sortDirection: 'asc', itemsView: 'full' },
+  { expectedGeneration: session.generation, timeoutMs: 30_000 });
+  if (!rpc.isSessionCurrent(session.generation)) fail();
+  return qualifyNativeFirstTurnHistory(page, scope);
 }
