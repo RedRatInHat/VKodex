@@ -331,6 +331,11 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
     private readonly projectCatalogMode: ProjectCatalogMode = "no-live-legacy",
   ) {}
+  assertProjectAssignmentAvailable(): void {
+    if (this.projectCatalogMode === "no-live-legacy") {
+      throw new ActionRejectedError("Защитный режим не читает состояние проектов Codex; назначение проекта через VKodex недоступно.");
+    }
+  }
   async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
     const home = this.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
     const metadata = this.createMetadata(home);
@@ -463,9 +468,7 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     } finally { db?.close(); }
   }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
-    if (this.projectCatalogMode === "no-live-legacy") {
-      throw new ActionRejectedError("Защитный режим не читает состояние проектов Codex; назначение проекта через VKodex недоступно.");
-    }
+    this.assertProjectAssignmentAvailable();
     const home = this.sourceHome(task);
     await preflightLegacyProjectAssignment(home, task.threadId, projectId);
     await this.createMetadata(home).assignProject(task, projectId);

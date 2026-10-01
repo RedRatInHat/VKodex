@@ -3040,6 +3040,47 @@ test("an observed incompatible stream version still fails compatibility", async 
   assert.match(status.message, /несовместима/u);
 });
 
+test("App Server creator rejects unavailable project assignment before starting a thread", async () => {
+  let started = 0;
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => assert.fail("No workspace should be prepared"),
+    sourceHome: () => assert.fail("No profile should be opened"),
+    listTasks: async () => assert.fail("No task should exist"),
+    listModels: async () => [{ id: "model-a", title: "Model A", efforts: ["high"], defaultEffort: "high" }],
+  }, {
+    assertProjectAssignmentAvailable: () => { throw new ActionRejectedError("Project assignment unavailable"); },
+    rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+  }, (() => { started++; throw new Error("No App Server should start"); }) as never);
+  await assert.rejects(creator.createTask({ operationId: "unavailable-project", projectId: "visible",
+    title: "Test", prompt: "Test", model: "model-a", effort: "high", environment: "local" }),
+  /Project assignment unavailable/u);
+  assert.equal(started, 0);
+});
+
+test("App Server creator leaves a new projectless thread unassigned", async () => {
+  const workspace = process.cwd();
+  const task: DesktopTask = { hostId: "local", threadId: "projectless-thread", title: "Initial", workspace,
+    projectId: null, rolloutPath: path.join(workspace, "projectless-rollout.jsonl"), updatedAt: 1 };
+  let assignmentCalls = 0;
+  const creator = new AppServerTaskCreator({
+    resolveProject: async () => assert.fail("Projectless creation must not resolve a project"),
+    sourceHome: () => path.resolve("fixture-home"), listTasks: async () => [task],
+    listModels: async () => [{ id: "model-a", title: "Model A", efforts: ["high"], defaultEffort: "high" }],
+  }, {
+    assertProjectAssignmentAvailable: () => assert.fail("Projectless creation needs no assignment gate"),
+    rename: async () => {}, archive: async () => {}, markdown: async () => "",
+    assignProject: async () => { assignmentCalls++; },
+  }, () => ({ startThread: () => ({ runStreamed: async () => ({ events: (async function* () {
+    yield { type: "thread.started", thread_id: task.threadId } as const;
+    yield { type: "turn.started" } as const;
+    yield { type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } } as const;
+  })() }) }) }) as never);
+  const created = await creator.createTask({ operationId: "projectless-create", projectId: null, workspace,
+    title: "Projectless", prompt: "Initial", model: "model-a", effort: "high", environment: "local" });
+  assert.equal(created.threadId, task.threadId);
+  assert.equal(assignmentCalls, 0);
+});
+
 test("App Server creator materializes a new task with its atomic first turn", async () => {
   const profileRoot = path.resolve("fixture-app-server-home"); const workspace = path.resolve("fixture-project"); const worktree = path.resolve("fixture-project_worktree");
   const metadata: string[] = []; const calls: { readonly options: unknown; readonly prompt: string }[] = [];
@@ -3720,6 +3761,23 @@ test("transfer source archival verifies exact persisted state without launching 
     });
   await adapter.archiveTransferredSource(source);
   assert.equal(archives, 1);
+});
+
+test("App Server transfer rejects unavailable project assignment before staging or fork", async () => {
+  let catalogCalls = 0;
+  const transfer = new AppServerTaskTransfer({
+    sourceHome: () => { catalogCalls++; throw new Error("No source lookup expected"); },
+    listSources: () => { catalogCalls++; return []; },
+    listTasks: async () => { catalogCalls++; return []; },
+    listProjects: async () => { catalogCalls++; return []; },
+  }, {
+    assertProjectAssignmentAvailable: () => { throw new ActionRejectedError("Project assignment unavailable"); },
+    rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+  });
+  await assert.rejects(transfer.fork({ operationId: "blocked-transfer", startedAt: 1, task: {
+    hostId: "local", threadId: "source-thread", title: "Source", rolloutPath: path.resolve("source.jsonl"),
+  }, targetSourceId: "work", projectId: "target-project" }), /Project assignment unavailable/u);
+  assert.equal(catalogCalls, 0);
 });
 
 test("App Server transfer forks a fixed completed boundary into the target profile", async () => {

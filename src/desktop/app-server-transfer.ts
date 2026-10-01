@@ -464,6 +464,7 @@ export class AppServerTaskTransfer implements DesktopTaskTransfer {
       throw new ActionRejectedError("Исходный каталог не сообщил путь истории задачи. Обнови список и повтори перенос.");
     }
     if ((request.task.sourceId ?? "") === request.targetSourceId) throw new ActionRejectedError("Задача уже находится в выбранном каталоге Codex.");
+    if (request.projectId !== null) this.metadata.assertProjectAssignmentAvailable?.();
     const targetRef = { hostId: "local", threadId: "", ...(request.targetSourceId ? { sourceId: request.targetSourceId } : {}) };
     const targetHome = this.catalog.sourceHome(targetRef);
     const sourceHome = this.catalog.sourceHome(request.task);

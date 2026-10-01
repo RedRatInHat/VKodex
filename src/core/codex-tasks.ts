@@ -203,6 +203,8 @@ export interface AccountUsageProvider {
 }
 
 export interface DesktopMetadata {
+  /** Fail before creating/forking a thread when its project cannot be assigned safely. */
+  assertProjectAssignmentAvailable?(): void;
   /** Returns the raw native project ID; callers with multi-catalog views must rebind it to a source-qualified catalog ID. */
   createProject?(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject>;
   queue?(request: SubmitTaskRequest, input: readonly Record<string, unknown>[]): Promise<string>;

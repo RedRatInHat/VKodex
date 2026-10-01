@@ -85,6 +85,7 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
     if (!available || (effort && !available.efforts.includes(effort))) {
       throw new ActionRejectedError("Версия Codex CLI, установленная с VKodex, не поддерживает выбранную модель или уровень рассуждения. Обнови VKodex или выбери доступную модель; задача не создана.");
     }
+    if (request.projectId !== null) this.metadata.assertProjectAssignmentAvailable?.();
     const resolved = await this.resolveWorkspace(request);
     const controller = new AbortController();
     const thread = this.createCodex(resolved.sourceHome).startThread({
@@ -106,7 +107,9 @@ export class AppServerTaskCreator implements DesktopTaskCreator {
     await accepted(turnStarted.promise);
     const task = await this.waitForCatalog(initialTask);
     try {
-      await this.metadata.assignProject(task, resolved.rawProjectId);
+      // A brand-new projectless thread has no assignment to clear. In the
+      // protective catalog mode, only project-backed creation is refused.
+      if (resolved.rawProjectId !== null) await this.metadata.assignProject(task, resolved.rawProjectId);
       await this.metadata.rename(task, request.title);
     } catch (error) {
       throw error instanceof ActionRejectedError ? new UncertainActionError() : error;
