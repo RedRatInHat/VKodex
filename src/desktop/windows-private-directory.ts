@@ -4,7 +4,10 @@ import { Worker } from "node:worker_threads";
 
 const PRIVATE_DIRECTORY_UNAVAILABLE = "Private capability directory unavailable";
 const MAX_WORKER_IO_BYTES = 64 * 1024;
-const DIRECT_HELPER_TIMEOUT_MS = 2_000;
+// Cold Windows CI/host PowerShell startup can exceed two seconds. Keep the
+// synchronous final ACL check bounded and fail-closed at the same limit as the
+// existing worker helper; do not substitute a cached earlier attestation.
+export const WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS = 6_000;
 const WORKER_HELPER_TIMEOUT_MS = 6_000;
 const WORKER_TIMEOUT_MS = 9_000;
 
@@ -104,7 +107,8 @@ function checkDirectory(directory: string): { result: DirectoryCheck; diagnostic
   const helper = helperArguments(directory);
   if (!helper) return { result: "invalid", diagnostic: "invalid-path" };
   const result = spawnSync(helper.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", helper.script], {
-    input: directory, encoding: "utf8", windowsHide: true, timeout: DIRECT_HELPER_TIMEOUT_MS, maxBuffer: 4096, env: helper.environment,
+    input: directory, encoding: "utf8", windowsHide: true,
+    timeout: WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS, maxBuffer: 4096, env: helper.environment,
   });
   // spawnSync reports launch failures, timeouts, and max-buffer overflow
   // (for example ENOBUFS) through error. Only that bounded helper class may retry.

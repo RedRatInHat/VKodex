@@ -21,7 +21,7 @@ import { prepareNativeFirstThreadStart } from '../../src/desktop/native-first-tu
 import { dispatchPreparedNativeFirstThreadStartCanary } from
   '../../src/desktop/native-first-thread-start-canary.js';
 import { readWindowsProcessIdentity } from '../../src/desktop/windows-process-identity.js';
-import { privateDirectoryAclVerificationScript } from
+import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS } from
   '../../src/desktop/windows-private-directory.js';
 
 function aclPhase(directory: string): 'ok' | 'acl-invalid' | 'timeout' | 'helper-error' {
@@ -38,7 +38,8 @@ function aclPhase(directory: string): 'ok' | 'acl-invalid' | 'timeout' | 'helper
   }
   environment.PSModulePath = modulePath;
   const result = spawnSync(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
-    input: directory, encoding: 'utf8', windowsHide: true, timeout: 2_000, maxBuffer: 4096, env: environment,
+    input: directory, encoding: 'utf8', windowsHide: true,
+    timeout: WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS, maxBuffer: 4096, env: environment,
   });
   if (result.error) return (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
     ? 'timeout' : 'helper-error';
