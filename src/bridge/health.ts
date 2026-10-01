@@ -160,10 +160,14 @@ export class BridgeHealthMonitor {
 
     setPhase("runtime-and-store");
     const runtime = this.runtime();
+    const clockReversed = checkedAt < runtime.lastTickAt ||
+      runtime.updateStartedAt !== null && checkedAt < runtime.updateStartedAt;
     const tickAge = Math.max(0, checkedAt - runtime.lastTickAt);
     const updateAge = runtime.updateStartedAt === null ? 0 : Math.max(0, checkedAt - runtime.updateStartedAt);
     checks.push(runtime.stopped || tickAge > 10_000 || updateAge > 60_000
       ? { name: "runtime", state: "failed", detail: `Цикл моста не отвечает вовремя: tick ${Math.round(tickAge / 1_000)} с, update ${Math.round(updateAge / 1_000)} с.` }
+      : clockReversed
+        ? { name: "runtime", state: "degraded", detail: "Системное время сдвинулось назад; свежесть цикла не подтверждена." }
       : updateAge > 15_000
         ? { name: "runtime", state: "degraded", detail: `Обновление выполняется уже ${Math.round(updateAge / 1_000)} с.` }
         : { name: "runtime", state: "ok", detail: `Цикл активен; последний tick ${Math.round(tickAge / 1_000)} с назад.` });
@@ -541,7 +545,8 @@ export class BridgeHealthMonitor {
 
   private async checkCompatibility(force: boolean, checkedAt: number): Promise<HealthCheckResult> {
     if (!this.desktop.compatibility) return { name: "codex_live_api", state: "degraded", detail: "Адаптер не сообщает совместимость live API." };
-    if (this.desktop.checkCompatibility && (force || checkedAt - this.lastCompatibilityAt >= this.compatibilityIntervalMs)) {
+    if (this.desktop.checkCompatibility && (force || checkedAt < this.lastCompatibilityAt ||
+      checkedAt - this.lastCompatibilityAt >= this.compatibilityIntervalMs)) {
       this.lastCompatibilityAt = checkedAt;
       try { await withTimeout(this.desktop.checkCompatibility(), 20_000); }
       catch { return { name: "codex_live_api", state: "failed", detail: "Проверка named pipe и stream protocol не завершилась за 20 секунд." }; }

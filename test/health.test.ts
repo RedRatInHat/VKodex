@@ -97,6 +97,31 @@ test("routine health reuses a recent SQLite integrity verdict but explicit check
   assert.equal(integrityChecks, 3, "the periodic deep check must eventually refresh integrity");
 });
 
+test("health does not report a future-dated runtime tick as fresh after clock rollback", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const chat = new HealthChat(); const desktop = new HealthDesktop();
+  let now = 100_000;
+  const runtime = () => ({ startedAt: 40_000, lastTickAt: 100_000,
+    updateStartedAt: null, stopped: false, activeBindings: 0, connectedBindings: 0,
+    requiredBindings: 0, connectedRequiredBindings: 0 });
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime,
+    undefined, () => now, undefined, () => true);
+  assert.equal((await monitor.check()).checks.find(check => check.name === "runtime")?.state, "ok");
+  now = 99_999;
+  const rolledBack = (await monitor.check()).checks.find(check => check.name === "runtime")!;
+  assert.equal(rolledBack.state, "degraded");
+  assert.match(rolledBack.detail, /Системное время/u);
+});
+
+test("health retries native compatibility after clock rollback", async t => {
+  const s = setup(t);
+  await s.monitor.check(true);
+  assert.equal(s.desktop.compatibilityChecks, 1);
+  s.advance(-1);
+  await s.monitor.check();
+  assert.equal(s.desktop.compatibilityChecks, 2);
+});
+
 test("explicit integrity check arriving during routine health runs after that snapshot", async t => {
   const s = setup(t);
   let integrityChecks = 0;

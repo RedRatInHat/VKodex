@@ -264,6 +264,19 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
 
+test("runtime schedules a fresh health check after clock rollback", async t => {
+  let checks = 0;
+  const s = runtimeSetup(t, async () => {
+    checks++;
+    return { state: "ok", checkedAt: 100_000, pid: 1, uptimeSeconds: 0, checks: [] };
+  });
+  await s.runtime.tick(false);
+  assert.equal(checks, 1);
+  s.advance(-1);
+  await s.runtime.tick(false);
+  assert.equal(checks, 2);
+});
+
 test("restart recovery does not resume a turn still active in a UI owner", async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-recovery-"));
   t.after(async () => { await rm(root, { recursive: true, force: true }); });

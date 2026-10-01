@@ -653,7 +653,9 @@ export class BridgeRuntime {
   tick(waitForConnections = true, bindingId?: string): Promise<void> {
     // Health must keep running while a previous update waits for an unavailable
     // client. Otherwise its stale pre-restart report can mask that very stall.
-    if (!this.stopped && this.now() - this.lastHealthAt >= this.healthIntervalMs) void this.checkHealth().catch(() => {});
+    const now = this.now();
+    if (!this.stopped && (now < this.lastHealthAt || now - this.lastHealthAt >= this.healthIntervalMs))
+      void this.checkHealth().catch(() => {});
     if (this.stopped) return Promise.resolve();
     this.updateStartedAt = this.now();
     try { this.update(); }
