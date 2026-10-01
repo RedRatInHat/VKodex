@@ -514,7 +514,7 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   const controlKey = {}, adapterKey = {};
   let notify: ((event: ManagedWorkerNotification) => void) | null = null;
   let failObserver: ((reason: WorkerObserverFailure) => void) | null = null;
-  let ownerCurrent = true, noPendingAutoStart = false, unresolved = 0;
+  let ownerCurrent = true, sourceCurrent = true, noPendingAutoStart = false, unresolved = 0;
   let inFlight = 0, unconfirmed = false;
   let acceptedQueue = false, acceptedReceipt = false, terminalReceipt = false,
     notificationsDuringRead = 0;
@@ -556,6 +556,7 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   };
   const qualifier = new ManagedNativeCliSourceQualifier({ host, taskId, ownerEpoch,
     adapterKey, controlKey, assertOwnerCurrent: () => ownerCurrent,
+    assertSourceCurrent: () => { if (!sourceCurrent) throw new Error('source replaced'); },
     noPendingAutoStart: () => noPendingAutoStart });
   qualifier.start();
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
@@ -567,6 +568,9 @@ test('CLI source qualifier fences live worker changes around complete idle reads
   assert.equal(proof.effectiveSettings.permissions, ':read-only');
   assert.deepEqual(proof.effectiveSettings.collaborationMode, settings.collaborationMode);
   proof.assertCurrent();
+  sourceCurrent = false;
+  assert.throws(() => proof.assertCurrent(), /source replaced/u);
+  sourceCurrent = true;
   inFlight = 1;
   await assert.rejects(qualifier.qualify(qualifyNativeCliResumePolicy(resumeResult(), taskId)),
     /ledger/i);

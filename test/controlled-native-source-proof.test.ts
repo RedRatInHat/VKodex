@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
-import { mkdir, mkdtemp, rename, symlink, truncate, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -17,6 +17,7 @@ import { captureControlledNativeSourcePreflight, ControlledNativeSourceUnqualifi
   proveAuthenticatedProfileSource,
   proveControlledNativeSource, type ControlledNativeSourceIdentity } from '../src/desktop/controlled-native-source-proof.js';
 import { deriveControlledNativeCliSourceScope, assertControlledNativeCliSourceScope,
+  assertControlledNativeCliSourceScopeCurrent,
   verifyControlledNativeCliSourceScope } from
   '../src/desktop/controlled-native-cli-source-scope.js';
 
@@ -197,6 +198,8 @@ test('CLI source scope requires explicit authenticated-profile opt-in and then v
   const preflight = await captureAuthenticatedProfileSourcePreflight(proofIdentity, f.home, f.workspace);
   await persistAuthenticatedProfileSourcePreflightReceipt(receiptPath, preflight);
   const candidate = await rollout(f.home, threadA, f.workspace, 'returned-by-native');
+  const candidateInitial = await import('node:fs/promises').then(({ readFile }) => readFile(candidate, 'utf8'));
+  await writeFile(candidate, `${candidateInitial}{"type":"event_msg","body":"body-A"}\n`);
   const requestedPolicy = { model: 'gpt-5.6-sol', modelProvider: 'openai', effort: 'medium',
     cwd: f.workspace, runtimeWorkspaceRoots: [f.workspace], approvalPolicy: 'never',
     approvalsReviewer: 'user', activePermissionProfile: { id: ':danger-full-access', extends: null },
@@ -232,15 +235,25 @@ test('CLI source scope requires explicit authenticated-profile opt-in and then v
     const scope = await deriveControlledNativeCliSourceScope({ ...options,
       allowAuthenticatedProfile: true });
     assert.equal(scope.taskId, threadA);
+    assert.doesNotThrow(() => assertControlledNativeCliSourceScopeCurrent(scope));
     await verifyControlledNativeCliSourceScope(scope, { taskId: threadA,
       home: f.home, cwd: f.workspace, approvedTaskPolicy: effectivePolicy });
-    const legacy = JSON.parse(await import('node:fs/promises').then(({ readFile }) => readFile(receiptPath, 'utf8'))) as Record<string, unknown>;
+    const originalReceipt = await import('node:fs/promises').then(({ readFile }) => readFile(receiptPath, 'utf8'));
+    const legacy = JSON.parse(originalReceipt) as Record<string, unknown>;
     legacy.schemaVersion = 2;
     delete legacy.workspaceDev; delete legacy.workspaceIno; delete legacy.workspaceBirthtimeMs;
     await writeFile(receiptPath, JSON.stringify(legacy));
+    assert.throws(() => assertControlledNativeCliSourceScopeCurrent(scope), /source-drift/i);
     await assert.rejects(verifyControlledNativeCliSourceScope(scope, { taskId: threadA,
       home: f.home, cwd: f.workspace, approvedTaskPolicy: effectivePolicy }), /scope/i);
     await assert.rejects(deriveControlledNativeCliSourceScope({ ...options, allowAuthenticatedProfile: true }), /scope/i);
+    await writeFile(receiptPath, originalReceipt);
+    assert.doesNotThrow(() => assertControlledNativeCliSourceScopeCurrent(scope));
+    const candidateBeforeEdit = await import('node:fs/promises').then(({ readFile }) => readFile(candidate, 'utf8'));
+    const priorTimes = statSync(candidate);
+    await writeFile(candidate, candidateBeforeEdit.replace('body-A', 'body-B'));
+    await utimes(candidate, priorTimes.atime, priorTimes.mtime);
+    assert.throws(() => assertControlledNativeCliSourceScopeCurrent(scope), /source-drift/i);
   } finally { journal.close(); }
 });
 

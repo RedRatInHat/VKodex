@@ -25,7 +25,8 @@ import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
 import { captureControlledNativeSourcePreflight, persistControlledNativeSourcePreflightReceipt } from
   '../src/desktop/controlled-native-source-proof.js';
-import { deriveControlledNativeCliSourceScope, verifyControlledNativeCliSourceScope } from
+import { deriveControlledNativeCliSourceScope, assertControlledNativeCliSourceScopeCurrent,
+  verifyControlledNativeCliSourceScope } from
   '../src/desktop/controlled-native-cli-source-scope.js';
 
 test('daemon requires explicit follower and IPC policy before private state is read', () => {
@@ -757,6 +758,7 @@ test('controlled CLI source scope refuses journal, source, and manifest drift', 
   try {
     const scope = own.cliOptions!.sourceScope!;
     await verifyControlledNativeCliSourceScope(scope);
+    assert.doesNotThrow(() => assertControlledNativeCliSourceScopeCurrent(scope));
     await assert.rejects(verifyControlledNativeCliSourceScope(scope, {
       taskId: randomUUID(), home: own.home, cwd: own.home, approvedTaskPolicy: scope.policy }),
     /scope/i);
@@ -766,11 +768,29 @@ test('controlled CLI source scope refuses journal, source, and manifest drift', 
     await writeFile(path.join(own.home, 'sessions', `${randomUUID()}.jsonl`),
       `${JSON.stringify({ type: 'session_meta', payload: { id: randomUUID(),
         session_id: randomUUID(), cwd: own.home } })}\n`);
+    assert.throws(() => assertControlledNativeCliSourceScopeCurrent(scope), /source-drift/i);
     await assert.rejects(verifyControlledNativeCliSourceScope(scope), /unqualified/i);
     own.creationJournal!.close();
     await assert.rejects(verifyControlledNativeCliSourceScope(scope), /scope/i);
   } finally {
     await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-drift-stop');
+  }
+});
+
+test('controlled CLI final source fence rejects an in-place rollout header change', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', false, null, undefined, undefined, false, undefined, undefined,
+    { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
+  try {
+    const scope = own.cliOptions!.sourceScope!;
+    const rolloutPath = path.join(own.home, 'sessions', `${own.taskId}.jsonl`);
+    assert.doesNotThrow(() => assertControlledNativeCliSourceScopeCurrent(scope));
+    const original = await readFile(rolloutPath, 'utf8');
+    await writeFile(rolloutPath, original.replace(own.taskId, randomUUID()));
+    assert.throws(() => assertControlledNativeCliSourceScopeCurrent(scope), /source-drift/i);
+  } finally {
+    await controlStop(own.privateDirectory, own.reserved.epoch, 'cli-header-drift-stop');
   }
 });
 

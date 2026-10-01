@@ -33,7 +33,8 @@ import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server
 import { deriveManagedTaskStateToken } from './managed-worker-task-state-token.js';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
-import { assertControlledNativeCliSourceScope, verifyControlledNativeCliSourceScope,
+import { assertControlledNativeCliSourceScope, assertControlledNativeCliSourceScopeCurrent,
+  verifyControlledNativeCliSourceScope,
   type ControlledNativeCliSourceScope } from './controlled-native-cli-source-scope.js';
 
 type State = 'new' | 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
@@ -976,6 +977,10 @@ export class ManagedWorkerDaemon {
           host: this.#host, adapterKey, controlKey,
           taskId: manifest.taskId, ownerEpoch: manifest.epoch,
           assertOwnerCurrent: ownerCurrent,
+          ...(this.#options.nativeCliWebSocket.sourceScope ? {
+            assertSourceCurrent: () => assertControlledNativeCliSourceScopeCurrent(
+              this.#options.nativeCliWebSocket!.sourceScope!),
+          } : {}),
           noPendingAutoStart: () =>
             (this.#state === 'starting' || this.#state === 'ready' && this.#admissionOpen) &&
             !this.#ingressRevoked && this.#headlessPending === 0 &&

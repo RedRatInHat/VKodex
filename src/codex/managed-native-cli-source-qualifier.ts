@@ -20,6 +20,8 @@ export interface ManagedNativeCliSourceQualifierOptions {
   readonly assertOwnerCurrent: () => boolean;
   /** Synchronous stock scheduler/goal proof; not inferred from an empty queue. */
   readonly noPendingAutoStart: () => boolean;
+  /** Physical source fence, rechecked synchronously at the command write. */
+  readonly assertSourceCurrent?: () => void;
   /** Controlled zero-turn source: reject any intervening native turn. */
   readonly requireEmptyHistory?: true;
 }
@@ -42,7 +44,9 @@ export class ManagedNativeCliSourceQualifier {
         typeof options.taskId !== 'string' || !options.taskId ||
         typeof options.ownerEpoch !== 'string' || !options.ownerEpoch ||
         typeof options.assertOwnerCurrent !== 'function' ||
-        typeof options.noPendingAutoStart !== 'function') fail('qualifier unavailable');
+        typeof options.noPendingAutoStart !== 'function' ||
+        options.assertSourceCurrent !== undefined && typeof options.assertSourceCurrent !== 'function')
+      fail('qualifier unavailable');
     this.#options = Object.freeze({ ...options });
   }
 
@@ -98,6 +102,12 @@ export class ManagedNativeCliSourceQualifier {
         meta.backendGeneration !== this.#generation ||
         this.#options.assertOwnerCurrent() !== true)
       fail('owner or worker changed');
+    const sourceCheck: unknown = this.#options.assertSourceCurrent?.();
+    if (sourceCheck !== undefined) {
+      if (sourceCheck && typeof sourceCheck === 'object' && 'then' in sourceCheck &&
+          typeof sourceCheck.then === 'function') void Promise.resolve(sourceCheck).catch(() => {});
+      fail('source fence must be synchronous');
+    }
     if (revision !== undefined && this.#revision !== revision) fail('revision changed');
     const requests = host.requestQuiescence(this.#options.controlKey);
     if (requests.generation !== this.#generation || requests.unresolved !== 0)
