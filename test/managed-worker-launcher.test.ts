@@ -245,6 +245,8 @@ test('opt-in launch snapshots explicit policy and rejects changed resume before 
       queueMicrotask(() => child.emit('spawn')); return child; } });
   assert.deepEqual((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy, policy);
   assert.equal(Object.isFrozen((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy), true);
+  assert.deepEqual((protectedManifest as { managedOwnerClaim: unknown }).managedOwnerClaim,
+    { storePath, bindingId: binding.id, claimId: store.managedOwner(binding)?.id });
   assert.equal(store.managedOwner(binding)?.state, 'registering');
   store.close();
 });

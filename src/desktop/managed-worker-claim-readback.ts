@@ -7,6 +7,10 @@ export interface ManagedWorkerClaimBinding {
   readonly bindingId: string;
 }
 
+export interface ManagedWorkerClaimReference extends ManagedWorkerClaimBinding {
+  readonly claimId: string;
+}
+
 export class ManagedWorkerClaimDispatchError extends Error {
   constructor(readonly outcome: 'not-dispatched' | 'unknown') {
     super('Managed worker bridge claim dispatch unavailable');
@@ -25,6 +29,15 @@ export function assertManagedWorkerClaimBinding(value: unknown):
   if (Object.keys(item).length !== 2 || typeof item.storePath !== 'string' ||
       !path.isAbsolute(item.storePath) || typeof item.bindingId !== 'string' ||
       !uuid.test(item.bindingId)) unavailable();
+}
+
+export function assertManagedWorkerClaimReference(value: unknown):
+  asserts value is ManagedWorkerClaimReference {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) unavailable();
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).length !== 3 || typeof item.claimId !== 'string' ||
+      !uuid.test(item.claimId)) unavailable();
+  assertManagedWorkerClaimBinding({ storePath: item.storePath, bindingId: item.bindingId });
 }
 
 /** A new read-only SQLite connection independently observes the committed
@@ -72,9 +85,18 @@ export function readManagedWorkerClaim(binding: ManagedWorkerClaimBinding,
   }
 }
 
+/** Child startup must independently reject a retired or replaced claim before
+ * host registration. This is a snapshot, not a native writer lease. */
+export function assertManagedWorkerClaimCurrent(reference: ManagedWorkerClaimReference,
+  attempt: WorkerAttempt, taskId: string): void {
+  assertManagedWorkerClaimReference(reference);
+  if (readManagedWorkerClaim({ storePath: reference.storePath,
+    bindingId: reference.bindingId }, attempt, taskId) !== reference.claimId) unavailable();
+}
+
 /** The short IMMEDIATE transaction prevents a concurrent bridge handoff from
- * committing between final claim readback and the synchronous OS spawn call.
- * It is not a native writer lease; the child must independently fence startup. */
+ * committing between final claim readback and a synchronous spawn or host
+ * registration call. It is not a native writer lease after the call returns. */
 export function dispatchWithManagedWorkerClaim<T>(binding: ManagedWorkerClaimBinding,
   attempt: WorkerAttempt, taskId: string, expectedClaimId: string, dispatch: () => T): T {
   assertManagedWorkerClaimBinding(binding);

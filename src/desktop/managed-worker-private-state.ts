@@ -7,6 +7,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
 import { isWindowsPrivateDirectoryAclAck, privateDirectoryAclVerificationScript } from "./windows-private-directory.js";
+import { assertManagedWorkerClaimReference, type ManagedWorkerClaimReference } from
+  "./managed-worker-claim-readback.js";
 
 
 
@@ -31,6 +33,7 @@ export interface ManagedWorkerPrivateManifest {
   readonly initializeRequest: JsonObject;
   readonly resumeParams: JsonObject;
   readonly approvedTaskPolicy?: ApprovedTaskPolicy;
+  readonly managedOwnerClaim?: ManagedWorkerClaimReference;
   readonly registryPath: string;
 }
 
@@ -116,7 +119,7 @@ function manifest(value: unknown): ManagedWorkerPrivateManifest {
   const legacyKeys = ["schemaVersion", "epoch", "taskId", "familyRoot", "home", "cwd", "cliPath",
     "cliSha256", "initializeRequest", "resumeParams", "registryPath"];
   const withPolicy = Object.hasOwn(item, "approvedTaskPolicy");
-  const expected = withPolicy ? [...legacyKeys, "approvedTaskPolicy"] : legacyKeys;
+  const expected = withPolicy ? [...legacyKeys, "approvedTaskPolicy", "managedOwnerClaim"] : legacyKeys;
   if (Object.keys(item).length !== expected.length || expected.some(key => !Object.hasOwn(item, key)) ||
     item.schemaVersion !== 1) fail();
   const epoch = bounded(item.epoch, 36); if (!UUID.test(epoch)) fail();
@@ -124,16 +127,20 @@ function manifest(value: unknown): ManagedWorkerPrivateManifest {
   const taskId = bounded(item.taskId, 256), cwd = absolute(item.cwd);
   const resumeParams = object(item.resumeParams);
   let approvedTaskPolicy: ApprovedTaskPolicy | undefined;
+  let managedOwnerClaim: ManagedWorkerClaimReference | undefined;
   if (withPolicy) {
     try {
       approvedTaskPolicy = approveTaskPolicy(item.approvedTaskPolicy);
       assertApprovedResumeIntent(approvedTaskPolicy, resumeParams, taskId, cwd);
+      assertManagedWorkerClaimReference(item.managedOwnerClaim);
+      managedOwnerClaim = Object.freeze({ storePath: item.managedOwnerClaim.storePath,
+        bindingId: item.managedOwnerClaim.bindingId, claimId: item.managedOwnerClaim.claimId });
     } catch { fail(); }
   }
   return Object.freeze({ schemaVersion: 1, epoch, taskId: bounded(item.taskId, 256), familyRoot: bounded(item.familyRoot, 256),
     home: absolute(item.home), cwd, cliPath: absolute(item.cliPath), cliSha256: cliSha256.toLowerCase(),
     initializeRequest: object(item.initializeRequest), resumeParams, registryPath: absolute(item.registryPath),
-    ...(approvedTaskPolicy ? { approvedTaskPolicy } : {}) });
+    ...(approvedTaskPolicy ? { approvedTaskPolicy, managedOwnerClaim: managedOwnerClaim! } : {}) });
 }
 function keyBundle(value: unknown): ManagedWorkerPrivateKeyBundle {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail();

@@ -19,6 +19,8 @@ import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
   type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
+import { assertManagedWorkerClaimCurrent, dispatchWithManagedWorkerClaim } from
+  './managed-worker-claim-readback.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
 import { assertManagedStockSettingsPolicy, createManagedStockSettingsInitializer,
@@ -664,12 +666,21 @@ export class ManagedWorkerDaemon {
       const reserved = this.#registry.get(manifest.home, manifest.familyRoot);
       if (!reserved || reserved.epoch !== manifest.epoch || reserved.state !== 'reserved')
         throw new Error('Exact reserved worker epoch unavailable');
+      if (manifest.approvedTaskPolicy) {
+        if (!manifest.managedOwnerClaim) throw new Error('Managed worker bridge claim unavailable');
+        assertManagedWorkerClaimCurrent(manifest.managedOwnerClaim, reserved, manifest.taskId);
+      }
       this.#attempt = reserved;
       const observe = this.#options.dependencies?.observeProcess ?? readWindowsProcessIdentity;
       const self = observe(process.pid);
       if (!self) throw new Error('Host process birth unavailable');
       this.#self = self;
-      this.#attempt = this.#registry.registerHost(reserved, self);
+      this.#attempt = manifest.managedOwnerClaim ? dispatchWithManagedWorkerClaim(
+        { storePath: manifest.managedOwnerClaim.storePath,
+          bindingId: manifest.managedOwnerClaim.bindingId },
+        reserved, manifest.taskId, manifest.managedOwnerClaim.claimId,
+        () => this.#registry!.registerHost(reserved, self)) :
+        this.#registry.registerHost(reserved, self);
       this.#startupPhase = 'host-registered';
       await pinnedCli(manifest.cliPath, manifest.cliSha256);
       const adapterKey = {}, controlKey = {};
