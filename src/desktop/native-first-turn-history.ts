@@ -1,12 +1,12 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { fingerprintNativeFirstTurnUserItem, type NativeFirstTurnInputScope } from
+  './native-first-turn-input-fingerprint.js';
 
 type JsonObject = Record<string, unknown>;
-export interface NativeFirstTurnHistoryScope {
-  readonly threadId: string;
+export interface NativeFirstTurnHistoryScope extends NativeFirstTurnInputScope {
   readonly turnId: string;
-  readonly clientUserMessageId: string;
-  /** Protected, caller-owned key; never saved with the digest. */
-  readonly fingerprintKey: Uint8Array;
+  /** The durable keyedFingerprint from the one-shot bootstrap journal. */
+  readonly expectedInputFingerprint: string;
 }
 export interface NativeFirstTurnHistoryReader {
   initializedSession(): Promise<{ readonly generation: number }>;
@@ -70,6 +70,7 @@ function qualifyNativeFirstTurnHistory(page: unknown,
   scope: NativeFirstTurnHistoryScope): NativeFirstTurnHistoryEvidence {
   if (!scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
       !identifier(scope.clientUserMessageId) ||
+      !/^[a-f0-9]{64}$/u.test(scope.expectedInputFingerprint) ||
       !(scope.fingerprintKey instanceof Uint8Array) ||
       scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) return fail();
   if (!object(page)) return fail();
@@ -94,6 +95,7 @@ function qualifyNativeFirstTurnHistory(page: unknown,
       typeof turn.durationMs !== 'number' || !Number.isFinite(turn.durationMs) ||
       turn.durationMs < 0 || turn.error !== null) fail();
   let userCount = 0, assistantCount = 0;
+  let userItem: JsonObject | null = null;
   const itemIds = new Set<string>();
   for (const item of turn.items) {
     if (!object(item) || !identifier(item.id) || typeof item.type !== 'string' ||
@@ -104,6 +106,7 @@ function qualifyNativeFirstTurnHistory(page: unknown,
         if (!exactKeys(item, ['id', 'type', 'clientId', 'content']) ||
             item.clientId !== scope.clientUserMessageId || !Array.isArray(item.content)) fail();
         userCount++;
+        userItem = item;
         break;
       case 'agentMessage':
         // The observed 0.155.1 one-turn full-history response has four null
@@ -126,7 +129,13 @@ function qualifyNativeFirstTurnHistory(page: unknown,
       default: fail();
     }
   }
-  if (userCount !== 1 || assistantCount < 1) fail();
+  if (userCount !== 1 || assistantCount < 1 || !userItem) fail();
+  const actualInputFingerprint = (() => {
+    try { return fingerprintNativeFirstTurnUserItem(userItem, scope); }
+    catch { return fail(); }
+  })();
+  if (!timingSafeEqual(Buffer.from(actualInputFingerprint, 'hex'),
+    Buffer.from(scope.expectedInputFingerprint, 'hex'))) fail();
   const digest = createHmac('sha256', scope.fingerprintKey)
     .update('vkodex-native-first-turn-history-v1\0')
     .update(JSON.stringify([scope.threadId, scope.turnId, scope.clientUserMessageId]))
@@ -145,6 +154,7 @@ export async function readAndQualifyNativeFirstTurnHistory(rpc: NativeFirstTurnH
       typeof rpc.isSessionCurrent !== 'function' || typeof rpc.request !== 'function' ||
       !scope || !identifier(scope.threadId) || !identifier(scope.turnId) ||
       !identifier(scope.clientUserMessageId) ||
+      !/^[a-f0-9]{64}$/u.test(scope.expectedInputFingerprint) ||
       !(scope.fingerprintKey instanceof Uint8Array) ||
       scope.fingerprintKey.byteLength < 32 || scope.fingerprintKey.byteLength > 128) fail();
   const session = await rpc.initializedSession();

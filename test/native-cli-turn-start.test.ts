@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
+import { prepareNativeFirstTurnBootstrapCommand, NATIVE_FIRST_TURN_TEXT_MAX_BYTES } from
+  '../src/desktop/native-first-turn-input-fingerprint.js';
 import { ManagedNativeCliStartAdmission, NativeCliStartNotSubmittedError } from
   '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
@@ -62,6 +64,28 @@ test('native CLI read-only start compiles exact scope with stable operation iden
   // command dispatcher must then reject the conflicting fingerprint.
   assert.equal(prepareNativeCliTurnStart(start({ input: [{ type: 'text', text: 'different' }] }),
     { taskId, ownerEpoch, effectiveSettings: settings }).operationId, first.operationId);
+});
+
+test('first-turn bootstrap command applies its recoverable text bound before journal reservation', () => {
+  const identity = { operationId: 'b857db38-8ad4-4b6c-83cc-2ba63b6aef61',
+    sourceId: 'profile-a', sourceGeneration: '3818c7d2-4c41-4e93-a310-0fbfcfbe5d55',
+    ownerEpoch, threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64),
+    threadId: taskId, clientUserMessageId: clientId, fingerprintKey: Buffer.alloc(32, 7) };
+  const good = prepareNativeFirstTurnBootstrapCommand(start({ input: [{ type: 'text',
+    text: 'a'.repeat(NATIVE_FIRST_TURN_TEXT_MAX_BYTES) }] }),
+  { taskId, ownerEpoch, effectiveSettings: settings }, identity);
+  assert.equal(good.command.method, 'turn/start');
+  assert.match(good.keyedFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(Object.isFrozen(good.command), true);
+  assert.equal(Object.isFrozen(good.command.params), true);
+  assert.equal(Object.isFrozen(good.command.params.input), true);
+  assert.equal(Object.isFrozen((good.command.params.input as unknown[])[0]), true);
+  assert.throws(() => {
+    ((good.command.params.input as { text: string }[])[0]!).text = 'changed after fingerprint';
+  }, TypeError);
+  assert.throws(() => prepareNativeFirstTurnBootstrapCommand(start({ input: [{ type: 'text',
+    text: 'a'.repeat(NATIVE_FIRST_TURN_TEXT_MAX_BYTES + 1) }] }),
+  { taskId, ownerEpoch, effectiveSettings: settings }, identity), /first-turn input/u);
 });
 
 test('native CLI start rejects source, settings, context, and input drift', () => {

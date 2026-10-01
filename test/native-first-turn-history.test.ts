@@ -2,13 +2,22 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
 import { readAndQualifyNativeFirstTurnHistory } from '../src/desktop/native-first-turn-history.js';
+import { fingerprintNativeFirstTurnInput, fingerprintNativeFirstTurnUserItem } from
+  '../src/desktop/native-first-turn-input-fingerprint.js';
 
 const key = randomBytes(32);
-const expected = { threadId: 'thread-a', turnId: 'turn-a', clientUserMessageId: 'client-a' } as const;
+const identity = { operationId: 'b857db38-8ad4-4b6c-83cc-2ba63b6aef61',
+  sourceId: 'profile-a', sourceGeneration: '3818c7d2-4c41-4e93-a310-0fbfcfbe5d55',
+  ownerEpoch: '2967ba72-3675-41ce-a591-f0dc7958482f',
+  threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64) };
+const expected = { ...identity, threadId: '01a0f511-86e7-7942-8067-91d169eb18c7',
+  turnId: 'turn-a', clientUserMessageId: 'client-a' } as const;
+const expectedInputFingerprint = fingerprintNativeFirstTurnInput(
+  [{ type: 'text', text: 'canary' }], { ...expected, fingerprintKey: key });
 const turn = () => ({ id: expected.turnId, status: 'completed', itemsView: 'full',
   startedAt: null, completedAt: 123, durationMs: 34, error: null, items: [
   { id: 'user-a', type: 'userMessage', clientId: expected.clientUserMessageId,
-    content: [{ type: 'text', text: 'canary' }] },
+    content: [{ type: 'text', text: 'canary', text_elements: [] }] },
   { id: 'reason-a', type: 'reasoning', summary: [], content: [] },
   { id: 'answer-a', type: 'agentMessage', text: 'done', delivery: null,
     memoryCitation: null, phase: null, questions: null },
@@ -27,7 +36,7 @@ const read = (value: unknown, onRequest?: () => void) => {
       return value;
     } };
   return readAndQualifyNativeFirstTurnHistory(rpc,
-    { ...expected, fingerprintKey: key });
+    { ...expected, expectedInputFingerprint, fingerprintKey: key });
 };
 
 test('one completed full native turn binds the exact client input without exposing content', async () => {
@@ -42,9 +51,10 @@ test('one completed full native turn binds the exact client input without exposi
     items: turn().items, error: null, durationMs: 34, completedAt: 123,
     startedAt: null, itemsView: 'full', status: 'completed', id: expected.turnId,
   }] }), evidence);
-  assert.notEqual((await read(page({ ...turn(), items: [
-    { ...turn().items[0], content: [{ type: 'text', text: 'changed' }] }, ...turn().items.slice(1),
-  ] }))).historyHmac, evidence.historyHmac);
+  await assert.rejects(read(page({ ...turn(), items: [
+    { ...turn().items[0], content: [{ type: 'text', text: 'changed', text_elements: [] }] },
+    ...turn().items.slice(1),
+  ] })), /first-turn history unqualified/u);
 });
 
 test('incomplete, wrong, duplicate or nonterminal first turns cannot qualify', async () => {
@@ -83,11 +93,13 @@ test('scope, key and bounded JSON are mandatory', async () => {
   await assert.rejects(readAndQualifyNativeFirstTurnHistory({
     initializedSession: async () => ({ generation: 7 }), isSessionCurrent: () => true,
     request: async () => page(),
-  }, { ...expected, fingerprintKey: new Uint8Array(4) }), /first-turn history unqualified/u);
+  }, { ...expected, expectedInputFingerprint,
+    fingerprintKey: new Uint8Array(4) }), /first-turn history unqualified/u);
   await assert.rejects(readAndQualifyNativeFirstTurnHistory({
     initializedSession: async () => ({ generation: 7 }), isSessionCurrent: () => true,
     request: async () => page(),
-  }, { ...expected, threadId: '', fingerprintKey: key }), /first-turn history unqualified/u);
+  }, { ...expected, threadId: '', expectedInputFingerprint,
+    fingerprintKey: key }), /first-turn history unqualified/u);
   await assert.rejects(read(page({ ...turn(), extra: 'x'.repeat(1024 * 1024 + 1) })),
     /first-turn history unqualified/u);
 });
@@ -98,5 +110,26 @@ test('history read refuses a changed backend generation rather than rebinding to
     initializedSession: async () => ({ generation: 7 }),
     isSessionCurrent: generation => current && generation === 7,
     request: async () => { current = false; return page(); },
-  }, { ...expected, fingerprintKey: key }), /first-turn history unqualified/u);
+  }, { ...expected, expectedInputFingerprint, fingerprintKey: key }), /first-turn history unqualified/u);
+});
+
+test('durable first-turn input fingerprint round-trips exact native text without storing it', () => {
+  const scope = { ...expected, fingerprintKey: key };
+  const input = [{ type: 'text', text: '  exact Unicode ё🚀 text  ' }];
+  const native = { id: 'user-a', type: 'userMessage', clientId: expected.clientUserMessageId,
+    content: [{ type: 'text', text: input[0]!.text, text_elements: [] }] };
+  const fp = fingerprintNativeFirstTurnInput(input, scope);
+  assert.match(fp, /^[0-9a-f]{64}$/u);
+  assert.equal(fingerprintNativeFirstTurnUserItem(native, scope), fp);
+  assert.notEqual(fingerprintNativeFirstTurnInput([{ type: 'text', text: '  exact Unicode ё🚀 text ' }],
+    scope), fp);
+  assert.notEqual(fingerprintNativeFirstTurnUserItem(native, { ...scope,
+    ownerEpoch: 'b1ff8bbf-17c6-4f1e-b145-a49fe9781635' }), fp);
+  for (const item of [
+    { ...native, clientId: 'other' },
+    { ...native, content: [{ type: 'text', text: input[0]!.text, extra: true }] },
+    { ...native, content: [{ ...native.content[0], text_elements: [{ opaque: true }] }] },
+    { ...native, content: [native.content[0], native.content[0]] },
+    { ...native, content: 'legacy string' },
+  ]) assert.throws(() => fingerprintNativeFirstTurnUserItem(item, scope), /first-turn input/u);
 });
