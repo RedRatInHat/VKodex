@@ -1,7 +1,9 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import DatabaseConstructor, { type Database } from 'better-sqlite3';
+import { comparablePath } from '../core/paths.js';
 import { pinnedDetachedProfileBackendHome, pinnedDetachedProfileBackendIdentity,
+  pinnedDetachedProfilePrivateDirectory,
   type PinnedDetachedProfileRpc } from '../codex/detached-profile-capability.js';
 import { assertAuthenticatedProfileSourcePreflightForWrite,
   assertAuthenticatedProfileSourceReceiptForWrite,
@@ -203,11 +205,17 @@ export class NativeFirstTurnBootstrapJournal {
   #ingressRow(): IngressRow | undefined {
     return this.#db.prepare('SELECT * FROM native_first_turn_ingress_leases WHERE slot=1').get() as IngressRow | undefined;
   }
+  #assertPinnedIngressJournal(rpc: PinnedDetachedProfileRpc, generation: number): void {
+    const directory = pinnedDetachedProfilePrivateDirectory(rpc, generation);
+    if (comparablePath(this.#filePath) !== comparablePath(path.join(directory, 'first-turn.sqlite')))
+      ingressFail();
+  }
   #assertIngressAuthority(scope: NativeFirstTurnIngressLeaseScope): void {
     validIngressScope(scope);
     const authority = ingressAuthorities.get(scope);
     if (!authority || authority.filePath !== this.#filePath) return ingressFail();
     try {
+      this.#assertPinnedIngressJournal(authority.rpc, authority.backendGeneration);
       if (pinnedDetachedProfileBackendIdentity(authority.rpc, authority.backendGeneration) !== scope.backendIdentity ||
           pinnedDetachedProfileBackendHome(authority.rpc, authority.backendGeneration) !== authority.preflight.sourceHome ||
           authority.backendGeneration !== scope.backendGeneration) ingressFail();
@@ -238,6 +246,7 @@ export class NativeFirstTurnBootstrapJournal {
         this.getThreadStartFenceStatus(operationId) !== 'passed') return ingressFail();
     const session = await rpc.initializedSession().catch(() => ingressFail());
     const generation = session.generation;
+    try { this.#assertPinnedIngressJournal(rpc, generation); } catch { return ingressFail(); }
     const scope: NativeFirstTurnIngressLeaseScope = Object.freeze({ operationId, threadId: record.threadId,
       sourceId: record.sourceId, sourceGeneration: record.sourceGeneration, ownerEpoch: record.ownerEpoch,
       backendIdentity: record.backendIdentity, backendGeneration: generation,

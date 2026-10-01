@@ -43,7 +43,9 @@ export interface PinnedDetachedProfileRpc extends AppServerRpc {
 
 // Only the dependency-free production factory grants a backend identity to a
 // future native writer. Injected readers used by tests cannot mint one.
-const productionPinnedBackends = new WeakMap<object, Readonly<{ identity: string; home: string }>>();
+const productionPinnedBackends = new WeakMap<object, Readonly<{
+  identity: string; home: string; privateDirectory: string;
+}>>();
 function backendIdentityOf(descriptor: DetachedProfileDescriptor): string {
   return createHash("sha256").update("vkodex-pinned-detached-backend-v1\0")
     .update(JSON.stringify([descriptor.epoch, descriptor.profileKey,
@@ -68,6 +70,15 @@ export function pinnedDetachedProfileBackendHome(rpc: PinnedDetachedProfileRpc,
   generation: number): string {
   pinnedDetachedProfileBackendIdentity(rpc, generation);
   return productionPinnedBackends.get(rpc)!.home;
+}
+
+/** The protected server directory bound to this exact pinned connector. A
+ * first-turn admission must use its one canonical private journal, rather
+ * than a caller-selected SQLite file for the same physical profile. */
+export function pinnedDetachedProfilePrivateDirectory(rpc: PinnedDetachedProfileRpc,
+  generation: number): string {
+  pinnedDetachedProfileBackendIdentity(rpc, generation);
+  return productionPinnedBackends.get(rpc)!.privateDirectory;
 }
 
 /** Stable private locator; never use a VK-supplied name as a path segment. */
@@ -336,7 +347,8 @@ export function createPinnedDetachedProfileConnection(privateDirectory: string,
   const rpc = createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
   if (arguments.length === 3) {
     Object.freeze(rpc);
-    productionPinnedBackends.set(rpc, Object.freeze({ identity: backendIdentityOf(pin), home: pin.home }));
+    productionPinnedBackends.set(rpc, Object.freeze({ identity: backendIdentityOf(pin),
+      home: pin.home, privateDirectory }));
   }
   return rpc;
 }

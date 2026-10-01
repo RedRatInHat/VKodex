@@ -218,10 +218,34 @@ test('Windows production-pinned authenticated source permits one fenced first th
     assert.deepEqual(idle, { operationId: scope.operationId, threadId,
       backendGeneration: initialized.generation, journalRevision: 2, idleAndEmpty: true });
     assert.ok(Number.isSafeInteger(idle.backendGeneration) && idle.backendGeneration > 0);
+    const bootstrapJournal = journal;
     const nativeMethods = () => methods.filter(method => method !== 'initialized');
     const qualifiedMethods = ['initialize', 'thread/start', 'thread/read', 'thread/turns/list',
       'thread/goal/get', 'thread/queue/list', 'thread/read'];
     assert.deepEqual(nativeMethods(), qualifiedMethods);
+
+    const acceptedRecord = bootstrapJournal.get(scope.operationId);
+    assert.ok(acceptedRecord?.threadId);
+    const alternateJournal = new NativeFirstTurnBootstrapJournal(
+      path.join(privateDirectory, 'alternate-first-turn.sqlite'));
+    try {
+      alternateJournal.persistThreadStartIntent({ operationId: acceptedRecord.operationId,
+        sourceId: acceptedRecord.sourceId, sourceGeneration: acceptedRecord.sourceGeneration,
+        ownerEpoch: acceptedRecord.ownerEpoch, threadStartFingerprint: acceptedRecord.threadStartFingerprint,
+        backendIdentity: acceptedRecord.backendIdentity });
+      alternateJournal.markThreadStartWriteFencePassed(acceptedRecord.operationId);
+      alternateJournal.persistThreadAccepted({ operationId: acceptedRecord.operationId,
+        expectedRevision: 1, threadId: acceptedRecord.threadId });
+      const beforeAlternateQualification = nativeMethods();
+      let alternateQualificationError: unknown;
+      try {
+        await alternateJournal.qualifyFirstTurnIngressLeaseScope(scope.operationId, client, preflight);
+      } catch (error) { alternateQualificationError = error; }
+      assert.deepEqual(nativeMethods(), beforeAlternateQualification,
+        'an arbitrary bootstrap journal must be rejected before any native read');
+      assert.ok(alternateQualificationError instanceof Error,
+        'ingress qualification is restricted to the operation’s private bootstrap journal');
+    } finally { alternateJournal.close(); }
 
     queueHasPendingItem = true;
     await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),
