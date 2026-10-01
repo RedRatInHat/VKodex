@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
+import { createPrivateKeyWithDependencies, loadPrivateKeyWithDependencies } from
+  '../src/desktop/native-first-turn-private-key-core.js';
+import { createNativeFirstTurnPrivateKey } from '../src/desktop/native-first-turn-private-key.js';
 
 const identity = () => ({ sourceId: 'profile-a', sourceGeneration: randomUUID(),
   ownerEpoch: randomUUID(), threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64) });
@@ -72,4 +75,62 @@ test('one-shot database refuses a fresh operation ID and invalid fingerprint', (
   journal.markFirstTurnAccepted({ operationId, expectedRevision: 3, turnId: 'turn-1' });
   assert.equal(journal.get(operationId)?.state, 'turn-accepted');
   journal.close();
+});
+
+test('first-turn fingerprint key is protected, exclusive and recoverable without journal plaintext', async () => {
+  const directory = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-key-')), 'private');
+  const stored = new Map<string, Uint8Array>();
+  const filesystem = {
+    async ensureProtectedDirectory(checkedPath: string) { mkdirSync(checkedPath, { recursive: true }); },
+    async writeExclusive(filePath: string, bytes: Uint8Array) {
+      if (stored.has(filePath)) throw new Error('exists');
+      stored.set(filePath, Uint8Array.from(bytes));
+    },
+    async readProtectedFile(filePath: string) {
+      const bytes = stored.get(filePath); if (!bytes) throw new Error('missing');
+      return Uint8Array.from(bytes);
+    },
+  };
+  const protector = { async protect(bytes: Uint8Array) {
+    return Uint8Array.from(bytes, value => value ^ 0xa5);
+  }, async unprotect(bytes: Uint8Array) { return Uint8Array.from(bytes, value => value ^ 0xa5); } };
+  const key = await createPrivateKeyWithDependencies(directory, protector, filesystem);
+  assert.equal(key.byteLength, 32);
+  assert.equal(stored.size, 1);
+  assert.notDeepEqual([...stored.values()][0], key);
+  assert.deepEqual(await loadPrivateKeyWithDependencies(directory, protector, filesystem), key);
+  await assert.rejects(createPrivateKeyWithDependencies(directory, protector, filesystem));
+  const cipherPath = [...stored.keys()][0]!;
+  stored.set(cipherPath, new Uint8Array([1, 2, 3]));
+  await assert.rejects(loadPrivateKeyWithDependencies(directory, protector, filesystem));
+});
+
+test('production first-turn key entrypoint rejects injected fake dependencies', async () => {
+  await assert.rejects(createNativeFirstTurnPrivateKey({ directory: 'C:\\fake',
+    protector: {}, filesystem: {} } as unknown as string), /private key unavailable/u);
+});
+
+test('failed key creation does not overwrite an existing or uncertain ciphertext', async () => {
+  const directory = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-key-')), 'private');
+  const stored = new Map<string, Uint8Array>();
+  const filesystem = {
+    async ensureProtectedDirectory(checkedPath: string) { mkdirSync(checkedPath, { recursive: true }); },
+    async writeExclusive(filePath: string, bytes: Uint8Array) {
+      if (stored.has(filePath)) throw new Error('already exists');
+      stored.set(filePath, Uint8Array.from(bytes));
+      throw new Error('ACK lost after durable write');
+    },
+    async readProtectedFile(filePath: string) {
+      const bytes = stored.get(filePath); if (!bytes) throw new Error('missing');
+      return Uint8Array.from(bytes);
+    },
+  };
+  const protector = { async protect(bytes: Uint8Array) {
+    return Uint8Array.from(bytes, value => value ^ 0xa5);
+  }, async unprotect(bytes: Uint8Array) { return Uint8Array.from(bytes, value => value ^ 0xa5); } };
+  await assert.rejects(createPrivateKeyWithDependencies(directory, protector, filesystem), /ACK lost/u);
+  const firstCiphertext = Uint8Array.from([...stored.values()][0]!);
+  await assert.rejects(createPrivateKeyWithDependencies(directory, protector, filesystem));
+  assert.deepEqual([...stored.values()][0], firstCiphertext);
+  assert.equal((await loadPrivateKeyWithDependencies(directory, protector, filesystem)).byteLength, 32);
 });

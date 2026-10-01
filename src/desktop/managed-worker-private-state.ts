@@ -260,7 +260,7 @@ function safeProtectionPhase(error: unknown): string {
     ? phase : "unclassified";
 }
 
-class WindowsDpapiProtector implements ManagedWorkerPrivateStateProtector {
+export class WindowsDpapiProtector implements ManagedWorkerPrivateStateProtector {
   readonly #runner: ManagedWorkerPrivateStatePowerShellRunner;
   constructor(runner: ManagedWorkerPrivateStatePowerShellRunner = { run: (script, input) => runPowerShell(script, input, true) }) { this.#runner = runner; }
   #decodeOutput(output: Uint8Array): Uint8Array {
@@ -305,7 +305,7 @@ async function createUnlinkedDirectory(directory: string): Promise<void> {
     if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("unsafe");
   }
 }
-class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
+export class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
   async ensureProtectedDirectory(directory: string): Promise<void> {
     let leafExists = false;
     try {
