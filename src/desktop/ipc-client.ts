@@ -127,7 +127,7 @@ export type IpcComposerIngressMethod = 'thread-follower-start-turn' |
   'thread-follower-set-queued-follow-ups-state';
 export type IpcComposerIngressOutcome = 'seen' | 'handled' | 'refused';
 
-export type IpcRequestFailureCategory = 'owner-refused' | 'queue-gate-refused' |
+export type IpcRequestFailureCategory = 'owner-refused' | 'direct-stock-start-refused' | 'queue-gate-refused' |
   'queue-shape-refused' | 'queue-baseline-refused' |
   'settings-refused' | 'queue-state-refused' | 'entry-refused' |
   'worker-not-written' | 'unclassified';
@@ -152,6 +152,8 @@ function incomingFailureCategory(error: unknown): IpcRequestFailureCategory {
     case 'Native repeated admission refused: owner epoch mismatch':
     case 'Native repeated admission refused: request ingress changed':
       return 'owner-refused';
+    case 'Native stock queue refuses direct start':
+      return 'direct-stock-start-refused';
     case 'Managed native stock queue request refused':
       return 'queue-gate-refused';
     case 'Native repeated admission refused: effective settings changed':

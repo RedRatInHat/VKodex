@@ -918,7 +918,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     if (request.method !== 'thread-follower-start-turn') throw refuse();
     // Stock repeated admission owns command ordering for this opt-in route.
     // A direct start would bypass its homogeneous settings and queue journal.
-    if (this.#queueAdapter) throw refuse();
+    if (this.#queueAdapter) throw new Error('Native stock queue refuses direct start');
     if (!this.#followerCurrent(request.sourceClientId) || !this.#startHandler ||
         this.#grants.size + this.#queueGrants.size >= 128 ||
         this.#grants.has(request.requestId) || this.#queueGrants.has(request.requestId)) throw refuse();

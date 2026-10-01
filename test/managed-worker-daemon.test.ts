@@ -1408,10 +1408,15 @@ test('stock daemon routes two native queue sends through one journaled backend a
   };
   try {
     await wait(() => broker.frames.some(frame => frame.method === 'thread-queued-followups-changed'));
-    broker.send(composerRequest(own.taskId, own.home, 'stock-direct-denied'));
+    broker.send({ ...composerRequest(own.taskId, own.home, 'stock-direct-denied'),
+      targetClientId: broker.ownerId });
     await wait(() => broker.frames.some(frame => frame.type === 'response' &&
       frame.requestId === 'stock-direct-denied'));
     assert.equal(broker.frames.find(frame => frame.requestId === 'stock-direct-denied')?.resultType, 'error');
+    assert.equal(broker.frames.find(frame => frame.requestId === 'stock-direct-denied')?.error,
+      'error-handling-request');
+    assert.equal(own.daemon.metadata.nativeStartup?.lastRequestFailure?.category,
+      'direct-stock-start-refused');
     assert.equal(own.backend.writes, 0);
     for (let index = 1; index <= 2; index++) {
       const entry = stockEntry(own.home);
@@ -1985,6 +1990,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
       brokers.push(broker); return broker;
     }, 500, { canHandle: request => handler.canHandle(request),
       onComposerIngress: (method, outcome) => handler.onComposerIngress?.(method, outcome),
+      onRequestFailure: category => handler.onRequestFailure?.(category),
       handle: async (request, signal) => {
         try { return await handler.handle(request, signal); }
         catch (error) { handlerErrors.push(error instanceof Error ? error.message : 'non-error'); throw error; }

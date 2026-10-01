@@ -199,7 +199,7 @@ const startupStages = new Set(['not-started', 'observing', 'reading-initial',
 const notificationKeys = ['status', 'settings', 'goal', 'usage', 'startup-or-warning',
   'turn', 'item', 'other'] as const;
 const requestFailureCategories = new Set<IpcRequestFailureCategory>([
-  'owner-refused', 'queue-gate-refused', 'queue-shape-refused', 'queue-baseline-refused',
+  'owner-refused', 'direct-stock-start-refused', 'queue-gate-refused', 'queue-shape-refused', 'queue-baseline-refused',
   'settings-refused', 'queue-state-refused',
   'entry-refused', 'worker-not-written', 'unclassified',
 ]);
