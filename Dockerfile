@@ -3,7 +3,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm install --global npm@11.12.1 && npm ci --include=dev
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.build.json ./
+COPY scripts/assert-production-build.mjs ./scripts/
 COPY src ./src
 RUN npm run build
 RUN npm prune --omit=dev
