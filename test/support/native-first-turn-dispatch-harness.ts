@@ -32,9 +32,8 @@ export async function dispatchPreparedNativeFirstTurnForOfflineTest(journal: Nat
       record.clientUserMessageId !== params.clientUserMessageId ||
       prepared.command.method !== 'turn/start') return fail();
   const filePath = journal.filePath();
-  let writeFencePassed = false;
   const positiveAck = (envelope: AppServerResponseEnvelope): void => {
-    if (!writeFencePassed || !('result' in envelope) || !envelope.result ||
+    if (!('result' in envelope) || !envelope.result ||
         typeof envelope.result !== 'object' || Array.isArray(envelope.result)) return;
     const turn = envelope.result.turn;
     if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return;
@@ -48,6 +47,7 @@ export async function dispatchPreparedNativeFirstTurnForOfflineTest(journal: Nat
       // same one-operation database; never issue a second native request.
       const reopened = new NativeFirstTurnBootstrapJournal(filePath);
       try {
+        if (reopened.getFirstTurnWriteFenceStatus(prepared.operationId) !== 'passed') return;
         const current = reopened.get(prepared.operationId);
         if (!current || current.keyedFingerprint !== prepared.keyedFingerprint ||
             current.threadId !== params.threadId ||
@@ -66,7 +66,7 @@ export async function dispatchPreparedNativeFirstTurnForOfflineTest(journal: Nat
       mutating: true, expectedGeneration: session.generation,
       assertBeforeWrite: () => {
         if (!rpc.isSessionCurrent(session.generation) || authority() !== true) fail();
-        writeFencePassed = true;
+        journal.markFirstTurnWriteFencePassed(prepared.operationId);
       },
       onResponseEnvelope: positiveAck, onLateResponseEnvelope: positiveAck,
     });

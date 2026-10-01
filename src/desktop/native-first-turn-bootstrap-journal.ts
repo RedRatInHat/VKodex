@@ -34,6 +34,7 @@ export interface NativeFirstTurnBootstrapIdentity {
   readonly backendIdentity: string;
 }
 export type NativeFirstThreadStartFenceStatus = 'not-passed' | 'passed' | 'legacy-unknown';
+export type NativeFirstTurnWriteFenceStatus = NativeFirstThreadStartFenceStatus;
 
 // Codex thread IDs may be UUIDv7; creator/owner IDs are currently UUIDv4.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -102,6 +103,11 @@ export class NativeFirstTurnBootstrapJournal {
       this.#db.exec(`CREATE TABLE IF NOT EXISTS native_first_thread_start_fences (
         operation_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('not-passed','passed'))
       )`);
+      // A missing marker on an older reserved turn says nothing about whether
+      // its native command crossed the socket write boundary.
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS native_first_turn_write_fences (
+        operation_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('not-passed','passed'))
+      )`);
     } catch (error) { this.#db.close(); throw error; }
   }
   close(): void { if (!this.#closed) { this.#closed = true; this.#db.close(); } }
@@ -122,6 +128,16 @@ export class NativeFirstTurnBootstrapJournal {
     if (!row) return 'legacy-unknown';
     const status = row.status;
     if (status === 'not-passed' || status === 'passed') return status;
+    return fail();
+  }
+  getFirstTurnWriteFenceStatus(operationId: string): NativeFirstTurnWriteFenceStatus {
+    this.#open(); if (!UUID.test(operationId)) fail();
+    const current = this.get(operationId);
+    if (!current || current.revision < 3) fail();
+    const row = this.#db.prepare('SELECT status FROM native_first_turn_write_fences WHERE operation_id=?')
+      .get(operationId) as { status: string } | undefined;
+    if (!row) return 'legacy-unknown';
+    if (row.status === 'not-passed' || row.status === 'passed') return row.status;
     return fail();
   }
   persistThreadStartIntent(intent: NativeFirstTurnBootstrapIdentity): void {
@@ -156,9 +172,32 @@ export class NativeFirstTurnBootstrapJournal {
     nextRevision: 2, changes: ['thread_id=?'], values: [threadId], validate: () => { if (!UUID.test(threadId)) fail(); } }); }
   reserveFirstTurn({ operationId, expectedRevision, clientUserMessageId, keyedFingerprint }: {
     readonly operationId: string; readonly expectedRevision: number; readonly clientUserMessageId: string; readonly keyedFingerprint: string;
-  }): void { this.#transition({ operationId, expectedRevision, state: 'thread-accepted', next: 'turn-reserved',
-    nextRevision: 3, changes: ['client_user_message_id=?', 'keyed_fingerprint=?'], values: [clientUserMessageId, keyedFingerprint],
-    validate: () => { if (!identifier(clientUserMessageId) || !FINGERPRINT.test(keyedFingerprint)) fail(); } }); }
+  }): void {
+    this.#open();
+    if (!UUID.test(operationId) || expectedRevision !== 2 ||
+        !identifier(clientUserMessageId) || !FINGERPRINT.test(keyedFingerprint)) fail();
+    try { this.#db.transaction(() => {
+      const changed = this.#db.prepare(`UPDATE native_first_turn_bootstraps
+        SET state='turn-reserved', revision=3, client_user_message_id=?, keyed_fingerprint=?
+        WHERE operation_id=? AND state='thread-accepted' AND revision=2`)
+        .run(clientUserMessageId, keyedFingerprint, operationId);
+      if (changed.changes !== 1) fail();
+      this.#db.prepare(`INSERT INTO native_first_turn_write_fences (operation_id,status)
+        VALUES (?,'not-passed')`).run(operationId);
+    }).immediate(); } catch { fail(); }
+  }
+  /** Durable one-shot boundary immediately before native turn/start. A passed
+   * marker is an uncertain write, never proof of server acceptance. */
+  markFirstTurnWriteFencePassed(operationId: string): void {
+    this.#open(); if (!UUID.test(operationId)) fail();
+    try { this.#db.transaction(() => {
+      const current = this.get(operationId);
+      if (!current || current.state !== 'turn-reserved' || current.revision !== 3) fail();
+      const changed = this.#db.prepare(`UPDATE native_first_turn_write_fences SET status='passed'
+        WHERE operation_id=? AND status='not-passed'`).run(operationId);
+      if (changed.changes !== 1) fail();
+    }).immediate(); } catch { fail(); }
+  }
   markFirstTurnUnknown({ operationId, expectedRevision }: { readonly operationId: string; readonly expectedRevision: number }): void {
     this.#transition({ operationId, expectedRevision, state: 'turn-reserved', next: 'turn-unknown', nextRevision: 4,
       changes: [], values: [], validate: () => {} });

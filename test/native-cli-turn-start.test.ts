@@ -163,16 +163,18 @@ test('first-turn dispatch records only a positive native ACK and sends once', as
       mutating?: boolean; expectedGeneration?: number; assertBeforeWrite?: () => void;
       onResponseEnvelope?: (value: { result: Record<string, unknown> }) => void;
     }) {
-      writes++;
       assert.equal(method, 'turn/start'); assert.equal(params.threadId, taskId);
       assert.equal(options.mutating, true); assert.equal(options.expectedGeneration, 5);
       options.assertBeforeWrite?.();
+      assert.equal(journal.getFirstTurnWriteFenceStatus(prepared.operationId), 'passed');
+      writes++;
       options.onResponseEnvelope?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
       return { turn: { id: turnId, status: 'inProgress' } };
     } };
   try {
     const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
     assert.equal(result.state, 'turn-accepted'); assert.equal(result.turnId, turnId);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(prepared.operationId), 'passed');
     assert.equal(writes, 1);
     await assert.rejects(dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true), /unqualified/u);
     assert.equal(writes, 1);
@@ -196,12 +198,14 @@ test('first-turn timeout stays unknown; late positive ACK may reconcile without 
   try {
     const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => true);
     assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(prepared.operationId), 'passed');
   } finally { journal.close(); }
   late?.({ result: { turn: { id: turnId, status: 'inProgress' } } });
   const reopened = new NativeFirstTurnBootstrapJournal(filePath);
   try {
     assert.equal(reopened.get(prepared.operationId)?.state, 'turn-accepted');
     assert.equal(reopened.get(prepared.operationId)?.revision, 5);
+    assert.equal(reopened.getFirstTurnWriteFenceStatus(prepared.operationId), 'passed');
     assert.equal(writes, 1);
   } finally { reopened.close(); }
 });
@@ -226,6 +230,7 @@ test('first-turn prewrite authority refusal and malformed ACK never create accep
     const result = await dispatchPreparedNativeFirstTurnForOfflineTest(refused.journal, refused.prepared,
       rpc, () => false);
     assert.equal(result.state, 'turn-unknown'); assert.equal(writes, 1);
+    assert.equal(refused.journal.getFirstTurnWriteFenceStatus(refused.prepared.operationId), 'not-passed');
   } finally { refused.journal.close(); }
 });
 
@@ -249,6 +254,7 @@ test('first-turn ACK before the final write fence cannot claim a refused write',
     const result = await dispatchPreparedNativeFirstTurnForOfflineTest(journal, prepared, rpc, () => authorized);
     assert.equal(result.state, 'turn-unknown'); assert.equal(result.turnId, null);
     assert.equal(writes, 0);
+    assert.equal(journal.getFirstTurnWriteFenceStatus(prepared.operationId), 'not-passed');
   } finally { journal.close(); }
 });
 

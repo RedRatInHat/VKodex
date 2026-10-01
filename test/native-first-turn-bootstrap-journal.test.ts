@@ -48,8 +48,12 @@ test('durably sequences thread creation before a first-turn reservation without 
   journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId });
   journal.reserveFirstTurn({ operationId, expectedRevision: 2, clientUserMessageId: 'first-message',
     keyedFingerprint: fingerprint('first') });
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'not-passed');
   assert.deepEqual(journal.get(operationId), { operationId, ...source, state: 'turn-reserved', revision: 3,
     threadId, clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first'), turnId: null });
+  journal.close();
+  journal = open(filePath);
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'not-passed');
   journal.close();
 });
 
@@ -80,6 +84,67 @@ test('write fence is durable, CAS-bound, and absent legacy markers remain unknow
   assert.equal(journal.getThreadStartFenceStatus(operationId), 'legacy-unknown');
   assert.throws(() => journal.markThreadStartWriteFencePassed(operationId), /conflict/u);
   journal.close();
+});
+
+test('first-turn write fence is atomic with reservation and an absent legacy marker stays unknown', () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite');
+  const operationId = randomUUID();
+  let journal = open(filePath);
+  assert.throws(() => journal.getFirstTurnWriteFenceStatus(operationId), /conflict/u);
+  journal.persistThreadStartIntent({ operationId, ...identity() });
+  assert.throws(() => journal.getFirstTurnWriteFenceStatus(operationId), /conflict/u);
+  journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId: randomUUID() });
+  assert.throws(() => journal.getFirstTurnWriteFenceStatus(operationId), /conflict/u);
+  assert.throws(() => journal.reserveFirstTurn({ operationId, expectedRevision: 2,
+    clientUserMessageId: 'first-message', keyedFingerprint: 'plaintext' }), /conflict/u);
+  assert.equal(journal.get(operationId)?.state, 'thread-accepted');
+  journal.reserveFirstTurn({ operationId, expectedRevision: 2,
+    clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first') });
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'not-passed');
+  journal.close();
+
+  journal = open(filePath);
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'not-passed');
+  assert.throws(() => journal.markFirstTurnWriteFencePassed(randomUUID()), /conflict/u);
+  journal.markFirstTurnWriteFencePassed(operationId);
+  assert.throws(() => journal.markFirstTurnWriteFencePassed(operationId), /conflict/u);
+  journal.close();
+  journal = open(filePath);
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'passed');
+  journal.markFirstTurnUnknown({ operationId, expectedRevision: 3 });
+  assert.throws(() => journal.markFirstTurnWriteFencePassed(operationId), /conflict/u);
+  journal.close();
+
+  const old = new DatabaseConstructor(filePath);
+  old.exec('DROP TABLE native_first_turn_write_fences');
+  old.close();
+  journal = open(filePath);
+  assert.equal(journal.getFirstTurnWriteFenceStatus(operationId), 'legacy-unknown');
+  assert.throws(() => journal.markFirstTurnWriteFencePassed(operationId), /conflict/u);
+  journal.close();
+});
+
+test('first-turn reservation rolls back when its durable fence insert fails', () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite');
+  const operationId = randomUUID();
+  const journal = open(filePath);
+  try {
+    journal.persistThreadStartIntent({ operationId, ...identity() });
+    journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId: randomUUID() });
+    const raw = new DatabaseConstructor(filePath);
+    try {
+      raw.exec(`CREATE TRIGGER reject_first_turn_fence BEFORE INSERT ON native_first_turn_write_fences
+        BEGIN SELECT RAISE(ABORT, 'simulated fence persistence failure'); END`);
+    } finally { raw.close(); }
+    assert.throws(() => journal.reserveFirstTurn({ operationId, expectedRevision: 2,
+      clientUserMessageId: 'first-message', keyedFingerprint: fingerprint('first') }), /conflict/u);
+    assert.equal(journal.get(operationId)?.state, 'thread-accepted');
+    assert.equal(journal.get(operationId)?.revision, 2);
+    assert.throws(() => journal.getFirstTurnWriteFenceStatus(operationId), /conflict/u);
+    const reopened = open(filePath);
+    try { assert.equal(reopened.get(operationId)?.state, 'thread-accepted'); }
+    finally { reopened.close(); }
+  } finally { journal.close(); }
 });
 
 test('first-turn terminal transitions are CAS-bound and an unknown reservation never replays after reopen', () => {
