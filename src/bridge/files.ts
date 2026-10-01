@@ -514,7 +514,7 @@ export class TaskFiles {
           this.store.getValue<boolean>(`${fileKey}:queued`) || this.store.getValue<string>(`${fileKey}:uploaded`) ||
           !["uploading", "unknown"].includes(this.store.getValue<string>(`${fileKey}:upload-state`) ?? ""))
         throw new ActionRejectedError("Для этого файла нет неподтверждённой staged-загрузки.");
-      await this.stagedContents(receipt, job, binding.id);
+      await this.verifyStagedContents(receipt, job, binding.id);
       const remote = await this.chat.resolveDocumentAttachment(attachment);
       if (remote.sizeBytes !== receipt.bytes || !Number.isSafeInteger(remote.sizeBytes))
         throw new ActionRejectedError("Размер документа VK не совпадает с сохранённой версией файла.");
@@ -540,6 +540,13 @@ export class TaskFiles {
     } finally { this.documentReconciliations.delete(fileKey); }
   }
   private async stagedContents(receipt: StagedFile, job: FileJob, bindingId: string, reuse?: Buffer): Promise<Buffer> {
+    return (await this.checkedStagedContents(receipt, job, bindingId, reuse, true))!;
+  }
+  private async verifyStagedContents(receipt: StagedFile, job: FileJob, bindingId: string): Promise<void> {
+    await this.checkedStagedContents(receipt, job, bindingId, undefined, false);
+  }
+  private async checkedStagedContents(receipt: StagedFile, job: FileJob, bindingId: string,
+    reuse: Buffer | undefined, materialize: boolean): Promise<Buffer | undefined> {
     const folder = await this.stageDirectory(job, bindingId);
     // A transfer may advance the job's routing generation; the receipt keeps
     // the generation at capture time as provenance for its immutable bytes.
@@ -569,12 +576,16 @@ export class TaskFiles {
       if (receipt.identity && (!sameStageIdentity(before, receipt.identity, legacyBefore)
         || !sameStageIdentity(opened, receipt.identity, legacyOpened)))
         throw new Error("replaced stage file");
-      const contents = reuse ?? Buffer.allocUnsafe(receipt.bytes);
-      if (contents.length !== receipt.bytes) throw new Error("incorrect stage buffer");
+      const contents = materialize ? (reuse ?? Buffer.allocUnsafe(receipt.bytes)) : undefined;
+      if (contents && contents.length !== receipt.bytes) throw new Error("incorrect stage buffer");
+      const chunk = contents ?? Buffer.allocUnsafe(Math.min(receipt.bytes, 64 * 1024));
+      const hash = createHash("sha256");
       let size = 0;
-      while (size < contents.length) {
-        const read = await handle.read(contents, size, Math.min(64 * 1024, contents.length - size), null);
+      while (size < receipt.bytes) {
+        const length = Math.min(64 * 1024, receipt.bytes - size);
+        const read = await handle.read(chunk, contents ? size : 0, length, null);
         if (!read.bytesRead) break;
+        hash.update(chunk.subarray(contents ? size : 0, (contents ? size : 0) + read.bytesRead));
         size += read.bytesRead;
       }
       const extra = await handle.read(Buffer.alloc(1), 0, 1, null);
@@ -582,7 +593,7 @@ export class TaskFiles {
       const legacyAfter = receipt.identity && !("version" in receipt.identity) ? await handle.stat() : undefined;
       if (size !== receipt.bytes || extra.bytesRead || after.size !== before.size || after.nlink !== 1n
         || after.dev !== before.dev || after.ino !== before.ino || after.birthtimeNs !== before.birthtimeNs
-        || digest(contents) !== receipt.sha256 || (receipt.identity && !sameStageIdentity(after, receipt.identity, legacyAfter)))
+        || hash.digest("hex") !== receipt.sha256 || (receipt.identity && !sameStageIdentity(after, receipt.identity, legacyAfter)))
         throw new Error("corrupt stage file");
       return contents;
     } catch {
@@ -711,13 +722,13 @@ export class TaskFiles {
         // a verified recycle receipt or explicit operator repair exists.
         continue;
       }
-      try { await this.stagedContents(receipt, job, row.bindingId); }
+      try { await this.verifyStagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       if (this.stopped || this.maintenanceStopped || !this.store.markStageRecyclePending(row.key, row.path)) continue;
       // Recheck after journaling: an accidental path replacement during that
       // interval must not recycle another file or release this reservation.
       // A same-user actor can still race a pathname-based Recycle Bin move.
-      try { await this.stagedContents(receipt, job, row.bindingId); }
+      try { await this.verifyStagedContents(receipt, job, row.bindingId); }
       catch (error) { if (error instanceof ActionRejectedError) continue; throw error; }
       const current = await lstat(row.path, { bigint: true }).catch(() => null);
       const legacyCurrent = current && !("version" in identity) ? await lstat(row.path).catch(() => null) : undefined;
@@ -1084,7 +1095,7 @@ export class TaskFiles {
             // Do not clear the typed result until the immutable bytes have
             // been verified. The retry count is committed before another VK
             // call, so a crash during the retry stays unknown.
-            try { await this.stagedContents(receipt, job, binding.id); }
+            try { await this.verifyStagedContents(receipt, job, binding.id); }
             catch (error) {
               if (!(error instanceof StageContentUnavailableError)) throw error;
               this.store.atomic(() => {

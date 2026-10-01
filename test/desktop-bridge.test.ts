@@ -4231,7 +4231,7 @@ test("a lost recycle acknowledgement remains charged when the staged path cannot
   lost.mock.restore();
   assert.equal(moves, 1);
   assert.equal(s.store.stageReservedBytes(binding.id, "uncertain-recycle"), 5);
-  const unavailable = t.mock.method(files as unknown as { stagedContents: () => Promise<Buffer> }, "stagedContents", async () => {
+  const unavailable = t.mock.method(files as unknown as { verifyStagedContents: () => Promise<void> }, "verifyStagedContents", async () => {
     throw new ActionRejectedError("staged path missing after recycle");
   });
   assert.equal(await files.reconcileStagedArtifacts(), 0);
@@ -4884,6 +4884,35 @@ test("an unknown staged upload can bind only a VK document with identical verifi
   assert.equal(await restored.collect(binding, true), 1);
   assert.equal(s.chat.binaryUploads.length, 1);
   assert.ok(s.store.pendingDeliveries().some(delivery => delivery.view.attachments?.includes("doc-202_77")));
+});
+
+test("unknown staged document verification does not allocate a full file buffer", async t => {
+  const s = setup(t); const binding = s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-streamed-verify-test-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate, undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const prepared = await files.prepare(binding, "streamed-verify", []);
+  files.finish(binding.id, "streamed-verify", "accepted", "completed-turn");
+  await writeFile(path.join(prepared.outboxDir, "large.bin"), Buffer.alloc(128 * 1024, 0x42));
+  files.observe(binding.id, "idle", "completed-turn");
+  const setValue = s.store.setValue.bind(s.store);
+  const crash = t.mock.method(s.store, "setValue", (key: string, value: unknown) => {
+    if (key.endsWith(":uploaded")) throw new Error("crash after remote save");
+    return setValue(key, value);
+  });
+  await assert.rejects(files.collect(binding), /crash after remote save/u);
+  crash.mock.restore();
+  const receipt = Object.values(s.store.getValue<Record<string, { key: string }>>(
+    `file-stage-index:${binding.id}:streamed-verify`) ?? {})[0]!;
+  s.chat.resolveDocumentAttachment = async () => { throw new Error("reached remote lookup"); };
+  const originalAllocUnsafe = Buffer.allocUnsafe;
+  const allocation = t.mock.method(Buffer, "allocUnsafe", (size: number) => {
+    if (size > 64 * 1024) throw new Error("full file buffer allocated");
+    return originalAllocUnsafe(size);
+  });
+  try {
+    await assert.rejects(files.reconcileUnknownDocument(binding, "streamed-verify", receipt.key, "doc-202_77"),
+      /reached remote lookup/u);
+  } finally { allocation.mock.restore(); }
+  assert.equal(s.store.getValue(`${receipt.key}:upload-state`), "uploading");
 });
 
 test("unknown staged document reconciliation stops when the binding changes during download", async t => {
