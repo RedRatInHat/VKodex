@@ -2092,6 +2092,19 @@ test("runtime reports the actual connection failure without leaking malformed IP
   await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /прочитать/u.test(error.message) && !error.message.includes("private-data"));
 });
 
+test("diagnostic IPC client rejects a snapshot above its smaller inbound limit before allocation", async t => {
+  assert.throws(() => new FrameDecoder(0), RangeError);
+  assert.throws(() => new DesktopIpcClient(() => new Server(), 50, null, 256 * 1024 * 1024 + 1), RangeError);
+  const server = new Server();
+  const client = new DesktopIpcClient(() => server, 50, null, 1024);
+  t.after(() => client.close());
+  const oversized = Buffer.alloc(4); oversized.writeUInt32LE(1025);
+  server.onFollow = () => server.push(oversized);
+  const subscription = new TaskSubscription(client, ref, () => assert.fail("Oversized snapshot accepted"), () => {});
+  await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /1024 байт/u.test(error.message));
+  assert.equal(server.received.some(message => String(message.method).startsWith("thread-follower-")), false);
+});
+
 test("runtime silently retries desktop discovery while a task owner is loading", async t => {
   const s = runtimeSetup(t); s.server.rejectDiscovery = true;
   s.store.setValue(`task-details:${s.binding.id}`, { status: "running", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
