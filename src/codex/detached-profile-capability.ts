@@ -168,7 +168,8 @@ export function inspectDetachedProfileBackend(privateDirectory: string,
 /** The caller supplies a trusted private directory, never a path from VK. The
  * epoch-specific token is deliberately absent from the public ready record. */
 function openDetachedProfileConnection(privateDirectory: string,
-  home: string, dependencies: DetachedProfileCapabilityDependencies): AppServerRpc {
+  home: string, dependencies: DetachedProfileCapabilityDependencies,
+  expected: DetachedProfileDescriptor | null): AppServerRpc {
   if (!path.isAbsolute(privateDirectory) || !path.isAbsolute(home) ||
     /[\x00-\x1f]/u.test(home)) throw new TypeError("Invalid detached profile scope");
   const read = dependencies.readFile ?? boundedRead;
@@ -188,6 +189,10 @@ function openDetachedProfileConnection(privateDirectory: string,
   };
   try { assertBase(); } catch { unavailable(); }
   const original = loadDescriptor();
+  // A one-shot caller can pin the server it inspected before opening a
+  // socket. A newer, otherwise valid ready record must not silently replace
+  // that backend between preflight and the first write.
+  if (expected && !descriptorEquals(original, expected)) unavailable();
   const tokenFile = path.join(privateDirectory, original.epoch, "token");
   const loadToken = (): string => {
     try {
@@ -230,8 +235,9 @@ function openDetachedProfileConnection(privateDirectory: string,
 /** A missing or stale ready record disables only this profile. A later first
  * request may attach after its independent server publishes a valid record;
  * once attached, it never silently adopts a different epoch. */
-export function createDetachedProfileConnection(privateDirectory: string,
-  home: string, dependencies: DetachedProfileCapabilityDependencies = {}): AppServerRpc {
+function createScopedDetachedProfileConnection(privateDirectory: string,
+  home: string, dependencies: DetachedProfileCapabilityDependencies,
+  expected: DetachedProfileDescriptor | null): AppServerRpc {
   if (!path.isAbsolute(privateDirectory) || !path.isAbsolute(home) ||
     /[\x00-\x1f]/u.test(home)) throw new TypeError("Invalid detached profile scope");
   let rpc: AppServerRpc | null = null;
@@ -242,7 +248,7 @@ export function createDetachedProfileConnection(privateDirectory: string,
   const current = (): AppServerRpc => {
     if (closed) unavailable();
     if (!rpc) {
-      const created = openDetachedProfileConnection(privateDirectory, home, dependencies);
+      const created = openDetachedProfileConnection(privateDirectory, home, dependencies, expected);
       created.onNotification(notification => { for (const listener of notifications) listener(notification); });
       created.onDisconnect?.(error => { for (const listener of disconnections) listener(error); });
       created.onServerRequest(serverRequest);
@@ -261,4 +267,19 @@ export function createDetachedProfileConnection(privateDirectory: string,
       await rpc?.close();
     },
   };
+}
+
+export function createDetachedProfileConnection(privateDirectory: string,
+  home: string, dependencies: DetachedProfileCapabilityDependencies = {}): AppServerRpc {
+  return createScopedDetachedProfileConnection(privateDirectory, home, dependencies, null);
+}
+
+/** Bind a new client to one exact protected ready record. The expected value
+ * is copied and validated before the lazy connection; subsequent requests
+ * retain the existing descriptor/token and PID/birth fences. */
+export function createPinnedDetachedProfileConnection(privateDirectory: string,
+  home: string, expected: DetachedProfileDescriptor,
+  dependencies: DetachedProfileCapabilityDependencies = {}): AppServerRpc {
+  const pin = exactDescriptor(expected, home);
+  return createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
 }

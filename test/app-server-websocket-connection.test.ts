@@ -7,7 +7,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { createAppServerWebSocketConnection } from "../src/codex/app-server-websocket-connection.js";
-import { canonicalDetachedProfileHome, createDetachedProfileConnection,
+import { canonicalDetachedProfileHome, createDetachedProfileConnection, createPinnedDetachedProfileConnection,
   detachedProfileKey, inspectDetachedProfileBackend } from "../src/codex/detached-profile-capability.js";
 
 type JsonObject = Record<string, unknown>;
@@ -162,6 +162,45 @@ test("detached profile rejects a changed token before first connection", async (
     token = "replaced-test-capability";
     await assert.rejects(start, AppServerUnavailableError);
     assert.equal(native.connections, 0);
+  } finally { await client.close(); await native.close(); }
+});
+
+test("pinned detached profile refuses a different live epoch before its first socket", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-pinned-epoch");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const expected = { schemaVersion: 1 as const, epoch: "00000000-0000-4000-8000-000000000001",
+    profileKey: detachedProfileKey(home), home, url: native.url,
+    backend: { pid: 1234, birthTicks: "12345678" } };
+  let actual = { ...expected };
+  const client = createPinnedDetachedProfileConnection(directory, home, expected, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(actual) : native.token,
+    identity: pid => ({ pid, birthTicks: "12345678" }),
+  });
+  try {
+    actual = { ...expected, epoch: "00000000-0000-4000-8000-000000000002" };
+    await assert.rejects(client.start(), AppServerUnavailableError);
+    assert.equal(native.connections, 0);
+  } finally { await client.close(); await native.close(); }
+});
+
+test("pinned detached profile accepts only its exact backend and fences replacement", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-pinned-backend");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const expected = { schemaVersion: 1 as const, epoch: "00000000-0000-4000-8000-000000000001",
+    profileKey: detachedProfileKey(home), home, url: native.url,
+    backend: { pid: 1234, birthTicks: "12345678" } };
+  let actual = { ...expected };
+  const client = createPinnedDetachedProfileConnection(directory, home, expected, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(actual) : native.token,
+    identity: pid => ({ pid, birthTicks: actual.backend.birthTicks }),
+  });
+  try {
+    assert.deepEqual(await client.request("thread/read"), { ok: true });
+    actual = { ...expected, backend: { pid: 1234, birthTicks: "98765432" } };
+    await assert.rejects(client.request("thread/rename", {}, { mutating: true }), AppServerUnavailableError);
+    assert.equal(native.methods.includes("thread/rename"), false);
   } finally { await client.close(); await native.close(); }
 });
 
