@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Duplex, PassThrough } from "node:stream";
 import test, { type TestContext } from "node:test";
@@ -12,7 +13,7 @@ import { ConnectedDesktopTasks, submissionMode } from "../src/desktop/desktop-ta
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
-import { AppServerTaskTransfer, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
+import { AppServerTaskTransfer, readTransferContext, rolloutContainsThread, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
 import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, MutableQueuedInputTurnError, QueueHistoryReadError, readQueuedHistoryPage, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";
 import { DesktopIpcClient, encodeFrame, FrameDecoder, isObject, type IpcObject } from "../src/desktop/ipc-client.js";
@@ -3646,6 +3647,60 @@ test("semantic transfer checkpoints ignore harmless file metadata changes but re
   await assert.rejects(transfer.verifySource(task, { ...expected, effort: "medium" }), TransferConflictError);
   await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10, semanticDigest: "different" }), TransferConflictError);
   await assert.rejects(transfer.verifySource(task, { lastTurnId: "last", rolloutPath: file, size: 100, mtimeMs: 10 }), TransferConflictError);
+});
+
+test("early rollout match and parse failure release their input streams", async t => {
+  const matchedInput = new PassThrough();
+  const invalidContextInput = new PassThrough();
+  t.after(() => { matchedInput.destroy(); invalidContextInput.destroy(); });
+  matchedInput.write(`${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  assert.equal(await rolloutContainsThread("unused-fixture", "source", () => matchedInput), true);
+  assert.equal(matchedInput.destroyed, true, "early match must close the underlying file stream");
+
+  invalidContextInput.write('{"type":"turn_context","payload":\n');
+  await assert.rejects(readTransferContext("unused-fixture", "turn", () => invalidContextInput), TransferConflictError);
+  assert.equal(invalidContextInput.destroyed, true, "parse failure must close the underlying file stream");
+});
+
+test("rollout reader cleanup fails closed without masking a primary parse failure", async t => {
+  class FaultyCloseStream extends PassThrough {
+    override _destroy(_error: Error | null, callback: (error?: Error | null) => void): void {
+      callback(Object.assign(new Error("fixture close failure"), { code: "EIO" }));
+    }
+  }
+  const matchedInput = new FaultyCloseStream();
+  const invalidContextInput = new FaultyCloseStream();
+  t.after(() => { matchedInput.destroy(); invalidContextInput.destroy(); });
+  matchedInput.write(`${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n`);
+  assert.equal(await rolloutContainsThread("unused-fixture", "source", () => matchedInput), false,
+    "a failed close cannot be reported as verified lineage");
+
+  invalidContextInput.write('{"type":"turn_context","payload":\n');
+  await assert.rejects(readTransferContext("unused-fixture", "turn", () => invalidContextInput), TransferConflictError);
+});
+
+test("early rollout readers release Windows file handles before return", { skip: process.platform !== "win32" }, async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-reader-"));
+  t.after(() => {
+    const script = "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $root=[IO.Path]::GetFullPath($env:TEMP).TrimEnd('\\')+'\\'; if(-not $target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)";
+    const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-Command", script],
+      { env: { ...process.env, VKODEX_TEST_RECYCLE_TARGET: home }, encoding: "utf8", timeout: 60_000, windowsHide: true });
+    assert.equal(result.status, 0, "Windows rollout fixture must be moved to Recycle Bin");
+  });
+  const trailing = " ".repeat(2 * 1024 * 1024);
+  const matchedPath = path.join(home, "matched.jsonl");
+  const matchedReplacement = path.join(home, "matched-replacement.jsonl");
+  await writeFile(matchedPath, `${JSON.stringify({ type: "session_meta", payload: { id: "source" } })}\n${trailing}`);
+  await writeFile(matchedReplacement, "replacement\n");
+  assert.equal(await rolloutContainsThread(matchedPath, "source"), true);
+  await rename(matchedReplacement, matchedPath);
+
+  const invalidPath = path.join(home, "invalid.jsonl");
+  const invalidReplacement = path.join(home, "invalid-replacement.jsonl");
+  await writeFile(invalidPath, `{"type":"turn_context","payload":\n${trailing}`);
+  await writeFile(invalidReplacement, "replacement\n");
+  await assert.rejects(readTransferContext(invalidPath, "turn"), TransferConflictError);
+  await rename(invalidReplacement, invalidPath);
 });
 
 test("transfer verifies workspace, model and effort from the target rollout before switching", async t => {
