@@ -210,7 +210,7 @@ async function runPowerShell(encoded: string, input: Uint8Array, requireComplete
       if (!message || typeof message !== "object" || !("ok" in message)) return settle();
       if (message.ok !== true) {
         const phase = "phase" in message && typeof message.phase === "string" ? message.phase : "unclassified";
-        return settle(undefined, /^(?:spawn-throw|process-error|invalid-input|input-mismatch|command-mismatch|input-length|exit-(?:null|\d+)(?:-(?:empty|security|parser(?:-token|-parenthesis)?(?:-l\d{1,4}c\d{1,5})?|runtime|other))?)$/u.test(phase)
+        return settle(undefined, /^(?:timeout|output-limit|spawn-throw|process-error|invalid-input|input-mismatch|command-mismatch|input-length|exit-(?:null|\d+)(?:-(?:empty|security|parser(?:-token|-parenthesis)?(?:-l\d{1,4}c\d{1,5})?|runtime|other))?)$/u.test(phase)
           ? phase : "unclassified");
       }
       const output = "output" in message ? message.output : null;

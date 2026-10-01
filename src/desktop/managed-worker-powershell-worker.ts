@@ -106,7 +106,10 @@ process.once("message", (value: unknown) => {
         stderr.includes("Exception") || stderr.includes("InvalidOperation") || stderr.includes("ErrorRecord")
           ? "runtime" : "other";
     }
-    const phase = result.error ? "process-error" : result.status === 42 ? "input-length" :
+    const errorCode = result.error && "code" in result.error ? result.error.code : undefined;
+    const phase = errorCode === "ETIMEDOUT" ? "timeout" :
+      errorCode === "ENOBUFS" ? "output-limit" :
+      result.error ? "process-error" : result.status === 42 ? "input-length" :
       `exit-${result.status}-${stderrKind}${stderrKind.startsWith("parser") && Buffer.isBuffer(stderr) ? parserCoordinate(stderr) : ""}`;
     if (Buffer.isBuffer(stdout)) stdout.fill(0);
     if (Buffer.isBuffer(stderr)) stderr.fill(0);

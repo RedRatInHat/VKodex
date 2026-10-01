@@ -223,6 +223,23 @@ test("protector failure and malformed or oversized strict JSON never reach files
   });
   assert.deepEqual(failureFilesystem.actions, []);
 
+  const timedOutFilesystem = new MemoryFilesystem();
+  const timedOutRunner: ManagedWorkerPrivateStatePowerShellRunner = {
+    async run(): Promise<Uint8Array> {
+      throw new Error("fixture-secret-must-not-escape", { cause: { phase: "timeout" } });
+    },
+  };
+  await assert.rejects(createManagedWorkerPrivateState(manifest(), {
+    baseDirectory: fixturePath("private", "timeout"), filesystem: timedOutFilesystem,
+    powerShellRunner: timedOutRunner,
+  }), error => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Managed worker private state protection failed");
+    assert.deepEqual(error.cause, { phase: "timeout" });
+    return true;
+  });
+  assert.deepEqual(timedOutFilesystem.actions, []);
+
   const malformedOutputFilesystem = new MemoryFilesystem();
   const malformedOutputRunner: ManagedWorkerPrivateStatePowerShellRunner = { async run() { return Buffer.from("not base64!"); } };
   await assert.rejects(createManagedWorkerPrivateState(manifest(), { baseDirectory: fixturePath("private", "managed"), filesystem: malformedOutputFilesystem, powerShellRunner: malformedOutputRunner }), /protection failed/u);
