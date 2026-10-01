@@ -286,6 +286,38 @@ test("health distinguishes a live task stream from a missing native owner adapte
   assert.equal(recovered.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "ok");
 });
 
+test("health probes a bounded disconnected running source without calling rollout readers", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding({ ...task, sourceId: "work-source", title: "Disconnected task" });
+  store.setChat(binding.id, 2_000_000_004, 4);
+  store.setAttached(binding.id, true);
+  const peers = [binding];
+  for (let index = 1; index <= 2; index++) {
+    const extra = store.ensureBinding({ ...task, threadId: `disconnected-${index}`,
+      sourceId: "work-source", title: `Disconnected task ${index}` });
+    store.setChat(extra.id, 2_000_000_004 + index, 4 + index);
+    store.setAttached(extra.id, true);
+    peers.push(extra);
+  }
+  let probes = 0;
+  const desktop = Object.assign(new HealthDesktop(), {
+    ownerAdapterStatus: async () => { probes++; return "missing" as const; },
+  });
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, desktop, new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 3, connectedBindings: 0, requiredBindings: 3, connectedRequiredBindings: 0,
+    bindings: peers.map(item => ({ id: item.id, title: item.title, source: ".codex-work", status: "running", connected: false,
+      lastConfirmedAt: null, failure: null })),
+  }), undefined, () => now, undefined, () => true);
+  const report = await monitor.check(true);
+  const probe = report.checks.find(check => check.name === "codex_owner_probe:work-source");
+  assert.equal(probes, 2);
+  assert.equal(probe?.state, "ok");
+  assert.match(probe?.detail ?? "", /2.*не заявлен/u);
+});
+
 test("health identifies a blocked rollout recovery without exposing its history", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const now = 100_000;

@@ -440,16 +440,29 @@ export class BridgeHealthMonitor {
   private async checkOwnerAdapters(runtime: RuntimeHealthState): Promise<readonly HealthCheckResult[]> {
     if (!this.desktop.ownerAdapterStatus) return [];
     const profiles = new Map<string, { tasks: NonNullable<ReturnType<BridgeStore["getBinding"]>>[]; label: string }>();
+    const disconnected = new Map<string, { tasks: NonNullable<ReturnType<BridgeStore["getBinding"]>>[]; label: string }>();
+    let disconnectedSampled = 0;
     for (const item of runtime.bindings ?? []) {
-      if (!item.connected) continue;
+      if (!item.connected && !["running", "approval"].includes(item.status)) continue;
       const task = this.store.getBinding(item.id);
       if (!task?.attached || task.peerId === null) continue;
       const source = task.sourceId || "primary";
+      if (!item.connected) {
+        // A disconnected running task is exactly where the old health check
+        // hid owner-probe evidence. Sample at most four tasks globally and two
+        // per source; do not scan rollouts or turn history from health.
+        const profile = disconnected.get(source);
+        if (disconnectedSampled >= 4 || (profile?.tasks.length ?? 0) >= 2) continue;
+        if (profile) profile.tasks.push(task);
+        else disconnected.set(source, { tasks: [task], label: item.source });
+        disconnectedSampled++;
+        continue;
+      }
       const profile = profiles.get(source);
       if (profile) profile.tasks.push(task);
       else profiles.set(source, { tasks: [task], label: item.source });
     }
-    return Promise.all([...profiles].map(async ([source, { tasks, label }]) => {
+    const connectedChecksPromise = Promise.all([...profiles].map(async ([source, { tasks, label }]) => {
       const results = await Promise.all(tasks.map(async task => {
         try { return await withTimeout(this.desktop.ownerAdapterStatus!(task), 5_000); }
         catch { return "unknown" as const; }
@@ -462,6 +475,21 @@ export class BridgeHealthMonitor {
           ? `${label}: адаптер владельца не подтверждён для ${missing + unknown} из ${tasks.length} подключённых задач (отсутствует: ${missing}, проверка не удалась: ${unknown}). ${affected}. Архивация источника при переносе может быть недоступна.`
           : `${label}: адаптер владельца отвечает для ${tasks.length} подключённых задач.` } satisfies HealthCheckResult;
     }));
+    const disconnectedChecksPromise = Promise.all([...disconnected].map(async ([source, { tasks, label }]) => {
+      const results = await Promise.all(tasks.map(async task => {
+        try { return await withTimeout(this.desktop.ownerAdapterStatus!(task), 5_000); }
+        catch { return "unknown" as const; }
+      }));
+      const ready = results.filter(result => result === "ready").length;
+      const missing = results.filter(result => result === "missing").length;
+      const unknown = results.length - ready - missing;
+      return { name: `codex_owner_probe:${source}`, state: unknown ? "degraded" : "ok",
+        detail: `${label}: выборочная IPC-проверка ${tasks.length} отключённых выполняющихся задач: ` +
+          `владелец отвечает ${ready}, не заявлен ${missing}, проверка не удалась ${unknown}. ` +
+          `Это не устанавливает причину потери потока; история задач не читалась.` } satisfies HealthCheckResult;
+    }));
+    const [connectedChecks, disconnectedChecks] = await Promise.all([connectedChecksPromise, disconnectedChecksPromise]);
+    return [...connectedChecks, ...disconnectedChecks];
   }
 
   private async checkCatalog(): Promise<readonly HealthCheckResult[]> {
