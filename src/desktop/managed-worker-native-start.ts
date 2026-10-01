@@ -110,6 +110,17 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     try { this.#capture(request); return true; } catch { return false; }
   }
 
+  /** A duplicate with a matching worker ledger row can only retrieve its prior
+   * outcome. An intent-only row is not a replay proof and must pass fresh idle
+   * admission before the dispatcher is allowed to reserve a command. */
+  hasKnownWorkerOperation(clientId: string): boolean {
+    if (this.#closed || typeof clientId !== 'string' || !clientId || clientId.length > 128) return false;
+    const stored = this.#options.intentStore?.getByClientUserMessageId(clientId)?.intent ??
+      [...this.#commands.values()].find(value => value.command.params.clientUserMessageId === clientId);
+    return stored !== undefined && typeof this.#options.host.commandStatusForIntent === 'function' &&
+      this.#options.host.commandStatusForIntent(this.#options.controlKey, stored.command) !== null;
+  }
+
   #sameAuthority(request: IpcIncomingRequest, expected: NativeStartAuthority): void {
     const actual = this.#capture(request);
     if (actual.ownerEpoch !== expected.ownerEpoch || actual.backendGeneration !== expected.backendGeneration ||

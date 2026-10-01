@@ -615,6 +615,50 @@ test('stock native ingress serializes the pre-reservation baseline for overlappi
   } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
+test('direct native ingress waits before reserving another start and refuses it without terminal proof', async () => {
+  const f = await fixture(async () => composerState(), undefined, undefined, true);
+  const secondClientId = randomUUID();
+  try {
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-stream-state-changed');
+    f.broker.send(firstComposerRequest(randomUUID(), 'direct-one'));
+    const firstWire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+    f.broker.send(firstComposerRequest(secondClientId, 'direct-two'));
+    await waitUntil(() => f.owner.metadata.pendingNativeOperations === 2);
+    assert.equal(f.intentStore?.getByClientUserMessageId(secondClientId) === null, true,
+      'a second direct ingress must wait before storing its intent');
+    f.child.reply(firstWire.id, { turn: { id: 'direct-turn-one', status: 'inProgress' } });
+    const first = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'direct-one');
+    const second = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'direct-two');
+    assert.equal(first.resultType, 'success');
+    assert.equal(second.resultType, 'error');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.host.operationCounts(f.controlKey).operations, 1);
+    f.child.send('turn/started', { threadId: taskId,
+      turn: { id: 'direct-turn-one', status: 'inProgress', startedAt: 2, items: [] } });
+    await waitUntil(() => f.owner.metadata.revision >= 3);
+    f.child.send('turn/completed', { threadId: taskId,
+      turn: { id: 'direct-turn-one', status: 'completed', startedAt: 2,
+        completedAt: 3, items: [] } });
+    await waitUntil(() => f.owner.metadata.revision >= 4);
+    f.broker.send({ type: 'request', requestId: 'direct-after-terminal', sourceClientId: 'follower',
+      hostId: 'local', targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+      params: { conversationId: taskId, turnStart: {
+        request: { threadId: taskId, clientUserMessageId: randomUUID(),
+          input: [{ type: 'text', text: 'next', text_elements: [] }] },
+        context: { inheritThreadSettings: true } } } });
+    const nextWire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start' &&
+      frame.id !== firstWire.id);
+    f.child.reply(nextWire.id, { turn: { id: 'direct-turn-two', status: 'inProgress' } });
+    const next = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'direct-after-terminal');
+    assert.equal(next.resultType, 'success');
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 2);
+  } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+});
+
 test('stock queue backend event during qualification invalidates the pending actual write', async () => {
   let release!: () => void;
   let entered!: () => void;
@@ -1410,12 +1454,12 @@ test('qualified second Composer send uses one actual wire and accepted duplicate
     assert.equal((wire.params as IpcObject).model, null);
     assert.equal((wire.params as IpcObject).approvalPolicy, 'on-request');
     // The accepted native receipt has not yet appeared in full terminal
-    // history. A different command cannot use the old continuation proof.
+    // history. Admission refuses a different command before qualification.
     f.broker.send(continuationRequest(randomUUID(), 'continuation-other'));
     const denied = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
       frame.requestId === 'continuation-other');
     assert.equal(denied.resultType, 'error');
-    assert.equal(qualified, 2);
+    assert.equal(qualified, 1);
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
     f.child.send('turn/started', { threadId: taskId,
       turn: { id: 'continuation-turn', status: 'inProgress', startedAt: 3, items: [] } });
@@ -1429,7 +1473,7 @@ test('qualified second Composer send uses one actual wire and accepted duplicate
       frame.requestId === 'continuation-duplicate');
     assert.equal(duplicate.resultType, 'success');
     assert.deepEqual(duplicate.result, first.result);
-    assert.equal(qualified, 2);
+    assert.equal(qualified, 1);
     assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
 });
