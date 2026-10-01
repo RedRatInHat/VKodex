@@ -17,7 +17,7 @@ import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
 import { comparablePath } from "../core/paths.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
-import { MutableQueuedInputTurnError } from "../desktop/input-reconciliation.js";
+import { MutableQueuedInputTurnError, QueueHistoryReadError } from "../desktop/input-reconciliation.js";
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
@@ -342,7 +342,8 @@ export class BridgeRuntime {
         this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
           pages, lastAttemptAt: attemptAt,
           lastFailure: error instanceof MutableQueuedInputTurnError ? "active_turn"
-            : error instanceof DesktopUnavailableError ? "history_unavailable" : "scan_error",
+            : error instanceof QueueHistoryReadError ? `history_${error.reason}`
+              : error instanceof DesktopUnavailableError ? "history_unavailable" : "scan_error",
           lastCompletedNoTerminalProofAt,
           nextAt: this.now() + (error instanceof MutableQueuedInputTurnError ? 30_000 : 60 * 60_000) } satisfies QueueHistoryProgress);
     })

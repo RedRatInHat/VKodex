@@ -1,11 +1,34 @@
 import { createHash } from "node:crypto";
 import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from "../core/codex-tasks.js";
-import { DesktopUnavailableError } from "./contracts.js";
+import { ActionRejectedError, DesktopUnavailableError, TransferPageTooLargeError } from "./contracts.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 
 /** A live turn can gain items or change status; its page is not a durable scan boundary. */
 export class MutableQueuedInputTurnError extends DesktopUnavailableError {
   constructor() { super("Ход очереди ещё изменяется."); this.name = "MutableQueuedInputTurnError"; }
+}
+
+/** Fixed, content-free classification of a failed native history RPC. It is
+ * distinct from a successful RPC whose history fails local validation. */
+export class QueueHistoryReadError extends DesktopUnavailableError {
+  constructor(readonly reason: "read_rejected" | "read_unavailable" | "read_too_large") {
+    super("Не удалось прочитать историю очереди из Codex.");
+    this.name = "QueueHistoryReadError";
+  }
+}
+
+/** Keep transport/RPC failure categories separate from a structurally invalid
+ * history page, without retaining the native error or any page content. */
+export async function readQueuedHistoryPage(
+  list: (params: IpcObject) => Promise<IpcObject>, params: IpcObject,
+): Promise<IpcObject> {
+  try { return await list(params); }
+  catch (error) {
+    if (error instanceof TransferPageTooLargeError) throw new QueueHistoryReadError("read_too_large");
+    if (error instanceof ActionRejectedError) throw new QueueHistoryReadError("read_rejected");
+    if (error instanceof DesktopUnavailableError) throw new QueueHistoryReadError("read_unavailable");
+    throw error;
+  }
 }
 
 /** A clientUserMessageId in persisted history proves that Codex accepted input.
