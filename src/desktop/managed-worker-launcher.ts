@@ -113,7 +113,9 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     home: input.home, cwd: input.cwd, registryPath: input.registryPath,
     cliPath: input.cliPath, cliSha256: input.cliSha256,
     initializeRequest: input.initializeRequest, resumeParams: input.resumeParams,
-    ...(approvedTaskPolicy ? { approvedTaskPolicy } : {}),
+    ...(approvedTaskPolicy ? { approvedTaskPolicy, managedOwnerClaim: Object.freeze({
+      storePath: claimBinding!.storePath, bindingId: claimBinding!.bindingId, claimId: claimId!,
+    }) } : {}),
   };
   try {
     if (claimId !== null &&

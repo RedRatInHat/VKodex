@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
+import { BridgeStore } from '../src/bridge/store.js';
 import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-operation-journal.js';
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
@@ -1902,6 +1903,18 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
       runtimeWorkspaceRoots: [home] }], approvalPolicy: 'never', approvalsReviewer: 'user',
     activePermissionProfile: { id: ':read-only', extends: null },
     sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null }) : null;
+  let managedOwnerClaim: { storePath: string; bindingId: string; claimId: string } | null = null;
+  if (cliPolicy || stock) {
+    const storePath = path.join(root, 'bridge.sqlite');
+    const bridge = new BridgeStore(storePath);
+    try {
+      const binding = bridge.ensureBinding({ hostId: 'local', threadId: taskId,
+        sourceId: 'daemon-fixture', title: 'Daemon fixture', workspace: root, updatedAt: 1 });
+      const claim = bridge.claimManagedOwner(binding.id, { ownerEpoch: reserved.epoch,
+        canonicalHome: reserved.canonicalHome, familyRoot: reserved.familyRoot });
+      managedOwnerClaim = { storePath, bindingId: binding.id, claimId: claim.id };
+    } finally { bridge.close(); }
+  }
   let cliOptions = nativeCliWebSocket;
   let creationJournal: ControlledNativeCreationJournal | null = null;
   if (nativeCliWebSocket?.singleAcceptedStart && cliPolicy) {
@@ -2002,6 +2015,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
         resumeParams: { threadId: taskId, cwd: home, model: 'gpt-5.6-sol',
           permissions: stock && stockFailure !== 'policy' ? ':danger-full-access' : ':read-only', approvalPolicy: 'never',
           runtimeWorkspaceRoots: [home], config: { model_reasoning_effort: stock ? 'medium' : 'low' } },
+        ...(managedOwnerClaim ? { managedOwnerClaim } : {}),
         ...(cliPolicy ? { approvedTaskPolicy: cliPolicy } : stock ? { approvedTaskPolicy: approveTaskPolicy({ threadId: taskId,
           model: 'gpt-5.6-sol', modelProvider: 'openai', effort: stock ? 'medium' : 'low', cwd: home,
           runtimeWorkspaceRoots: [home], environments: stock ? [] :
@@ -2840,6 +2854,68 @@ test('exact reserved epoch is required before observing or launching a worker', 
   const check = new ManagedWorkerRegistry(registryPath);
   try { assert.equal(check.get(home, 'own-family')?.epoch, actual.epoch); }
   finally { check.close(); }
+});
+
+test('policy worker refuses a retired or replaced bridge claim before host registration', async () => {
+  for (const scenario of ['retired', 'replaced', 'revoked-after-first-read'] as const) {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'vk-daemon-claim-'));
+    const home = path.join(root, 'home'), privateDirectory = path.join(root, 'private');
+    await Promise.all([mkdir(home), mkdir(privateDirectory)]);
+    const registryPath = path.join(root, 'registry.sqlite');
+    const registry = new ManagedWorkerRegistry(registryPath);
+    const reserved = registry.reserve(home, 'own-family'); registry.close();
+    const taskId = randomUUID(), storePath = path.join(root, 'bridge.sqlite');
+    const bridge = new BridgeStore(storePath);
+    const binding = bridge.ensureBinding({ hostId: 'local', threadId: taskId,
+      sourceId: 'daemon-claim-test', title: 'Claim test', workspace: root, updatedAt: 1 });
+    const claim = bridge.claimManagedOwner(binding.id, { ownerEpoch: reserved.epoch,
+      canonicalHome: reserved.canonicalHome, familyRoot: reserved.familyRoot });
+    if (scenario === 'retired') {
+      const pending = bridge.transitionManagedOwner(claim, 'handoff_pending');
+      bridge.retireManagedOwner(pending);
+    }
+    bridge.close();
+    const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna',
+      modelProvider: 'openai', effort: 'low', cwd: home, runtimeWorkspaceRoots: [home],
+      environments: [], approvalPolicy: 'never', approvalsReviewer: 'user',
+      activePermissionProfile: { id: ':read-only', extends: null },
+      sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null });
+    let observed = 0, launched = 0, controls = 0;
+    const daemon = new ManagedWorkerDaemon({
+      baseDirectory: root, epoch: reserved.epoch,
+      allowFollower: () => false, clientFactory: () => { throw new Error('unexpected IPC'); },
+      verifyFamilyQuiescent: async () => false,
+      dependencies: {
+        loadPrivateState: async () => ({ manifest: {
+          schemaVersion: 1, epoch: reserved.epoch, taskId, familyRoot: reserved.familyRoot,
+          home, cwd: home, cliPath: path.join(root, 'cli.exe'), cliSha256: '0'.repeat(64),
+          initializeRequest: { clientInfo: {}, capabilities: {} }, resumeParams: {}, registryPath,
+          approvedTaskPolicy: policy, managedOwnerClaim: { storePath, bindingId: binding.id,
+            claimId: scenario === 'replaced' ? randomUUID() : claim.id },
+        }, keys: { fingerprintKey: '', intentKey: '', controlToken: '' }, privateDirectory }),
+        observeProcess: () => {
+          observed++;
+          if (scenario === 'revoked-after-first-read') {
+            const revoker = new BridgeStore(storePath);
+            try {
+              const pending = revoker.transitionManagedOwner(claim, 'handoff_pending');
+              revoker.retireManagedOwner(pending);
+            } finally { revoker.close(); }
+          }
+          return { pid: process.pid, birthTicks: '1' };
+        },
+        createControl: () => { controls++; throw new Error('unexpected control'); },
+        launch: () => { launched++; throw new Error('unexpected launch'); },
+      },
+    });
+    await assert.rejects(daemon.start(), /startup unavailable/);
+    assert.equal(daemon.metadata.state, 'failed');
+    assert.equal(observed, scenario === 'revoked-after-first-read' ? 1 : 0);
+    assert.equal(controls, 0); assert.equal(launched, 0);
+    const check = new ManagedWorkerRegistry(registryPath);
+    try { assert.equal(check.get(home, 'own-family')?.state, 'reserved'); }
+    finally { check.close(); }
+  }
 });
 
 test('CLI pin mismatch is refused before launch and retains host registration', async () => {

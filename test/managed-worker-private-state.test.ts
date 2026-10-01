@@ -94,12 +94,28 @@ test("optional approved policy roundtrips immutably; unknown and mismatched poli
     approvalPolicy: "never", approvalsReviewer: "user",
     activePermissionProfile: { id: ":danger-full-access", extends: null },
     sandbox: { type: "dangerFullAccess" }, serviceTier: null });
-  const created = await createManagedWorkerPrivateState({ ...base, approvedTaskPolicy: policy }, options(filesystem));
+  await assert.rejects(createManagedWorkerPrivateState({ ...base, approvedTaskPolicy: policy },
+    options(filesystem)), /Invalid managed worker private state/u);
+  const managedOwnerClaim = { storePath: fixturePath("bridge.sqlite"),
+    bindingId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    claimId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+  const created = await createManagedWorkerPrivateState({ ...base, approvedTaskPolicy: policy,
+    managedOwnerClaim }, options(filesystem));
   assert.equal(Object.isFrozen(created.manifest.approvedTaskPolicy?.sandbox), true);
+  assert.deepEqual(created.manifest.managedOwnerClaim, managedOwnerClaim);
   const loaded = await loadManagedWorkerPrivateState({ ...options(filesystem), epoch });
   assert.deepEqual(loaded.manifest.approvedTaskPolicy, policy);
+  assert.deepEqual(loaded.manifest.managedOwnerClaim, managedOwnerClaim);
   const [filePath, encoded] = [...filesystem.values.entries()][0]!;
   const payload = JSON.parse(Buffer.from(encoded).toString("utf8")) as { manifest: Record<string, unknown> };
+  payload.manifest.managedOwnerClaim = { ...managedOwnerClaim, claimId: "wrong" };
+  filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
+  await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
+  payload.manifest.managedOwnerClaim = managedOwnerClaim;
+  delete payload.manifest.managedOwnerClaim;
+  filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
+  await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
+  payload.manifest.managedOwnerClaim = managedOwnerClaim;
   payload.manifest.approvedTaskPolicy = { ...policy, model: "different" };
   filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
   await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
@@ -107,6 +123,8 @@ test("optional approved policy roundtrips immutably; unknown and mismatched poli
   payload.manifest.unreviewed = true;
   filesystem.values.set(filePath, Buffer.from(JSON.stringify(payload)));
   await assert.rejects(loadManagedWorkerPrivateState({ ...options(filesystem), epoch }), /Invalid managed worker private state/u);
+  await assert.rejects(createManagedWorkerPrivateState({ ...base, managedOwnerClaim },
+    options(new MemoryFilesystem())), /Invalid managed worker private state/u);
 });
 
 test("private state is scoped, immutable, and directory protection precedes exclusive write", async () => {
