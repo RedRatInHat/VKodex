@@ -434,6 +434,24 @@ test("partial-migration project move preflights before native or legacy state mu
     rejected: error instanceof ActionRejectedError }, { nativeCalls: 0, stateUnchanged: true, rejected: true });
 });
 
+test("no-live project mode rejects assignment before legacy file access or native mutation", async () => {
+  const { randomUUID } = await import("node:crypto");
+  const { tmpdir } = await import("node:os");
+  const { default: path } = await import("node:path");
+  const home = path.join(tmpdir(), `vkodex-no-live-${randomUUID()}`);
+  let nativeCalls = 0;
+  let sourceHomeCalls = 0;
+  const native = new NativeDesktopMetadata({ call: async () => { nativeCalls++; return {}; } });
+  const metadata = new ProfileDesktopMetadata(() => { sourceHomeCalls++; return home; }, () => native,
+    undefined, "no-live-legacy");
+  for (const projectId of ["new-project", null]) {
+    await assert.rejects(metadata.assignProject({ hostId: "local", threadId: "fixture" }, projectId),
+      error => error instanceof ActionRejectedError && /диагностическ/iu.test(error.message));
+  }
+  assert.equal(sourceHomeCalls, 0);
+  assert.equal(nativeCalls, 0);
+});
+
 test("malformed legacy projectless IDs reject before native project mutation", async () => {
   const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
   const { default: path } = await import("node:path");

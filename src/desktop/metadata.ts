@@ -8,6 +8,7 @@ import { normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 export { parseTaskGoal } from "../core/task-goals.js";
 import { isObject, type IpcObject } from "./ipc-client.js";
 import { preflightLegacyProjectAssignment } from "./projects.js";
+import type { ProjectCatalogMode } from "./catalog.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
 import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
@@ -328,6 +329,7 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
+    private readonly projectCatalogMode: ProjectCatalogMode = "legacy-file",
   ) {}
   async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
     const home = this.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
@@ -461,6 +463,9 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     } finally { db?.close(); }
   }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
+    if (this.projectCatalogMode === "no-live-legacy") {
+      throw new ActionRejectedError("Диагностический режим не читает состояние проектов Codex; назначение проекта через VKodex недоступно.");
+    }
     const home = this.sourceHome(task);
     await preflightLegacyProjectAssignment(home, task.threadId, projectId);
     await this.createMetadata(home).assignProject(task, projectId);

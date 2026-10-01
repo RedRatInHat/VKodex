@@ -44,7 +44,7 @@ store.assertPrimaryHome(config.codexHome);
 const gateway = new DesktopVkGateway(config, undefined, undefined, logger);
 const catalog = new MultiDesktopCatalog(config.codexHomes,
   home => new LocalDesktopCatalog(home, config.projectCatalogMode));
-const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
+const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task), undefined, undefined, config.projectCatalogMode);
 const launcher = new SourceTaskLauncher(config.codexSources, task => catalog.sourceHome(task));
 const creator = new AppServerTaskCreator(catalog, metadata);
 const transfer = new AppServerTaskTransfer(catalog, metadata);
