@@ -24,12 +24,13 @@ import { readWindowsProcessIdentity } from '../../src/desktop/windows-process-id
 import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS } from
   '../../src/desktop/windows-private-directory.js';
 
-function aclPhase(directory: string): 'ok' | 'acl-invalid' | 'timeout' | 'helper-error' {
+type AclPhase = 'ok' | 'acl-exit' | 'output-invalid' | 'timeout' | 'helper-error';
+function aclPhase(directory: string): AclPhase {
   const root = process.env.SystemRoot ?? '';
   if (!path.win32.isAbsolute(root)) return 'helper-error';
   const executable = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const modulePath = path.win32.join(path.dirname(executable), 'Modules');
-  const command = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().Trim();" +
+  const command = "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$p=[Console]::In.ReadToEnd().Trim();" +
     privateDirectoryAclVerificationScript;
   const environment: NodeJS.ProcessEnv = {};
   for (const key of ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE']) {
@@ -37,17 +38,18 @@ function aclPhase(directory: string): 'ok' | 'acl-invalid' | 'timeout' | 'helper
     if (value) environment[key] = value;
   }
   environment.PSModulePath = modulePath;
-  const result = spawnSync(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+  const encoded = Buffer.from(command, 'utf16le').toString('base64');
+  const result = spawnSync(executable,
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
     input: directory, encoding: 'utf8', windowsHide: true,
     timeout: WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS, maxBuffer: 4096, env: environment,
   });
   if (result.error) return (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
     ? 'timeout' : 'helper-error';
   if (result.status === 0 && result.stdout === 'OK' && !result.stderr.trim()) return 'ok';
-  return result.status === null ? 'helper-error' : 'acl-invalid';
+  return result.status === null ? 'helper-error' : result.status === 0 ? 'output-invalid' : 'acl-exit';
 }
 
-type AclPhase = 'ok' | 'acl-invalid' | 'timeout' | 'helper-error';
 type AclPhases = readonly [AclPhase, AclPhase, AclPhase, AclPhase];
 
 function aclFailureSummary(phases: AclPhases): string {

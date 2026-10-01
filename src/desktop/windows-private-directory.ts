@@ -48,7 +48,7 @@ export const privateDirectoryAclVerificationScript =
   "[Security.AccessControl.FileSystemRights]::FullControl){exit 15};$seen[$sid]=$true};" +
   "if(-not $seen[$me]){exit 16};if(-not $seen['S-1-5-18']){exit 17};[Console]::Out.Write('OK')";
 
-const checkScript = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().Trim();" +
+const checkScript = "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$p=[Console]::In.ReadToEnd().Trim();" +
   privateDirectoryAclVerificationScript;
 
 /** Reject PowerShell warnings, partial output, or any other success-shaped text. */
@@ -106,7 +106,12 @@ function helperArguments(directory: string): { executable: string; script: strin
 function checkDirectory(directory: string): { result: DirectoryCheck; diagnostic: WindowsPrivateDirectoryDiagnostic } {
   const helper = helperArguments(directory);
   if (!helper) return { result: "invalid", diagnostic: "invalid-path" };
-  const result = spawnSync(helper.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", helper.script], {
+  // Use the same static EncodedCommand transport as the protected async ACL
+  // installer. Windows PowerShell can keep stdin in its command-reader path
+  // with -Command on CI hosts, leaving ReadToEnd blocked until our timeout.
+  const encoded = Buffer.from(helper.script, "utf16le").toString("base64");
+  const result = spawnSync(helper.executable,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
     input: directory, encoding: "utf8", windowsHide: true,
     timeout: WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS, maxBuffer: 4096, env: helper.environment,
   });
@@ -151,7 +156,9 @@ export async function assertWindowsPrivateDirectoryAfterAcl(directory: string,
     const createWorker = dependencies.createWorker ?? (() => new Worker(`
       const { spawnSync } = require("node:child_process");
       const { parentPort, workerData } = require("node:worker_threads");
-      const result = spawnSync(workerData.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", workerData.script], {
+      const encoded = Buffer.from(workerData.script, "utf16le").toString("base64");
+      const result = spawnSync(workerData.executable,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
         input: workerData.directory, encoding: "utf8", windowsHide: true, timeout: workerData.helperTimeoutMs, maxBuffer: workerData.maxBuffer, env: workerData.environment,
       });
       let diagnostic = "helper-output-invalid";
