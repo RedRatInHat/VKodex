@@ -204,6 +204,49 @@ test("pinned detached profile accepts only its exact backend and fences replacem
   } finally { await client.close(); await native.close(); }
 });
 
+test("pinned detached profile exposes its exact initialized generation to a one-shot writer", async () => {
+  const native = await fixture();
+  const directory = path.resolve("test-detached-profile-pinned-generation");
+  const home = canonicalDetachedProfileHome(os.tmpdir());
+  const expected = { schemaVersion: 1 as const, epoch: "00000000-0000-4000-8000-000000000001",
+    profileKey: detachedProfileKey(home), home, url: native.url,
+    backend: { pid: 1234, birthTicks: "12345678" } };
+  const client = createPinnedDetachedProfileConnection(directory, home, expected, {
+    readFile: file => file.endsWith("ready.json") ? JSON.stringify(expected) : native.token,
+    identity: pid => ({ pid, birthTicks: expected.backend.birthTicks }),
+  });
+  try {
+    assert.equal(client.isSessionCurrent(1), false);
+    const session = await client.initializedSession();
+    assert.equal(client.isSessionCurrent(session.generation), true);
+    assert.deepEqual(await client.request("thread/read", {}, { expectedGeneration: session.generation }), { ok: true });
+    await assert.rejects(client.request("thread/read", {}, { expectedGeneration: session.generation + 1 }),
+      AppServerUnavailableError);
+    assert.equal(native.methods.filter(method => method === "thread/read").length, 1);
+    const disconnected = new Promise<void>(resolve => { client.onDisconnect(() => resolve()); });
+    for (const socket of native.sockets) socket.terminate();
+    await disconnected;
+    assert.equal(client.isSessionCurrent(session.generation), false);
+    await assert.rejects(client.request("turn/start", {}, { mutating: true }), AppServerUnavailableError);
+    await assert.rejects(client.request("turn/start", {}), AppServerUnavailableError);
+    await assert.rejects(client.request("unknown/write", {}), AppServerUnavailableError);
+    await assert.rejects(client.request("turn/start", {}, { mutating: true,
+      expectedGeneration: session.generation }), AppServerUnavailableError);
+    await assert.rejects(client.request("thread/read", {}, { expectedGeneration: session.generation }),
+      AppServerUnavailableError);
+    assert.equal(native.connections, 1, "a stale mutation generation must not reconnect itself");
+    assert.equal(native.methods.includes("turn/start"), false);
+    assert.deepEqual(await client.request("thread/read", {}), { ok: true });
+    assert.equal(native.connections, 2, "a read may intentionally reconnect");
+    const fresh = await client.initializedSession();
+    assert.ok(fresh.generation > session.generation);
+    assert.equal(client.isSessionCurrent(fresh.generation), true);
+    assert.deepEqual(await client.request("turn/start", {}, { mutating: true,
+      expectedGeneration: fresh.generation }), { ok: true });
+  } finally { await client.close(); await native.close(); }
+  assert.equal(client.isSessionCurrent(1), false);
+});
+
 test("detached profile rejects mismatched home and missing capability without a socket", async () => {
   const native = await fixture();
   const directory = path.resolve("test-detached-profile-invalid");

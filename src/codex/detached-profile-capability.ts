@@ -4,7 +4,7 @@ import path from "node:path";
 import { comparablePath } from "../core/paths.js";
 import { readWindowsProcessIdentity } from "../desktop/windows-process-identity.js";
 import { assertWindowsPrivateDirectory } from "../desktop/windows-private-directory.js";
-import { AppServerUnavailableError, type AppServerEnvelope, type AppServerRequestOptions,
+import { AppServerUnavailableError, type AppServerEnvelope, type AppServerInitializedSession, type AppServerRequestOptions,
   type AppServerRpc, type AppServerServerRequestHandler } from "./app-server-connection.js";
 import { createAppServerWebSocketConnection } from "./app-server-websocket-connection.js";
 
@@ -12,6 +12,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const TOKEN = /^[A-Za-z0-9_-]{16,512}$/u;
 const BIRTH = /^[1-9]\d{0,23}$/u;
 const MAX_DESCRIPTOR_BYTES = 4096;
+const PINNED_READ_METHODS = new Set(["account/read", "model/list", "thread/read",
+  "thread/turns/list", "thread/goal/get", "thread/queue/list", "config/read",
+  "configRequirements/read", "collaborationMode/list", "hooks/list"]);
 
 /** Published only after an independent native server has answered initialize.
  * A ready record is a locator, never evidence of a Codex writer lease. */
@@ -28,6 +31,14 @@ export interface DetachedProfileCapabilityDependencies {
   readonly readFile?: (file: string, limit: number) => string;
   readonly identity?: (pid: number) => Readonly<{ pid: number; birthTicks: string }> | null;
   readonly assertPrivateDirectory?: (directory: string) => void;
+}
+
+/** A pinned one-shot writer must fence the same initialized WebSocket session
+ * on every mutation; the descriptor alone does not prevent a reconnect. */
+export interface PinnedDetachedProfileRpc extends AppServerRpc {
+  initializedSession(): Promise<AppServerInitializedSession>;
+  isSessionCurrent(generation: number): boolean;
+  onDisconnect(listener: (error: Error) => void): () => void;
 }
 
 /** Stable private locator; never use a VK-supplied name as a path segment. */
@@ -169,7 +180,7 @@ export function inspectDetachedProfileBackend(privateDirectory: string,
  * epoch-specific token is deliberately absent from the public ready record. */
 function openDetachedProfileConnection(privateDirectory: string,
   home: string, dependencies: DetachedProfileCapabilityDependencies,
-  expected: DetachedProfileDescriptor | null): AppServerRpc {
+  expected: DetachedProfileDescriptor | null): PinnedDetachedProfileRpc {
   if (!path.isAbsolute(privateDirectory) || !path.isAbsolute(home) ||
     /[\x00-\x1f]/u.test(home)) throw new TypeError("Invalid detached profile scope");
   const read = dependencies.readFile ?? boundedRead;
@@ -218,6 +229,8 @@ function openDetachedProfileConnection(privateDirectory: string,
   const rpc = createAppServerWebSocketConnection(original.url, token, 30_000, assertCurrent);
   return {
     start: () => rpc.start(),
+    initializedSession: () => rpc.initializedSession(),
+    isSessionCurrent: generation => rpc.isSessionCurrent(generation),
     request(method: string, params?: Record<string, unknown>, options: AppServerRequestOptions = {}) {
       return rpc.request(method, params, { ...options,
         // An established WebSocket cannot be rebound to a different process.
@@ -237,15 +250,15 @@ function openDetachedProfileConnection(privateDirectory: string,
  * once attached, it never silently adopts a different epoch. */
 function createScopedDetachedProfileConnection(privateDirectory: string,
   home: string, dependencies: DetachedProfileCapabilityDependencies,
-  expected: DetachedProfileDescriptor | null): AppServerRpc {
+  expected: DetachedProfileDescriptor | null): PinnedDetachedProfileRpc {
   if (!path.isAbsolute(privateDirectory) || !path.isAbsolute(home) ||
     /[\x00-\x1f]/u.test(home)) throw new TypeError("Invalid detached profile scope");
-  let rpc: AppServerRpc | null = null;
+  let rpc: PinnedDetachedProfileRpc | null = null;
   let closed = false;
   let serverRequest: AppServerServerRequestHandler | null = null;
   const notifications = new Set<(notification: AppServerEnvelope) => void>();
   const disconnections = new Set<(error: Error) => void>();
-  const current = (): AppServerRpc => {
+  const current = (): PinnedDetachedProfileRpc => {
     if (closed) unavailable();
     if (!rpc) {
       const created = openDetachedProfileConnection(privateDirectory, home, dependencies, expected);
@@ -258,7 +271,17 @@ function createScopedDetachedProfileConnection(privateDirectory: string,
   };
   return {
     start: async () => current().start(),
-    request: async (method, params, options) => current().request(method, params, options),
+    initializedSession: async () => current().initializedSession(),
+    isSessionCurrent: generation => !closed && rpc !== null && rpc.isSessionCurrent(generation),
+    request: async (method, params, options = {}) => {
+      // A pinned descriptor fences the backend, but not a reconnect of this
+      // client's socket. All non-read requests need an explicitly qualified
+      // live generation; forgetting `mutating` must not bypass this boundary.
+      if (expected && (options.mutating === true || !PINNED_READ_METHODS.has(method)) &&
+        (options.mutating !== true || !Number.isSafeInteger(options.expectedGeneration) ||
+          !rpc?.isSessionCurrent(options.expectedGeneration!))) unavailable();
+      return current().request(method, params, options);
+    },
     onNotification(listener) { notifications.add(listener); return () => { notifications.delete(listener); }; },
     onDisconnect(listener) { disconnections.add(listener); return () => { disconnections.delete(listener); }; },
     onServerRequest(handler) { serverRequest = handler; rpc?.onServerRequest(handler); },
@@ -279,7 +302,7 @@ export function createDetachedProfileConnection(privateDirectory: string,
  * retain the existing descriptor/token and PID/birth fences. */
 export function createPinnedDetachedProfileConnection(privateDirectory: string,
   home: string, expected: DetachedProfileDescriptor,
-  dependencies: DetachedProfileCapabilityDependencies = {}): AppServerRpc {
+  dependencies: DetachedProfileCapabilityDependencies = {}): PinnedDetachedProfileRpc {
   const pin = exactDescriptor(expected, home);
   return createScopedDetachedProfileConnection(privateDirectory, home, dependencies, pin);
 }
