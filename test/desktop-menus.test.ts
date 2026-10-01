@@ -428,7 +428,7 @@ test("partial-migration project move preflights before native or legacy state mu
   await writeFile(statePath, original);
   const calls: string[] = [];
   const native = new NativeDesktopMetadata({ call: async method => { calls.push(method); return {}; } });
-  const metadata = new ProfileDesktopMetadata(() => home, () => native);
+  const metadata = new ProfileDesktopMetadata(() => home, () => native, undefined, "legacy-file");
   const error = await metadata.assignProject({ hostId: "local", threadId: "fixture" }, "new-project").catch(error => error);
   assert.deepEqual({ nativeCalls: calls.length, stateUnchanged: await readFile(statePath, "utf8") === original,
     rejected: error instanceof ActionRejectedError }, { nativeCalls: 0, stateUnchanged: true, rejected: true });
@@ -442,11 +442,10 @@ test("no-live project mode rejects assignment before legacy file access or nativ
   let nativeCalls = 0;
   let sourceHomeCalls = 0;
   const native = new NativeDesktopMetadata({ call: async () => { nativeCalls++; return {}; } });
-  const metadata = new ProfileDesktopMetadata(() => { sourceHomeCalls++; return home; }, () => native,
-    undefined, "no-live-legacy");
+  const metadata = new ProfileDesktopMetadata(() => { sourceHomeCalls++; return home; }, () => native);
   for (const projectId of ["new-project", null]) {
     await assert.rejects(metadata.assignProject({ hostId: "local", threadId: "fixture" }, projectId),
-      error => error instanceof ActionRejectedError && /диагностическ/iu.test(error.message));
+      error => error instanceof ActionRejectedError && /защитн/iu.test(error.message));
   }
   assert.equal(sourceHomeCalls, 0);
   assert.equal(nativeCalls, 0);
@@ -462,7 +461,7 @@ test("malformed legacy projectless IDs reject before native project mutation", a
   await writeFile(statePath, original);
   const calls: string[] = [];
   const native = new NativeDesktopMetadata({ call: async method => { calls.push(method); return {}; } });
-  const metadata = new ProfileDesktopMetadata(() => home, () => native);
+  const metadata = new ProfileDesktopMetadata(() => home, () => native, undefined, "legacy-file");
   await assert.rejects(metadata.assignProject({ hostId: "local", threadId: "fixture" }, "new-project"), DesktopUnavailableError);
   assert.deepEqual(calls, []);
   assert.equal(await readFile(statePath, "utf8"), original);

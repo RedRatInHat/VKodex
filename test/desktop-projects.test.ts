@@ -210,7 +210,7 @@ test("no-live-legacy catalog mode never imports live sidebar assignments", async
     "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } },
     "thread-project-assignments": { fixture: { projectKind: "local", projectId: "native-first" } },
   }));
-  const live = new LocalDesktopCatalog(home);
+  const live = new LocalDesktopCatalog(home, "legacy-file");
   assert.equal((await live.listTasks())[0]!.projectId, "native-first");
   const snapshot = await live.listSnapshot();
   assert.equal(snapshot.tasks.status, "fulfilled");
@@ -229,6 +229,7 @@ test("no-live-legacy catalog mode never imports live sidebar assignments", async
   const detached = new LocalDesktopCatalog(home, "no-live-legacy");
   assert.equal((await detached.listTasks())[0]!.projectId, undefined);
   assert.deepEqual((await detached.listProjects()).map(project => project.id), ["native-first", "native-second"]);
+  assert.equal((await new LocalDesktopCatalog(home).listTasks())[0]!.projectId, undefined);
   const combined = new MultiDesktopCatalog([home], () => detached);
   await combined.listTasks();
   assert.match(combined.catalogWarnings()[0]!, /назначения проектов задач неизвестны/u);
