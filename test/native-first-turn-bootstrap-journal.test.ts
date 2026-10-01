@@ -11,6 +11,10 @@ import { createPrivateKeyWithDependencies, loadPrivateKeyWithDependencies } from
 import { createNativeFirstTurnPrivateKey } from '../src/desktop/native-first-turn-private-key.js';
 import { reconcileUnknownNativeFirstTurnFromPinnedHistory } from
   '../src/desktop/native-first-turn-unknown-reconciler.js';
+import { observeNativeFirstTurnCandidate } from
+  '../src/desktop/native-first-turn-candidate-observation.js';
+import type { AuthenticatedProfileSourcePreflight } from
+  '../src/desktop/controlled-native-source-proof.js';
 import type { PinnedDetachedProfileRpc } from '../src/codex/detached-profile-capability.js';
 
 const identity = () => ({ sourceId: 'profile-a', sourceGeneration: randomUUID(),
@@ -184,6 +188,23 @@ test('unknown-turn reconciliation refuses an unbranded backend without reading o
   } as unknown as PinnedDetachedProfileRpc;
   await assert.rejects(reconcileUnknownNativeFirstTurnFromPinnedHistory(
     journal, operationId, fake));
+  assert.equal(reads, 0);
+  assert.deepEqual(journal.get(operationId), before);
+  journal.close();
+});
+
+test('first-turn candidate observation refuses an unbranded backend before native reads', async () => {
+  const journal = open(); const operationId = randomUUID();
+  journal.persistThreadStartIntent({ operationId, ...identity() });
+  journal.markThreadStartWriteFencePassed(operationId);
+  journal.persistThreadAccepted({ operationId, expectedRevision: 1, threadId: randomUUID() });
+  const before = journal.get(operationId);
+  let reads = 0;
+  const fake = { initializedSession: async () => ({ generation: 1 }),
+    isSessionCurrent: () => true, request: async () => { reads++; return {}; },
+  } as unknown as PinnedDetachedProfileRpc;
+  await assert.rejects(observeNativeFirstTurnCandidate(journal, operationId, fake,
+    {} as AuthenticatedProfileSourcePreflight));
   assert.equal(reads, 0);
   assert.deepEqual(journal.get(operationId), before);
   journal.close();

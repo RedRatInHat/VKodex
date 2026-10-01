@@ -20,6 +20,8 @@ import { NativeFirstTurnBootstrapJournal } from
 import { prepareNativeFirstThreadStart } from '../../src/desktop/native-first-turn-thread-start.js';
 import { dispatchPreparedNativeFirstThreadStartCanary } from
   '../../src/desktop/native-first-thread-start-canary.js';
+import { observeNativeFirstTurnCandidate } from
+  '../../src/desktop/native-first-turn-candidate-observation.js';
 import { readWindowsProcessIdentity } from '../../src/desktop/windows-process-identity.js';
 import { privateDirectoryAclVerificationScript, WINDOWS_PRIVATE_DIRECTORY_DIRECT_TIMEOUT_MS } from
   '../../src/desktop/windows-private-directory.js';
@@ -68,6 +70,7 @@ test('Windows production-pinned authenticated source permits one fenced first th
   const serverListening = new Promise<void>(resolve => server.once('listening', resolve));
   let serverError: unknown;
   let startRequests = 0;
+  let queueHasPendingItem = false;
   const methods: string[] = [];
   const sockets = new Set<WebSocket>();
   let journal: NativeFirstTurnBootstrapJournal | undefined;
@@ -144,15 +147,46 @@ test('Windows production-pinned authenticated source permits one fenced first th
               socket.send(JSON.stringify({ id: message.id, result: { serverInfo: { name: 'loopback-test' } } }));
               return;
             }
-            if (message.method !== 'thread/start') throw new Error('Unexpected native request method');
-            startRequests++;
-            assert.deepEqual(message.params, compileControlledNativeStartParams(policy));
-            const reopened = new NativeFirstTurnBootstrapJournal(journalPath);
-            try {
-              assert.equal(reopened.getThreadStartFenceStatus(scope.operationId), 'passed');
-              assert.equal(reopened.get(scope.operationId)?.state, 'thread-reserved');
-            } finally { reopened.close(); }
-            socket.send(JSON.stringify({ id: message.id, result: response }));
+            if (message.method === 'thread/start') {
+              startRequests++;
+              assert.deepEqual(message.params, compileControlledNativeStartParams(policy));
+              const reopened = new NativeFirstTurnBootstrapJournal(journalPath);
+              try {
+                assert.equal(reopened.getThreadStartFenceStatus(scope.operationId), 'passed');
+                assert.equal(reopened.get(scope.operationId)?.state, 'thread-reserved');
+              } finally { reopened.close(); }
+              socket.send(JSON.stringify({ id: message.id, result: response }));
+              return;
+            }
+            if (message.method === 'thread/read') {
+              assert.deepEqual(message.params, { threadId, includeTurns: false });
+              socket.send(JSON.stringify({ id: message.id, result: {
+                thread: { id: threadId, status: { type: 'idle' }, turns: [] },
+              } }));
+              return;
+            }
+            if (message.method === 'thread/turns/list') {
+              assert.deepEqual(message.params, { threadId, limit: 2,
+                sortDirection: 'asc', itemsView: 'summary' });
+              socket.send(JSON.stringify({ id: message.id, result: {
+                data: [], nextCursor: null, backwardsCursor: null,
+              } }));
+              return;
+            }
+            if (message.method === 'thread/goal/get') {
+              assert.deepEqual(message.params, { threadId });
+              socket.send(JSON.stringify({ id: message.id, result: { goal: null } }));
+              return;
+            }
+            if (message.method === 'thread/queue/list') {
+              assert.deepEqual(message.params, { threadId, limit: 2 });
+              socket.send(JSON.stringify({ id: message.id, result: {
+                data: queueHasPendingItem ? [{ id: 'pending-queue-item' }] : [],
+                nextCursor: null,
+              } }));
+              return;
+            }
+            throw new Error('Unexpected native request method');
           })().catch(error => { serverError = error; socket.close(1011); });
         });
       } catch (error) { serverError = error; socket.close(1011); }
@@ -178,8 +212,32 @@ test('Windows production-pinned authenticated source permits one fenced first th
     assert.equal(outcome.record.state, 'thread-accepted');
     assert.equal(outcome.record.threadId, threadId);
     assert.equal(startRequests, 1);
-    assert.equal(methods.filter(method => method === 'thread/start').length, 1);
-    assert.deepEqual(methods.filter(method => method !== 'initialized'), ['initialize', 'thread/start']);
+    const initialized = await client.initializedSession();
+    const idle = await observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight);
+    assert.deepEqual(idle, { operationId: scope.operationId, threadId,
+      backendGeneration: initialized.generation, journalRevision: 2, idleAndEmpty: true });
+    assert.ok(Number.isSafeInteger(idle.backendGeneration) && idle.backendGeneration > 0);
+    const nativeMethods = () => methods.filter(method => method !== 'initialized');
+    const qualifiedMethods = ['initialize', 'thread/start', 'thread/read', 'thread/turns/list',
+      'thread/goal/get', 'thread/queue/list', 'thread/read'];
+    assert.deepEqual(nativeMethods(), qualifiedMethods);
+
+    queueHasPendingItem = true;
+    await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),
+      /Native first-turn idle state unqualified/u);
+    assert.equal(serverError, undefined);
+    assert.deepEqual(nativeMethods(), [...qualifiedMethods, 'thread/read', 'thread/turns/list',
+      'thread/goal/get', 'thread/queue/list']);
+    assert.equal(startRequests, 1);
+    assert.equal(nativeMethods().filter(method => method === 'thread/start').length, 1);
+    assert.equal(nativeMethods().some(method => method === 'turn/start' || method === 'model/turn/start'), false);
+
+    const beforeReservation = nativeMethods();
+    journal.reserveFirstTurn({ operationId: scope.operationId, expectedRevision: 2,
+      clientUserMessageId: 'reserved-only', keyedFingerprint: 'a'.repeat(64) });
+    await assert.rejects(observeNativeFirstTurnCandidate(journal, scope.operationId, client, preflight),
+      /Native first-turn candidate unqualified/u);
+    assert.deepEqual(nativeMethods(), beforeReservation);
   } finally {
     await client?.close();
     journal?.close();
