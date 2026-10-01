@@ -7,11 +7,11 @@ import type { AppServerRpc } from '../codex/app-server-connection.js';
 import { approveTaskPolicy, assertEffectiveResume, type ApprovedTaskPolicy } from
   '../codex/managed-task-policy.js';
 import { comparablePath } from '../core/paths.js';
-import { captureAuthenticatedProfileSourcePreflight, captureControlledNativeSourcePreflight,
+import { assertAuthenticatedProfileSourcePreflightForWrite, captureAuthenticatedProfileSourcePreflight, captureControlledNativeSourcePreflight,
   loadAuthenticatedProfileSourcePreflightReceipt, loadControlledNativeSourcePreflightReceipt,
   persistAuthenticatedProfileSourcePreflightReceipt, persistControlledNativeSourcePreflightReceipt,
   proveAuthenticatedProfileSource, proveControlledNativeSource,
-  type ControlledNativeSourceIdentity } from './controlled-native-source-proof.js';
+  type AuthenticatedProfileSourcePreflight, type ControlledNativeSourceIdentity } from './controlled-native-source-proof.js';
 
 type Row = Record<string, unknown>;
 export type PolicyTemplate = Omit<ApprovedTaskPolicy, 'threadId' | 'serviceTier' | 'environments'> & Readonly<{
@@ -401,6 +401,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
   const reservation = await options.persistIntent(intent);
   if (!reservation || typeof reservation.isCurrent !== 'function' ||
     reservation.isCurrent() !== true) refuse();
+  let authenticatedPreflight: AuthenticatedProfileSourcePreflight | undefined;
   if (options.sourceProof) {
     const identity: ControlledNativeSourceIdentity = { operationId: intent.operationId,
       sourceId: intent.sourceId, sourceGeneration: intent.sourceGeneration };
@@ -409,6 +410,7 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
         options.sourceProof.sourceHome, requestedPolicy.cwd);
       if (reservation.isCurrent() !== true) refuse();
       await persistAuthenticatedProfileSourcePreflightReceipt(options.sourceProof.preflightReceiptPath, preflight);
+      authenticatedPreflight = preflight;
     } else {
       const preflight = await captureControlledNativeSourcePreflight(identity,
         options.sourceProof.sourceHome, requestedPolicy.cwd);
@@ -433,6 +435,11 @@ export async function createControlledNativeTask(options: ControlledNativeTaskCr
       mutating: true, expectedGeneration: session.generation,
       assertBeforeWrite: () => {
         if (!options.rpc.isSessionCurrent(session.generation) || reservation.isCurrent() !== true) refuse();
+        if (options.sourceProof?.mode === 'authenticated-profile-new-task') {
+          const preflight = authenticatedPreflight ?? refuse();
+          assertAuthenticatedProfileSourcePreflightForWrite(preflight, intent,
+            options.sourceProof.sourceHome, requestedPolicy.cwd);
+        }
       },
     });
     const candidateId = row(start.thread) ? start.thread.id : null;

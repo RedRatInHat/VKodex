@@ -4,7 +4,7 @@ import { comparablePath } from '../core/paths.js';
 import type { ApprovedTaskPolicy } from '../codex/managed-task-policy.js';
 import { ControlledNativeCreationJournal, type ControlledCreationJournalRecord } from
   './controlled-native-creation-journal.js';
-import { loadAuthenticatedProfileSourcePreflightReceipt, loadControlledNativeSourcePreflightReceipt,
+import { assertAuthenticatedProfileSourcePreflightForWrite, loadAuthenticatedProfileSourcePreflightReceipt, loadControlledNativeSourcePreflightReceipt,
   proveAuthenticatedProfileSource, proveControlledNativeSource } from
   './controlled-native-source-proof.js';
 
@@ -56,6 +56,10 @@ export async function verifyControlledNativeCliSourceScope(scope: ControlledNati
     if (mode === 'authenticated-profile-new-task') {
       const preflight = await loadAuthenticatedProfileSourcePreflightReceipt(state.preflightReceiptPath,
         identity, state.sourceHome, state.workspace).catch(() => refuse('preflight'));
+      // A scope is write-capable. Legacy v2 receipts are retained only for
+      // read-only candidate reconciliation and cannot establish this handle.
+      try { assertAuthenticatedProfileSourcePreflightForWrite(preflight, identity, state.sourceHome, state.workspace); }
+      catch { return refuse('preflight-write'); }
       const proof = await proveAuthenticatedProfileSource(preflight, qualified.rolloutPath, qualified.threadId)
         .catch(() => refuse('rollout'));
       return { preflight, proof };

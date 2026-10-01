@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -669,6 +669,34 @@ test('authenticated-profile opt-in selects the exact returned task from a popula
     assert.equal(restored?.intent.sourceProofMode, 'authenticated-profile-new-task');
     assert.equal(restored?.qualified?.threadId, taskId);
     assert.equal(await realpath(restored!.qualified!.rolloutPath), await realpath(nativePath));
+  } finally { journal.close(); }
+});
+
+test('authenticated-profile workspace replacement rejects immediately before thread/start with zero writes', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'vkodex-controlled-auth-workspace-'));
+  const sourceHome = path.join(root, 'home'), workspace = path.join(root, 'workspace');
+  const preflightReceiptPath = path.join(root, 'preflight.json');
+  mkdirSync(path.join(sourceHome, 'sessions'), { recursive: true }); mkdirSync(workspace);
+  writeFileSync(path.join(sourceHome, 'sessions', 'legacy.jsonl'), '{"legacy":true}\n');
+  const journal = new ControlledNativeCreationJournal(path.join(root, 'creation.sqlite'));
+  let writes = 0, replaced = false;
+  const rpc = { async initializedSession() {
+      if (!replaced) { renameSync(workspace, path.join(root, 'replaced-workspace')); mkdirSync(workspace); replaced = true; }
+      return { generation: 1 };
+    }, isSessionCurrent: (generation: number) => generation === 1,
+    async request(method: string, _params: Record<string, unknown>, options?: { assertBeforeWrite?: () => void }) {
+      assert.equal(method, 'thread/start');
+      options?.assertBeforeWrite?.(); writes++;
+      return startResult;
+    } } as unknown as ControlledNativeTaskCreatorOptions['rpc'];
+  try {
+    await assert.rejects(createControlledNativeTask({ rpc, operationId: randomUUID(), sourceId: 'authenticated-profile',
+      requestedPolicy: { ...template, cwd: workspace, runtimeWorkspaceRoots: [workspace] },
+      persistIntent: intent => journal.persistIntent(intent), persistStarted: started => journal.persistStarted(started),
+      persistQualified: qualified => journal.persistQualified(qualified),
+      resolveSource: async () => { throw new Error('uncontrolled resolver'); },
+      sourceProof: { mode: 'authenticated-profile-new-task', sourceHome, preflightReceiptPath } }));
+    assert.equal(writes, 0);
   } finally { journal.close(); }
 });
 

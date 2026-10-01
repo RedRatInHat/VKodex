@@ -8,6 +8,7 @@ import { ControlledNativeCreationJournal } from '../src/desktop/controlled-nativ
 import type { ControlledCreationIntent, ControlledCreationStarted,
   ControlledCreationReceipt } from '../src/desktop/controlled-native-task-creator.js';
 import { captureControlledNativeSourcePreflight, ControlledNativeSourceUnqualifiedError,
+  assertAuthenticatedProfileSourcePreflightForWrite,
   captureAuthenticatedProfileSourcePreflight,
   loadAuthenticatedProfileSourcePreflightReceipt,
   loadControlledNativeSourcePreflightReceipt, persistControlledNativeSourcePreflightReceipt,
@@ -35,6 +36,41 @@ async function rollout(home: string, id: string, cwd: string, name = id) {
   return file;
 }
 const rejected = (promise: Promise<unknown>) => assert.rejects(promise, ControlledNativeSourceUnqualifiedError);
+
+test('authenticated-profile final pre-write check accepts only its captured preflight receipt', async () => {
+  const f = await setup();
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  assert.doesNotThrow(() => assertAuthenticatedProfileSourcePreflightForWrite(preflight, identity, f.home, f.workspace));
+  const cloned = Object.freeze({ ...preflight, identity: Object.freeze({ ...preflight.identity }) });
+  assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(cloned, identity, f.home, f.workspace),
+    ControlledNativeSourceUnqualifiedError);
+});
+
+test('authenticated-profile final pre-write check requires the exact expected identity', async () => {
+  const f = await setup();
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  const wrongIdentity = { ...identity, sourceGeneration: '00000000-0000-4000-8000-000000000099' };
+  assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(preflight, wrongIdentity, f.home, f.workspace),
+    ControlledNativeSourceUnqualifiedError);
+});
+
+test('authenticated-profile final pre-write check rejects a replaced home', async () => {
+  const f = await setup();
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  await rename(f.home, path.join(f.root, 'replaced-home'));
+  await mkdir(path.join(f.home, 'sessions'), { recursive: true });
+  assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(preflight, identity, f.home, f.workspace),
+    ControlledNativeSourceUnqualifiedError);
+});
+
+test('authenticated-profile final pre-write check rejects a replaced workspace', async () => {
+  const f = await setup();
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  await rename(f.workspace, path.join(f.root, 'replaced-workspace'));
+  await mkdir(f.workspace);
+  assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(preflight, identity, f.home, f.workspace),
+    ControlledNativeSourceUnqualifiedError);
+});
 
 test('header-only rollout qualifies after a recorded empty preflight without state sqlite', async () => {
   const f = await setup();
@@ -187,6 +223,13 @@ test('CLI source scope requires explicit authenticated-profile opt-in and then v
     assert.equal(scope.taskId, threadA);
     await verifyControlledNativeCliSourceScope(scope, { taskId: threadA,
       home: f.home, cwd: f.workspace, approvedTaskPolicy: effectivePolicy });
+    const legacy = JSON.parse(await import('node:fs/promises').then(({ readFile }) => readFile(receiptPath, 'utf8'))) as Record<string, unknown>;
+    legacy.schemaVersion = 2;
+    delete legacy.workspaceDev; delete legacy.workspaceIno; delete legacy.workspaceBirthtimeMs;
+    await writeFile(receiptPath, JSON.stringify(legacy));
+    await assert.rejects(verifyControlledNativeCliSourceScope(scope, { taskId: threadA,
+      home: f.home, cwd: f.workspace, approvedTaskPolicy: effectivePolicy }), /scope/i);
+    await assert.rejects(deriveControlledNativeCliSourceScope({ ...options, allowAuthenticatedProfile: true }), /scope/i);
   } finally { journal.close(); }
 });
 
@@ -309,4 +352,19 @@ test('authenticated-profile durable receipt recovers candidate-only proof after 
   const restored = await loadAuthenticatedProfileSourcePreflightReceipt(receipt, identity, f.home, f.workspace);
   assert.equal((await proveAuthenticatedProfileSource(restored, candidate, threadA)).rolloutPath,
     await import('node:fs/promises').then(({ realpath }) => realpath(candidate)));
+});
+
+test('legacy authenticated-profile v2 receipt remains read-only reconcilable but cannot authorize a write', async () => {
+  const f = await setup(), receipt = path.join(f.root, 'authenticated-profile-receipt.json');
+  const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  await persistAuthenticatedProfileSourcePreflightReceipt(receipt, preflight);
+  const legacy = JSON.parse(await import('node:fs/promises').then(({ readFile }) => readFile(receipt, 'utf8'))) as Record<string, unknown>;
+  legacy.schemaVersion = 2;
+  delete legacy.workspaceDev; delete legacy.workspaceIno; delete legacy.workspaceBirthtimeMs;
+  await writeFile(receipt, JSON.stringify(legacy));
+  const candidate = await rollout(f.home, threadA, f.workspace);
+  const restored = await loadAuthenticatedProfileSourcePreflightReceipt(receipt, identity, f.home, f.workspace);
+  assert.equal((await proveAuthenticatedProfileSource(restored, candidate, threadA)).threadId, threadA);
+  assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(restored, identity, f.home, f.workspace),
+    ControlledNativeSourceUnqualifiedError);
 });

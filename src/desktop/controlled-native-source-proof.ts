@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { lstat, open, realpath, readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { comparablePath } from '../core/paths.js';
@@ -9,7 +10,8 @@ const MAX_ROLLOUT_FILES = 128;
 const MAX_SOURCE_ENTRIES = 1024;
 const MAX_SOURCE_DEPTH = 16;
 const MAX_RECEIPT_BYTES = 16 * 1024;
-const AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION = 2;
+const AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION = 3;
+const LEGACY_AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION = 2;
 const AUTHENTICATED_PROFILE_BIRTHTIME_TOLERANCE_MS = 5_000;
 /** This proof is deliberately single-candidate, never an inventory claim. */
 const MAX_AUTHENTICATED_PROFILE_CLAIMS = 1;
@@ -64,6 +66,8 @@ export interface AuthenticatedProfileSourcePreflight {
   readonly workspace: string;
   readonly capturedAtMs: number;
   readonly sourceHomeIdentity: FileSystemIdentity;
+  /** Missing only on a v2 receipt loaded for read-only reconciliation. */
+  readonly workspaceIdentity?: FileSystemIdentity;
 }
 
 export interface AuthenticatedProfileSourceProof {
@@ -117,6 +121,26 @@ function identityOf(metadata: { dev: bigint; ino: bigint; birthtimeMs: bigint })
 
 function sameFileSystemIdentity(left: FileSystemIdentity, right: FileSystemIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
+}
+
+function checkedRealDirectorySync(value: string): string {
+  if (typeof value !== 'string' || !absolute(value)) refuse();
+  let metadata: ReturnType<typeof lstatSync>, resolved: string;
+  try {
+    metadata = lstatSync(value);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) refuse();
+    resolved = realpathSync(value);
+  } catch { return refuse(); }
+  return resolved;
+}
+
+function checkedDirectoryIdentitySync(value: string): Readonly<{ path: string; identity: FileSystemIdentity }> {
+  const resolved = checkedRealDirectorySync(value);
+  let metadata: ReturnType<typeof statSync>;
+  try { metadata = statSync(resolved, { bigint: true }); }
+  catch { return refuse(); }
+  if (!metadata.isDirectory()) refuse();
+  return Object.freeze({ path: resolved, identity: identityOf(metadata) });
 }
 
 async function checkedDirectoryIdentity(value: string): Promise<Readonly<{ path: string; identity: FileSystemIdentity }>> {
@@ -350,37 +374,67 @@ export async function proveControlledNativeSource(preflight: ControlledSourcePre
 export async function captureAuthenticatedProfileSourcePreflight(identity: ControlledNativeSourceIdentity,
   sourceHome: string, workspace: string): Promise<AuthenticatedProfileSourcePreflight> {
   if (!validIdentity(identity)) refuse();
-  const [home, work] = await Promise.all([checkedDirectoryIdentity(sourceHome), checkedRealDirectory(workspace)]);
-  const preflight = Object.freeze({ identity: Object.freeze({ ...identity }), sourceHome: home.path, workspace: work,
-    capturedAtMs: Date.now(), sourceHomeIdentity: home.identity });
+  const [home, work] = await Promise.all([checkedDirectoryIdentity(sourceHome), checkedDirectoryIdentity(workspace)]);
+  const preflight = Object.freeze({ identity: Object.freeze({ ...identity }), sourceHome: home.path, workspace: work.path,
+    capturedAtMs: Date.now(), sourceHomeIdentity: home.identity, workspaceIdentity: work.identity });
   brand.add(preflight);
   return preflight;
 }
 
 function validProfilePreflight(preflight: AuthenticatedProfileSourcePreflight): boolean {
-  const pin = preflight.sourceHomeIdentity;
+  if (!preflight || typeof preflight !== 'object') return false;
+  const pin = preflight.sourceHomeIdentity, workspacePin = preflight.workspaceIdentity;
   return brand.has(preflight) && validIdentity(preflight.identity) && typeof preflight.sourceHome === 'string' &&
     typeof preflight.workspace === 'string' && Number.isSafeInteger(preflight.capturedAtMs) && preflight.capturedAtMs >= 0 &&
     pin !== null && typeof pin === 'object' && typeof pin.dev === 'bigint' && typeof pin.ino === 'bigint' &&
-    typeof pin.birthtimeMs === 'bigint' && pin.birthtimeMs >= 0n;
+    typeof pin.birthtimeMs === 'bigint' && pin.birthtimeMs >= 0n && (workspacePin === undefined ||
+      workspacePin !== null && typeof workspacePin === 'object' && typeof workspacePin.dev === 'bigint' &&
+      typeof workspacePin.ino === 'bigint' && typeof workspacePin.birthtimeMs === 'bigint' && workspacePin.birthtimeMs >= 0n);
+}
+
+/**
+ * Performs the final synchronous, read-only gate immediately before a caller
+ * writes through an authenticated-profile source. It intentionally does not
+ * replace the asynchronous candidate proof.
+ */
+export function assertAuthenticatedProfileSourcePreflightForWrite(preflight: AuthenticatedProfileSourcePreflight,
+  expectedIdentity: ControlledNativeSourceIdentity, expectedSourceHome: string, expectedWorkspace: string): void {
+  if (!validProfilePreflight(preflight) || !validIdentity(expectedIdentity) ||
+    typeof expectedSourceHome !== 'string' || typeof expectedWorkspace !== 'string') refuse();
+  const workspacePin = preflight.workspaceIdentity ?? refuse();
+  const home = checkedDirectoryIdentitySync(preflight.sourceHome);
+  const workspace = checkedDirectoryIdentitySync(preflight.workspace);
+  const expectedHome = checkedDirectoryIdentitySync(expectedSourceHome);
+  const expectedWork = checkedDirectoryIdentitySync(expectedWorkspace);
+  if (!sameIdentity(preflight.identity, expectedIdentity) || !equalPath(home.path, preflight.sourceHome) ||
+    !equalPath(workspace.path, preflight.workspace) || !equalPath(home.path, expectedHome.path) ||
+    !equalPath(workspace.path, expectedWork.path) || !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity) ||
+    !sameFileSystemIdentity(home.identity, expectedHome.identity) ||
+    !sameFileSystemIdentity(workspace.identity, workspacePin) ||
+    !sameFileSystemIdentity(workspace.identity, expectedWork.identity)) refuse();
 }
 
 function profileReceipt(preflight: AuthenticatedProfileSourcePreflight): string {
+  const workspacePin = preflight.workspaceIdentity ?? refuse();
   return JSON.stringify({ schemaVersion: AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION,
     operationId: preflight.identity.operationId, sourceId: preflight.identity.sourceId,
     sourceGeneration: preflight.identity.sourceGeneration, sourceHome: preflight.sourceHome,
     workspace: preflight.workspace, capturedAtMs: preflight.capturedAtMs,
     sourceHomeDev: preflight.sourceHomeIdentity.dev.toString(), sourceHomeIno: preflight.sourceHomeIdentity.ino.toString(),
-    sourceHomeBirthtimeMs: preflight.sourceHomeIdentity.birthtimeMs.toString() });
+    sourceHomeBirthtimeMs: preflight.sourceHomeIdentity.birthtimeMs.toString(),
+    workspaceDev: workspacePin.dev.toString(), workspaceIno: workspacePin.ino.toString(),
+    workspaceBirthtimeMs: workspacePin.birthtimeMs.toString() });
 }
 
 /** Persists a versioned receipt for the candidate-only authenticated-profile variant. */
 export async function persistAuthenticatedProfileSourcePreflightReceipt(filePath: string,
   preflight: AuthenticatedProfileSourcePreflight): Promise<void> {
   if (!validProfilePreflight(preflight) || !absolute(filePath)) refuse();
-  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedRealDirectory(preflight.workspace)]);
-  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace, preflight.workspace) ||
-    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity)) refuse();
+  const workspacePin = preflight.workspaceIdentity ?? refuse();
+  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedDirectoryIdentity(preflight.workspace)]);
+  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace.path, preflight.workspace) ||
+    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity) ||
+    !sameFileSystemIdentity(workspace.identity, workspacePin)) refuse();
   const lexical = path.resolve(filePath), parent = await checkedRealDirectory(path.dirname(lexical));
   const name = path.basename(lexical);
   if (!name || name === '.' || name === '..') refuse();
@@ -413,14 +467,22 @@ export async function loadAuthenticatedProfileSourcePreflightReceipt(filePath: s
   } catch { refuse(); }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) refuse();
   const item = parsed as Record<string, unknown>;
-  const keys = ['schemaVersion', 'operationId', 'sourceId', 'sourceGeneration', 'sourceHome', 'workspace', 'capturedAtMs',
-    'sourceHomeDev', 'sourceHomeIno', 'sourceHomeBirthtimeMs'];
+  const legacy = item.schemaVersion === LEGACY_AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION;
+  const keys = legacy
+    ? ['schemaVersion', 'operationId', 'sourceId', 'sourceGeneration', 'sourceHome', 'workspace', 'capturedAtMs',
+      'sourceHomeDev', 'sourceHomeIno', 'sourceHomeBirthtimeMs']
+    : ['schemaVersion', 'operationId', 'sourceId', 'sourceGeneration', 'sourceHome', 'workspace', 'capturedAtMs',
+      'sourceHomeDev', 'sourceHomeIno', 'sourceHomeBirthtimeMs', 'workspaceDev', 'workspaceIno', 'workspaceBirthtimeMs'];
   const pin = { dev: decimalBigInt(item.sourceHomeDev), ino: decimalBigInt(item.sourceHomeIno),
     birthtimeMs: decimalBigInt(item.sourceHomeBirthtimeMs) };
+  const workspacePin = { dev: decimalBigInt(item.workspaceDev), ino: decimalBigInt(item.workspaceIno),
+    birthtimeMs: decimalBigInt(item.workspaceBirthtimeMs) };
   if (Reflect.ownKeys(item).length !== keys.length || !keys.every(key => Object.hasOwn(item, key)) ||
-    item.schemaVersion !== AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION || typeof item.sourceHome !== 'string' ||
+    (!legacy && item.schemaVersion !== AUTHENTICATED_PROFILE_RECEIPT_SCHEMA_VERSION) || typeof item.sourceHome !== 'string' ||
     typeof item.workspace !== 'string' || typeof item.capturedAtMs !== 'number' || !Number.isSafeInteger(item.capturedAtMs) ||
     item.capturedAtMs < 0 || pin.dev === undefined || pin.ino === undefined || pin.birthtimeMs === undefined || pin.birthtimeMs < 0n ||
+    (!legacy && (workspacePin.dev === undefined || workspacePin.ino === undefined || workspacePin.birthtimeMs === undefined ||
+      workspacePin.birthtimeMs < 0n)) ||
     !validIdentity({ operationId: item.operationId, sourceId: item.sourceId, sourceGeneration: item.sourceGeneration }) ||
     !sameIdentity({ operationId: item.operationId as string, sourceId: item.sourceId as string,
       sourceGeneration: item.sourceGeneration as string }, expectedIdentity)) refuse();
@@ -428,12 +490,16 @@ export async function loadAuthenticatedProfileSourcePreflightReceipt(filePath: s
     receiptCapturedAtMs = item.capturedAtMs as number,
     receiptPin = { dev: pin.dev as bigint, ino: pin.ino as bigint, birthtimeMs: pin.birthtimeMs as bigint };
   const [home, work, expectedHome, expectedWork] = await Promise.all([checkedDirectoryIdentity(receiptHome),
-    checkedRealDirectory(receiptWorkspace), checkedDirectoryIdentity(expectedSourceHome), checkedRealDirectory(expectedWorkspace)]);
-  if (!equalPath(home.path, expectedHome.path) || !equalPath(work, expectedWork) ||
+    checkedDirectoryIdentity(receiptWorkspace), checkedDirectoryIdentity(expectedSourceHome), checkedDirectoryIdentity(expectedWorkspace)]);
+  if (!equalPath(home.path, expectedHome.path) || !equalPath(work.path, expectedWork.path) ||
     !sameFileSystemIdentity(home.identity, expectedHome.identity) ||
-    !sameFileSystemIdentity(home.identity, receiptPin)) refuse();
-  const preflight = Object.freeze({ identity: Object.freeze({ ...expectedIdentity }), sourceHome: home.path, workspace: work,
-    capturedAtMs: receiptCapturedAtMs, sourceHomeIdentity: Object.freeze(receiptPin) });
+    !sameFileSystemIdentity(home.identity, receiptPin) || (!legacy &&
+      !sameFileSystemIdentity(work.identity, { dev: workspacePin.dev as bigint, ino: workspacePin.ino as bigint,
+        birthtimeMs: workspacePin.birthtimeMs as bigint }))) refuse();
+  const preflight = Object.freeze({ identity: Object.freeze({ ...expectedIdentity }), sourceHome: home.path, workspace: work.path,
+    capturedAtMs: receiptCapturedAtMs, sourceHomeIdentity: Object.freeze(receiptPin),
+    ...(!legacy ? { workspaceIdentity: Object.freeze({ dev: workspacePin.dev as bigint, ino: workspacePin.ino as bigint,
+      birthtimeMs: workspacePin.birthtimeMs as bigint }) } : {}) });
   brand.add(preflight);
   return preflight;
 }
@@ -446,20 +512,22 @@ export async function proveAuthenticatedProfileSource(preflight: AuthenticatedPr
   observedNativePath: string, threadId: string): Promise<AuthenticatedProfileSourceProof> {
   if (!validProfilePreflight(preflight) || typeof observedNativePath !== 'string' || !absolute(observedNativePath) ||
     typeof threadId !== 'string' || !UUID.test(threadId)) refuse();
-  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedRealDirectory(preflight.workspace)]);
-  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace, preflight.workspace) ||
-    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity)) refuse();
+  const [home, workspace] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome), checkedDirectoryIdentity(preflight.workspace)]);
+  if (!equalPath(home.path, preflight.sourceHome) || !equalPath(workspace.path, preflight.workspace) ||
+    !sameFileSystemIdentity(home.identity, preflight.sourceHomeIdentity) ||
+    (preflight.workspaceIdentity !== undefined && !sameFileSystemIdentity(workspace.identity, preflight.workspaceIdentity))) refuse();
   const candidate = await checkedProfileCandidate(home.path, observedNativePath);
   const earliestAllowedBirthtime = BigInt(Math.max(0, preflight.capturedAtMs - AUTHENTICATED_PROFILE_BIRTHTIME_TOLERANCE_MS));
   if (candidate.header.id !== threadId || candidate.identity.birthtimeMs < earliestAllowedBirthtime) refuse();
   const candidateWorkspace = await checkedRealDirectory(candidate.header.cwd);
-  if (!equalPath(candidateWorkspace, workspace)) refuse();
+  if (!equalPath(candidateWorkspace, workspace.path)) refuse();
   const [recheckedHome, recheckedWorkspace, recheckedCandidate] = await Promise.all([checkedDirectoryIdentity(preflight.sourceHome),
-    checkedRealDirectory(preflight.workspace), checkedProfileCandidate(home.path, observedNativePath)]);
+    checkedDirectoryIdentity(preflight.workspace), checkedProfileCandidate(home.path, observedNativePath)]);
   if (!sameFileSystemIdentity(recheckedHome.identity, preflight.sourceHomeIdentity) ||
     !sameFileSystemIdentity(recheckedCandidate.identity, candidate.identity) ||
     recheckedCandidate.headerSha256 !== candidate.headerSha256 || recheckedCandidate.header.id !== candidate.header.id ||
-    !equalPath(recheckedWorkspace, workspace) || !equalPath(recheckedCandidate.header.cwd, candidate.header.cwd) ||
+    !equalPath(recheckedWorkspace.path, workspace.path) || !equalPath(recheckedCandidate.header.cwd, candidate.header.cwd) ||
+    (preflight.workspaceIdentity !== undefined && !sameFileSystemIdentity(recheckedWorkspace.identity, preflight.workspaceIdentity)) ||
     !equalPath(recheckedCandidate.path, candidate.path)) refuse();
   const claim = authenticatedProfileClaims.get(preflight);
   if (claim !== undefined && (claim.threadId !== threadId || !equalPath(claim.path, candidate.path) ||
