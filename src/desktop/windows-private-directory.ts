@@ -28,7 +28,8 @@ export interface WindowsPrivateDirectoryAfterAclDependencies {
   readonly workerTimeoutMs?: number;
 }
 
-const checkScript = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().Trim();" +
+/** Shared rule for both standalone reads and the write-path's in-process ACL installation. */
+export const privateDirectoryAclVerificationScript =
   "$entry=Get-Item -LiteralPath $p -Force;" +
   "if($entry.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 10};" +
   "if(-not $entry.PSIsContainer){exit 11};" +
@@ -43,6 +44,14 @@ const checkScript = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().
   "($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne " +
   "[Security.AccessControl.FileSystemRights]::FullControl){exit 15};$seen[$sid]=$true};" +
   "if(-not $seen[$me]){exit 16};if(-not $seen['S-1-5-18']){exit 17};[Console]::Out.Write('OK')";
+
+const checkScript = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().Trim();" +
+  privateDirectoryAclVerificationScript;
+
+/** Reject PowerShell warnings, partial output, or any other success-shaped text. */
+export function isWindowsPrivateDirectoryAclAck(output: Uint8Array): boolean {
+  return output.byteLength === 2 && output[0] === 0x4f && output[1] === 0x4b;
+}
 
 function aclDiagnostic(status: number | null): WindowsPrivateDirectoryDiagnostic {
   switch (status) {

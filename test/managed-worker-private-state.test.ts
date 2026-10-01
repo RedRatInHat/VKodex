@@ -6,8 +6,8 @@ import { mkdir, mkdtemp, readFile, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createManagedWorkerPrivateState, loadManagedWorkerPrivateState, type ManagedWorkerPrivateManifest, type ManagedWorkerPrivateStateFilesystem, type ManagedWorkerPrivateStateProtector, type ManagedWorkerPrivateStatePowerShellRunner } from "../src/desktop/managed-worker-private-state.js";
-import { assertWindowsPrivateDirectoryAfterAcl } from "../src/desktop/windows-private-directory.js";
+import { createManagedWorkerPrivateState, ensureProtectedLocalDirectory, loadManagedWorkerPrivateState, type ManagedWorkerPrivateManifest, type ManagedWorkerPrivateStateFilesystem, type ManagedWorkerPrivateStateProtector, type ManagedWorkerPrivateStatePowerShellRunner } from "../src/desktop/managed-worker-private-state.js";
+import { assertWindowsPrivateDirectoryAfterAcl, isWindowsPrivateDirectoryAclAck } from "../src/desktop/windows-private-directory.js";
 import { approveTaskPolicy } from "../src/codex/managed-task-policy.js";
 
 const epoch = "11111111-1111-4111-8111-111111111111";
@@ -72,6 +72,13 @@ class WorkerHarness {
   terminate(): Promise<number> { this.terminated++; return Promise.resolve(0); }
   emit(event: "message" | "error" | "exit", value: unknown): void { this.listeners.get(event)?.(value); }
 }
+
+test("private ACL acknowledgement accepts only the exact verifier output", () => {
+  assert.equal(isWindowsPrivateDirectoryAclAck(Buffer.from("OK")), true);
+  for (const value of ["", "O", "OK\n", " OK", "OKOK", "false", "1"]) {
+    assert.equal(isWindowsPrivateDirectoryAclAck(Buffer.from(value)), false, value);
+  }
+});
 
 const options = (filesystem: MemoryFilesystem) => ({ baseDirectory: fixturePath("private", "managed"), protector: new IdentityProtector(), filesystem });
 
@@ -304,6 +311,7 @@ test("Windows DPAPI smoke keeps a random sentinel out of the persisted blob", { 
   const statePath = path.join(created.privateDirectory, "state.v1.dpapi");
   const stored = await readFile(statePath);
   assert.equal(stored.includes(Buffer.from(sentinel, "utf8")), false);
+  await ensureProtectedLocalDirectory(created.privateDirectory);
   await assert.rejects(createManagedWorkerPrivateState(input, { baseDirectory }), /Managed worker private state/u);
   assert.deepEqual(await readFile(statePath), stored);
   let loaded;

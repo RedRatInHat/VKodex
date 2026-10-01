@@ -6,7 +6,7 @@ import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { approveTaskPolicy, assertApprovedResumeIntent, type ApprovedTaskPolicy } from "../codex/managed-task-policy.js";
-import { assertWindowsPrivateDirectory, assertWindowsPrivateDirectoryAfterAcl } from "./windows-private-directory.js";
+import { isWindowsPrivateDirectoryAclAck, privateDirectoryAclVerificationScript } from "./windows-private-directory.js";
 
 
 
@@ -247,17 +247,10 @@ const aclScript = [
   "$acl.AddAccessRule($rule)",
   "}",
   "[IO.Directory]::CreateDirectory($p,$acl)|Out-Null",
-  "$d=[IO.DirectoryInfo]::new($p)",
-  "if(($d.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
-  "$before=[IO.Directory]::GetAccessControl($p)",
-  "$beforeOwner=$before.GetOwner([Security.Principal.SecurityIdentifier])",
-  "$actualOwner=$beforeOwner.Value",
-  "$expectedOwner=$sid.Value",
-  "if($actualOwner -ne $expectedOwner){exit 48}",
-  "[IO.Directory]::SetAccessControl($p,$acl)",
-  "$check=[IO.DirectoryInfo]::new($p)",
-  "if(($check.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'}",
+  privateDirectoryAclVerificationScript,
 ].join(";");
+const aclCheckScript = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd().Trim();" +
+  privateDirectoryAclVerificationScript;
 
 function safeProtectionPhase(error: unknown): string {
   if (!(error instanceof Error) || !error.cause || typeof error.cause !== "object" ||
@@ -314,6 +307,7 @@ async function createUnlinkedDirectory(directory: string): Promise<void> {
 }
 class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
   async ensureProtectedDirectory(directory: string): Promise<void> {
+    let leafExists = false;
     try {
       await createUnlinkedDirectory(path.dirname(directory));
       await rejectLinked(path.dirname(directory));
@@ -322,15 +316,18 @@ class DefaultFilesystem implements ManagedWorkerPrivateStateFilesystem {
         throw error;
       });
       if (leaf && (!leaf.isDirectory() || leaf.isSymbolicLink())) throw new Error("unsafe");
+      leafExists = leaf !== null;
     }
     catch { throw new Error("Managed worker private state directory is unsafe"); }
     if (process.platform !== "win32") throw new Error("Managed worker private state requires Windows");
-    try { assertWindowsPrivateDirectory(directory); return; }
-    catch { /* A new directory needs its private DACL; an unsafe owner still fails below. */ }
-    await runPowerShell(aclScript, Buffer.from(directory, "utf8"));
+    // An existing leaf must already be private. Never rewrite its ACL: a path
+    // swap between a reparse check and SetAccessControl could alter another target.
+    const output = await runPowerShell(leafExists ? aclCheckScript : aclScript, Buffer.from(directory, "utf8"));
+    const verified = isWindowsPrivateDirectoryAclAck(output);
+    output.fill(0);
+    if (!verified) throw new Error("Private capability directory unavailable");
     try { await rejectLinked(directory); }
     catch { throw new Error("Managed worker private state directory is unsafe"); }
-    await assertWindowsPrivateDirectoryAfterAcl(directory);
   }
   async writeExclusive(filePath: string, data: Uint8Array): Promise<void> {
     try {
