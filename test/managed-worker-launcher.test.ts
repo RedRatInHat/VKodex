@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import DatabaseConstructor from 'better-sqlite3';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { launchManagedWorker, ManagedWorkerLaunchError } from '../src/desktop/managed-worker-launcher.js';
 import { buildManagedWorkerEnvironment, buildDetachedWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
@@ -190,7 +191,7 @@ test('read-only task-state launch opt-in reaches only the exact worker argument'
 });
 
 test('opt-in launch snapshots explicit policy and rejects changed resume before reservation', async () => {
-  const { options } = fixture();
+  const { root, options } = fixture();
   const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21c';
   const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
     effort: 'high', cwd: options.cwd, runtimeWorkspaceRoots: [options.cwd], environments: [],
@@ -202,6 +203,11 @@ test('opt-in launch snapshots explicit policy and rejects changed resume before 
     runtimeWorkspaceRoots: [options.cwd], config: { model_reasoning_effort: policy.effort } };
   let protectedManifest: unknown;
   const input = { ...options, taskId, familyRoot: taskId, approvedTaskPolicy: policy, resumeParams };
+  const storePath = path.join(root, 'bridge.sqlite');
+  const store = new BridgeStore(storePath);
+  const binding = store.ensureBinding({ hostId: 'local', threadId: taskId,
+    sourceId: 'policy-source', title: 'Policy fixture', workspace: root, updatedAt: 1 });
+  const claimBinding = { storePath, bindingId: binding.id };
   await assert.rejects(launchManagedWorker({ ...input,
     resumeParams: { ...resumeParams, model: 'unapproved' } }, {
     protectState: async () => { throw new Error('must not protect'); },
@@ -215,14 +221,138 @@ test('opt-in launch snapshots explicit policy and rejects changed resume before 
     claimReservation: true as never,
     protectState: async () => { throw new Error('must not protect'); },
   }), /claim/i);
+  await assert.rejects(launchManagedWorker(input, {
+    claimReservation: async () => {},
+    protectState: async () => { throw new Error('must not protect'); },
+  }), /claim/i);
   const unclaimed = new ManagedWorkerRegistry(options.registryPath);
   try { assert.equal(unclaimed.get(options.home, taskId), null); } finally { unclaimed.close(); }
   await launchManagedWorker(input, { protectState: async manifest => { protectedManifest = manifest; },
-    claimReservation: async () => {},
-    spawn: () => { const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
+    claimBinding,
+    claimReservation: async attempt => {
+      store.claimManagedOwner(binding.id, { ownerEpoch: attempt.epoch,
+        canonicalHome: attempt.canonicalHome, familyRoot: attempt.familyRoot });
+    },
+    spawn: () => {
+      const competing = new DatabaseConstructor(storePath);
+      try {
+        competing.pragma('busy_timeout = 0');
+        assert.throws(() => competing.prepare(`UPDATE managed_owner_bindings
+          SET state = 'unavailable' WHERE binding_id = ?`).run(binding.id),
+        (error: unknown) => error instanceof Error && 'code' in error && error.code === 'SQLITE_BUSY');
+      } finally { competing.close(); }
+      const child = Object.assign(new EventEmitter(), { pid: 1234, unref: () => {} });
       queueMicrotask(() => child.emit('spawn')); return child; } });
   assert.deepEqual((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy, policy);
   assert.equal(Object.isFrozen((protectedManifest as { approvedTaskPolicy: unknown }).approvedTaskPolicy), true);
+  assert.equal(store.managedOwner(binding)?.state, 'registering');
+  store.close();
+});
+
+test('policy worker refuses a no-op claim hook after reservation without starting a worker', async () => {
+  const { root, options } = fixture();
+  const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21d';
+  const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+    effort: 'low', cwd: root, runtimeWorkspaceRoots: [root], environments: [],
+    approvalPolicy: 'never', approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':read-only', extends: null },
+    sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null });
+  const storePath = path.join(root, 'bridge.sqlite');
+  const store = new BridgeStore(storePath);
+  const binding = store.ensureBinding({ hostId: 'local', threadId: taskId,
+    sourceId: 'policy-source', title: 'Policy fixture', workspace: root, updatedAt: 1 });
+  let protects = 0, spawns = 0;
+  try {
+    await assert.rejects(launchManagedWorker({ ...options, taskId, familyRoot: taskId,
+      approvedTaskPolicy: policy, resumeParams: { threadId: taskId, cwd: root,
+        model: policy.model, approvalPolicy: policy.approvalPolicy,
+        permissions: policy.activePermissionProfile.id, runtimeWorkspaceRoots: [root],
+        config: { model_reasoning_effort: policy.effort } } }, {
+      claimBinding: { storePath, bindingId: binding.id }, claimReservation: async () => {},
+      protectState: async () => { protects++; },
+      spawn: () => { spawns++; throw new Error('must not spawn'); },
+    }), (error: unknown) => error instanceof ManagedWorkerLaunchError &&
+      error.phase === 'claim' && error.outcome === 'not-dispatched');
+    assert.equal(protects, 0); assert.equal(spawns, 0);
+    assert.equal(store.managedOwner(binding), null);
+    const registry = new ManagedWorkerRegistry(options.registryPath);
+    try { assert.equal(registry.get(root, taskId)?.state, 'reserved'); }
+    finally { registry.close(); }
+  } finally { store.close(); }
+});
+
+test('policy worker refuses a claim for another binding and never protects state', async () => {
+  const { root, options } = fixture();
+  const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21e';
+  const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+    effort: 'low', cwd: root, runtimeWorkspaceRoots: [root], environments: [],
+    approvalPolicy: 'never', approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':read-only', extends: null },
+    sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null });
+  const storePath = path.join(root, 'bridge.sqlite');
+  const store = new BridgeStore(storePath);
+  const target = store.ensureBinding({ hostId: 'local', threadId: taskId,
+    sourceId: 'target', title: 'Target', workspace: root, updatedAt: 1 });
+  const other = store.ensureBinding({ hostId: 'local', threadId: taskId,
+    sourceId: 'other', title: 'Other', workspace: root, updatedAt: 1 });
+  let protects = 0;
+  try {
+    await assert.rejects(launchManagedWorker({ ...options, taskId, familyRoot: taskId,
+      approvedTaskPolicy: policy, resumeParams: { threadId: taskId, cwd: root,
+        model: policy.model, approvalPolicy: policy.approvalPolicy,
+        permissions: policy.activePermissionProfile.id, runtimeWorkspaceRoots: [root],
+        config: { model_reasoning_effort: policy.effort } } }, {
+      claimBinding: { storePath, bindingId: target.id },
+      claimReservation: async attempt => {
+        store.claimManagedOwner(other.id, { ownerEpoch: attempt.epoch,
+          canonicalHome: attempt.canonicalHome, familyRoot: attempt.familyRoot });
+      },
+      protectState: async () => { protects++; },
+    }), (error: unknown) => error instanceof ManagedWorkerLaunchError && error.phase === 'claim');
+    assert.equal(protects, 0);
+    assert.equal(store.managedOwner(target), null);
+    assert.equal(store.managedOwner(other)?.state, 'registering');
+  } finally { store.close(); }
+});
+
+test('policy worker rechecks exact claim after private state and refuses revocation before spawn', async () => {
+  const { root, options } = fixture();
+  const taskId = '01a0e498-4fa0-74c0-a795-c5047a06d21f';
+  const policy = approveTaskPolicy({ threadId: taskId, model: 'gpt-6-luna', modelProvider: 'openai',
+    effort: 'low', cwd: root, runtimeWorkspaceRoots: [root], environments: [],
+    approvalPolicy: 'never', approvalsReviewer: 'user',
+    activePermissionProfile: { id: ':read-only', extends: null },
+    sandbox: { type: 'readOnly', networkAccess: false }, serviceTier: null });
+  const storePath = path.join(root, 'bridge.sqlite');
+  const store = new BridgeStore(storePath);
+  const binding = store.ensureBinding({ hostId: 'local', threadId: taskId,
+    sourceId: 'target', title: 'Target', workspace: root, updatedAt: 1 });
+  let protects = 0, spawns = 0;
+  try {
+    await assert.rejects(launchManagedWorker({ ...options, taskId, familyRoot: taskId,
+      approvedTaskPolicy: policy, resumeParams: { threadId: taskId, cwd: root,
+        model: policy.model, approvalPolicy: policy.approvalPolicy,
+        permissions: policy.activePermissionProfile.id, runtimeWorkspaceRoots: [root],
+        config: { model_reasoning_effort: policy.effort } } }, {
+      claimBinding: { storePath, bindingId: binding.id },
+      claimReservation: async attempt => {
+        store.claimManagedOwner(binding.id, { ownerEpoch: attempt.epoch,
+          canonicalHome: attempt.canonicalHome, familyRoot: attempt.familyRoot });
+      },
+      protectState: async () => {
+        protects++;
+        const registering = store.managedOwner(binding)!;
+        const pending = store.transitionManagedOwner(registering, 'handoff_pending');
+        store.retireManagedOwner(pending);
+      },
+      spawn: () => { spawns++; throw new Error('must not spawn'); },
+    }), (error: unknown) => error instanceof ManagedWorkerLaunchError &&
+      error.phase === 'spawn' && error.outcome === 'not-dispatched');
+    assert.equal(protects, 1); assert.equal(spawns, 0);
+    const registry = new ManagedWorkerRegistry(options.registryPath);
+    try { assert.equal(registry.get(root, taskId)?.state, 'reserved'); }
+    finally { registry.close(); }
+  } finally { store.close(); }
 });
 
 test('private-state failure keeps reservation and never starts a worker or leaks error content', async () => {

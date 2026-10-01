@@ -7,6 +7,9 @@ import { ManagedWorkerRegistry, type WorkerAttempt } from '../codex/managed-work
 import { createManagedWorkerPrivateState, type ManagedWorkerPrivateManifest } from './managed-worker-private-state.js';
 import { buildDetachedWorkerSpawnOptions } from './managed-worker-environment.js';
 import { approveTaskPolicy, assertApprovedResumeIntent } from '../codex/managed-task-policy.js';
+import { assertManagedWorkerClaimBinding, dispatchWithManagedWorkerClaim,
+  ManagedWorkerClaimDispatchError, readManagedWorkerClaim,
+  type ManagedWorkerClaimBinding } from './managed-worker-claim-readback.js';
 
 export interface ManagedWorkerLaunchOptions extends Omit<ManagedWorkerPrivateManifest, 'schemaVersion' | 'epoch'> {
   readonly privateBaseDirectory: string;
@@ -24,6 +27,8 @@ export interface ManagedWorkerLaunchDependencies {
    * A rejection leaves the reservation for explicit reconciliation; no worker is spawned.
    * This ordering does not prove a native Desktop/VS Code writer lease. */
   readonly claimReservation?: (attempt: WorkerAttempt) => Promise<void>;
+  /** Durable bridge DB and exact binding to verify independently after claim. */
+  readonly claimBinding?: ManagedWorkerClaimBinding;
   readonly protectState?: (manifest: ManagedWorkerPrivateManifest, baseDirectory: string) => Promise<void>;
   readonly spawn?: (executable: string, args: string[], options: SpawnOptions) => DetachedChild;
 }
@@ -69,6 +74,10 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     throw new TypeError('Invalid managed native task-state opt-in');
   const approvedTaskPolicy = Object.hasOwn(input, 'approvedTaskPolicy')
     ? approveTaskPolicy(input.approvedTaskPolicy) : undefined;
+  const claimReservation = dependencies.claimReservation;
+  const claimBinding = dependencies.claimBinding === undefined ? null :
+    Object.freeze({ storePath: dependencies.claimBinding.storePath,
+      bindingId: dependencies.claimBinding.bindingId });
   for (const file of [input.home, input.cwd, input.registryPath, input.privateBaseDirectory]) absolute(file);
   if (input.nativeIpc !== 'local') throw new TypeError('Managed worker launch requires local native IPC');
   for (const value of [input.taskId, input.familyRoot]) {
@@ -77,8 +86,11 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   }
   if (approvedTaskPolicy)
     assertApprovedResumeIntent(approvedTaskPolicy, input.resumeParams, input.taskId, input.cwd);
-  if (approvedTaskPolicy && typeof dependencies.claimReservation !== 'function')
-    throw new TypeError('Managed worker policy launch requires durable claim hook');
+  if (approvedTaskPolicy) {
+    if (typeof claimReservation !== 'function' || !claimBinding)
+      throw new TypeError('Managed worker policy launch requires durable claim hook and binding');
+    assertManagedWorkerClaimBinding(claimBinding);
+  }
   if (path.extname(input.runtime.entrypoint).toLowerCase() !== '.js')
     throw new TypeError('Managed worker entrypoint must be compiled JavaScript');
   await verifyPinnedFiles(input);
@@ -87,8 +99,13 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
   try { reservation = registry.reserve(input.home, input.familyRoot); }
   finally { registry.close(); }
   const epoch = reservation.epoch;
-  if (dependencies.claimReservation) {
-    try { await dependencies.claimReservation(reservation); }
+  let claimId: string | null = null;
+  if (claimReservation) {
+    try {
+      await claimReservation(reservation);
+      if (approvedTaskPolicy)
+        claimId = readManagedWorkerClaim(claimBinding!, reservation, input.taskId);
+    }
     catch { throw new ManagedWorkerLaunchError(epoch, 'claim', 'not-dispatched'); }
   }
   const manifest: ManagedWorkerPrivateManifest = {
@@ -99,10 +116,18 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     ...(approvedTaskPolicy ? { approvedTaskPolicy } : {}),
   };
   try {
+    if (claimId !== null &&
+        readManagedWorkerClaim(claimBinding!, reservation, input.taskId) !== claimId)
+      throw new Error('Managed worker bridge claim changed');
     if (dependencies.protectState) await dependencies.protectState(manifest, input.privateBaseDirectory);
     else await createManagedWorkerPrivateState(manifest, { baseDirectory: input.privateBaseDirectory });
   } catch { throw new ManagedWorkerLaunchError(epoch, 'private-state', 'not-dispatched'); }
-  try { await verifyPinnedFiles(input); }
+  try {
+    if (claimId !== null &&
+        readManagedWorkerClaim(claimBinding!, reservation, input.taskId) !== claimId)
+      throw new Error('Managed worker bridge claim changed');
+    await verifyPinnedFiles(input);
+  }
   catch { throw new ManagedWorkerLaunchError(epoch, 'spawn', 'not-dispatched'); }
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -112,11 +137,13 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
     };
     const timer = setTimeout(() => fail('unknown'), 10_000);
     try {
-      const child = (dependencies.spawn ?? spawn)(input.runtime.executable,
+      const dispatch = () => (dependencies.spawn ?? spawn)(input.runtime.executable,
         [input.runtime.entrypoint, '--private-base', input.privateBaseDirectory, '--epoch', epoch,
           '--native-ipc', input.nativeIpc,
           ...(input.nativeTaskState ? ['--native-task-state'] : [])],
         buildDetachedWorkerSpawnOptions(input.cwd, input.home, process.env));
+      const child = claimId === null ? dispatch() : dispatchWithManagedWorkerClaim(
+        claimBinding!, reservation, input.taskId, claimId, dispatch);
       // No exit/EOF listener kills a worker; the durable registry/control plane reports its state.
       child.once('error', () => fail('not-dispatched'));
       child.once('spawn', () => {
@@ -126,6 +153,6 @@ export async function launchManagedWorker(options: ManagedWorkerLaunchOptions,
         settled = true; clearTimeout(timer);
         resolve(Object.freeze({ epoch, state: 'dispatched', pid: child.pid! }));
       });
-    } catch { fail('not-dispatched'); }
+    } catch (error) { fail(error instanceof ManagedWorkerClaimDispatchError ? error.outcome : 'not-dispatched'); }
   });
 }
