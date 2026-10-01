@@ -3,6 +3,7 @@ import path from "node:path";
 import { realpathSync, statSync } from "node:fs";
 import { comparablePath } from "../core/paths.js";
 import type { OwnerAccess } from "./contracts.js";
+import type { ProjectCatalogMode } from "../desktop/catalog.js";
 
 export type StagedFilePilot =
   | Readonly<{ readonly mode: "disabled" }>
@@ -18,6 +19,8 @@ export interface DesktopBridgeConfig {
   readonly codexHome: string;
   readonly codexHomes: readonly string[];
   readonly codexSources: readonly CodexSourceConfig[];
+  /** Opt-in diagnostic: no hot reads of Desktop's legacy global-state file. */
+  readonly projectCatalogMode: ProjectCatalogMode;
   readonly healthIntervalMs: number;
   readonly inboundFileLimits: { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number };
   /** DPAPI-protected file read by the local PowerShell helper on demand. */
@@ -130,6 +133,13 @@ export function configuredCodexHomes(env: NodeJS.ProcessEnv = process.env): stri
   return result;
 }
 
+export function configuredProjectCatalogMode(env: NodeJS.ProcessEnv = process.env): ProjectCatalogMode {
+  const value = env.VKODEX_PROJECT_CATALOG_MODE?.trim();
+  if (value === undefined || value === "legacy-file" || value === "") return "legacy-file";
+  if (value === "no-live-legacy") return value;
+  throw new Error("VKODEX_PROJECT_CATALOG_MODE must be legacy-file or no-live-legacy");
+}
+
 export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): DesktopBridgeConfig {
   const id = (name: string): number => {
     const raw = env[name]?.trim();
@@ -171,7 +181,7 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
     access: { ownerId: id("VK_OWNER_ID"), groupId: id("VK_GROUP_ID") },
     dataDir: path.resolve(env.BOT_DATA_DIR || "./data/desktop"),
     projectlessRoot: path.resolve(automaticRoot || path.join(localData, "VKodex", "workspaces")),
-    codexHome: codexHomes[0]!, codexHomes, codexSources, healthIntervalMs,
+    codexHome: codexHomes[0]!, codexHomes, codexSources, projectCatalogMode: configuredProjectCatalogMode(env), healthIntervalMs,
     inboundFileLimits: { maxFiles: maxInboundFiles, maxFileBytes: maxInboundFileBytes, maxTotalBytes: maxInboundTotalBytes, timeoutMs: downloadTimeoutMs },
     documentTokenPath, stagedFilePilot,
   };

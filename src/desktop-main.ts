@@ -5,6 +5,7 @@ import { loadDesktopBridgeConfig, type DesktopBridgeConfig } from "./bridge/conf
 import { BridgeRuntime } from "./bridge/runtime.js";
 import { BridgeStore } from "./bridge/store.js";
 import { MultiDesktopCatalog } from "./desktop/multi-catalog.js";
+import { LocalDesktopCatalog } from "./desktop/catalog.js";
 import { ConnectedDesktopTasks } from "./desktop/desktop-tasks.js";
 import { AppServerTaskCreator } from "./desktop/app-server-creator.js";
 import { AppServerTaskTransfer } from "./desktop/app-server-transfer.js";
@@ -41,7 +42,8 @@ catch (error) {
 const store = new BridgeStore(path.join(config.dataDir, "vkodex.sqlite"));
 store.assertPrimaryHome(config.codexHome);
 const gateway = new DesktopVkGateway(config, undefined, undefined, logger);
-const catalog = new MultiDesktopCatalog(config.codexHomes);
+const catalog = new MultiDesktopCatalog(config.codexHomes,
+  home => new LocalDesktopCatalog(home, config.projectCatalogMode));
 const metadata = new ProfileDesktopMetadata(task => catalog.sourceHome(task));
 const launcher = new SourceTaskLauncher(config.codexSources, task => catalog.sourceHome(task));
 const creator = new AppServerTaskCreator(catalog, metadata);

@@ -46,8 +46,13 @@ export function readTaskCatalog(database: Database, limit: number | null = 100, 
   });
 }
 
+/** A no-live-legacy catalog is a diagnostic safety mode. It preserves native
+ * project names but treats every thread assignment as unknown until an
+ * effective owner-side metadata source is qualified. */
+export type ProjectCatalogMode = "legacy-file" | "no-live-legacy";
+
 export class LocalDesktopCatalog {
-  constructor(private readonly codexHome: string) {}
+  constructor(private readonly codexHome: string, readonly projectCatalogMode: ProjectCatalogMode = "legacy-file") {}
 
   async listModels(_task?: TaskRef): Promise<readonly DesktopModel[]> {
     try {
@@ -101,13 +106,15 @@ export class LocalDesktopCatalog {
 
   private async projectState(database?: Database): Promise<IpcObject | null> {
     let legacy: IpcObject | null = null;
-    try {
-      const value: unknown = JSON.parse(await readFile(path.join(this.codexHome, ".codex-global-state.json"), "utf8"));
-      legacy = isObject(value) ? value : null;
-    } catch (error) {
-      // A CLI-only home has no desktop project settings. An unreadable existing
-      // file leaves membership unknown, while its tasks remain available in All.
-      legacy = isObject(error) && error.code === "ENOENT" ? {} : null;
+    if (this.projectCatalogMode === "legacy-file") {
+      try {
+        const value: unknown = JSON.parse(await readFile(path.join(this.codexHome, ".codex-global-state.json"), "utf8"));
+        legacy = isObject(value) ? value : null;
+      } catch (error) {
+        // A CLI-only home has no desktop project settings. An unreadable existing
+        // file leaves membership unknown, while its tasks remain available in All.
+        legacy = isObject(error) && error.code === "ENOENT" ? {} : null;
+      }
     }
     let opened: Database | undefined;
     try {

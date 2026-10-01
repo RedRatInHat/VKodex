@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
-import { configuredCodexHomes, configuredCodexSources } from "../src/bridge/config.js";
+import { configuredCodexHomes, configuredCodexSources, configuredProjectCatalogMode } from "../src/bridge/config.js";
 import { BridgeStore, migrateBindingSources } from "../src/bridge/store.js";
 import { DesktopUnavailableError, taskKey, type AccountUsage, type DesktopMetadata, type DesktopProject, type DesktopTask } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks } from "../src/desktop/desktop-tasks.js";
@@ -32,6 +32,13 @@ test("invalid source configuration fails without exposing its value", () => {
   for (const value of ["PRIVATE_PATH", '"PRIVATE_PATH"', '{"path":"PRIVATE_PATH"}', '[42]', '[""]', '["a\\u0000b"]', JSON.stringify(Array(17).fill("PRIVATE_PATH"))]) {
     assert.throws(() => configuredCodexHomes({ CODEX_EXTRA_HOMES: value }), error => error instanceof Error && !error.message.includes("PRIVATE_PATH"));
   }
+});
+
+test("no-live legacy catalog diagnostic must be selected explicitly", () => {
+  assert.equal(configuredProjectCatalogMode({}), "legacy-file");
+  assert.equal(configuredProjectCatalogMode({ VKODEX_PROJECT_CATALOG_MODE: "no-live-legacy" }), "no-live-legacy");
+  assert.throws(() => configuredProjectCatalogMode({ VKODEX_PROJECT_CATALOG_MODE: "PRIVATE" }),
+    error => error instanceof Error && !error.message.includes("PRIVATE"));
 });
 
 test("structured sources bind each Codex home to a launcher and legacy homes remain compatible", () => {

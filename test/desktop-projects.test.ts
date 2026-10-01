@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { type DesktopTask, DesktopUnavailableError } from "../src/desktop/contracts.js";
-import { readTaskCatalog } from "../src/desktop/catalog.js";
+import { LocalDesktopCatalog, readTaskCatalog } from "../src/desktop/catalog.js";
 import { assignTaskProjects, desktopProjects, preflightLegacyProjectAssignment, readDesktopProjectState } from "../src/desktop/projects.js";
 import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
 
@@ -184,6 +185,38 @@ test("unreadable legacy state keeps native project names but not unverified thre
   assert.equal(desktopProjects(unknown)[0]!.id, "native-project");
   assert.equal(assignTaskProjects([{ ...task, projectId: "native-project" }], unknown)[0]!.projectId, undefined);
   assert.equal(assignTaskProjects([{ ...task, projectId: null }], unknown)[0]!.projectId, undefined);
+});
+
+test("no-live-legacy catalog mode never imports live sidebar assignments", async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "vkodex-no-live-catalog-"));
+  t.after(() => {
+    if (process.platform !== "win32") return;
+    const script = "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $root=[IO.Path]::GetFullPath($env:TEMP).TrimEnd('\\')+'\\'; if(-not $target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)";
+    const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-Command", script],
+      { env: { ...process.env, VKODEX_TEST_RECYCLE_TARGET: home }, encoding: "utf8" });
+    assert.equal(result.status, 0, "Windows test fixture must be moved to Recycle Bin");
+  });
+  const db = new Database(path.join(home, "state_5.sqlite"));
+  db.exec(`CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, thread_source TEXT, source TEXT,
+      archived INTEGER, updated_at_ms INTEGER, updated_at INTEGER, is_pinned INTEGER, recency_at_ms INTEGER, project_id TEXT);
+    CREATE TABLE projects (id TEXT, name TEXT, position INTEGER);
+    CREATE TABLE project_roots (project_id TEXT, path TEXT, position INTEGER);
+    INSERT INTO threads VALUES ('fixture', 'Fixture', 'Fixture', 'D:/Fixture/First', 'user', 'cli', 0, 1000, 1, 0, 1000, 'native-second');
+    INSERT INTO projects VALUES ('native-first', 'First', 0), ('native-second', 'Second', 1);
+    INSERT INTO project_roots VALUES ('native-first', 'D:/Fixture/First', 0), ('native-second', 'D:/Fixture/Second', 0);`);
+  db.close();
+  await writeFile(path.join(home, ".codex-global-state.json"), JSON.stringify({
+    "app-server-projects-migration-by-host": { [`local:${home}`]: { projectsMigrated: true, threadAssignmentsMigrated: false } },
+    "thread-project-assignments": { fixture: { projectKind: "local", projectId: "native-first" } },
+  }));
+  const live = new LocalDesktopCatalog(home);
+  assert.equal((await live.listTasks())[0]!.projectId, "native-first");
+  const detached = new LocalDesktopCatalog(home, "no-live-legacy");
+  assert.equal((await detached.listTasks())[0]!.projectId, undefined);
+  assert.deepEqual((await detached.listProjects()).map(project => project.id), ["native-first", "native-second"]);
+  const combined = new MultiDesktopCatalog([home], () => detached);
+  await combined.listTasks();
+  assert.match(combined.catalogWarnings()[0]!, /назначения проектов задач неизвестны/u);
 });
 
 test("desktop project catalog preserves all roots and includes projects without folders", () => {

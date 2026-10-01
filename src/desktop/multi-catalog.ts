@@ -77,6 +77,10 @@ export class MultiDesktopCatalog {
 
   private updateWarnings(snapshot: readonly SourceSnapshot[]): number {
     this.warnings = [];
+    if (this.sources.some(source => source.catalog instanceof LocalDesktopCatalog
+      && source.catalog.projectCatalogMode === "no-live-legacy")) {
+      this.warnings.push("Диагностический режим каталога: назначения проектов задач неизвестны; каталог VKodex не читает .codex-global-state.json.");
+    }
     let readable = 0;
     for (const entry of snapshot) {
       if (entry.tasks.status === "fulfilled") readable++;
