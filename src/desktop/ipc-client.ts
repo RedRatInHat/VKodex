@@ -9,9 +9,17 @@ export type IpcObject = Record<string, unknown>;
 // Match the desktop IPC limit: a task snapshot includes its full loaded history.
 const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 
-function validateFrameSize(size: number): void {
+function validateInboundFrameLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_FRAME_BYTES) {
+    throw new RangeError("Invalid inbound IPC frame limit");
+  }
+}
+
+function validateFrameSize(size: number, limit = MAX_FRAME_BYTES): void {
   if (size === 0) throw new DesktopUnavailableError("Codex прислал некорректный размер пакета состояния.");
-  if (size > MAX_FRAME_BYTES) throw new DesktopUnavailableError("Пакет состояния Codex превышает лимит подключения 256 МиБ.");
+  if (size > limit) throw new DesktopUnavailableError(limit === MAX_FRAME_BYTES
+    ? "Пакет состояния Codex превышает лимит подключения 256 МиБ."
+    : `Пакет состояния Codex превышает заданный лимит подключения ${limit} байт.`);
 }
 
 export function isObject(value: unknown): value is IpcObject {
@@ -24,6 +32,10 @@ export class FrameDecoder {
   private payload: Buffer | null = null;
   private payloadBytes = 0;
 
+  constructor(private readonly maxFrameBytes = MAX_FRAME_BYTES) {
+    validateInboundFrameLimit(maxFrameBytes);
+  }
+
   push(chunk: Buffer): IpcObject[] {
     const messages: IpcObject[] = [];
     let offset = 0;
@@ -34,7 +46,7 @@ export class FrameDecoder {
         this.headerBytes += bytes; offset += bytes;
         if (this.headerBytes < 4) break;
         const size = this.header.readUInt32LE(0);
-        validateFrameSize(size);
+        validateFrameSize(size, this.maxFrameBytes);
         this.headerBytes = 0;
         // Copy each byte once, instead of repeatedly concatenating the entire
         // snapshot whenever the pipe supplies another small chunk.
@@ -186,7 +198,8 @@ export class DesktopIpcClient {
     private readonly connectStream: () => Duplex = () => createConnection("\\\\.\\pipe\\codex-ipc"),
     private readonly requestTimeoutMs = 5_000,
     private readonly requestHandler: IpcRequestHandler | null = null,
-  ) {}
+    private readonly maxInboundFrameBytes = MAX_FRAME_BYTES,
+  ) { validateInboundFrameLimit(maxInboundFrameBytes); }
 
   async connect(): Promise<void> {
     if (this.clientId) return;
@@ -206,7 +219,7 @@ export class DesktopIpcClient {
     const stream = this.connectStream();
     this.stream = stream;
     this.incomingAbort = new AbortController();
-    const decoder = new FrameDecoder();
+    const decoder = new FrameDecoder(this.maxInboundFrameBytes);
     stream.on("data", (chunk: Buffer) => {
       if (this.stream !== stream) return;
       try { for (const message of decoder.push(chunk)) this.receive(message); }
