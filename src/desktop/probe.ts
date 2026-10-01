@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { parseEnv } from "node:util";
-import { configuredCodexHomes } from "../bridge/config.js";
+import { configuredCodexHomes, configuredProjectCatalogMode } from "../bridge/config.js";
 import { MultiDesktopCatalog } from "./multi-catalog.js";
+import { LocalDesktopCatalog } from "./catalog.js";
 import { DesktopIpcClient } from "./ipc-client.js";
 import { TaskSubscription } from "./subscription.js";
 import { projectSnapshot } from "./projector.js";
@@ -15,10 +16,18 @@ const homes = configuredCodexHomes({
   CODEX_EXTRA_HOMES: process.env.CODEX_EXTRA_HOMES ?? local.CODEX_EXTRA_HOMES ?? "",
 });
 const threadId = process.argv[2];
-const catalog = new MultiDesktopCatalog(homes);
+const projectCatalogMode = configuredProjectCatalogMode({
+  VKODEX_PROJECT_CATALOG_MODE: process.env.VKODEX_PROJECT_CATALOG_MODE ?? local.VKODEX_PROJECT_CATALOG_MODE,
+});
+const catalog = new MultiDesktopCatalog(homes,
+  home => new LocalDesktopCatalog(home, projectCatalogMode));
 const tasks = await catalog.listTasks();
 const projects = await catalog.listProjects();
-process.stdout.write(`${JSON.stringify({ sourceCount: homes.length, taskCount: tasks.length, projectCount: projects.length, unreadableSources: catalog.catalogWarnings().length, readOnly: true })}\n`);
+const warnings = catalog.catalogWarnings();
+process.stdout.write(`${JSON.stringify({ sourceCount: homes.length, taskCount: tasks.length, projectCount: projects.length,
+  unreadableSources: warnings.filter(warning => warning.startsWith("Не удалось прочитать каталог")).length,
+  catalogMode: projectCatalogMode,
+  unknownAssignments: tasks.filter(task => task.projectId === undefined).length, readOnly: true })}\n`);
 if (threadId) {
   const matches = tasks.filter(task => task.threadId === threadId);
   if (matches.length !== 1) throw new Error("Task is missing or its ID occurs in several configured directories; select one source through CODEX_HOME and CODEX_EXTRA_HOMES");
