@@ -28,7 +28,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
     "test": "node --import tsx --test --test-concurrency=4 test/*.test.ts",
-    "check": "npm run typecheck && npm test"
+    "integration:test": "node --import tsx --test --test-concurrency=1 test/integration/production-pinned-first-thread.test.ts",
+    "check": "npm run typecheck && npm test && npm run integration:test"
   },
   "dependencies": {
     "@openai/codex-sdk": "0.155.1",
