@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { realpathSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, rename, symlink, truncate, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { comparablePath } from '../src/core/paths.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
 import type { ControlledCreationIntent, ControlledCreationStarted,
@@ -40,6 +42,16 @@ const rejected = (promise: Promise<unknown>) => assert.rejects(promise, Controll
 test('authenticated-profile final pre-write check accepts only its captured preflight receipt', async () => {
   const f = await setup();
   const preflight = await captureAuthenticatedProfileSourcePreflight(identity, f.home, f.workspace);
+  assert.equal(comparablePath(realpathSync(f.home)), comparablePath(preflight.sourceHome), 'home canonical path');
+  assert.equal(comparablePath(realpathSync(f.workspace)), comparablePath(preflight.workspace), 'workspace canonical path');
+  const home = statSync(preflight.sourceHome, { bigint: true });
+  const work = statSync(preflight.workspace, { bigint: true });
+  assert.deepEqual([home.dev, home.ino, home.birthtimeMs],
+    [preflight.sourceHomeIdentity.dev, preflight.sourceHomeIdentity.ino, preflight.sourceHomeIdentity.birthtimeMs],
+    'home async/sync filesystem identity');
+  assert.deepEqual([work.dev, work.ino, work.birthtimeMs],
+    [preflight.workspaceIdentity?.dev, preflight.workspaceIdentity?.ino, preflight.workspaceIdentity?.birthtimeMs],
+    'workspace async/sync filesystem identity');
   assert.doesNotThrow(() => assertAuthenticatedProfileSourcePreflightForWrite(preflight, identity, f.home, f.workspace));
   const cloned = Object.freeze({ ...preflight, identity: Object.freeze({ ...preflight.identity }) });
   assert.throws(() => assertAuthenticatedProfileSourcePreflightForWrite(cloned, identity, f.home, f.workspace),
