@@ -329,7 +329,7 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createMetadata: (home: string) => DesktopMetadata = home => new NativeDesktopMetadata(new MetadataRpc(home)),
     private readonly ownerArchive: (home: string, threadId: string) => Promise<boolean> = archiveThroughOwner,
-    private readonly projectCatalogMode: ProjectCatalogMode = "legacy-file",
+    private readonly projectCatalogMode: ProjectCatalogMode = "no-live-legacy",
   ) {}
   async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
     const home = this.sourceHome({ hostId: "local", threadId: "", ...(sourceId ? { sourceId } : {}) });
@@ -464,7 +464,7 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
   }
   async assignProject(task: TaskRef, projectId: string | null): Promise<void> {
     if (this.projectCatalogMode === "no-live-legacy") {
-      throw new ActionRejectedError("Диагностический режим не читает состояние проектов Codex; назначение проекта через VKodex недоступно.");
+      throw new ActionRejectedError("Защитный режим не читает состояние проектов Codex; назначение проекта через VKodex недоступно.");
     }
     const home = this.sourceHome(task);
     await preflightLegacyProjectAssignment(home, task.threadId, projectId);

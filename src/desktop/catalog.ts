@@ -46,7 +46,7 @@ export function readTaskCatalog(database: Database, limit: number | null = 100, 
   });
 }
 
-/** A no-live-legacy catalog is a diagnostic safety mode. It preserves native
+/** A no-live-legacy catalog is the safe default. It preserves native
  * project names but treats every thread assignment as unknown until an
  * effective owner-side metadata source is qualified. */
 export type ProjectCatalogMode = "legacy-file" | "no-live-legacy";
@@ -57,7 +57,7 @@ export interface LocalCatalogSnapshot {
 }
 
 export class LocalDesktopCatalog {
-  constructor(private readonly codexHome: string, readonly projectCatalogMode: ProjectCatalogMode = "legacy-file") {}
+  constructor(private readonly codexHome: string, readonly projectCatalogMode: ProjectCatalogMode = "no-live-legacy") {}
 
   async listModels(_task?: TaskRef): Promise<readonly DesktopModel[]> {
     try {

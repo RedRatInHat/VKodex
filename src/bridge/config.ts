@@ -19,7 +19,7 @@ export interface DesktopBridgeConfig {
   readonly codexHome: string;
   readonly codexHomes: readonly string[];
   readonly codexSources: readonly CodexSourceConfig[];
-  /** Opt-in diagnostic: no hot reads of Desktop's legacy global-state file. */
+  /** Safe default: no hot reads of Desktop's legacy global-state file. */
   readonly projectCatalogMode: ProjectCatalogMode;
   readonly healthIntervalMs: number;
   readonly inboundFileLimits: { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number };
@@ -135,8 +135,8 @@ export function configuredCodexHomes(env: NodeJS.ProcessEnv = process.env): stri
 
 export function configuredProjectCatalogMode(env: NodeJS.ProcessEnv = process.env): ProjectCatalogMode {
   const value = env.VKODEX_PROJECT_CATALOG_MODE?.trim();
-  if (value === undefined || value === "legacy-file" || value === "") return "legacy-file";
-  if (value === "no-live-legacy") return value;
+  if (value === undefined || value === "" || value === "no-live-legacy") return "no-live-legacy";
+  if (value === "legacy-file") return value;
   throw new Error("VKODEX_PROJECT_CATALOG_MODE must be legacy-file or no-live-legacy");
 }
 

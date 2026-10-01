@@ -34,8 +34,9 @@ test("invalid source configuration fails without exposing its value", () => {
   }
 });
 
-test("no-live legacy catalog diagnostic must be selected explicitly", () => {
-  assert.equal(configuredProjectCatalogMode({}), "legacy-file");
+test("the catalog defaults to no live Desktop state reads", () => {
+  assert.equal(configuredProjectCatalogMode({}), "no-live-legacy");
+  assert.equal(configuredProjectCatalogMode({ VKODEX_PROJECT_CATALOG_MODE: "legacy-file" }), "legacy-file");
   assert.equal(configuredProjectCatalogMode({ VKODEX_PROJECT_CATALOG_MODE: "no-live-legacy" }), "no-live-legacy");
   assert.throws(() => configuredProjectCatalogMode({ VKODEX_PROJECT_CATALOG_MODE: "PRIVATE" }),
     error => error instanceof Error && !error.message.includes("PRIVATE"));
