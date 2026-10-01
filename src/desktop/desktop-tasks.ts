@@ -710,7 +710,11 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     const probe = this.createClient();
     try { await probe.connect(); }
     catch {
-      this.compatibilityState = { state: "failed", message: "Named pipe Codex не принял initialize." }; return this.compatibilityState;
+      // A failed initialize does not establish a protocol incompatibility.
+      // Keep native commands gated by their own fresh connection, not by a
+      // stale health sample that could block them after the pipe recovers.
+      this.compatibilityState = { state: "unverified", message: "Named pipe Codex не принял initialize; доступность временно не подтверждена." };
+      return this.compatibilityState;
     } finally { probe.close(); }
     let versionFailure = false;
     let tasks: readonly TaskRef[];

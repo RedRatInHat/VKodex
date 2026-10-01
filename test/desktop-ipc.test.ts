@@ -2900,6 +2900,36 @@ test("compatibility canary confirms stream protocol v11 through an open task", a
   assert.equal(status.state, "ok"); assert.match(status.message, /v11/u); assert.equal(servers.length, 2);
 });
 
+test("a transient named-pipe initialize refusal remains unverified and can recover", async () => {
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  let connections = 0;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    connections++;
+    return new DesktopIpcClient(() => {
+      if (connections === 1) throw new Error("fixture pipe temporarily unavailable");
+      return new Server();
+    }, 100);
+  });
+  const first = await adapter.checkCompatibility();
+  assert.equal(first.state, "unverified");
+  assert.match(first.message, /Named pipe.*initialize/u);
+  assert.equal(adapter.compatibility().state, "unverified");
+  const recovered = await adapter.checkCompatibility();
+  assert.equal(recovered.state, "ok");
+  assert.equal(connections, 3, "the second probe and its stream check use fresh sockets");
+});
+
+test("an observed incompatible stream version still fails compatibility", async () => {
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+    const server = new Server(); server.onFollow = () => server.snapshot(10);
+    return new DesktopIpcClient(() => server, 100);
+  });
+  const status = await adapter.checkCompatibility();
+  assert.equal(status.state, "failed");
+  assert.match(status.message, /несовместима/u);
+});
+
 test("App Server creator materializes a new task with its atomic first turn", async () => {
   const profileRoot = path.resolve("fixture-app-server-home"); const workspace = path.resolve("fixture-project"); const worktree = path.resolve("fixture-project_worktree");
   const metadata: string[] = []; const calls: { readonly options: unknown; readonly prompt: string }[] = [];
