@@ -3,8 +3,10 @@ import { connect } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import { validManagedVkControlRequest, type ManagedWorkerControlStatus,
-  validManagedWorkerHandoffProof, type ManagedWorkerHandoffScope,
+  validManagedWorkerHandoffProof, validNativeCliCanaryEvidence,
+  type ManagedWorkerHandoffScope,
   type ManagedWorkerControlHandoffProof, type ManagedWorkerVkStatus } from './managed-worker-control.js';
+import type { NativeCliCanaryEvidence } from './managed-worker-daemon.js';
 
 export interface ManagedWorkerControlClientOptions {
   readonly host: '127.0.0.1';
@@ -35,7 +37,8 @@ export interface ManagedWorkerScopedControlStatus extends ManagedWorkerControlSt
 }
 
 type Method = 'status' | 'submit-vk-v1' | 'vk-submission-status-v1' |
-  'vk-submission-status-by-id-v1' | 'revoke-ingress-v1' | 'qualify-handoff-v1';
+  'vk-submission-status-by-id-v1' | 'revoke-ingress-v1' | 'qualify-handoff-v1' |
+  'cli-canary-evidence-v1';
 const object = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
@@ -132,6 +135,14 @@ export class ManagedWorkerControlClient {
       !Number.isSafeInteger(result.nativeRevision) || (result.nativeRevision as number) < 0)
       throw new ManagedWorkerControlUnknownError();
     return result as unknown as ManagedWorkerScopedControlStatus;
+  }
+
+  /** Read-only scalar evidence; never starts or resumes a native task. */
+  async nativeCliCanaryEvidence(): Promise<NativeCliCanaryEvidence> {
+    const result = await this.#call('cli-canary-evidence-v1', {});
+    if (!validNativeCliCanaryEvidence(result, this.#options.ownerEpoch,
+      this.#options.taskId)) throw new ManagedWorkerControlUnknownError();
+    return result;
   }
 
   async submitVk(request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {

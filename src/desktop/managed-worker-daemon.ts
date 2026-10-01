@@ -409,6 +409,7 @@ export class ManagedWorkerDaemon {
           capability !== cli.capability || this.#state !== 'ready' ||
           !this.#admissionOpen || this.#ingressRevoked || !host || !owner || !key ||
           !taskId || !generation || this.#cliEvidencePending) throw new Error();
+      const sourceScope = cli.sourceScope;
       this.#cliEvidencePending = true;
       acquired = true;
       const current = (): void => {
@@ -419,6 +420,7 @@ export class ManagedWorkerDaemon {
             host.metadata.backendGeneration !== generation ||
             owner.metadata.state !== 'connected' ||
             this.#currentOwner?.() !== true) unavailable();
+        assertControlledNativeCliSourceScopeCurrent(sourceScope);
       };
       const text = (value: unknown): value is string => typeof value === 'string' &&
         value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/u.test(value);
@@ -719,6 +721,11 @@ export class ManagedWorkerDaemon {
             owner: this.metadata.nativeStartup,
             ...(proof ? { refusalOnlyEvidence: proof } : {}) };
         },
+        ...(this.#options.nativeCliWebSocket?.singleAcceptedStart === true &&
+          this.#options.nativeCliWebSocket.sourceScope ? {
+            cliCanaryEvidence: () => this.nativeCliCanaryEvidence(
+              this.#options.nativeCliWebSocket!.capability),
+          } : {}),
         requestStop: () => this.#requestStop(controlKey, manifest.home, manifest.familyRoot, observe),
         ...(this.#options.nativeStockQueue?.handoffCapability ? { handoff: {
           revoke: (expected: ManagedWorkerHandoffScope) => {

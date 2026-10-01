@@ -51,6 +51,9 @@ test('authenticated metadata control survives client EOF without stopping its wo
     assert.equal((await b.read()).error, 'refused');
     b.send({ id: 'rpc', epoch, method: 'turn/start' });
     assert.equal((await b.read()).error, 'refused');
+    b.send({ id: 'no-canary', epoch, taskId: 'owned-thread',
+      method: 'cli-canary-evidence-v1' });
+    assert.equal((await b.read()).error, 'refused');
     assert.equal(stops, 0);
     b.socket.destroy();
   } finally { await server.close(); }
@@ -129,6 +132,43 @@ test('control client status reads exact scoped health without requesting a worke
       nativeState: 'disconnected', nativeRevision: 7 });
     assert.equal(reads, 1);
     assert.equal(stops, 0);
+  } finally { await server.close(); }
+});
+
+test('opt-in CLI canary control returns only scoped content-free evidence', async () => {
+  const epoch = randomUUID(), taskId = 'isolated-canary';
+  let reads = 0, leak = false, sparse = false;
+  const evidence = { taskId, ownerEpoch: epoch, backendGeneration: 4,
+    nativeState: 'connected' as const, threadStatus: 'idle' as const,
+    turns: [], turnsPageComplete: true, goalEmpty: true, queueEmpty: true,
+    acceptedStartSha256: [], commandInFlight: 0, commandUnconfirmed: false,
+    requestsUnresolved: 0, pendingNativeOperations: 0, pendingEvents: 0 };
+  const server = new ManagedWorkerControlServer({ ownerEpoch: epoch, taskId,
+    status: () => ({ hostState: 'running', backendGeneration: 4,
+      nativeState: 'connected', nativeRevision: 0 }),
+    requestStop: async () => { throw new Error('stop must not run'); },
+    cliCanaryEvidence: async () => { reads++; return leak ?
+      { ...evidence, prompt: 'must-not-leak' } : sparse ?
+      { ...evidence, turns: Array(1) } : evidence; } });
+  const cap = await server.listen();
+  try {
+    const client = new ManagedWorkerControlClient({ ...cap, ownerEpoch: epoch, taskId });
+    assert.deepEqual(await client.nativeCliCanaryEvidence(), evidence);
+    const raw = await peer(cap);
+    raw.send({ id: 'wrong', epoch, taskId: 'other', method: 'cli-canary-evidence-v1' });
+    assert.equal((await raw.read()).error, 'refused');
+    raw.send({ id: 'extra', epoch, taskId, method: 'cli-canary-evidence-v1', extra: true });
+    assert.equal((await raw.read()).error, 'refused');
+    raw.socket.destroy();
+    assert.equal(reads, 1);
+    leak = true;
+    await assert.rejects(client.nativeCliCanaryEvidence(),
+      ManagedWorkerControlUnknownError);
+    assert.equal(reads, 2);
+    leak = false; sparse = true;
+    await assert.rejects(client.nativeCliCanaryEvidence(),
+      ManagedWorkerControlUnknownError);
+    assert.equal(reads, 3);
   } finally { await server.close(); }
 });
 

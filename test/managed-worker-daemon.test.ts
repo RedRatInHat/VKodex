@@ -17,7 +17,8 @@ import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
 import { OneShotComposerCommandGate, oneShotComposerCommandAuthorized } from '../src/desktop/one-shot-composer-command.js';
 import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
-import { ManagedWorkerControlClient } from '../src/desktop/managed-worker-control-client.js';
+import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError } from
+  '../src/desktop/managed-worker-control-client.js';
 import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
@@ -492,6 +493,12 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
   try {
     await assert.rejects(own.daemon.nativeCliCanaryEvidence({}), /unavailable/i);
     const first = await own.daemon.nativeCliCanaryEvidence(capability);
+    const locator = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'startup-control.v1.json'), 'utf8')) as { control: { port: number } };
+    const controlClient = new ManagedWorkerControlClient({ host: '127.0.0.1',
+      port: locator.control.port, token: Buffer.alloc(32, 3).toString('base64url'),
+      ownerEpoch: own.reserved.epoch, taskId: own.taskId });
+    assert.deepEqual(await controlClient.nativeCliCanaryEvidence(), first);
     assert.equal(first.taskId, own.taskId);
     assert.equal(first.ownerEpoch, own.reserved.epoch);
     assert.equal(first.backendGeneration, own.daemon.metadata.generation);
@@ -511,6 +518,10 @@ test('controlled native CLI canary evidence is capability-bound and contains onl
     assert.ok(evidenceRead, 'canary evidence must not clone the full thread history');
     assert.ok(own.backend.frames.some(frame => frame.method === 'thread/turns/list' &&
       (frame.params as Record<string, unknown> | undefined)?.itemsView === 'summary'));
+    const canaryReads = own.backend.frames.slice(-8).map(frame => frame.method);
+    assert.ok(canaryReads.every(method => ['thread/goal/get', 'thread/queue/list',
+      'thread/read', 'thread/turns/list'].includes(String(method))));
+    assert.equal(own.backend.writes, 0);
     assert.deepEqual(Object.keys(first).sort(), [
       'acceptedStartSha256', 'backendGeneration', 'commandInFlight', 'commandUnconfirmed',
       'goalEmpty', 'nativeState', 'ownerEpoch', 'pendingEvents', 'pendingNativeOperations',
@@ -588,13 +599,21 @@ test('controlled native CLI canary evidence permits only one outstanding history
     'normal', false, null, undefined, undefined, false, undefined, undefined,
     { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
   try {
+    const locator = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'startup-control.v1.json'), 'utf8')) as { control: { port: number } };
+    const controlClient = new ManagedWorkerControlClient({ host: '127.0.0.1',
+      port: locator.control.port, token: Buffer.alloc(32, 3).toString('base64url'),
+      ownerEpoch: own.reserved.epoch, taskId: own.taskId });
     own.backend.holdEvidenceRead = true;
-    const first = own.daemon.nativeCliCanaryEvidence(capability);
+    const first = controlClient.nativeCliCanaryEvidence();
     await waitFor(() => own.backend.heldEvidenceRead !== null, 1500);
-    await assert.rejects(own.daemon.nativeCliCanaryEvidence(capability), /unavailable/i);
+    const reads = own.backend.frames.length;
+    await assert.rejects(controlClient.nativeCliCanaryEvidence(), ManagedWorkerControlUnknownError);
+    assert.equal(own.backend.frames.length, reads);
+    assert.equal(own.backend.writes, 0);
     own.backend.answerHeldEvidenceRead();
     assert.equal((await first).turnsPageComplete, true);
-    assert.equal((await own.daemon.nativeCliCanaryEvidence(capability)).turnsPageComplete, true);
+    assert.equal((await controlClient.nativeCliCanaryEvidence()).turnsPageComplete, true);
   } finally {
     await controlStop(own.privateDirectory, own.reserved.epoch, 'canary-singleflight-stop');
   }
@@ -757,8 +776,14 @@ test('controlled CLI source scope refuses journal, source, and manifest drift', 
     { capability, noPendingExternalAutoStart: () => true, singleAcceptedStart: true });
   try {
     const scope = own.cliOptions!.sourceScope!;
+    const locator = JSON.parse(await readFile(path.join(own.privateDirectory,
+      'startup-control.v1.json'), 'utf8')) as { control: { port: number } };
+    const controlClient = new ManagedWorkerControlClient({ host: '127.0.0.1',
+      port: locator.control.port, token: Buffer.alloc(32, 3).toString('base64url'),
+      ownerEpoch: own.reserved.epoch, taskId: own.taskId });
     await verifyControlledNativeCliSourceScope(scope);
     assert.doesNotThrow(() => assertControlledNativeCliSourceScopeCurrent(scope));
+    await controlClient.nativeCliCanaryEvidence();
     await assert.rejects(verifyControlledNativeCliSourceScope(scope, {
       taskId: randomUUID(), home: own.home, cwd: own.home, approvedTaskPolicy: scope.policy }),
     /scope/i);
@@ -769,6 +794,10 @@ test('controlled CLI source scope refuses journal, source, and manifest drift', 
       `${JSON.stringify({ type: 'session_meta', payload: { id: randomUUID(),
         session_id: randomUUID(), cwd: own.home } })}\n`);
     assert.throws(() => assertControlledNativeCliSourceScopeCurrent(scope), /source-drift/i);
+    const reads = own.backend.frames.length;
+    await assert.rejects(controlClient.nativeCliCanaryEvidence(), ManagedWorkerControlUnknownError);
+    assert.equal(own.backend.frames.length, reads);
+    assert.equal(own.backend.writes, 0);
     await assert.rejects(verifyControlledNativeCliSourceScope(scope), /unqualified/i);
     own.creationJournal!.close();
     await assert.rejects(verifyControlledNativeCliSourceScope(scope), /scope/i);

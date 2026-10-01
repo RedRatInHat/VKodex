@@ -5,6 +5,7 @@ import path from 'node:path';
 import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { IpcRequestFailureCategory } from './ipc-client.js';
 import type { ComposerIngressDiagnosis } from './managed-worker-native-owner.js';
+import type { NativeCliCanaryEvidence } from './managed-worker-daemon.js';
 
 export interface ManagedWorkerControlStatus {
   readonly hostState: string;
@@ -67,6 +68,8 @@ export interface ManagedWorkerControlOptions {
   readonly authenticatedIdleTimeoutMs?: number;
   readonly status: () => ManagedWorkerControlStatus;
   readonly diagnose?: () => ManagedWorkerControlDiagnosis;
+  /** Opt-in read-only, content-free evidence for one controlled native CLI task. */
+  readonly cliCanaryEvidence?: () => Promise<NativeCliCanaryEvidence>;
   /** Must independently authorize stop and fence current task/family safety.
    * Resolve only after actual shutdown; a failed/unknown attempt is never retried here. */
   readonly requestStop: () => Promise<void>;
@@ -112,10 +115,18 @@ const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const exactPlain = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
+  object(value) && Object.getPrototypeOf(value) === Object.prototype &&
+  Reflect.ownKeys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const denseArray = (value: unknown, max: number): value is unknown[] =>
+  Array.isArray(value) && value.length <= max &&
+  Reflect.ownKeys(value).length === value.length + 1 &&
+  Array.from({ length: value.length }, (_, index) => Object.hasOwn(value, index)).every(Boolean);
 const text = (value: unknown, max: number): value is string => typeof value === 'string' &&
   value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const positive = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+const hexSha256 = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9]{64}$/u.test(v);
 const ticks = (v: unknown): v is string => typeof v === 'string' && /^[1-9][0-9]*$/u.test(v);
 const handoffScope = (v: unknown): v is ManagedWorkerHandoffScope => object(v) &&
   exact(v, ['backendGeneration', 'registryRevision']) &&
@@ -204,6 +215,30 @@ function validRefusalEvidence(value: unknown): boolean {
     positive(value.backendGeneration) && value.intentStore === 'absent' &&
     refusalZeroKeys.every(key => value[key] === 0);
 }
+export function validNativeCliCanaryEvidence(value: unknown, ownerEpoch: string,
+  taskId: string): value is NativeCliCanaryEvidence {
+  if (!exactPlain(value, ['taskId', 'ownerEpoch', 'backendGeneration',
+    'nativeState', 'threadStatus', 'turns', 'turnsPageComplete', 'goalEmpty',
+    'queueEmpty', 'acceptedStartSha256', 'commandInFlight', 'commandUnconfirmed',
+    'requestsUnresolved', 'pendingNativeOperations', 'pendingEvents']) ||
+    value.taskId !== taskId || value.ownerEpoch !== ownerEpoch ||
+    !positive(value.backendGeneration) || value.nativeState !== 'connected' ||
+    !['idle', 'active', 'inProgress', 'notLoaded', 'systemError'].includes(String(value.threadStatus)) ||
+    !denseArray(value.turns, 1) ||
+    !denseArray(value.acceptedStartSha256, 1) ||
+    !value.acceptedStartSha256.every(hexSha256) ||
+    !['turnsPageComplete', 'goalEmpty', 'queueEmpty', 'commandUnconfirmed']
+      .every(key => typeof value[key] === 'boolean') ||
+    !['commandInFlight', 'requestsUnresolved', 'pendingNativeOperations', 'pendingEvents']
+      .every(key => Number.isSafeInteger(value[key]) && (value[key] as number) >= 0 &&
+        (value[key] as number) <= 1_000_000)) return false;
+  return value.turns.every((turn: unknown) => object(turn) &&
+    exactPlain(turn, turn.status === 'failed' ? ['idSha256', 'status', 'failureKind'] :
+      ['idSha256', 'status']) && hexSha256(turn.idSha256) &&
+    ['inProgress', 'completed', 'failed', 'interrupted'].includes(String(turn.status)) &&
+    (turn.status !== 'failed' ||
+      ['usageLimit', 'serverOverloaded', 'unclassified', 'missing'].includes(String(turn.failureKind))));
+}
 function validDiagnosis(value: unknown): value is ManagedWorkerControlDiagnosis {
   if (!object(value) || Object.keys(value).some(key => !['schemaVersion', 'startupPhase',
     'daemonState', 'failureCode', 'bootstrapFailureCode', 'registryState', 'owner',
@@ -283,6 +318,7 @@ export class ManagedWorkerControlServer {
     if (!options || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(options.ownerEpoch) ||
         !text(options.taskId, 256) || typeof options.status !== 'function' ||
         options.diagnose !== undefined && typeof options.diagnose !== 'function' ||
+        options.cliCanaryEvidence !== undefined && typeof options.cliCanaryEvidence !== 'function' ||
         options.vk !== undefined && (!options.vk || typeof options.vk.submit !== 'function' ||
           typeof options.vk.status !== 'function' || typeof options.vk.statusByOperationId !== 'function') ||
         options.handoff !== undefined && (!options.handoff ||
@@ -355,20 +391,34 @@ export class ManagedWorkerControlServer {
         const vkMethod = frame.method === 'submit-vk-v1' || frame.method === 'vk-submission-status-v1' ||
           frame.method === 'vk-submission-status-by-id-v1';
         const handoffMethod = frame.method === 'revoke-ingress-v1' || frame.method === 'qualify-handoff-v1';
+        const cliCanaryMethod = frame.method === 'cli-canary-evidence-v1';
         if (!(handoffMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           'backendGeneration', 'registryRevision']) : vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           frame.method === 'vk-submission-status-by-id-v1' ? 'operationId' : 'request']) :
+          cliCanaryMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method']) :
           exact(frame, ['id', 'epoch', 'method'])) || frame.epoch !== this.#options.ownerEpoch ||
             vkMethod && (frame.taskId !== this.#options.taskId || !this.#options.vk) ||
+            cliCanaryMethod && (frame.taskId !== this.#options.taskId || !this.#options.cliCanaryEvidence) ||
             handoffMethod && (frame.taskId !== this.#options.taskId || !this.#options.handoff ||
               !positive(frame.backendGeneration) || !positive(frame.registryRevision)) ||
-            !['status', 'diagnose-v1', 'stop', 'submit-vk-v1', 'vk-submission-status-v1',
+            !['status', 'diagnose-v1', 'stop', 'cli-canary-evidence-v1', 'submit-vk-v1', 'vk-submission-status-v1',
               'vk-submission-status-by-id-v1', 'revoke-ingress-v1',
               'qualify-handoff-v1'].includes(String(frame.method)) ||
             ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
+        if (cliCanaryMethod) {
+          outstanding++;
+          void Promise.resolve().then(() => this.#options.cliCanaryEvidence!()).then(result => {
+            if (!validNativeCliCanaryEvidence(result, this.#options.ownerEpoch,
+              this.#options.taskId)) throw new Error();
+            send({ id, result });
+          }, () => send({ id, error: 'cli-canary-unavailable' }))
+            .catch(() => send({ id, error: 'cli-canary-unavailable' }))
+            .finally(() => { outstanding--; });
+          continue;
+        }
         if (handoffMethod) {
           const expected = Object.freeze({ backendGeneration: frame.backendGeneration as number,
             registryRevision: frame.registryRevision as number });
