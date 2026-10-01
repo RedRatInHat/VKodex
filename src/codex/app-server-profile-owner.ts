@@ -7,7 +7,7 @@ import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/tas
 import { AppServerConnection, type AppServerRpc } from "./app-server-connection.js";
 import { nativeCodexPath } from "./native-cli.js";
 import { AppServerTaskExecutor } from "./app-server-task-executor.js";
-import { AppServerTaskStateTransport, observeAppServerTaskState } from "./app-server-task-state.js";
+import { AppServerTaskStateTransport, observeAppServerTaskState, type AppServerStreamDiagnostic } from "./app-server-task-state.js";
 import { createDetachedProfileConnection, detachedProfileDirectory } from "./detached-profile-capability.js";
 
 /** One explicit task owner: one CODEX_HOME, one long-lived App Server connection. */
@@ -21,14 +21,15 @@ export class AppServerProfileOwner {
 
   constructor(readonly sourceId: string, private readonly rpc: AppServerRpc,
     private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
-    private readonly detachedThreadIds?: ReadonlySet<string>) {
+    private readonly detachedThreadIds?: ReadonlySet<string>,
+    onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {}) {
     if (detachedThreadIds) this.routingPolicy = "exclusive";
     this.executor = new AppServerTaskExecutor(rpc);
     this.nativeStates = new AppServerTaskStateTransport(rpc,
       threadId => this.executor.questionSnapshot(threadId),
       (task, release) => this.executor.release(task, release),
       (task, result) => { this.executor.acceptResumedTask(task, result); },
-      task => this.executor.resumeForStream(task));
+      task => this.executor.resumeForStream(task), onDiagnostic);
     this.unsubscribeQuestions = this.executor.onQuestionsChanged(threadId => this.nativeStates.refresh(threadId));
     this.states = {
       subscribe: (task, onState, onError) => {
@@ -127,22 +128,24 @@ export class AppServerProfileOwner {
 }
 
 export function createAppServerProfileOwner(sourceId: string, codexHome: string,
-  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>): AppServerProfileOwner {
+  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
+  onDiagnostic?: (task: TaskRef, event: AppServerStreamDiagnostic) => void): AppServerProfileOwner {
   const rpc = new AppServerConnection(() => spawn(nativeCodexPath(), ["app-server", "--stdio"], {
     windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     env: { ...buildCodexEnvironment(process.env), CODEX_HOME: codexHome },
   }));
-  return new AppServerProfileOwner(sourceId, rpc, resolveProject);
+  return new AppServerProfileOwner(sourceId, rpc, resolveProject, undefined, onDiagnostic);
 }
 
 /** Opt-in only: the bridge obtains a client capability from the independent
  * profile server's ready record and never becomes its process owner. */
 export function createDetachedAppServerProfileOwner(sourceId: string, codexHome: string,
   dataDirectory: string, threadIds: readonly string[],
-  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>): AppServerProfileOwner {
+  resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
+  onDiagnostic?: (task: TaskRef, event: AppServerStreamDiagnostic) => void): AppServerProfileOwner {
   const privateDirectory = detachedProfileDirectory(dataDirectory, codexHome);
   return new AppServerProfileOwner(sourceId,
-    createDetachedProfileConnection(privateDirectory, codexHome), resolveProject, new Set(threadIds));
+    createDetachedProfileConnection(privateDirectory, codexHome), resolveProject, new Set(threadIds), onDiagnostic);
 }
 
 /** Routes state subscriptions to an explicit profile owner without fallback. */

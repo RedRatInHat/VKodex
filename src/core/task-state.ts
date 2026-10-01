@@ -124,6 +124,14 @@ export interface TaskStateConnectionFailure {
   readonly lastVerifiedAt: number | null;
 }
 
+export interface TaskStateConnectionEvent {
+  readonly phase: "subscribe" | "resume" | "verify" | "notification";
+  readonly outcome: "attempt" | "confirmed" | "failed";
+  readonly reason?: NonNullable<TaskStateRouteDiagnostic["failureClass"]>;
+  readonly routeGeneration: number;
+  readonly elapsedMs?: number;
+}
+
 interface TaskStateConnection {
   readonly task: TaskRef;
   readonly key: string;
@@ -142,7 +150,12 @@ export class TaskStateConnections {
   private readonly retryAfter = new Map<string, { since: number; until: number }>();
   private generation = 0;
 
-  constructor(private readonly transport: TaskStateTransport, private readonly now: () => number = Date.now) {}
+  constructor(private readonly transport: TaskStateTransport, private readonly now: () => number = Date.now,
+    private readonly onDiagnostic: (id: string, event: TaskStateConnectionEvent, task: TaskRef) => void = () => {}) {}
+
+  private report(id: string, task: TaskRef, event: TaskStateConnectionEvent): void {
+    try { this.onDiagnostic(id, event, task); } catch { /* Diagnostics cannot change task ownership. */ }
+  }
 
   ids(): readonly string[] { return [...this.connections.keys()]; }
   has(id: string): boolean { return this.connections.has(id); }
@@ -200,6 +213,8 @@ export class TaskStateConnections {
     this.close(id);
     if (previousFailure?.key === taskKey(task)) this.lastFailures.set(id, previousFailure);
     const generation = ++this.generation;
+    const startedAt = this.now();
+    this.report(id, task, { phase: "subscribe", outcome: "attempt", routeGeneration: generation });
     let stream!: TaskStateStream;
     try {
       stream = this.transport.subscribe(task, (state, initial) => {
@@ -209,6 +224,8 @@ export class TaskStateConnections {
         onState(state, initial);
       }, error => this.fail(id, stream, error));
     } catch (error) {
+      this.report(id, task, { phase: "subscribe", outcome: "failed", reason: failureClass(error),
+        routeGeneration: generation, elapsedMs: Math.max(0, this.now() - startedAt) });
       this.lastFailures.set(id, { key: taskKey(task), at: this.now(),
         diagnostic: { kind: "unknown", failureClass: failureClass(error), routeGeneration: generation } });
       throw error;
@@ -222,11 +239,15 @@ export class TaskStateConnections {
       if (this.connections.get(id)?.stream !== stream) return;
       connection.ready = true;
       connection.lastVerifiedAt = this.now();
+      this.report(id, task, { phase: "resume", outcome: "confirmed", routeGeneration: generation,
+        elapsedMs: Math.max(0, this.now() - startedAt) });
       this.retryAfter.delete(id);
       this.lastFailures.delete(id);
     } catch (error) {
       if (this.connections.get(id)?.stream !== stream) return;
       const diagnostic = failedRouteDiagnostic(stream, error, generation);
+      this.report(id, task, { phase: "resume", outcome: "failed", reason: diagnostic.failureClass ?? "other",
+        routeGeneration: generation, elapsedMs: Math.max(0, this.now() - startedAt) });
       this.close(id);
       this.lastFailures.set(id, { key: connection.key, at: this.now(), diagnostic });
       throw error;
@@ -240,17 +261,19 @@ export class TaskStateConnections {
     if (age !== null && age >= 0 && age < intervalMs) return;
     const check = connection.stream.verifyOwner().then(() => {
       if (this.connections.get(id) === connection) connection.lastVerifiedAt = this.now();
-    }, error => this.fail(id, connection.stream, error)).finally(() => {
+    }, error => this.fail(id, connection.stream, error, "verify")).finally(() => {
       if (connection.verifying === check) connection.verifying = null;
     });
     connection.verifying = check;
   }
 
-  private fail(id: string, stream: TaskStateStream, error: Error): void {
+  private fail(id: string, stream: TaskStateStream, error: Error, phase: "verify" | "notification" = "notification"): void {
     const connection = this.connections.get(id);
     if (connection?.stream !== stream) return;
     const failure = { task: connection.task, error, lastVerifiedAt: connection.lastVerifiedAt } satisfies TaskStateConnectionFailure;
     const diagnostic = failedRouteDiagnostic(stream, error, connection.generation);
+    this.report(id, connection.task, { phase, outcome: "failed", reason: diagnostic.failureClass ?? "other",
+      routeGeneration: connection.generation });
     this.close(id);
     this.lastFailures.set(id, { key: connection.key, at: this.now(), diagnostic });
     connection.onFailure(failure);

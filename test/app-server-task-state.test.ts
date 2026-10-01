@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AppServerEnvelope, AppServerRequestOptions, AppServerRpc, AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
-import { AppServerTaskStateTransport, observeAppServerTaskState } from "../src/codex/app-server-task-state.js";
+import { AppServerUnavailableError, type AppServerEnvelope, type AppServerRequestOptions, type AppServerRpc, type AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
+import { AppServerTaskStateTransport, observeAppServerTaskState, type AppServerStreamDiagnostic } from "../src/codex/app-server-task-state.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import type { TaskState } from "../src/core/task-state.js";
@@ -82,11 +82,14 @@ test("native ownership verification rejects unloaded or unrecognized runtime sta
     { thread: { id: "task" } },
     { thread: { id: "task", status: { type: "futureUnknownStatus" } } },
   ]);
-  const transport = new AppServerTaskStateTransport(rpc);
+  const diagnostics: AppServerStreamDiagnostic[] = [];
+  const transport = new AppServerTaskStateTransport(rpc, undefined, undefined, undefined, undefined,
+    (_task, event) => diagnostics.push(event));
   const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
   try {
     await stream.start();
     for (let i = 0; i < 3; i++) await assert.rejects(stream.verifyOwner());
+    assert.equal(diagnostics.filter(event => event.phase === "verify" && event.outcome === "failed" && event.reason === "not-loaded").length, 3);
   } finally { transport.close(); }
 });
 
@@ -257,6 +260,74 @@ test("a rejected final unsubscribe with an idle backend remains fail-closed", as
     assert.equal(rpc.calls.filter(call => call.method === "thread/read").length, 1);
     assert.equal(rpc.calls.filter(call => call.method === "thread/resume").length, 1);
     next.close();
+  } finally { transport.close(); }
+});
+
+test("lifecycle diagnostics identify failed unsubscribe and blocked reattach without logging error text", async () => {
+  const rpc = new FakeRpc();
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") return resume([]);
+    if (method === "thread/read") return { thread: { id: "task", status: { type: "active" } } };
+    throw new Error("private token and local path");
+  };
+  const events: AppServerStreamDiagnostic[] = [];
+  const transport = new AppServerTaskStateTransport(rpc, undefined, undefined, undefined, undefined,
+    (_task, event) => events.push(event));
+  const task = { hostId: "h", threadId: "task" };
+  const first = transport.subscribe(task, () => {}, () => {});
+  try {
+    await first.start();
+    first.close();
+    await new Promise(resolve => setImmediate(resolve));
+    const next = transport.subscribe(task, () => {}, () => {});
+    await assert.rejects(next.start());
+    assert.deepEqual(events.filter(event => event.phase === "unsubscribe" || event.phase === "reattach-fence").slice(0, 4), [
+      { phase: "unsubscribe", outcome: "attempt" },
+      { phase: "unsubscribe", outcome: "failed", reason: "other" },
+      { phase: "reattach-fence", outcome: "attempt" },
+      { phase: "reattach-fence", outcome: "blocked", reason: "still-loaded" },
+    ]);
+    assert.equal(JSON.stringify(events).includes("private"), false);
+    next.close();
+  } finally { transport.close(); }
+});
+
+test("disconnect records why unsubscribe was skipped without stopping another task", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  const events: AppServerStreamDiagnostic[] = [];
+  const transport = new AppServerTaskStateTransport(rpc, undefined, undefined, undefined, undefined,
+    (_task, event) => events.push(event));
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  try {
+    await stream.start();
+    rpc.disconnect();
+    stream.close();
+    assert.ok(events.some(event => event.phase === "disconnect" && event.reason === "disconnected"));
+    assert.ok(events.some(event => event.phase === "unsubscribe" && event.outcome === "skipped" && event.reason === "disconnected"));
+    assert.equal(rpc.calls.some(call => call.method === "thread/unsubscribe"), false);
+  } finally { transport.close(); }
+});
+
+test("unsubscribe timeout is classified without retaining its message", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([])]);
+  const events: AppServerStreamDiagnostic[] = [];
+  rpc.request = async (method: string, params: JsonObject = {}): Promise<JsonObject> => {
+    rpc.calls.push({ method, params });
+    if (method === "thread/resume") return resume([]);
+    throw new AppServerUnavailableError("private timeout detail", "timeout");
+  };
+  const transport = new AppServerTaskStateTransport(rpc, undefined, undefined, undefined, undefined,
+    (_task, event) => events.push(event));
+  const stream = transport.subscribe({ hostId: "h", threadId: "task" }, () => {}, () => {});
+  try {
+    await stream.start();
+    stream.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(events.some(event => event.phase === "unsubscribe" && event.outcome === "failed" && event.reason === "app-server-timeout"));
+    assert.equal(JSON.stringify(events).includes("private"), false);
   } finally { transport.close(); }
 });
 

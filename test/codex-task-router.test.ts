@@ -393,6 +393,28 @@ test("post-start onError retains fixed route evidence before closing the connect
   assert.equal(JSON.stringify(connections.lastFailureDiagnostic("binding-private")).includes("private"), false);
 });
 
+test("connection lifecycle reports notification failure stage without exception content", async () => {
+  const events: unknown[] = [];
+  const scopes: TaskRef[] = [];
+  let reportError: ((error: Error) => void) | undefined;
+  const transport: TaskStateTransport = { subscribe: (task, _onState, onError) => {
+    reportError = onError;
+    return { task, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
+  }, close: () => {} };
+  const connections = new TaskStateConnections(transport, () => 1_000, (_id, event, task) => {
+    events.push(event); scopes.push(task);
+  });
+  await connections.connect("binding", work, () => {}, () => {});
+  reportError!(new Error("private token and task path"));
+  assert.deepEqual(events, [
+    { phase: "subscribe", outcome: "attempt", routeGeneration: 1 },
+    { phase: "resume", outcome: "confirmed", routeGeneration: 1, elapsedMs: 0 },
+    { phase: "notification", outcome: "failed", reason: "other", routeGeneration: 1 },
+  ]);
+  assert.equal(JSON.stringify(events).includes("private"), false);
+  assert.deepEqual(scopes, [work, work, work]);
+});
+
 test("exclusive claim wins before legacy and never falls back after an owner error", async () => {
   const f = fixture();
   const legacy = { ...f.owner, owns: () => true };

@@ -22,6 +22,8 @@ import { inspectThroughOwner } from "./desktop/owner-channel.js";
 import { ManagedOwnerRouteResolver } from "./bridge/managed-owner-route-resolver.js";
 import { inspectManagedRestartTurn } from "./bridge/managed-owner-observed-task-state-transport.js";
 import { createDesktopRouting } from "./desktop/desktop-routing.js";
+import { sameTask } from "./core/codex-tasks.js";
+import type { AppServerStreamDiagnostic } from "./codex/app-server-task-state.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -48,6 +50,13 @@ const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task), undefined, () => catalog.listSources()), new ProfileDesktopGoals(task => catalog.sourceHome(task)),
   { launcher, creator, transfer });
 const sourceIds = catalog.listSources();
+const recordAppServerDiagnostic = (task: import("./core/codex-tasks.js").TaskRef, event: AppServerStreamDiagnostic): void => {
+  // The transport has a task, not a VK binding. Record only for exact attached matches.
+  const binding = store.bindings().find(candidate => candidate.attached && sameTask(candidate, task));
+  if (!binding) return;
+  try { store.recordConnectionDiagnostic(binding.id, { at: Date.now(), ...event }, task); }
+  catch { /* A diagnostic write must never affect a live Codex turn. */ }
+};
 const detachedProfileBase = process.env.LOCALAPPDATA && path.isAbsolute(process.env.LOCALAPPDATA)
   ? path.join(process.env.LOCALAPPDATA, "VKodex", "owner-private") : null;
 const appServerOwners = config.codexSources.flatMap((source, index) => {
@@ -56,11 +65,11 @@ const appServerOwners = config.codexSources.flatMap((source, index) => {
     return { rawProjectId: resolved.rawProjectId, ...(resolved.sourceId ? { sourceId: resolved.sourceId } : {}) };
   };
   if (source.owner === "app-server")
-    return [createAppServerProfileOwner(sourceIds[index]!.id, source.home, resolveProject)];
+    return [createAppServerProfileOwner(sourceIds[index]!.id, source.home, resolveProject, recordAppServerDiagnostic)];
   if (source.owner === "detached-app-server") {
     if (!detachedProfileBase) throw new Error("Independent profile owner requires Windows user-local storage");
     return [createDetachedAppServerProfileOwner(sourceIds[index]!.id, source.home,
-      detachedProfileBase, source.detachedThreadIds!, resolveProject)];
+      detachedProfileBase, source.detachedThreadIds!, resolveProject, recordAppServerDiagnostic)];
   }
   return [];
 });

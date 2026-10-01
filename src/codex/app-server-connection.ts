@@ -15,7 +15,9 @@ export interface AppServerWireEndpoint {
 }
 
 export class AppServerUnavailableError extends Error {
-  constructor(message = "Codex App Server недоступен.") { super(message); this.name = "AppServerUnavailableError"; }
+  constructor(message = "Codex App Server недоступен.", readonly reason: "unavailable" | "timeout" = "unavailable") {
+    super(message); this.name = "AppServerUnavailableError";
+  }
 }
 
 export class AppServerRejectedError extends Error {
@@ -262,7 +264,7 @@ export class AppServerConnection implements AppServerRpc {
           if (this.lateResponseReceipts.size > MAX_LATE_RESPONSE_RECEIPTS)
             this.lateResponseReceipts.delete(this.lateResponseReceipts.keys().next().value!);
         }
-        const error = pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError("Codex App Server не ответил вовремя.");
+        const error = pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError("Codex App Server не ответил вовремя.", "timeout");
         pending.reject(error);
         // A timeout describes this operation, not the health of the writer.
         // A mutation may already be running: keep its notifications and other

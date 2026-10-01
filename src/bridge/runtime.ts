@@ -123,7 +123,10 @@ export class BridgeRuntime {
     inboundFileLimits?: InboundFileLimits, private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
     store.assertOwner(access.ownerId, access.groupId);
     this.startedAt = now(); this.lastTickAt = this.startedAt;
-    this.connections = new TaskStateConnections(adapters.states, now);
+    this.connections = new TaskStateConnections(adapters.states, now, (bindingId, event, task) => {
+      try { store.recordConnectionDiagnostic(bindingId, { at: now(), ...event }, task); }
+      catch { /* Diagnostic persistence must not interrupt task observation. */ }
+    });
     this.observeTaskState = adapters.observe;
     this.historyRecovery = adapters.history;
     this.inspectExternalOwner = adapters.inspectExternalOwner;
@@ -202,6 +205,9 @@ export class BridgeRuntime {
       const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
       const streamMode: "attached" | "detached" | "unknown" = this.streamMode(binding.id) ?? (isConnected(binding) ? "attached" : "unknown");
       const lease = this.store.getValue<{ lastEventAt?: number | null; leaseSince?: number | null }>(`task-lease:${binding.id}`);
+      const connectionHistory = this.store.connectionDiagnostics(binding.id, binding);
+      const lastResume = connectionHistory.findLastIndex(event => event.phase === "resume" && event.outcome === "confirmed");
+      const recentConnectionHistory = connectionHistory.slice(lastResume + 1);
       const route = !this.desktop.isCreationActive?.(binding)
         ? this.connections.connected(binding.id)
           ? this.connections.diagnostic(binding.id)
@@ -211,6 +217,8 @@ export class BridgeRuntime {
         status: details?.status ?? "unavailable", connected: isConnected(binding),
         lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
         streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null,
+        lastConnectionDiagnostic: recentConnectionHistory.findLast(event => event.outcome === "failed" || event.outcome === "blocked")
+          ?? connectionHistory.at(-1) ?? null,
         ...(route ? { route } : {}) };
     });
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null

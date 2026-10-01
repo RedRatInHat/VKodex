@@ -92,6 +92,19 @@ export interface DeliveryFailure {
   readonly operation: "send" | "edit" | "delete";
   readonly retryAfterMs?: number;
 }
+/** Bounded, privacy-safe lifecycle evidence. Never store exception messages or native payloads here. */
+export interface ConnectionDiagnostic {
+  readonly at: number;
+  readonly phase: "subscribe" | "resume" | "verify" | "notification" | "disconnect" | "unsubscribe" | "reattach-fence";
+  readonly outcome: "attempt" | "confirmed" | "failed" | "skipped" | "blocked";
+  readonly reason?: "owner-busy" | "task-not-open" | "desktop-unavailable" | "app-server-unavailable" | "app-server-timeout" |
+    "rejected" | "other" | "not-subscribed" | "invalid-unsubscribe-response" | "disconnected" |
+    "resume-unconfirmed" | "read-failed" | "still-loaded" | "not-loaded" | "already-unloaded";
+  readonly routeGeneration?: number;
+  readonly elapsedMs?: number;
+  /** Opaque physical task identity; never expose it in VK health text. */
+  readonly taskFingerprint?: string;
+}
 export interface DeliveryHealthStats {
   readonly activePending: number;
   readonly criticalPending: number;
@@ -885,6 +898,25 @@ export class BridgeStore {
   }
   setValue(key: string, value: unknown): void {
     this.db.prepare("INSERT INTO bridge_values(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
+  }
+
+  connectionDiagnostics(bindingId: string, task?: TaskRef): readonly ConnectionDiagnostic[] {
+    const events = this.getValue<ConnectionDiagnostic[]>(`connection-diagnostics:${bindingId}`) ?? [];
+    if (!task) return events;
+    const fingerprint = createHash("sha256").update(taskKey(task)).digest("hex");
+    return events.filter(event => event.taskFingerprint === fingerprint);
+  }
+  recordConnectionDiagnostic(bindingId: string, event: ConnectionDiagnostic, task?: TaskRef): void {
+    this.atomic(() => {
+      if (task) {
+        const current = this.getBinding(bindingId);
+        if (!current || taskKey(current) !== taskKey(task)) return;
+      }
+      const scoped = task ? { ...event,
+        taskFingerprint: createHash("sha256").update(taskKey(task)).digest("hex") } : event;
+      this.setValue(`connection-diagnostics:${bindingId}`,
+        [...this.connectionDiagnostics(bindingId), scoped].slice(-32));
+    });
   }
 
   /** Reservations stay charged after a crash until a separate reconciler safely

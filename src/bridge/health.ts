@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { sameTask, taskKey, type DesktopCompatibility, type CodexTasks } from "../core/codex-tasks.js";
 import type { TaskStateRouteDiagnostic } from "../core/task-state.js";
 import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, OwnerAccess } from "./contracts.js";
-import { BridgeStore } from "./store.js";
+import { BridgeStore, type ConnectionDiagnostic } from "./store.js";
 import type { QueuedInputHistoryCursor } from "../core/codex-tasks.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 
@@ -45,6 +45,7 @@ export interface RuntimeHealthState {
     readonly leaseSince?: number | null;
     readonly lastConfirmedAt: number | null;
     readonly failure: "usageLimit" | "serverOverloaded" | "systemError" | null;
+    readonly lastConnectionDiagnostic?: ConnectionDiagnostic | null;
     /** Local route evidence, never a claim of physical native writer ownership. */
     readonly route?: TaskStateRouteDiagnostic;
   }[];
@@ -277,6 +278,16 @@ export class BridgeHealthMonitor {
         : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
+      const diagnostic = binding.lastConnectionDiagnostic;
+      if (!binding.connected && diagnostic && ["running", "approval"].includes(binding.status)) {
+        const date = Number.isFinite(diagnostic.at) ? new Date(diagnostic.at) : new Date(Number.NaN);
+        const at = Number.isFinite(date.getTime()) ? date.toISOString() : "время неизвестно";
+        checks.push({ name: `codex_connection_diagnostic:${binding.id}`, state: "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: ${at}; этап ${diagnostic.phase}; результат ${diagnostic.outcome}` +
+            `${diagnostic.reason ? `; причина ${diagnostic.reason}` : ""}` +
+            `${diagnostic.routeGeneration !== undefined ? `; поколение ${diagnostic.routeGeneration}` : ""}` +
+            `${diagnostic.elapsedMs !== undefined ? `; длительность ${diagnostic.elapsedMs} мс` : ""}. Журнал последних 32 переходов хранится в локальной БД.` });
+      }
       if (binding.connected && binding.route) {
         const route = binding.route;
         const label = route.kind === "native-observer" ? "наблюдатель native" : route.kind === "app-server" ? "канал App Server" : "не подтверждён";

@@ -771,6 +771,57 @@ test("health labels route evidence without equating it to physical native writer
   assert.match(report.checks.find(check => check.name === "codex_streams")!.detail, /локальных аренд потока VKodex.*не подтверждает физического native writer/u);
 });
 
+test("connection journal is bounded and health exposes the last disconnected lifecycle stage", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  for (let index = 0; index < 40; index++) store.recordConnectionDiagnostic("task", {
+    at: 1_000 + index, phase: "verify", outcome: "failed", reason: "app-server-unavailable", routeGeneration: index,
+  });
+  assert.equal(store.connectionDiagnostics("task").length, 32);
+  assert.equal(store.connectionDiagnostics("task")[0]?.routeGeneration, 8);
+  const last = store.connectionDiagnostics("task").at(-1)!;
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 0,
+    requiredBindings: 1, connectedRequiredBindings: 0, bindings: [{ id: "task", title: "Task", source: ".codex-work",
+      status: "running", connected: false, lastConfirmedAt: null, failure: null, lastConnectionDiagnostic: last }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  const check = report.checks.find(item => item.name === "codex_connection_diagnostic:task")!;
+  assert.equal(check.state, "degraded");
+  assert.match(check.detail, /verify.*failed.*app-server-unavailable.*39/u);
+});
+
+test("connection diagnostics cannot follow a VK binding into another physical task", t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const source = { hostId: "local", threadId: "source", sourceId: "work", title: "Source",
+    workspace: "C:/fixture", updatedAt: 1 };
+  const target = { ...source, threadId: "target", title: "Target" };
+  const binding = store.ensureBinding(source);
+  store.recordConnectionDiagnostic(binding.id, { at: 1_000, phase: "resume", outcome: "failed" }, source);
+  const transfer = { id: "connection-diagnostic-transfer", bindingId: binding.id, startedAt: 1_001,
+    source, targetSourceId: "work", targetProjectId: null, phase: "forking" as const };
+  store.beginTransfer(transfer);
+  store.switchTransfer(transfer, target, 1_002);
+  assert.deepEqual(store.connectionDiagnostics(binding.id, target), []);
+  store.recordConnectionDiagnostic(binding.id, { at: 1_003, phase: "verify", outcome: "failed" }, source);
+  assert.deepEqual(store.connectionDiagnostics(binding.id, target), []);
+  store.recordConnectionDiagnostic(binding.id, { at: 1_004, phase: "resume", outcome: "confirmed" }, target);
+  assert.deepEqual(store.connectionDiagnostics(binding.id, target).map(event => event.at), [1_004]);
+});
+
+test("invalid durable connection timestamp does not crash health", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false, activeBindings: 1, connectedBindings: 0,
+    requiredBindings: 1, connectedRequiredBindings: 0, bindings: [{ id: "task", title: "Task", source: ".codex-work",
+      status: "running", connected: false, lastConfirmedAt: null, failure: null,
+      lastConnectionDiagnostic: { at: Number.MAX_SAFE_INTEGER, phase: "verify", outcome: "failed" } }],
+  }), undefined, () => now);
+  const report = await monitor.check(true);
+  assert.match(report.checks.find(item => item.name === "codex_connection_diagnostic:task")!.detail, /время неизвестно/u);
+});
+
 test("health explains a failed route attempt without exposing transport exception text", async t => {
   const store = new BridgeStore(); t.after(() => store.close());
   const now = 100_000;

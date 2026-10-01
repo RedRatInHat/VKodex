@@ -10,6 +10,17 @@ type JsonObject = Record<string, unknown>;
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
 const string = (value: unknown): string | null => typeof value === "string" && value ? value : null;
 
+export interface AppServerStreamDiagnostic {
+  readonly phase: "resume" | "verify" | "disconnect" | "unsubscribe" | "reattach-fence";
+  readonly outcome: "attempt" | "confirmed" | "failed" | "skipped" | "blocked";
+  readonly reason?: "app-server-unavailable" | "app-server-timeout" | "rejected" | "other" | "owner-busy" |
+    "not-subscribed" | "invalid-unsubscribe-response" | "disconnected" | "resume-unconfirmed" | "read-failed" |
+    "still-loaded" | "not-loaded" | "already-unloaded";
+}
+const releaseFailureReason = (error: unknown): "app-server-unavailable" | "app-server-timeout" | "rejected" | "other" =>
+  error instanceof AppServerRejectedError ? "rejected" : error instanceof AppServerUnavailableError
+    ? error.reason === "timeout" ? "app-server-timeout" : "app-server-unavailable" : "other";
+
 interface NativeTurn {
   readonly id: string;
   readonly status: string;
@@ -171,13 +182,20 @@ class AppServerTaskStream implements TaskStateStream {
     private readonly startGate: <T>(work: () => Promise<T>) => Promise<T>,
     private readonly onResume: (task: TaskRef, result: JsonObject) => void,
     private readonly resumeTask: ((task: TaskRef) => Promise<JsonObject>) | null,
-    private readonly onClose: (stream: AppServerTaskStream, release: Promise<void> | null) => void) {}
+    private readonly onClose: (stream: AppServerTaskStream, release: Promise<void> | null) => void,
+    private readonly onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void) {}
+
+  private report(event: AppServerStreamDiagnostic): void {
+    try { this.onDiagnostic(this.task, event); } catch { /* Never change stream lifecycle for diagnostics. */ }
+  }
 
   async start(): Promise<void> {
     this.starting = true;
+    this.report({ phase: "resume", outcome: "attempt" });
     this.unsubscribeNotification = this.rpc.onNotification(notification => this.receive(notification));
     this.unsubscribeDisconnect = this.rpc.onDisconnect?.(error => {
       this.disconnected = true;
+      this.report({ phase: "disconnect", outcome: "failed", reason: "disconnected" });
       if (!this.closed) this.onError(error);
     }) ?? null;
     try {
@@ -197,6 +215,7 @@ class AppServerTaskStream implements TaskStateStream {
       // A matching response has already acquired the upstream subscription.
       // Cleanup must not depend on local callbacks/projection also succeeding.
       this.resumeConfirmed = true;
+      this.report({ phase: "resume", outcome: "confirmed" });
       // The profile command executor uses this exact App Server connection.
       // Publish ownership before the initial state callback so a VK prompt
       // can go straight to turn/start instead of issuing a second resume.
@@ -209,6 +228,8 @@ class AppServerTaskStream implements TaskStateStream {
       for (const notification of this.queued.splice(0)) this.apply(notification);
       if (!this.closed) this.onState(this.snapshot, true);
     } catch (error) {
+      this.report({ phase: "resume", outcome: "failed", reason: error instanceof AppServerRejectedError && error.reason === "active-writer"
+        ? "owner-busy" : releaseFailureReason(error) });
       this.close();
       if (error instanceof AppServerRejectedError && error.reason === "active-writer") throw new TaskOwnedByClientError();
       throw error;
@@ -220,10 +241,19 @@ class AppServerTaskStream implements TaskStateStream {
 
   async verifyOwner(): Promise<void> {
     const unavailable = (): boolean => !this.started || this.closed || this.disconnected;
-    if (unavailable()) throw new AppServerUnavailableError("Подключение к задаче не активно.");
-    const result = await this.rpc.request("thread/read", { threadId: this.task.threadId, includeTurns: false });
+    if (unavailable()) {
+      this.report({ phase: "verify", outcome: "failed", reason: this.disconnected ? "disconnected" : "not-loaded" });
+      throw new AppServerUnavailableError("Подключение к задаче не активно.");
+    }
+    let result: JsonObject;
+    try { result = await this.rpc.request("thread/read", { threadId: this.task.threadId, includeTurns: false }); }
+    catch (error) {
+      this.report({ phase: "verify", outcome: "failed", reason: releaseFailureReason(error) });
+      throw error;
+    }
     if (unavailable() || !isObject(result.thread) || result.thread.id !== this.task.threadId
       || !isObject(result.thread.status) || !["idle", "active", "systemError"].includes(String(result.thread.status.type))) {
+      this.report({ phase: "verify", outcome: "failed", reason: "not-loaded" });
       throw new AppServerUnavailableError("Codex больше не подтверждает загруженное состояние задачи.");
     }
   }
@@ -300,6 +330,8 @@ class AppServerTaskStream implements TaskStateStream {
   private finishClose(): void {
     if (this.closeNotified) return;
     this.closeNotified = true;
+    this.report({ phase: "unsubscribe", outcome: this.resumeConfirmed && !this.disconnected ? "attempt" : "skipped",
+      ...(!this.resumeConfirmed || this.disconnected ? { reason: this.disconnected ? "disconnected" as const : "resume-unconfirmed" as const } : {}) });
     // Stop only this thread's subscription. A successful unsubscribe is not
     // proof that its writer was unloaded; never close the shared connection
     // as cleanup, since that would disrupt unrelated VK conversations.
@@ -309,8 +341,15 @@ class AppServerTaskStream implements TaskStateStream {
         // thread. Only a completed unsubscribe or an already-unloaded thread
         // can let a later consumer issue another resume.
         if (result.status !== "unsubscribed" && result.status !== "notLoaded") {
+          this.report({ phase: "unsubscribe", outcome: "blocked", reason: result.status === "notSubscribed"
+            ? "not-subscribed" : "invalid-unsubscribe-response" });
           throw new AppServerUnavailableError("Codex не подтвердил освобождение подписки задачи.");
         }
+        this.report({ phase: "unsubscribe", outcome: "confirmed",
+          ...(result.status === "notLoaded" ? { reason: "already-unloaded" as const } : {}) });
+      }, error => {
+        this.report({ phase: "unsubscribe", outcome: "failed", reason: releaseFailureReason(error) });
+        throw error;
       })
       : null;
     // The transport may be used without a command executor; never leave an
@@ -350,7 +389,11 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
     private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => [],
     private readonly onTaskClose: (task: TaskRef, release: Promise<void> | null) => void = () => {},
     private readonly onTaskResume: (task: TaskRef, result: JsonObject) => void = () => {},
-    private readonly resumeTask: ((task: TaskRef) => Promise<JsonObject>) | null = null) {}
+    private readonly resumeTask: ((task: TaskRef) => Promise<JsonObject>) | null = null,
+    private readonly onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {}) {}
+  private reportLifecycle(task: TaskRef, event: AppServerStreamDiagnostic): void {
+    try { this.onDiagnostic(task, event); } catch { /* Diagnostics cannot alter the release fence. */ }
+  }
   private async gate<T>(work: () => Promise<T>): Promise<T> {
     if (this.activeStarts >= 2) await new Promise<void>(resolve => this.startWaiters.push(resolve));
     this.activeStarts++;
@@ -417,11 +460,19 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
       // A timed-out unsubscribe is not proof of unload. After a backend
       // restart, however, a read can positively confirm there is no loaded
       // thread left to disrupt. Unknown/active states remain fail-closed.
-      const read = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false });
+      this.reportLifecycle(task, { phase: "reattach-fence", outcome: "attempt" });
+      let read: JsonObject;
+      try { read = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false }); }
+      catch (error) {
+        this.reportLifecycle(task, { phase: "reattach-fence", outcome: "failed", reason: "read-failed" });
+        throw error;
+      }
       if (!isObject(read.thread) || read.thread.id !== task.threadId || !isObject(read.thread.status)
         || read.thread.status.type !== "notLoaded") {
+        this.reportLifecycle(task, { phase: "reattach-fence", outcome: "blocked", reason: "still-loaded" });
         throw new AppServerUnavailableError("Предыдущая подписка не подтверждена как выгруженная; повторное подключение остановлено.");
       }
+      this.reportLifecycle(task, { phase: "reattach-fence", outcome: "confirmed" });
     });
     if (beforeStart) void beforeStart.catch(() => {});
     let resolveClosed!: () => void; let rejectClosed!: (error: unknown) => void;
@@ -439,7 +490,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
       this.trackRetiring(key, entry);
       try { this.onTaskClose(upstream.task, release); }
       finally { void Promise.all([beforeStart, release]).then(() => resolveClosed(), rejectClosed); }
-    });
+    }, (diagnosticTask, event) => this.reportLifecycle(diagnosticTask, event));
     const entry: SharedStateStream = { stream, consumers: new Set(), closed, beforeStart, latest: null, error: null, starting: null };
     this.streams.set(key, entry);
     return entry;
