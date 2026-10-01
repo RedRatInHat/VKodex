@@ -1,4 +1,3 @@
-import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import DatabaseConstructor, { type Database } from 'better-sqlite3';
 
@@ -74,10 +73,13 @@ function validRow(row: Row): NativeFirstTurnBootstrapRecord {
  * controlled zero-turn journal: an unknown start blocks replay after reopen. */
 export class NativeFirstTurnBootstrapJournal {
   readonly #db: Database;
+  readonly #directory: string;
   #closed = false;
   constructor(filePath: string) {
     if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) fail();
-    mkdirSync(path.dirname(filePath), { recursive: true });
+    this.#directory = path.dirname(filePath);
+    // The caller must establish the private directory/key before opening the
+    // journal. Never create an unprotected bootstrap parent as a side effect.
     this.#db = new DatabaseConstructor(filePath);
     try {
       this.#db.pragma('busy_timeout = 5000'); this.#db.pragma('journal_mode = WAL'); this.#db.pragma('synchronous = FULL');
@@ -95,6 +97,8 @@ export class NativeFirstTurnBootstrapJournal {
     } catch (error) { this.#db.close(); throw error; }
   }
   close(): void { if (!this.#closed) { this.#closed = true; this.#db.close(); } }
+  /** The key and one-operation database share a caller-owned private directory. */
+  directory(): string { this.#open(); return this.#directory; }
   synchronousMode(): number { this.#open(); return this.#db.pragma('synchronous', { simple: true }) as number; }
   #open(): void { if (this.#closed) fail(); }
   get(operationId: string): NativeFirstTurnBootstrapRecord | null {

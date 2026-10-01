@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -14,6 +14,12 @@ const identity = () => ({ sourceId: 'profile-a', sourceGeneration: randomUUID(),
 const fingerprint = (_value: string) => 'a'.repeat(64);
 const open = (filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite')) =>
   new NativeFirstTurnBootstrapJournal(filePath);
+
+test('bootstrap journal never creates a missing unprotected parent', () => {
+  const directory = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'missing');
+  assert.throws(() => open(path.join(directory, 'journal.sqlite')));
+  assert.equal(existsSync(directory), false);
+});
 
 test('durably sequences thread creation before a first-turn reservation without storing prompt material', () => {
   const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')), 'journal.sqlite');

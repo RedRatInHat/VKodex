@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { prepareNativeCliTurnStart } from '../src/codex/native-cli-turn-start.js';
 import { prepareNativeFirstTurnBootstrapCommand, NATIVE_FIRST_TURN_TEXT_MAX_BYTES } from
   '../src/desktop/native-first-turn-input-fingerprint.js';
+import { NativeFirstTurnBootstrapJournal } from '../src/desktop/native-first-turn-bootstrap-journal.js';
+import { reserveNativeFirstTurnWithKey } from '../src/desktop/native-first-turn-bootstrap-preparation.js';
 import { ManagedNativeCliStartAdmission, NativeCliStartNotSubmittedError } from
   '../src/codex/managed-native-cli-start-admission.js';
 import { readNativeCliIdleEvidence } from '../src/codex/managed-native-cli-source-reader.js';
@@ -86,6 +92,48 @@ test('first-turn bootstrap command applies its recoverable text bound before jou
   assert.throws(() => prepareNativeFirstTurnBootstrapCommand(start({ input: [{ type: 'text',
     text: 'a'.repeat(NATIVE_FIRST_TURN_TEXT_MAX_BYTES + 1) }] }),
   { taskId, ownerEpoch, effectiveSettings: settings }, identity), /first-turn input/u);
+});
+
+test('first-turn preparation reserves one durable fingerprint before any native dispatch', () => {
+  const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'vkodex-first-turn-')),
+    'journal.sqlite');
+  const journal = new NativeFirstTurnBootstrapJournal(filePath);
+  const identity = { operationId: randomUUID(), sourceId: 'profile-a',
+    sourceGeneration: randomUUID(), ownerEpoch,
+    threadStartFingerprint: 'c'.repeat(64), backendIdentity: 'b'.repeat(64) };
+  const cliScope = { taskId, ownerEpoch, effectiveSettings: settings };
+  const key = Buffer.alloc(32, 7);
+  try {
+    journal.persistThreadStartIntent(identity);
+    assert.equal(journal.directory(), path.dirname(filePath));
+    journal.persistThreadAccepted({ operationId: identity.operationId,
+      expectedRevision: 1, threadId: taskId });
+    assert.throws(() => reserveNativeFirstTurnWithKey(journal, { ...identity,
+      backendIdentity: 'd'.repeat(64) }, start(), cliScope, key), /unqualified/u);
+    assert.throws(() => reserveNativeFirstTurnWithKey(journal, identity,
+      start({ input: [{ type: 'text', text: 'a'.repeat(8193) }] }), cliScope, key), /first-turn input/u);
+    assert.equal(journal.get(identity.operationId)?.state, 'thread-accepted');
+    const result = reserveNativeFirstTurnWithKey(journal, identity, start(), cliScope, key);
+    assert.equal(result.revision, 3);
+    assert.equal(result.command.method, 'turn/start');
+    assert.equal(Object.isFrozen(result.command.params), true);
+    assert.equal(journal.get(identity.operationId)?.keyedFingerprint, result.keyedFingerprint);
+    assert.equal(journal.get(identity.operationId)?.clientUserMessageId, clientId);
+    assert.equal(JSON.stringify(journal.get(identity.operationId)).includes('isolated test'), false);
+    assert.throws(() => reserveNativeFirstTurnWithKey(journal, identity, start(), cliScope, key), /unqualified/u);
+    assert.equal(journal.get(identity.operationId)?.revision, 3);
+  } finally { journal.close(); key.fill(0); }
+  for (const suffix of ['', '-wal', '-shm']) {
+    const candidate = `${filePath}${suffix}`;
+    if (existsSync(candidate))
+      assert.equal(readFileSync(candidate).includes(Buffer.from('isolated test')), false);
+  }
+  const reopened = new NativeFirstTurnBootstrapJournal(filePath);
+  try {
+    assert.equal(reopened.get(identity.operationId)?.state, 'turn-reserved');
+    assert.throws(() => reserveNativeFirstTurnWithKey(reopened, identity, start(), cliScope,
+      Buffer.alloc(32, 7)), /unqualified/u);
+  } finally { reopened.close(); }
 });
 
 test('native CLI start rejects source, settings, context, and input drift', () => {
