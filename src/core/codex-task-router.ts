@@ -118,16 +118,11 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
     const owner = this.owner(request.task);
-    if (owner) {
-      if (owner.routingPolicy === "exclusive") this.unsupportedExclusive();
-      try { await owner.inspectTask(request.task); }
-      catch (error) {
-        if (error instanceof TaskOwnedByClientError && this.base.editLastUserTurn) return this.base.editLastUserTurn(request);
-        throw error;
-      }
-      throw new ActionRejectedError("Нативное редактирование последнего хода пока не включено для этого каталога Codex.");
-    }
+    if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
     if (!this.base.editLastUserTurn) throw new ActionRejectedError("Редактирование последнего хода недоступно.");
+    // This path attaches only to an already-open native UI owner and validates
+    // the exact latest turn/operation before its targeted edit. A read-only
+    // profile-owner inspect is not proof that such a UI owner is absent.
     return this.base.editLastUserTurn(request);
   }
   async interrupt(task: TaskRef): Promise<void> {

@@ -4317,6 +4317,35 @@ test("editing never rewrites an older or already-steered turn", async () => {
   }
 });
 
+test("editing refuses if another turn becomes latest while the old turn is being interrupted", async () => {
+  const server = new Server();
+  const oldTurn = { turnId: "fixture-turn", turnStartedAtMs: 100, status: "inProgress",
+    params: { clientUserMessageId: "vk-operation", input: [{ type: "text", text: "Old request" }] },
+    items: [{ type: "userMessage", id: "old-user", clientId: "vk-operation",
+      content: [{ type: "text", text: "Old request" }] }],
+  };
+  server.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed",
+    threadRuntimeStatus: { type: "active" }, turns: [oldTurn] };
+  server.interruptReply = () => {
+    server.dataState = { id: ref.threadId, hostId: ref.hostId, resumeState: "resumed",
+      threadRuntimeStatus: { type: "active" }, turns: [oldTurn, {
+        turnId: "newer-turn", turnStartedAtMs: 200, status: "inProgress",
+        params: { clientUserMessageId: "newer-operation", input: [{ type: "text", text: "New request" }] },
+        items: [],
+      }] };
+    server.snapshot();
+    return "success";
+  };
+  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100));
+  await assert.rejects(adapter.editLastUserTurn({ task: ref, operationId: "vk-operation",
+    expectedOperationId: "vk-operation", expectedTurnId: "fixture-turn", text: "Corrected" }),
+  /не последний запрос/u);
+  assert.equal(server.received.filter(message => message.method === "thread-follower-interrupt-turn").length, 1);
+  assert.equal(server.received.some(message => message.method === "thread-follower-edit-last-user-turn"), false);
+});
+
 test("an explicit idle runtime ignores an orphaned in-progress history turn", async () => {
   const server = new Server();
   server.dataState = {

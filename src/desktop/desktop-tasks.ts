@@ -659,20 +659,27 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     const task = (await this.listTasks()).find(candidate => sameTask(candidate, request.task));
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
     return this.follow(task, async (subscription, client) => {
-      const state = subscription.current!;
-      const latest = turnsFromState(state).at(-1);
-      const params = latest && isObject(latest.params) ? latest.params : null;
-      if (!latest || latest.turnId !== request.expectedTurnId || params?.clientUserMessageId !== request.expectedOperationId) {
-        throw new ActionRejectedError("Это уже не последний запрос задачи. Изменение осталось только в VK; контекст Codex не затронут.");
-      }
-      const items = Array.isArray(latest.items) ? latest.items.filter(isObject) : [];
-      if (items.some(item => item.type === "steeringUserMessage")) {
-        throw new ActionRejectedError("После этого запроса в текущий ход уже пришло уточнение. Codex не умеет безопасно отредактировать только раннюю часть хода; изменение осталось только в VK.");
-      }
+      const currentTarget = () => {
+        const latest = turnsFromState(subscription.current!).at(-1);
+        const params = latest && isObject(latest.params) ? latest.params : null;
+        if (!latest || latest.turnId !== request.expectedTurnId ||
+            params?.clientUserMessageId !== request.expectedOperationId) {
+          throw new ActionRejectedError("Это уже не последний запрос задачи. Изменение осталось только в VK; контекст Codex не затронут.");
+        }
+        const items = Array.isArray(latest.items) ? latest.items.filter(isObject) : [];
+        if (items.some(item => item.type === "steeringUserMessage")) {
+          throw new ActionRejectedError("После этого запроса в текущий ход уже пришло уточнение. Codex не умеет безопасно отредактировать только раннюю часть хода; изменение осталось только в VK.");
+        }
+        return latest;
+      };
+      const latest = currentTarget();
       if (latest.status === "inProgress") await this.interruptLive(task, request.expectedTurnId);
       else if (!["completed", "failed", "interrupted"].includes(String(latest.status))) {
         throw new ActionRejectedError("Последний ход находится в состоянии, которое нельзя безопасно перезапустить редактированием.");
       }
+      // Stopping an active turn awaits a second follower connection. During
+      // that gap another client may have started or steered a newer turn.
+      currentTarget();
       const reply = await client.request("thread-follower-edit-last-user-turn", 1, {
         conversationId: task.threadId,
         turnId: request.expectedTurnId,

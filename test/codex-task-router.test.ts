@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
-import { ActionRejectedError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type TaskRef } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
 import { RoutedTaskStateTransport, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
@@ -134,6 +134,38 @@ test("owner route loads through the profile owner without opening a UI client or
   await assert.rejects(f.routed.editLastUserTurn!({ operationId: "edit", task: work, text: "x", expectedTurnId: "t", expectedOperationId: "o" }), ActionRejectedError);
   assert.deepEqual(f.calls, ["owner:open"]);
   await f.routed.ensureOpen!(primary); assert.deepEqual(f.calls, ["owner:open", "base:open"]);
+});
+
+test("nonexclusive owner delegates a guarded last-turn edit to the already open UI client", async () => {
+  const f = fixture();
+  const request = { operationId: "edit", task: work, text: "corrected",
+    expectedTurnId: "last-turn", expectedOperationId: "last-prompt" };
+  let inspected = 0;
+  f.owner.inspectTask = async () => { inspected++; return {
+    status: "idle", workspace: null, model: null, effort: null,
+    nextModel: null, nextEffort: null, context: null,
+  }; };
+  const base = { ...f.base, editLastUserTurn: async (received: EditLastUserTurnRequest) => {
+    assert.deepEqual(received, request);
+    f.calls.push("base:connectedEdit");
+    return { turnId: "replacement", operationId: "replacement-prompt" };
+  } };
+  const routed = new RoutedCodexTasks(base, [f.owner]);
+  assert.deepEqual(await routed.editLastUserTurn!(request),
+    { turnId: "replacement", operationId: "replacement-prompt" });
+  assert.deepEqual(f.calls, ["base:connectedEdit"]);
+  assert.equal(inspected, 0);
+});
+
+test("a failed connected edit is not retried against the profile owner", async () => {
+  const f = fixture();
+  const base = { ...f.base, editLastUserTurn: async () => { f.calls.push("base:editRefused");
+    throw new ActionRejectedError("No active UI owner"); } };
+  const routed = new RoutedCodexTasks(base, [f.owner]);
+  await assert.rejects(routed.editLastUserTurn!({ operationId: "edit", task: work,
+    text: "corrected", expectedTurnId: "last-turn", expectedOperationId: "last-prompt" }),
+  /No active UI owner/u);
+  assert.deepEqual(f.calls, ["base:editRefused"]);
 });
 
 test("ensure open accepts an active writer as proof that the task is already open", async () => {
