@@ -430,7 +430,7 @@ export class TaskFiles {
   private maintenanceStopped = false;
   constructor(private readonly root: string, private readonly store: BridgeStore, private readonly chat: BridgeChat, private readonly gate: AccessGate,
     private readonly inboundLimits: InboundFileLimits = INBOUND_FILE_LIMITS,
-    /** Explicit one-chat pilot. Every other chat keeps direct source-byte delivery. */
+    /** Explicit rollout scope. Disabled keeps direct source-byte delivery. */
     private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED,
     private readonly recycleStage: (target: string) => Promise<void> = recycleStageOnWindows,
     private readonly stageFreeBytes: (folder: string) => Promise<bigint> = async folder => {
@@ -954,7 +954,8 @@ export class TaskFiles {
               return;
             }
             let receipt = staged;
-            if (!receipt && this.stagedFilePilot.mode === "single-chat" && binding.peerId === this.stagedFilePilot.peerId) {
+            if (!receipt && (this.stagedFilePilot.mode === "all-chats"
+              || this.stagedFilePilot.mode === "single-chat" && binding.peerId === this.stagedFilePilot.peerId)) {
               try { receipt = await this.stageFile(file, relativePath, fingerprint, key, job, binding); }
               catch (error) {
                 if (!(error instanceof StageQuotaError)) throw error;

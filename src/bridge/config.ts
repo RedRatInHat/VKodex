@@ -7,7 +7,8 @@ import type { ProjectCatalogMode } from "../desktop/catalog.js";
 
 export type StagedFilePilot =
   | Readonly<{ readonly mode: "disabled" }>
-  | Readonly<{ readonly mode: "single-chat"; readonly peerId: number }>;
+  | Readonly<{ readonly mode: "single-chat"; readonly peerId: number }>
+  | Readonly<{ readonly mode: "all-chats" }>;
 
 export const STAGED_FILE_PILOT_DISABLED: StagedFilePilot = Object.freeze({ mode: "disabled" });
 
@@ -25,7 +26,7 @@ export interface DesktopBridgeConfig {
   readonly inboundFileLimits: { readonly maxFiles: number; readonly maxFileBytes: number; readonly maxTotalBytes: number; readonly timeoutMs: number };
   /** DPAPI-protected file read by the local PowerShell helper on demand. */
   readonly documentTokenPath: string;
-  /** Explicitly scoped pilot; absent configuration disables new staging. */
+  /** Explicit rollout scope; absent configuration disables new staging. */
   readonly stagedFilePilot: StagedFilePilot;
 }
 
@@ -166,10 +167,12 @@ export function loadDesktopBridgeConfig(env: NodeJS.ProcessEnv = process.env): D
   const stagedPilotPeerId = stagedPilotPeer?.trim();
   const stagedFilePilot: StagedFilePilot = stagedPilotMode === undefined && stagedPilotPeer === undefined
     ? STAGED_FILE_PILOT_DISABLED
+    : stagedPilotMode?.trim() === "all-chats" && stagedPilotPeer === undefined
+      ? Object.freeze({ mode: "all-chats" })
     : stagedPilotMode?.trim() === "single-chat" && !!stagedPilotPeerId && /^\d+$/u.test(stagedPilotPeerId)
       && Number.isSafeInteger(Number(stagedPilotPeerId)) && Number(stagedPilotPeerId) > 0 && Number(stagedPilotPeerId) <= 2_147_483_647
       ? Object.freeze({ mode: "single-chat", peerId: Number(stagedPilotPeerId) })
-      : (() => { throw new Error("VKODEX_STAGED_FILE_PILOT must be single-chat with one valid VKODEX_STAGED_FILE_PILOT_PEER_ID"); })();
+      : (() => { throw new Error("VKODEX_STAGED_FILE_PILOT must be all-chats without a peer ID or single-chat with one valid VKODEX_STAGED_FILE_PILOT_PEER_ID"); })();
   const codexSources = configuredCodexSources(env);
   const codexHomes = codexSources.map(source => source.home);
   const automaticRoot = env.VKODEX_PROJECTLESS_ROOT?.trim();

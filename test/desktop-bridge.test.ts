@@ -3772,6 +3772,17 @@ test("single-chat staging pilot leaves every unallowlisted peer on source-byte d
   assert.equal(Object.keys(index).length, 1);
   assert.equal(s.chat.binaryUploads[1]!.traceId,
     createHash("sha256").update(Object.values(index)[0]!.key).digest("hex"));
+
+  s.store.setChat(initial.id, otherPeer, 18);
+  const allChatBinding = s.store.getBinding(initial.id)!;
+  const allChats = new TaskFiles(root, s.store, s.chat, s.gate, undefined, { mode: "all-chats" });
+  const allChatJob = await allChats.prepare(allChatBinding, "all-chat-peer", []);
+  allChats.finish(allChatBinding.id, "all-chat-peer", "accepted", "all-chat-turn");
+  await writeFile(path.join(allChatJob.outboxDir, "result.txt"), "all-chat bytes");
+  assert.equal(await allChats.collect(allChatBinding, true), 1);
+  const allChatIndex = s.store.getValue<Record<string, { key: string }>>(`file-stage-index:${allChatBinding.id}:all-chat-peer`) ?? {};
+  assert.equal(Object.keys(allChatIndex).length, 1, "all-chats mode must stage outside the single-chat allowlist");
+  assert.equal(s.chat.binaryUploads[2]!.contents.toString(), "all-chat bytes");
 });
 
 test("terminal history proof completes only its matching queued file job", async t => {
@@ -4494,14 +4505,17 @@ test("malformed legacy stage receipts fail closed for new stage admission", asyn
   restored.close();
 });
 
-test("a staged version survives source mutation and restart before upload", async t => {
+for (const { title, configuredPeer, pilot } of [
+  { title: "a staged version survives source mutation and restart before upload", configuredPeer: peerId, pilot: STAGED_FILE_PILOT_FOR_TEST },
+  { title: "all-chat staging survives source mutation and restart for an unallowlisted peer", configuredPeer: peerId - 1, pilot: { mode: "all-chats" as const } },
+]) test(title, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-staged-restart-test-"));
   const filename = path.join(root, "bridge.sqlite");
   const store = new BridgeStore(filename); const chat = new Chat();
   const bindingId = store.ensureBinding(task).id;
-  store.setChat(bindingId, peerId, 17);
+  store.setChat(bindingId, configuredPeer, 17);
   const binding = store.getBinding(bindingId)!;
-  const files = new TaskFiles(root, store, chat, new AccessGate(access, store), undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const files = new TaskFiles(root, store, chat, new AccessGate(access, store), undefined, pilot);
   const prepared = await files.prepare(binding, "staged-restart", []);
   files.finish(binding.id, "staged-restart", "accepted", "finished-turn");
   const source = path.join(prepared.outboxDir, "result.txt");
@@ -4527,7 +4541,7 @@ test("a staged version survives source mutation and restart before upload", asyn
   const recovered = new BridgeStore(filename);
   t.after(() => recovered.close());
   const recoveredBinding = recovered.getBinding(binding.id)!;
-  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered), undefined, STAGED_FILE_PILOT_FOR_TEST);
+  const restored = new TaskFiles(root, recovered, chat, new AccessGate(access, recovered), undefined, pilot);
   const receiptKey = Object.keys(staged)[0]!;
   recovered.setValue(`file-stage-index:${binding.id}:staged-restart`, {
     ...staged, [receiptKey]: { ...receipt, threadId: "another-source-task" },
@@ -5378,6 +5392,9 @@ test("config accepts one owner and never includes private values in validation e
   assert.deepEqual(defaults.stagedFilePilot, { mode: "disabled" });
   assert.deepEqual(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "single-chat", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }).stagedFilePilot,
     { mode: "single-chat", peerId });
+  assert.deepEqual(loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "all-chats" }).stagedFilePilot,
+    { mode: "all-chats" });
+  assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "all-chats", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "single-chat" }));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT_PEER_ID: String(peerId) }));
   assert.throws(() => loadDesktopBridgeConfig({ ...env, VK_OWNER_ID: "101", VKODEX_STAGED_FILE_PILOT: "", VKODEX_STAGED_FILE_PILOT_PEER_ID: "" }));

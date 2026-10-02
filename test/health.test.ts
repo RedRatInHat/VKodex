@@ -149,6 +149,14 @@ test("health reports an enabled staging pilot's exact peer scope without storage
   assert.doesNotMatch(check.detail, /[\\/]|token|secret/i);
 });
 
+test("health reports all-chat immutable staging without storage paths", async t => {
+  const s = setup(t, Object.freeze({ mode: "all-chats" as const }));
+  const check = (await s.monitor.check()).checks.find(item => item.name === "stage_pilot")!;
+  assert.match(check.detail, /staged-копий включена для всех бесед/u);
+  assert.match(check.detail, /автоматическая уборка staged-копий отключена/u);
+  assert.doesNotMatch(check.detail, /[\\/]|token|secret/i);
+});
+
 test("stage storage health distinguishes normal retention from stale pending recycle and never exposes paths", async t => {
   const s = setup(t);
   let clock = 1_000;
