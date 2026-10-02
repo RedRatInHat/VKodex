@@ -55,6 +55,13 @@ export class AppServerTaskExecutor {
   private readonly unsubscribe: () => void;
   private readonly unsubscribeDisconnect: () => void;
 
+  executionSnapshot(task: TaskRef): { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending: boolean } {
+    return { activeTurnId: this.loaded.get(taskKey(task))?.activeTurnId ?? null,
+      releasePending: this.releasing.has(taskKey(task)),
+      blocked: this.questions.has(task.threadId) || this.resuming.has(taskKey(task))
+        || this.uncertainReleases.has(taskKey(task)) || this.archiving.has(task.threadId) };
+  }
+
   constructor(private readonly rpc: AppServerRpc) {
     this.unsubscribe = rpc.onNotification(notification => this.observe(notification));
     this.unsubscribeDisconnect = rpc.onDisconnect?.(error => this.connectionLost(error)) ?? (() => {});

@@ -347,7 +347,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return await this.metadata?.archiveRetryReady?.(task) ?? false;
   }
 
-  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
+  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing" | "unknown"> {
     if (!this.metadata?.ownerAdapterStatus) throw new DesktopUnavailableError("Проверка адаптера клиента-владельца недоступна.");
     return this.metadata.ownerAdapterStatus(task);
   }

@@ -236,7 +236,8 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   inspectManagedRestartTurn?: (task: import("../src/core/codex-tasks.js").TaskRef,
     snapshot: import("../src/desktop/restart-intent.js").RestartTaskSnapshot) =>
     Promise<"unclaimed" | "active" | "settled" | "unknown">,
-  passiveStates?: TaskStateTransport) {
+  passiveStates?: TaskStateTransport,
+  prepareRuntime?: (store: BridgeStore, binding: Binding, desktop: ConnectedDesktopTasks) => void) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -255,6 +256,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   };
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => client,
     undefined, undefined, goals);
+  prepareRuntime?.(store, binding, desktop);
   let now = 100_000;
   const adapters = {
     ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
@@ -280,6 +282,298 @@ test("runtime schedules a fresh health check after clock rollback", async t => {
   s.advance(-1);
   await s.runtime.tick(false);
   assert.equal(checks, 2);
+});
+
+test("runtime restores the owner fence before command callbacks and never treats persisted release as current proof", t => {
+  let restored = 0, callbackInstalled = false;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (store, binding, desktop) => {
+      store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "released",
+        at: 1, generation: store.streamGeneration(binding.id) });
+      Object.assign(desktop, {
+        executionDrainSupported: () => true,
+        restoreExecutionDrain: (task: typeof ref) => {
+          assert.equal(taskKey(task), taskKey(binding)); restored++;
+        },
+        onCreationUpdate: () => {
+          assert.equal(restored, 1, "commands cannot be installed before owner admission is fenced");
+          callbackInstalled = true;
+          return () => {};
+        },
+      });
+    });
+  assert.equal(restored, 1);
+  assert.equal(callbackInstalled, true);
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "unavailable");
+  assert.deepEqual(s.server.received, [], "rehydration never contacts or starts a backend");
+});
+
+test("health idle drain releases only the exact MS writer while preserving its old queue ACK", async t => {
+  let writerStarts = 0, writerCloses = 0, passiveStarts = 0, passiveCloses = 0;
+  let publishPassive!: (snapshot: IpcObject, initial: boolean) => void;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => {
+        writerStarts++;
+        onState({ ...state([], "completed"), id: task.threadId }, true);
+      }, verifyOwner: async () => {}, close: () => { writerCloses++; } };
+    }, close() {},
+  };
+  const passive: TaskStateTransport = {
+    readOnly: true,
+    subscribe(task, onState) {
+      publishPassive = onState;
+      return { task, readOnly: true, start: async () => {
+        passiveStarts++;
+        onState({ ...state([], "completed"), id: task.threadId }, true);
+      }, verifyOwner: async () => {}, close: () => { passiveCloses++; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer, undefined, undefined, undefined, undefined, undefined, passive);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null });
+  const operationId = "ms-old-accepted-queue-ack";
+  s.store.recordOperation(operationId, s.binding, "old-ms-ack-inbox", s.binding.id, 1);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "old-ms-native-queue", 1);
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+    .connectBinding(s.binding, ref);
+  assert.equal(writerStarts, 1, "the fixture begins with the existing command-capable writer route");
+
+  let drainCalls = 0, scanCalls = 0;
+  const desktop = s.desktop as unknown as { drainIdleExecution?: (task: typeof ref,
+    beforeRelease: () => unknown | Promise<unknown>) => Promise<string>; scanTerminalQueuedInput?:
+      (task: typeof ref, operationId: string, cursor: unknown) => Promise<{ done: boolean; turnId: string | null }> };
+  desktop.drainIdleExecution = async (_task, beforeRelease) => {
+    drainCalls++;
+    await beforeRelease();
+    return "waiting-unload";
+  };
+  desktop.scanTerminalQueuedInput = async () => { scanCalls++; return { done: true, turnId: null }; };
+
+  s.advance(60_001);
+  await s.runtime.tick();
+  (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  for (let i = 0; i < 100 && scanCalls === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(drainCalls > 0, "periodic health maintenance must consult the scoped writer drain capability");
+  assert.equal(writerCloses, 1, "the proven-idle writer for this binding is released");
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "waiting for unload does not consume the old ACK");
+  assert.ok(scanCalls > 0, "the separate read-only terminal scanner still runs");
+
+  await s.runtime.tick();
+  assert.equal(passiveStarts, 1, "the exact task remains observable through the passive route");
+  publishPassive({ ...state([{ type: "agentMessage", id: "ms-ro-progress", phase: "commentary", text: "Observed" }]),
+    id: ref.threadId }, false);
+  await s.runtime.tick();
+  assert.equal(writerStarts, 1, "read-only progress must not reacquire a writer");
+  assert.equal(writerCloses, 1);
+  assert.equal(passiveCloses, 0, "passive observation remains attached");
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+  assert.equal(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"]
+    .includes(String(message.method))), false, "health never dispatches another turn");
+});
+
+test("health idle drain blocks an active Android writer and releases only after fresh terminal proof", async t => {
+  let writerStarts = 0, writerCloses = 0, passiveStarts = 0;
+  let publishWriter!: (snapshot: IpcObject, initial: boolean) => void;
+  let publishPassive!: (snapshot: IpcObject, initial: boolean) => void;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) {
+      publishWriter = onState;
+      return { task, start: async () => {
+        writerStarts++;
+        onState({ ...state([], "inProgress"), id: task.threadId }, true);
+      }, verifyOwner: async () => {}, close: () => { writerCloses++; } };
+    }, close() {},
+  };
+  const passive: TaskStateTransport = {
+    readOnly: true,
+    subscribe(task, onState) {
+      publishPassive = onState;
+      return { task, readOnly: true, start: async () => {
+        passiveStarts++;
+        onState({ ...state([], "completed"), id: task.threadId }, true);
+      }, verifyOwner: async () => {}, close() {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer, undefined, undefined, undefined, undefined, undefined, passive);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running", workspace: "/fixture", model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null });
+  const operationIds = ["android-sep26-ack-a", "android-sep26-ack-b"];
+  for (const [index, operationId] of operationIds.entries()) {
+    s.store.recordOperation(operationId, s.binding, `android-ack-inbox-${index}`, s.binding.id, index + 1);
+    s.store.finishOperation(operationId, "accepted");
+    s.store.rememberQueuedInput(s.binding.id, operationId, `android-native-queue-${index}`, index + 1);
+    s.store.rememberAcceptedTurn(s.binding.id, `android-prior-turn-${index}`, operationId);
+  }
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+    .connectBinding(s.binding, ref);
+  assert.equal(writerStarts, 1, "the fixture begins with its already-held writer transport");
+
+  let backendState: "active" | "terminal-quiescent" = "active";
+  let drainCalls = 0, closeApprovals = 0;
+  const desktop = s.desktop as unknown as { drainIdleExecution?: (task: typeof ref,
+    beforeRelease: () => unknown | Promise<unknown>) => Promise<string> };
+  desktop.drainIdleExecution = async (_task, beforeRelease) => {
+    drainCalls++;
+    if (backendState === "active") return "blocked";
+    closeApprovals++;
+    await beforeRelease();
+    return "waiting-unload";
+  };
+
+  s.advance(60_001);
+  await s.runtime.tick();
+  assert.ok(drainCalls > 0, "periodic health maintenance checks the current writer against backend state");
+  assert.equal(closeApprovals, 0, "running state blocks the release callback");
+  assert.equal(writerCloses, 0, "health never closes a writer while execution is active");
+  assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), operationIds);
+  assert.equal(s.store.acceptedTurns(s.binding.id).length, 2, "accepted turn markers remain unconsumed");
+  assert.equal(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"]
+    .includes(String(message.method))), false);
+
+  backendState = "terminal-quiescent";
+  publishWriter({ ...state([], "completed"), id: ref.threadId }, false);
+  await s.runtime.tick();
+  s.advance(60_001);
+  await s.runtime.tick();
+  assert.equal(closeApprovals, 1, "only fresh terminal quiescence invokes the exact-binding release callback");
+  assert.equal(writerCloses, 1);
+  assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), operationIds,
+    "waiting for unload does not fabricate consumption of either ACK");
+  assert.equal(s.store.acceptedTurns(s.binding.id).length, 2);
+
+  await s.runtime.tick();
+  assert.equal(passiveStarts, 1, "released task switches to passive observation");
+  publishPassive({ ...state([{ type: "agentMessage", id: "android-ro-progress", phase: "commentary", text: "Observed" }]),
+    id: ref.threadId }, false);
+  await s.runtime.tick();
+  assert.equal(writerStarts, 1, "new passive progress does not restart the writer");
+  assert.equal(writerCloses, 1);
+  assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), operationIds);
+  assert.equal(s.store.acceptedTurns(s.binding.id).length, 2);
+});
+
+test("an old queued ACK does not let demanded outlive input preparation and suppress the next owner drain", async t => {
+  let writerStarts = 0, writerCloses = 0, drainCalls = 0;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { writerStarts++; onState({ ...state([], "inProgress"), id: task.threadId }, true); },
+        verifyOwner: async () => {}, close: () => { writerCloses++; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running", workspace: "/fixture", model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null });
+  const operationId = "old-accepted-queue-ack";
+  s.store.recordOperation(operationId, s.binding, "old-ack-inbox", s.binding.id, 1);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "old-native-queue", 1);
+  const desktop = s.desktop as unknown as { drainIdleExecution?:
+    (task: typeof ref, beforeRelease: () => void) => Promise<"waiting-unload" | "released" | "blocked" | "unavailable"> };
+  desktop.drainIdleExecution = async task => {
+    drainCalls++;
+    assert.equal(task.threadId, ref.threadId);
+    return "blocked";
+  };
+  const currentBinding = s.store.getBinding(s.binding.id)!;
+  const prepared = await (s.runtime as unknown as { prepareTaskInput(binding: Binding):
+    Promise<{ close(): void; assertReady(): void }> }).prepareTaskInput(currentBinding);
+  assert.equal(writerStarts, 1, "input preparation owns the existing command-capable route");
+  const demanded = (s.runtime as unknown as { demanded: Set<string> }).demanded;
+  const pendingReacquire = (s.runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire;
+  assert.equal(demanded.has(s.binding.id), true);
+  assert.equal(pendingReacquire.has(s.binding.id), true);
+
+  await s.runtime.tick();
+  assert.equal(drainCalls, 0, "owner proof waits while the input preparation scope is still active");
+  prepared.close();
+  assert.equal(pendingReacquire.has(s.binding.id), false, "scope completion clears only the in-flight reacquire marker");
+  assert.equal(demanded.has(s.binding.id), true, "stale running details plus an old ACK must not disguise demand as live work");
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+
+  s.advance(60_001);
+  await s.runtime.tick();
+  assert.equal(drainCalls, 1, "periodic maintenance still asks the original owner once input preparation is finished");
+  assert.equal(writerCloses, 0, "a blocked owner proof does not release the writer");
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "the drain proof never consumes the accepted receipt");
+});
+
+test("released writer lifecycle persists after close without a passive adapter or matching connection", async t => {
+  let writerStarts = 0, writerCloses = 0, drainCalls = 0;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { writerStarts++; onState({ ...state([], "completed"), id: task.threadId }, true); },
+        verifyOwner: async () => {}, close: () => { writerCloses++; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null });
+  const operationId = "released-writer-old-ack";
+  s.store.recordOperation(operationId, s.binding, "released-writer-inbox", s.binding.id, 1);
+  s.store.finishOperation(operationId, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, operationId, "released-writer-native-queue", 1);
+  const desktop = s.desktop as unknown as { drainIdleExecution?:
+    (task: typeof ref, beforeRelease: () => void) => Promise<"waiting-unload" | "released" | "blocked" | "unavailable"> };
+  desktop.drainIdleExecution = async (_task, beforeRelease) => {
+    drainCalls++;
+    if (drainCalls === 1) { beforeRelease(); return "waiting-unload"; }
+    return "released";
+  };
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+    .connectBinding(s.binding, ref);
+  s.advance(60_001);
+  await s.runtime.tick();
+  assert.equal(drainCalls, 1);
+  assert.equal(writerStarts, 1);
+  assert.equal(writerCloses, 1, "the first backend proof closes the exact current stream");
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "waiting-unload");
+
+  s.advance(60_001);
+  await s.runtime.tick();
+  assert.equal(drainCalls, 2, "the next lifecycle check runs with no matching writer connection");
+  assert.equal(writerStarts, 1, "no passive adapter means the health path must not reacquire a writer");
+  assert.equal(writerCloses, 1, "the already-closed stream is not closed twice");
+  const released = s.store.getValue<{ taskKey: string; state: string; generation: number }>(`execution-lifecycle:${s.binding.id}`);
+  assert.equal(released?.state, "released", "owner proof persists the released state after the stream disappears");
+  assert.equal(released?.taskKey, taskKey(s.binding));
+  assert.equal(released?.generation, s.store.streamGeneration(s.binding.id));
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1, "release does not clear the old ACK");
+});
+
+test("persisted waiting or released lifecycle refuses legacy command start despite a healthy passive observer", async t => {
+  for (const stateName of ["waiting-unload", "released"] as const) {
+    let writerStarts = 0, passiveStarts = 0, passiveCloses = 0;
+    const writer: TaskStateTransport = {
+      subscribe(task, onState) {
+        return { task, start: async () => { writerStarts++; onState({ ...state([], "completed"), id: task.threadId }, true); },
+          verifyOwner: async () => {}, close: () => {} };
+      }, close() {},
+    };
+    const passive: TaskStateTransport = {
+      readOnly: true,
+      subscribe(task, onState) {
+        return { task, readOnly: true, start: async () => {
+          passiveStarts++;
+          onState({ ...state([], "completed"), id: task.threadId }, true);
+        }, verifyOwner: async () => {}, close: () => { passiveCloses++; } };
+      }, close() {},
+    };
+    const s = runtimeSetup(t, undefined, writer, undefined, undefined, undefined, undefined, undefined, passive);
+    const generation = s.store.streamGeneration(s.binding.id);
+    s.store.setValue(`execution-lifecycle:${s.binding.id}`, { taskKey: taskKey(s.binding), state: stateName,
+      at: 100_000, generation });
+    await s.runtime.tick();
+    assert.equal(passiveStarts, 1, `${stateName} task remains available to passive observation`);
+    assert.equal(writerStarts, 0);
+    const prepare = (s.runtime as unknown as { prepareTaskInput(binding: Binding):
+      Promise<{ close(): void; assertReady(): void }> }).prepareTaskInput;
+    await assert.rejects(() => prepare.call(s.runtime, s.binding), ActionRejectedError,
+      `${stateName} from the persisted prior runtime is not permission for a legacy writer start`);
+    assert.equal(writerStarts, 0, "a healthy read-only observer never upgrades into a command writer");
+    assert.equal(passiveCloses, 0, "the passive observer remains live after the refused command attempt");
+  }
 });
 
 test("background recovery never starts the writer route for stale running or unresolved journal state", async t => {

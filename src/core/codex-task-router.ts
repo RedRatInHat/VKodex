@@ -4,13 +4,16 @@ import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavaila
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
   type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome, type GoalContinuationReceipt,
-  type NativeGoalActivation } from "./codex-tasks.js";
+  type NativeGoalActivation, type ExecutionDrainResult } from "./codex-tasks.js";
 
 export interface CodexTaskOwner {
   /** An exclusive claim is independent of transient adapter readiness. */
   readonly routingPolicy?: "exclusive";
   /** Health evidence only; never used to select or authorize a command route. */
   isReady?(task: TaskRef): boolean;
+  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing" | "unknown">;
+  drainIdleExecution?(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult>;
+  restoreExecutionDrain?(task: TaskRef): void;
   owns(task: TaskRef): boolean;
   /** Ensure this owner's route is ready without starting a turn. */
   ensureOpen?(task: TaskRef): Promise<void>;
@@ -220,13 +223,26 @@ export class RoutedCodexTasks implements CodexTasks {
     const owner = this.owner(task);
     return owner?.archiveRetryReady(task) ?? this.base.archiveRetryReady?.(task) ?? Promise.resolve(false);
   }
-  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing"> {
+  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing" | "unknown"> {
     const owner = this.owner(task);
     if (owner?.routingPolicy === "exclusive") {
       try { return Promise.resolve(owner.isReady?.(task) === true ? "ready" : "missing"); }
       catch { return Promise.resolve("missing"); }
     }
-    if (owner) return Promise.resolve("ready"); return this.base.ownerAdapterStatus?.(task) ?? Promise.resolve("missing");
+    if (owner) return owner.ownerAdapterStatus?.(task) ?? "unknown";
+    return this.base.ownerAdapterStatus?.(task) ?? "missing";
+  }
+  async drainIdleExecution(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult> {
+    // A metadata reader or another client cannot attest the original writer.
+    return this.owner(task)?.drainIdleExecution?.(task, beforeRelease) ?? "unavailable";
+  }
+  executionDrainSupported(task: TaskRef): boolean {
+    const owner = this.owner(task);
+    return !!owner?.drainIdleExecution && owner.routingPolicy !== "exclusive";
+  }
+  restoreExecutionDrain(task: TaskRef): void {
+    const owner = this.owner(task);
+    if (owner?.routingPolicy !== "exclusive") owner?.restoreExecutionDrain?.(task);
   }
   async renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
     const owner = this.owner(task); if (!owner) return this.base.renameTask(task, title);

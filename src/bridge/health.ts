@@ -49,6 +49,12 @@ export interface RuntimeHealthState {
     readonly lastConnectionDiagnostic?: ConnectionDiagnostic | null;
     /** Local route evidence, never a claim of physical native writer ownership. */
     readonly route?: TaskStateRouteDiagnostic;
+    /** Per-binding execution writer lifecycle evidence from the runtime. */
+    readonly executionLifecycle?: Readonly<{
+      readonly state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
+      readonly at: number;
+      readonly generation: number;
+    }>;
   }[];
 }
 
@@ -282,6 +288,28 @@ export class BridgeHealthMonitor {
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
       const diagnostic = binding.lastConnectionDiagnostic;
+      const lifecycle = binding.executionLifecycle;
+      if (lifecycle) {
+        const at = Number.isSafeInteger(lifecycle.at) && Math.abs(lifecycle.at) <= 8.64e15
+          ? new Date(lifecycle.at).toISOString() : "время неизвестно";
+        const generation = Number.isSafeInteger(lifecycle.generation) && lifecycle.generation >= 0
+          ? lifecycle.generation : "неизвестно";
+        const detail = lifecycle.state === "checking"
+          ? "Проверка состояния исполнения ещё идёт; освобождение native writer не подтверждено."
+          : lifecycle.state === "waiting-unload"
+            ? "Ожидается выгрузка исполнения; освобождение native writer не подтверждено."
+            : lifecycle.state === "blocked"
+              ? "Безопасное освобождение запрещено: полная quiescence не доказана (работа, неизвестный результат или изменившееся подключение). Writer не объявлен освобождённым."
+              : lifecycle.state === "unavailable"
+                ? "Состояние исполнения недоступно; освобождение writer не доказано."
+                : "Освобождение исполнения подтверждено для этого binding и поколения; это не подтверждает доступность всей Desktop/native UI.";
+        checks.push({ name: `codex_execution_lifecycle:${binding.id}`,
+          state: lifecycle.state === "released" ? "ok" : "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: ${detail} Наблюдение ${at}; поколение ${generation}.` });
+      } else if (binding.connected && binding.streamMode === "attached" && binding.route?.kind === "app-server") {
+        checks.push({ name: `codex_native_access:${binding.id}`, state: "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: подключённая legacy execution subscription через App Server не подтверждает совместный native доступ или освобождение writer; lifecycle-факт для этого binding отсутствует.` });
+      }
       if (!binding.connected && diagnostic && ["running", "approval"].includes(binding.status)) {
         const date = Number.isFinite(diagnostic.at) ? new Date(diagnostic.at) : new Date(Number.NaN);
         const at = Number.isFinite(date.getTime()) ? date.toISOString() : "время неизвестно";

@@ -197,6 +197,9 @@ export interface AccountUsage {
 
 export type UsageResetOutcome = "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
 
+/** Subscription release and physical native unload are different facts. */
+export type ExecutionDrainResult = "waiting-unload" | "released" | "blocked" | "unavailable";
+
 export interface AccountUsageProvider {
   read(task?: TaskRef): Promise<readonly AccountUsage[]>;
   consumeReset?(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome>;
@@ -227,7 +230,7 @@ export interface DesktopMetadata {
   /** Read-only check before retrying a previously rejected source archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
   /** Read-only native owner probe for transfer readiness. */
-  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing">;
+  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing" | "unknown">;
 }
 
 export interface TaskRenameResult {
@@ -337,7 +340,12 @@ export interface CodexTasks {
   isTaskArchived?(task: TaskRef, checkpoint?: TransferCheckpoint): Promise<boolean>;
   /** Read-only check used to resume a previously rejected archive. */
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
-  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing">;
+  ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing" | "unknown">;
+  /** Exact original execution owner only; callback is synchronous and fenced. */
+  drainIdleExecution?(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult>;
+  executionDrainSupported?(task: TaskRef): boolean;
+  /** Restore an admission fence only, never infer current ownership/unload. */
+  restoreExecutionDrain?(task: TaskRef): void;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;

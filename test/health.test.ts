@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BridgeHealthMonitor } from "../src/bridge/health.js";
+import { BridgeHealthMonitor, type RuntimeHealthState } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "../src/bridge/config.js";
@@ -55,9 +55,25 @@ function setup(t: { after(fn: () => void): void }, stagedFilePilot: StagedFilePi
   const store = new BridgeStore(); t.after(() => store.close());
   const chat = new HealthChat(); const desktop = new HealthDesktop(); let now = 100_000;
   const runtime = () => ({ startedAt: 40_000, lastTickAt: now, updateStartedAt: null, stopped: false, stagedFilePilot,
-    ...(stageLedgerAudit ? { stageLedgerAudit } : {}), activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0 });
+    ...(stageLedgerAudit ? { stageLedgerAudit } : {}), activeBindings: 0, connectedBindings: 0, requiredBindings: 0,
+    connectedRequiredBindings: 0 });
   const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
   return { store, chat, desktop, monitor, advance: (ms: number) => { now += ms; } };
+}
+
+function setupWithBindings(t: { after(fn: () => void): void }, bindings: () => RuntimeHealthState["bindings"]) {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const chat = new HealthChat(); const desktop = new HealthDesktop(); const now = 100_000;
+  const runtime = (): RuntimeHealthState => {
+    const current = bindings() ?? [];
+    return { startedAt: 40_000, lastTickAt: now, updateStartedAt: null,
+      stopped: false, activeBindings: current.length, connectedBindings: current.filter(item => item.connected).length,
+      requiredBindings: current.filter(item => ["running", "approval"].includes(item.status)).length,
+      connectedRequiredBindings: current.filter(item => item.connected && ["running", "approval"].includes(item.status)).length,
+      bindings: current };
+  };
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
+  return { store, chat, desktop, monitor };
 }
 
 test("health monitor verifies the complete healthy bridge and persists its snapshot", async t => {
@@ -317,6 +333,99 @@ test("health distinguishes a live task stream from a missing native owner adapte
   adapter = "ready";
   const recovered = await monitor.check(true);
   assert.equal(recovered.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "ok");
+});
+
+test("publishing task execution lifecycle warns independently of task status and queued ACK age", async t => {
+  const s = setupWithBindings(t, () => bindings);
+  const specs = [
+    { threadId: "01a07930-dbba-77c2-8910-17bd61638e6f", title: "RaceLineCalc : work new 5 - MS/Steam publishing",
+      status: "running", executionLifecycle: { state: "checking", at: 99_900, generation: 4 } },
+    { threadId: "01a06325-d3d0-7052-b495-371fcb7a2887", title: "RaceLineCalc : work new 5 - android publishing",
+      status: "idle", executionLifecycle: { state: "waiting-unload", at: 99_950, generation: 8 } },
+  ] as const;
+  const bindings = specs.map((spec, index) => {
+    const task = { hostId: "local", threadId: spec.threadId, title: spec.title, workspace: "/fixture", updatedAt: 1 };
+    const stored = s.store.ensureBinding(task); s.store.setChat(stored.id, 2_000_000_001 + index, 1 + index); s.store.setAttached(stored.id, true);
+    if (spec.title.includes("android publishing")) {
+      const operationId = "android-old-accepted-ack";
+      s.store.recordOperation(operationId, stored, "android-ack-inbox", stored.id, 1);
+      s.store.finishOperation(operationId, "accepted");
+      s.store.rememberQueuedInput(stored.id, operationId, "android-old-native-queue", 1);
+    }
+    return { id: stored.id, title: stored.title, source: ".codex-work", status: spec.status,
+      connected: true, streamMode: "attached" as const, lastConfirmedAt: 99_900, failure: null,
+      executionLifecycle: spec.executionLifecycle };
+  });
+  const report = await s.monitor.check(true);
+  const lifecycle = bindings.map(binding => report.checks.find(check => check.name === `codex_execution_lifecycle:${binding.id}`));
+  assert.equal(lifecycle.length, 2);
+  assert.ok(lifecycle.every(check => check?.state === "degraded"),
+    "running MS checking and idle Android waiting-unload both remain visible warnings");
+  assert.match(lifecycle[0]?.detail ?? "", /MS\/Steam publishing/u);
+  assert.match(lifecycle[1]?.detail ?? "", /android publishing/u);
+  assert.equal(s.store.queuedInputs(bindings[1]!.id).length, 1, "health reporting never consumes the accepted ACK");
+  assert.ok(lifecycle.every(check => !/физический writer освобождён|все native окна разблокированы/u.test(check?.detail ?? "")),
+    "checking or waiting for unload is not reported as native unlock");
+});
+
+test("execution lifecycle reports blocked and unavailable as degraded, then scopes released as OK", async t => {
+  const s = setupWithBindings(t, () => runtimeBindings);
+  const task = { hostId: "local", threadId: "01a07930-dbba-77c2-8910-17bd61638e6f",
+    title: "RaceLineCalc : work new 5 - MS/Steam publishing", workspace: "/fixture", updatedAt: 1 };
+  const stored = s.store.ensureBinding(task); s.store.setChat(stored.id, 2_000_000_001, 1); s.store.setAttached(stored.id, true);
+  let state: "checking" | "waiting-unload" | "blocked" | "unavailable" | "released" = "waiting-unload";
+  let generation = 3;
+  const makeRuntimeBinding = (connected: boolean): NonNullable<RuntimeHealthState["bindings"]>[number] => ({
+    id: stored.id, title: stored.title, source: ".codex-work", status: "running", connected,
+    streamMode: connected ? "attached" : "detached", lastConfirmedAt: 99_900, failure: null,
+    executionLifecycle: { state, at: 99_900 + generation, generation },
+  });
+  let runtimeBindings: NonNullable<RuntimeHealthState["bindings"]> = [makeRuntimeBinding(true)];
+  const read = async () => {
+    const report = await s.monitor.check(true);
+    return report.checks.find(check => check.name === `codex_execution_lifecycle:${stored.id}`);
+  };
+  let check = await read();
+  assert.equal(check?.state, "degraded", "waiting for the native unload is not a release proof");
+  for (const next of ["blocked", "unavailable"] as const) {
+    state = next; generation++;
+    runtimeBindings = [makeRuntimeBinding(true)];
+    check = await read();
+    assert.equal(check?.state, "degraded", `${next} must remain a visible lifecycle warning`);
+  }
+  state = "released"; generation++;
+  runtimeBindings = [makeRuntimeBinding(false)];
+  check = await read();
+  assert.equal(check?.state, "ok", "a scoped proof of release can clear the lifecycle warning even if native task status is running");
+  assert.match(check?.detail ?? "", /MS\/Steam publishing/u);
+  assert.doesNotMatch(check?.detail ?? "", /все native окна разблокированы|вся Desktop-сессия свободна/u,
+    "one binding release does not assert global UI health");
+});
+
+test("health flags an attached App Server route without lifecycle proof but not a passive native observer", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const chat = new HealthChat(); const desktop = new HealthDesktop(); const now = 100_000;
+  const taskA = { hostId: "local", threadId: "legacy-app-server", title: "Legacy attached", workspace: "/fixture", updatedAt: 1 };
+  const taskB = { hostId: "local", threadId: "native-observer", title: "Passive native observer", workspace: "/fixture", updatedAt: 1 };
+  const a = store.ensureBinding(taskA), b = store.ensureBinding(taskB);
+  store.setChat(a.id, 2_000_000_001, 1); store.setAttached(a.id, true);
+  store.setChat(b.id, 2_000_000_002, 2); store.setAttached(b.id, true);
+  const runtime = (): RuntimeHealthState => ({ startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 2, connectedBindings: 2, requiredBindings: 0, connectedRequiredBindings: 0,
+    bindings: [
+      { id: a.id, title: a.title, source: ".codex-work", status: "idle", connected: true,
+        lastConfirmedAt: now, failure: null, streamMode: "attached", route: { kind: "app-server", routeGeneration: 9 } },
+      { id: b.id, title: b.title, source: ".codex", status: "idle", connected: true,
+        lastConfirmedAt: now, failure: null, streamMode: "attached", route: { kind: "native-observer", routeGeneration: 10 } },
+    ] });
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, runtime, undefined, () => now, undefined, () => true);
+  const report = await monitor.check(true);
+  const appServer = report.checks.find(check => check.name === `codex_native_access:${a.id}`);
+  assert.equal(appServer?.state, "degraded");
+  assert.match(appServer?.detail ?? "", /Legacy attached/u);
+  assert.match(appServer?.detail ?? "", /не подтверждает совместный native доступ/u);
+  assert.equal(report.checks.some(check => check.name === `codex_native_access:${b.id}`), false,
+    "an explicit read-only native observer does not receive the legacy execution-route warning");
 });
 
 test("health probes a bounded disconnected running source without calling rollout readers", async t => {

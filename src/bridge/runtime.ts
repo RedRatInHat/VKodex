@@ -87,6 +87,14 @@ export class BridgeRuntime {
   private readonly connecting = new Map<string, Promise<void>>();
   private readonly connectionGenerations = new Map<string, number>();
   private readonly connectionAttempts = new Map<string, symbol>();
+  private readonly drainAttempts = new Map<string, { readonly since: number; readonly routeGeneration: number }>();
+  private readonly releasedExecutionScopes = new Map<string, string>();
+  private executionLifecycle(binding: Binding): { state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
+    at: number; generation: number } | null {
+    const fact = this.store.getValue<{ taskKey: string; state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
+      at: number; generation: number }>(`execution-lifecycle:${binding.id}`);
+    return fact?.taskKey === taskKey(binding) && fact.generation === this.store.streamGeneration(binding.id) ? fact : null;
+  }
   private matchesConnection(binding: Binding): boolean {
     return this.connections.matches(binding.id, binding)
       && this.connectionGenerations.get(binding.id) === this.store.streamGeneration(binding.id);
@@ -105,7 +113,9 @@ export class BridgeRuntime {
     const at = this.now();
     const writer = mode === "attached" && !this.connections.isReadOnly(bindingId);
     this.store.setValue(key, {
-      owner: writer ? "vkodex" : "external",
+      owner: writer ? "vkodex" : this.store.getBinding(bindingId) &&
+        ["checking", "waiting-unload", "unavailable"].includes(this.executionLifecycle(this.store.getBinding(bindingId)!)?.state ?? "")
+        ? "unknown" : "external",
       mode,
       leaseSince: writer ? (typeof previous?.leaseSince === "number" ? previous.leaseSince : at) : null,
       lastEventAt: at,
@@ -126,6 +136,16 @@ export class BridgeRuntime {
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
     inboundFileLimits?: InboundFileLimits, private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
     store.assertOwner(access.ownerId, access.groupId);
+    // Controls (model/goal/rename/stop/archive) bypass prompt preparation.
+    // Restore the exact owner's fence before installing ANY command callback.
+    for (const binding of store.bindings()) {
+      const lifecycle = this.executionLifecycle(binding);
+      if (!lifecycle || lifecycle.state === "blocked" || !desktop.restoreExecutionDrain
+        || desktop.executionDrainSupported?.(binding) === false) continue;
+      desktop.restoreExecutionDrain(binding);
+      store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "unavailable",
+        at: now(), generation: lifecycle.generation, previousState: lifecycle.state, previousAt: lifecycle.at });
+    }
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.connections = new TaskStateConnections(adapters.states, now, (bindingId, event, task) => {
       try { store.recordConnectionDiagnostic(bindingId, { at: now(), ...event }, task); }
@@ -225,7 +245,8 @@ export class BridgeRuntime {
         streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null,
         lastConnectionDiagnostic: recentConnectionHistory.findLast(event => event.outcome === "failed" || event.outcome === "blocked")
           ?? connectionHistory.at(-1) ?? null,
-        ...(route ? { route } : {}) };
+        ...(route ? { route } : {}),
+        ...(this.executionLifecycle(binding) ? { executionLifecycle: this.executionLifecycle(binding)! } : {}) };
     });
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
@@ -367,6 +388,10 @@ export class BridgeRuntime {
   /** Runs inside the manager's durable inbox and per-peer dispatch scope. */
   private async prepareTaskInput(binding: Binding): Promise<TaskInputScope> {
     if (this.stopped) throw new TaskNotOpenError();
+    const lifecycle = this.executionLifecycle(binding);
+    if (lifecycle && lifecycle.state !== "blocked" && !(lifecycle.state === "released"
+      && this.releasedExecutionScopes.get(binding.id) === JSON.stringify([taskKey(binding), lifecycle.generation])))
+      throw new ActionRejectedError("Освобождение прежнего исполнителя ещё не подтверждено для текущего процесса. Наблюдение продолжается; повторный захват задачи не выполнялся.");
     this.prepareBindingObservation(binding);
     const generation = this.store.streamGeneration(binding.id);
     const matches = (): boolean => {
@@ -640,6 +665,9 @@ export class BridgeRuntime {
       this.recordLease(binding.id, "attached");
       return;
     }
+    // Legacy release needs original-session proof, not a cached terminal UI
+    // status. Periodic maintenance performs the asynchronous scoped drain.
+    if (this.desktop.drainIdleExecution && this.desktop.executionDrainSupported?.(binding) !== false) return;
     // Releasing the Codex writer is a normal handoff, not a loss of
     // observability. Keep tailing the append-only rollout while Desktop/VS
     // Code owns the task so direct turns still reach VK without reacquiring a
@@ -677,6 +705,47 @@ export class BridgeRuntime {
   private hasPendingTaskWork(bindingId: string): boolean {
     return this.store.acceptedTurns(bindingId).length > 0 || this.store.queuedInputs(bindingId).length > 0
       || this.store.unresolvedPromptOperations(bindingId).length > 0;
+  }
+
+  private async maintainExecutionLifecycle(binding: Binding, matches: () => boolean): Promise<void> {
+    const pendingUnload = ["checking", "waiting-unload", "unavailable"].includes(this.executionLifecycle(binding)?.state ?? "");
+    if (!this.desktop.drainIdleExecution || this.desktop.executionDrainSupported?.(binding) === false
+      || !pendingUnload && (this.connections.isReadOnly(binding.id) || !this.matchesConnection(binding))
+      || this.connecting.has(binding.id)
+      || this.pendingReacquire.has(binding.id)) return;
+    const routeGeneration = this.connections.diagnostic(binding.id)?.routeGeneration ?? 0;
+    if (!pendingUnload && routeGeneration === 0) return;
+    const last = this.drainAttempts.get(binding.id);
+    if (last?.routeGeneration === routeGeneration && !intervalElapsed(this.now(), last.since, 60_000)) return;
+    this.drainAttempts.set(binding.id, { since: this.now(), routeGeneration });
+    const generation = this.store.streamGeneration(binding.id);
+    const writeFact = (state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable"): void => {
+      this.store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state, at: this.now(), generation });
+    };
+    writeFact("checking");
+    try {
+      const result = await this.desktop.drainIdleExecution(binding, () => {
+        // The owner revoked new admissions before probing. Recheck the exact
+        // local stream synchronously; never close a newer binding/connection.
+        if (!matches() || !this.matchesConnection(binding) || this.connections.isReadOnly(binding.id) || this.connecting.has(binding.id)
+          || this.pendingReacquire.has(binding.id)
+          || this.connections.diagnostic(binding.id)?.routeGeneration !== routeGeneration)
+          throw new ActionRejectedError("Подключение изменилось во время проверки освобождения.");
+        this.enableRolloutFallback(binding, this.now());
+        this.releasedIdle.add(binding.id);
+        this.setStreamMode(binding.id, "detached");
+        // No receipt or accepted turn is consumed by subscription cleanup.
+        this.connections.close(binding.id);
+        this.recordLease(binding.id, "detached");
+      });
+      if (matches()) {
+        writeFact(result);
+        if (result === "released") {
+          this.releasedExecutionScopes.set(binding.id, JSON.stringify([taskKey(binding), generation]));
+          this.recordLease(binding.id, "detached");
+        }
+      }
+    } catch { if (matches()) writeFact("unavailable"); }
   }
 
   tick(waitForConnections = true, bindingId?: string): Promise<void> {
@@ -850,6 +919,9 @@ export class BridgeRuntime {
       this.store.setPaused(binding.id, false);
       binding = this.store.getBinding(binding.id)!;
     }
+    await this.maintainExecutionLifecycle(binding, matches);
+    if (!matches()) return;
+    existing = this.connections.has(binding.id);
     // An old status or unresolved input journal does not authorize a writer
     // resume. Background recovery always uses the passive transport below.
     // A final answer is persisted before delivery is attempted. Closing a
@@ -904,6 +976,9 @@ export class BridgeRuntime {
     if (pending) return pending;
     const current = this.store.getBinding(binding.id);
     if (this.stopped || !current?.attached || !sameTask(current, task)) return Promise.resolve();
+    const lifecycle = this.executionLifecycle(current);
+    if (intent === "command" && lifecycle && ["checking", "waiting-unload", "released", "unavailable"].includes(lifecycle.state))
+      intent = "observe"; // Persisted drain intent never authorizes legacy writer reacquisition after restart.
     if (this.matchesConnection(binding)) return Promise.resolve();
     const transport = intent === "observe" ? this.passiveStates : undefined;
     if (intent === "observe" && !transport) { this.enableRolloutFallback(current); return Promise.resolve(); }
