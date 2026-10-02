@@ -5,9 +5,26 @@ import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelo
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): value is ObjectValue => !!value && typeof value === "object" && !Array.isArray(value);
 const id = (value: unknown): string | null => typeof value === "string" && value.length > 0 ? value : null;
+const scopeId = (value: unknown): string | null => typeof value === "string" && value.length > 0
+  && value.length <= 256 && !/[\s\x00-\x1f\x7f]/u.test(value) ? value : null;
+const MAX_TASK_REVISIONS = 4096;
 interface Drain { generation: number; state: ExecutionDrainResult | "checking"; unloaded: boolean;
   release: Promise<unknown> | null; restored?: true; assertRelease?: () => void }
 interface WorkReceipt { readonly turnId?: string; readonly clientId?: string }
+
+// Pinned native notifications with an explicit threadId and no family-topology
+// effect. Unknown/unscoped notifications retain a profile-wide proof fence.
+const taskNotifications = new Set([
+  "thread/status/changed", "thread/reverted", "thread/name/updated", "thread/attachment/updated",
+  "thread/goal/updated", "thread/goal/cleared", "thread/queue/changed", "thread/project/updated",
+  "thread/settings/updated", "thread/tokenUsage/updated", "thread/compacted",
+  "turn/started", "turn/completed", "turn/diff/updated", "turn/plan/updated", "hook/started", "hook/completed",
+  "item/started", "item/completed", "item/autoApprovalReview/started", "item/autoApprovalReview/completed",
+  "autoApprovalReview/strictReviewRequired", "item/agentMessage/delta", "item/plan/delta",
+  "item/commandExecution/outputDelta", "item/commandExecution/terminalInteraction", "item/fileChange/outputDelta",
+  "item/fileChange/patchUpdated", "item/mcpToolCall/progress", "item/reasoning/summaryTextDelta",
+  "item/reasoning/summaryPartAdded", "item/reasoning/textDelta", "serverRequest/resolved",
+]);
 
 /** A legacy profile connection must stop retaining idle execution separately
  * from reconciling historical bridge receipts. No probe may start a backend. */
@@ -19,6 +36,8 @@ export class LegacyExecutionLifecycle {
   private readonly unknown = new Set<string>();
   private readonly receipts = new Map<string, WorkReceipt[]>();
   private revision = 0;
+  private unscopedRevision = 0;
+  private readonly taskRevisions = new Map<string, number>();
   private readonly unsubscribe: () => void;
 
   constructor(private readonly original: AppServerRpc) {
@@ -30,9 +49,8 @@ export class LegacyExecutionLifecycle {
       onNotification: listener => original.onNotification(listener),
       onDisconnect: listener => original.onDisconnect?.(listener) ?? (() => {}),
       onServerRequest: handler => original.onServerRequest(handler ? (request, context) => {
-        const threadId = id(request.params.threadId) ?? "__unscoped_server_request__";
+        const threadId = scopeId(request.params.threadId) ?? "__unscoped_server_request__";
         this.changeBusy(threadId, 1);
-        this.revision++;
         // Removing a displayed question is not evidence that its reply was written.
         void context.responseWritten.then(() => {}, () => {
           this.unknown.add(threadId);
@@ -46,7 +64,24 @@ export class LegacyExecutionLifecycle {
   private changeBusy(threadId: string, amount: number): void {
     const count = (this.busy.get(threadId) ?? 0) + amount;
     if (count > 0) this.busy.set(threadId, count); else this.busy.delete(threadId);
-    this.revision++;
+    this.changed(threadId === "__unscoped_server_request__" ? null : threadId);
+  }
+  private changed(threadId: string | null): void {
+    const revision = ++this.revision;
+    const scoped = scopeId(threadId);
+    if (scoped === null) this.unscopedRevision = revision;
+    else {
+      if (!this.taskRevisions.has(scoped) && this.taskRevisions.size >= MAX_TASK_REVISIONS) {
+        // Eviction cannot erase changes underneath an in-flight family proof.
+        this.unscopedRevision = revision;
+        this.taskRevisions.clear();
+      }
+      this.taskRevisions.set(scoped, revision);
+    }
+  }
+  private changedSince(family: readonly string[], revision: number, unscopedRevision: number): boolean {
+    return this.unscopedRevision !== unscopedRevision
+      || family.some(threadId => (this.taskRevisions.get(threadId) ?? 0) > revision);
   }
   assertAdmission(task: TaskRef): void {
     const drain = this.drains.get(task.threadId);
@@ -131,8 +166,10 @@ export class LegacyExecutionLifecycle {
     this.receipts.set(threadId, entries);
   }
   private observe(event: AppServerEnvelope): void {
-    this.revision++;
-    const threadId = id(event.params.threadId);
+    const threadId = scopeId(event.params.threadId);
+    const nested = event.params.thread;
+    const scopeValid = nested === undefined || object(nested) && scopeId(nested.id) === threadId;
+    this.changed(threadId && scopeValid && taskNotifications.has(event.method) ? threadId : null);
     if (!threadId) return;
     const drain = this.drains.get(threadId);
     if (event.method === "thread/closed" && drain && this.current(drain.generation)) {
@@ -188,6 +225,7 @@ export class LegacyExecutionLifecycle {
     const drain: Drain = { generation, state: "checking", unloaded: false, release: null };
     this.drains.set(task.threadId, drain);
     const revision = this.revision;
+    const unscopedRevision = this.unscopedRevision;
     const deadline = performance.now() + 20_000;
     let closing = false;
     try {
@@ -209,11 +247,11 @@ export class LegacyExecutionLifecycle {
       }
       const confirmed = await this.family(task.threadId, generation, deadline);
       if (JSON.stringify(confirmed) !== JSON.stringify(family.slice(1))) return "blocked";
-      if (performance.now() >= deadline || !this.current(generation) || this.revision !== revision || local().blocked
+      if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision) || local().blocked
         || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId))
         || subscription().count !== 1 || subscription().revision !== scoped.revision) return "blocked";
       drain.assertRelease = () => {
-        if (performance.now() >= deadline || !this.current(generation) || this.revision !== revision || local().blocked || subscription().count !== 0
+        if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision) || local().blocked || subscription().count !== 0
           || this.busy.has("__unscoped_server_request__") || this.unknown.has("__unscoped_server_request__")
           || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId)))
           throw new AppServerUnavailableError();
