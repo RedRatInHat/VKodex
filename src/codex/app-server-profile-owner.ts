@@ -25,9 +25,10 @@ export class AppServerProfileOwner {
   constructor(readonly sourceId: string, rpc: AppServerRpc,
     private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
     private readonly detachedThreadIds?: ReadonlySet<string>,
-    onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {}) {
+    onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {},
+    now?: () => number) {
     if (detachedThreadIds) this.routingPolicy = "exclusive";
-    this.lifecycle = new LegacyExecutionLifecycle(rpc);
+    this.lifecycle = new LegacyExecutionLifecycle(rpc, now);
     this.rpc = this.lifecycle.rpc;
     this.executor = new AppServerTaskExecutor(this.rpc);
     this.nativeStates = new AppServerTaskStateTransport(this.rpc,
