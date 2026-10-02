@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { taskKey, type DesktopTask, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
+import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../core/paths.js";
@@ -103,6 +103,12 @@ export interface ConnectionDiagnostic {
   readonly routeGeneration?: number;
   readonly elapsedMs?: number;
   /** Opaque physical task identity; never expose it in VK health text. */
+  readonly taskFingerprint?: string;
+}
+/** Prompt refusal evidence, separate from subscription health. No native body. */
+export interface ForegroundRejectionDiagnostic extends PromptRejectionContext {
+  readonly at: number;
+  readonly reason: "model-not-supported-for-account";
   readonly taskFingerprint?: string;
 }
 export interface DeliveryHealthStats {
@@ -916,6 +922,31 @@ export class BridgeStore {
         taskFingerprint: createHash("sha256").update(taskKey(task)).digest("hex") } : event;
       this.setValue(`connection-diagnostics:${bindingId}`,
         [...this.connectionDiagnostics(bindingId), scoped].slice(-32));
+    });
+  }
+
+  foregroundRejections(bindingId: string, task?: TaskRef): readonly ForegroundRejectionDiagnostic[] {
+    const events = this.getValue<ForegroundRejectionDiagnostic[]>(`foreground-rejections:${bindingId}`) ?? [];
+    if (!task) return events;
+    const fingerprint = createHash("sha256").update(taskKey(task)).digest("hex");
+    return events.filter(event => event.taskFingerprint === fingerprint);
+  }
+  recordForegroundRejection(bindingId: string, event: ForegroundRejectionDiagnostic, task: TaskRef): void {
+    this.atomic(() => {
+      const current = this.getBinding(bindingId);
+      if (!current || taskKey(current) !== taskKey(task) || !this.isOwnOperation(event.operationId, task) ||
+          !this.db.prepare("SELECT 1 FROM bridge_operation_inputs WHERE operation_id = ? AND binding_id = ?")
+            .get(event.operationId, bindingId)) return;
+      if (!Number.isSafeInteger(event.at) || event.at < 0 ||
+          event.reason !== "model-not-supported-for-account" ||
+          !["turn/start", "turn/steer", "thread/queue/add"].includes(event.method) ||
+          event.backendGeneration !== null && (!Number.isSafeInteger(event.backendGeneration) || event.backendGeneration < 1))
+        throw new TypeError("Invalid foreground rejection diagnostic");
+      // Copy an allowlist, never arbitrary exception fields supplied by a caller.
+      const scoped: ForegroundRejectionDiagnostic = { at: event.at, operationId: event.operationId,
+        method: event.method, backendGeneration: event.backendGeneration, reason: event.reason,
+        taskFingerprint: createHash("sha256").update(taskKey(task)).digest("hex") };
+      this.setValue(`foreground-rejections:${bindingId}`, [...this.foregroundRejections(bindingId), scoped].slice(-32));
     });
   }
 

@@ -371,6 +371,31 @@ test("opt-in raw error callback retains native details while the Promise error s
   } finally { await connection.close(); }
 });
 
+test("account model rejection retains only a fixed reason and actual backend generation", async () => {
+  const detail = "The 'private-model' model is not supported when using Codex with a ChatGPT account.";
+  for (const native of [
+    { message: detail }, { message: JSON.stringify({ detail }) },
+    { message: "Request failed", data: { detail, token: "PRIVATE_SECRET" } },
+    { message: "A different unsupported model error", data: { detail: "not supported" } },
+  ]) {
+    const child = new AppServerChild();
+    child.respond = message => message.method === "turn/start"
+      ? { id: message.id, error: { code: -32600, ...native } }
+      : { id: message.id, result: { ok: true } };
+    const connection = new AppServerConnection(() => child.asChild());
+    try {
+      await assert.rejects(connection.request("turn/start", { threadId: "own" }, { mutating: true }), error => {
+        assert.ok(error instanceof AppServerRejectedError);
+        assert.equal(error.reason, native.message.startsWith("A different") ? null : "model-not-supported-for-account");
+        assert.equal(Reflect.get(error, "backendGeneration"), 1);
+        assert.equal(Reflect.get(error, "requestMethod"), "turn/start");
+        assert.doesNotMatch(JSON.stringify(error) + error.message, /private-model|PRIVATE_SECRET|Request failed/u);
+        return true;
+      });
+    } finally { await connection.close(); }
+  }
+});
+
 test("throwing raw response callback cannot lose the worker, response, or next notification", async () => {
   const child = new AppServerChild();
   child.respond = message => message.method === "thread/read" ? null

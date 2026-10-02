@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { InputBatcher } from "./input-batcher.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, ModelUnavailableForAccountError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
@@ -864,6 +864,11 @@ export class TaskManager {
       });
     } catch (error) {
       let reported = error;
+      if (error instanceof ModelUnavailableForAccountError && error.diagnostic.operationId === operationId) {
+        try { this.store.recordForegroundRejection(binding.id, { ...error.diagnostic, at: Date.now(),
+          reason: "model-not-supported-for-account" }, binding); }
+        catch { /* Diagnostic failure cannot turn a definite refusal into an unknown mutation. */ }
+      }
       if ((error instanceof ActionRejectedError || error instanceof TaskNotOpenError) && this.desktop.isTaskArchived) {
         const archived = await this.desktop.isTaskArchived(binding).catch(() => false);
         if (archived) reported = new ActionRejectedError(

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CodexQuestion, CodexQuestions } from "../core/codex-questions.js";
-import { ActionRejectedError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskNotOpenError, TaskOwnedByClientError, UncertainActionError, taskKey,
-  type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
+import { ActionRejectedError, ModelUnavailableForAccountError, DesktopUnavailableError, ProjectAssignmentUnconfirmedError, TaskNotOpenError, TaskOwnedByClientError, UncertainActionError, taskKey,
+  type PromptRejectionContext, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
 import { goalMatchesUpdate, normalizeTaskGoalUpdate, parseTaskGoal } from "../core/task-goals.js";
 import { taskInput } from "../core/task-input.js";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError,
@@ -34,6 +34,13 @@ const operationError = (error: unknown, action = "команду"): Error => err
   : error instanceof Error ? error : new ActionRejectedError("Codex не выполнил команду.");
 
 function idOf(value: unknown): string | null { return typeof value === "string" && value ? value : null; }
+
+function promptOperationError(error: unknown, request: SubmitTaskRequest,
+  method: PromptRejectionContext["method"], action: string): Error {
+  return error instanceof AppServerRejectedError && error.reason === "model-not-supported-for-account" && error.requestMethod === method
+    ? new ModelUnavailableForAccountError({ operationId: request.operationId, method,
+      backendGeneration: error.backendGeneration }) : operationError(error, action);
+}
 
 /** Command-side prototype for a VKodex-owned, profile-scoped App Server. */
 export class AppServerTaskExecutor {
@@ -178,7 +185,8 @@ export class AppServerTaskExecutor {
       if (!turnId) throw new UncertainActionError();
       this.loaded.set(taskKey(request.task), { ...loaded, activeTurnId: turnId });
       return { mode: "start", turnId };
-    } catch (error) { throw operationError(error, loaded.activeTurnId ? "добавление сообщения в текущий ход" : "запуск нового хода"); }
+    } catch (error) { throw promptOperationError(error, request, loaded.activeTurnId ? "turn/steer" : "turn/start",
+      loaded.activeTurnId ? "добавление сообщения в текущий ход" : "запуск нового хода"); }
   }
 
   async interrupt(task: TaskRef): Promise<void> {
@@ -238,7 +246,7 @@ export class AppServerTaskExecutor {
       const id = isObject(queued) ? idOf(queued.id) : null;
       if (!id || !isObject(queued) || queued.clientUserMessageId !== request.operationId) throw new UncertainActionError();
       return id;
-    } catch (error) { throw operationError(error, "добавление сообщения в очередь"); }
+    } catch (error) { throw promptOperationError(error, request, "thread/queue/add", "добавление сообщения в очередь"); }
   }
 
   async selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
@@ -253,7 +261,7 @@ export class AppServerTaskExecutor {
         // Settings are an idempotent assignment. A confirmed transient rejection
         // can be retried once, unlike turn/start or an outcome-unknown timeout.
         // Protocol/parameter errors and a competing writer cannot heal this way.
-        if (!(error instanceof AppServerRejectedError) || error.reason === "active-writer"
+        if (!(error instanceof AppServerRejectedError) || error.reason !== null
           || error.code === -32601 || error.code === -32602) throw error;
         await new Promise(resolve => setTimeout(resolve, 300));
         this.assertWritable(task.threadId);
