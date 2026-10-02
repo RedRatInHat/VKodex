@@ -1105,6 +1105,12 @@ export class ManagedWorkerDaemon {
           captureAuthority: authority.captureAuthority,
           assertAuthorityCurrent: authority.assertCurrent,
           acquireLease,
+          isClientReservedForNativeInput: clientId => {
+            if (!this.#intentStore || !this.#owner || !ownerCurrent())
+              throw new Error('Managed native input identities unavailable');
+            return this.#intentStore.getByClientUserMessageId(clientId) !== null ||
+              this.#owner.hasStockQueueClientIdentity(clientId);
+          },
         });
       }
       this.#attempt = this.#registry.markReady(this.#attempt, self, this.#backend, endpointRef);

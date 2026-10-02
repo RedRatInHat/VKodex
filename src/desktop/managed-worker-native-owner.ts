@@ -399,6 +399,13 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     catch { return null; }
   }
 
+  /** Metadata-only native queue collision proof; unavailable is never false. */
+  hasStockQueueClientIdentity(clientId: string): boolean {
+    if (!this.#queueAdapter || !['connected', 'disconnected'].includes(this.#state) ||
+        !this.#ownerCurrent()) throw refuse();
+    return this.#queueAdapter.hasClientIdentity(clientId);
+  }
+
   /** Captured once before retirement clears ingress grants or closes the
    * native queue journal. This proves only that this owner admitted no native
    * mutation; it is not backend idle or process-family evidence. */

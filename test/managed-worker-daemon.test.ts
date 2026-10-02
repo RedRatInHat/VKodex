@@ -25,6 +25,7 @@ import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.
 import { buildBackendWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 import { NativeStockQueueJournal } from '../src/codex/native-stock-queue-journal.js';
+import { NativeStartIntentStore } from '../src/codex/native-start-intent-store.js';
 import { ControlledNativeCreationJournal } from '../src/desktop/controlled-native-creation-journal.js';
 import { captureControlledNativeSourcePreflight, persistControlledNativeSourcePreflightReceipt } from
   '../src/desktop/controlled-native-source-proof.js';
@@ -1150,6 +1151,228 @@ test('headless VK uses the same managed stock worker queue and durable accepted 
     assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'vk-stock-stop')).result,
       { stopped: true });
   } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK refuses fresh admission after an accepted receipt lacks canonical history but preserves exact duplicate lookup', async () => {
+  const capability = {}, firstId = randomUUID(), secondId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  own.backend.stockHistory = [];
+  const request = (operationId: string) => ({ operationId,
+    task: { hostId: 'local', threadId: own.taskId }, text: `PUBLIC_${operationId}` });
+  const first = request(firstId);
+  try {
+    assert.deepEqual(await own.daemon.submitVk(capability, first), { submissionId: 'submission-1' });
+    assert.equal(own.daemon.vkSubmissionStatus(capability, first)?.state, 'accepted');
+    assert.equal(own.backend.queueWrites, 1);
+    await assert.rejects(own.daemon.submitVk(capability, request(secondId)),
+      'an ACK without its canonical user item must not authorize a different VK write');
+    assert.equal(own.backend.queueWrites, 1);
+    assert.deepEqual(await own.daemon.submitVk(capability, first), { submissionId: 'submission-1' },
+      'the original exact accepted lookup must keep its receipt');
+    assert.equal(own.backend.queueWrites, 1);
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK refuses a client ID reserved only by a native direct intent', async () => {
+  const capability = {}, clientId = randomUUID(), operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  const generation = own.daemon.metadata.generation;
+  assert.ok(generation);
+  const input = [{ type: 'text', text: 'NATIVE_INTENT_ONLY', text_elements: [] }];
+  const intentStore = new NativeStartIntentStore({
+    filePath: path.join(own.privateDirectory, 'start-intents.sqlite'),
+    ownerEpoch: own.reserved.epoch, backendGeneration: generation, threadId: own.taskId,
+    encryptionKey: Buffer.alloc(32, 2),
+  });
+  const intent = {
+    envelope: { conversationId: own.taskId, turnStart: { request: {
+      threadId: own.taskId, clientUserMessageId: clientId, input } } },
+    command: { operationId, method: 'turn/start' as const, params: {
+      threadId: own.taskId, clientUserMessageId: clientId, input } },
+    uiParams: null, localMetadata: null,
+    admission: { ownerEpoch: own.reserved.epoch, backendGeneration: generation,
+      snapshot: { id: own.taskId } },
+  };
+  try {
+    assert.equal(intentStore.reserve(operationId, clientId, intent).created, true);
+    const ledger = new Database(path.join(own.privateDirectory, 'operations.sqlite'), { readonly: true });
+    try {
+      assert.equal((ledger.prepare('SELECT count(*) AS n FROM managed_worker_operations WHERE client_user_message_id=?')
+        .get(clientId) as { n: number }).n, 0, 'the native intent has no worker operation yet');
+    } finally { ledger.close(); }
+    await assert.rejects(own.daemon.submitVk(capability, {
+      operationId: clientId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_COLLISION',
+    }), 'a direct-start intent reserves this client identity before worker admission');
+    assert.equal(own.backend.queueWrites, 0);
+  } finally {
+    intentStore.close();
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK refuses a client ID reserved only by a native queue operation', async () => {
+  const capability = {}, clientId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  const generation = own.daemon.metadata.generation;
+  assert.ok(generation);
+  const journal = new NativeStockQueueJournal({
+    filePath: path.join(own.privateDirectory, 'native-stock.sqlite'), taskId: own.taskId,
+    ownerEpoch: own.reserved.epoch, sourceGeneration: 'qualified-stock-v1',
+  });
+  try {
+    journal.reserve({ expectedVersion: journal.readTask().version, opId: clientId,
+      fingerprint: 'a'.repeat(64), nativeEntry: { id: clientId, text: 'NATIVE_RESERVED_ONLY' },
+      effectiveSettings: { model: 'gpt-5.6-sol', effort: 'medium' },
+      admissionEvidence: { taskId: own.taskId, ownerEpoch: own.reserved.epoch },
+      stockInput: [{ type: 'text', text: 'NATIVE_RESERVED_ONLY', text_elements: [] }],
+      forwardedUpstream: {},
+    });
+    const ledger = new Database(path.join(own.privateDirectory, 'operations.sqlite'), { readonly: true });
+    try {
+      assert.equal((ledger.prepare('SELECT count(*) AS n FROM managed_worker_operations WHERE client_user_message_id=?')
+        .get(clientId) as { n: number }).n, 0, 'the native reservation has no worker operation yet');
+    } finally { ledger.close(); }
+    await assert.rejects(own.daemon.submitVk(capability, {
+      operationId: clientId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_COLLISION',
+    }), 'an unresolved native reservation must not authorize VK admission');
+    assert.equal(own.backend.queueWrites, 0);
+  } finally {
+    journal.close();
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK admission resumes after completed VK and native direct turns with distinct receipts', async () => {
+  const capability = {}, firstId = randomUUID(), secondId = randomUUID();
+  const own = await readyFixture({ allow: true, expectedTurnCount: 3 },
+    { enabled: true, early: false }, 'normal', true, null, { capability, sourceId: '' });
+  own.backend.stockHistory = [];
+  const broker = own.brokers[0]!;
+  const wait = async (check: () => boolean) => {
+    const deadline = Date.now() + 12_000;
+    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(check(), JSON.stringify({ methods: own.backend.methods, errors: own.handlerErrors,
+      native: own.daemon.metadata.nativeState, frames: broker.frames.slice(-3) }));
+  };
+  const complete = async (turnId: string, clientId: string, content: unknown) => {
+    const startedAt = own.backend.stockHistory!.length + 1;
+    const userItem = { id: `item-${clientId}`, type: 'userMessage', clientId,
+      content: structuredClone(content) };
+    const turn = { id: turnId, status: 'inProgress', startedAt, items: [userItem] };
+    const terminal = { ...turn, status: 'completed', completedAt: startedAt + 1,
+      itemsView: 'full' };
+    own.backend.stockHistory!.push(terminal);
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started',
+      params: { threadId: own.taskId, turn } }) + '\n');
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/completed',
+      params: { threadId: own.taskId, turn: terminal } }) + '\n');
+    await wait(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+      JSON.stringify(frame).includes(turnId) && JSON.stringify(frame).includes('completed')));
+  };
+  const vkRequest = (operationId: string) => ({ operationId,
+    task: { hostId: 'local', threadId: own.taskId }, text: `PUBLIC_${operationId}` });
+  const response = async (requestId: string) => {
+    await wait(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === requestId));
+    const frame = broker.frames.find(value => value.type === 'response' && value.requestId === requestId)!;
+    assert.equal(frame.resultType, 'success', JSON.stringify({ frame, errors: own.handlerErrors }));
+    return frame.result as Record<string, unknown>;
+  };
+  try {
+    await wait(() => broker.frames.some(frame => frame.method === 'thread-queued-followups-changed'));
+    const first = await own.daemon.submitVk(capability, vkRequest(firstId));
+    const firstQueue = own.backend.frames.find(frame => frame.method === 'thread/queue/add')!;
+    const firstParams = firstQueue.params as Record<string, unknown>;
+    assert.equal(firstParams.clientUserMessageId, firstId);
+    await complete('vk-first-turn', firstId, firstParams.input);
+
+    const direct = composerRequest(own.taskId, own.home, 'vk-between-direct');
+    direct.targetClientId = broker.ownerId;
+    const directParams = direct.params as Record<string, unknown>;
+    const directStart = directParams.turnStart as Record<string, unknown>;
+    const directRequest = directStart.request as Record<string, unknown>;
+    directRequest.permissions = ':danger-full-access'; directRequest.approvalPolicy = 'never';
+    directRequest.collaborationMode = { mode: 'default', settings: { model: 'gpt-5.6-sol',
+      reasoning_effort: 'medium', developer_instructions: null } };
+    broker.send(direct);
+    const directResult = await response('vk-between-direct');
+    const directTurn = (directResult.result as Record<string, unknown>).turn as Record<string, unknown>;
+    assert.equal(own.backend.writes, 1, 'native direct start must have its actual worker ACK');
+    const directWorkerCommand = own.backend.frames.find(frame => frame.method === 'turn/start')!;
+    const directWorkerParams = directWorkerCommand.params as Record<string, unknown>;
+    const directClientId = directWorkerParams.clientUserMessageId as string;
+    assert.ok(directClientId);
+    await complete(directTurn.id as string, directClientId, directWorkerParams.input);
+
+    const second = await own.daemon.submitVk(capability, vkRequest(secondId));
+    const secondQueue = own.backend.frames.filter(frame => frame.method === 'thread/queue/add')[1]!;
+    const secondParams = secondQueue.params as Record<string, unknown>;
+    assert.equal(secondParams.clientUserMessageId, secondId);
+    assert.notEqual(first.submissionId, second.submissionId);
+    assert.notEqual(first.submissionId, directTurn.id);
+    assert.notEqual(second.submissionId, directTurn.id);
+    assert.equal(own.backend.queueWrites, 2);
+    assert.equal(own.backend.writes, 1);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, 1,
+      'all three accepted operations stay on the original backend generation');
+    await complete('vk-second-turn', secondId, secondParams.input);
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch,
+      'vk-native-vk-drained')).result, { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('headless VK refuses a quiet native queue client identity without a worker operation', async () => {
+  const capability = {}, clientId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  const journal = new NativeStockQueueJournal({
+    filePath: path.join(own.privateDirectory, 'native-stock.sqlite'), taskId: own.taskId,
+    ownerEpoch: own.reserved.epoch, sourceGeneration: 'qualified-stock-v1',
+  });
+  try {
+    const input = [{ type: 'text', text: 'NATIVE_QUIET_IDENTITY', text_elements: [] }];
+    journal.reserve({ expectedVersion: journal.readTask().version, opId: clientId,
+      fingerprint: 'c'.repeat(64), nativeEntry: { id: clientId, text: 'NATIVE_QUIET_IDENTITY' },
+      effectiveSettings: { model: 'gpt-5.6-sol', effort: 'medium' },
+      admissionEvidence: { taskId: own.taskId, ownerEpoch: own.reserved.epoch },
+      stockInput: input, forwardedUpstream: {},
+    });
+    journal.markAccepted({ opId: clientId, fingerprint: 'c'.repeat(64), stockId: 'native-stock-quiet' });
+    journal.consume({ opId: clientId, fingerprint: 'c'.repeat(64), turnId: 'native-quiet-turn',
+      authoritative: true });
+    assert.deepEqual(journal.quiescence(), { taskVersion: 3, unresolved: 0, unconsumed: 0 });
+    assert.deepEqual(journal.lookupIncomingIdentities({ ids: [clientId] }).items.map(item =>
+      item && { id: item.id, phase: item.phase, consumed: item.consumed }),
+    [{ id: clientId, phase: 'accepted', consumed: true }]);
+    const ledger = new Database(path.join(own.privateDirectory, 'operations.sqlite'), { readonly: true });
+    try {
+      assert.equal((ledger.prepare('SELECT count(*) AS n FROM managed_worker_operations WHERE client_user_message_id=?')
+        .get(clientId) as { n: number }).n, 0, 'native quiet identity is absent from the worker ledger');
+    } finally { ledger.close(); }
+    await assert.rejects(own.daemon.submitVk(capability, {
+      operationId: clientId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_COLLISION',
+    }));
+    assert.equal(own.backend.queueWrites, 0);
+  } finally {
+    journal.close();
     if (own.backend.exitCode === null) { own.backend.exitCode = 1;
       own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
     await (own.control as ManagedWorkerControlServer | null)?.close();

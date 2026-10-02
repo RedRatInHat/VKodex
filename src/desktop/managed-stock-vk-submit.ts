@@ -15,6 +15,9 @@ type Host = Readonly<{
   executeCommandWithResponse(key: object, command: WorkerCommand, beforeWrite?: () => void): Promise<WorkerCommandResponse>;
   commandStatusForIntent(key: object, command: WorkerCommand): WorkerOperation | null;
   commandQuiescence(key: object): WorkerCommandQuiescence;
+  acceptedCommandReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerCommand['method']; receiptId: string }>>;
+  acceptedQueueInputs(key: object): ReadonlyArray<Readonly<{ clientUserMessageId: string; submissionId: string }>>;
+  hasCommandClientIdentity(key: object, clientId: string): boolean;
 }>;
 export interface ManagedStockVkLease {
   /** Synchronous fence immediately adjacent to the durable reserve and wire write. */
@@ -31,12 +34,15 @@ export interface ManagedStockVkSubmitterOptions {
   readonly backendGeneration: number;
   readonly approvedTaskPolicy: ApprovedTaskPolicy;
   readonly host: Host;
-  readonly readStockState: (assertCurrent: () => void) => Promise<StockReadState>;
+  readonly readStockState: (assertCurrent: () => void,
+    expectedQueueClientIds: readonly string[]) => Promise<StockReadState>;
   readonly initialState: NativeProjectionState;
   readonly captureAuthority: () => ManagedNativeStockQueueAuthority;
   readonly assertAuthorityCurrent: (ticket: ManagedNativeStockQueueAuthority) => boolean;
   /** Acquires the shared native/VK admission lease before the first await. */
   readonly acquireLease: () => ManagedStockVkLease;
+  /** Daemon-owned union of direct intents and native queue identities. Unknown refuses. */
+  readonly isClientReservedForNativeInput: (clientId: string) => boolean;
 }
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -57,7 +63,8 @@ export function managedVkStockCommandId(ownerEpoch: string, taskId: string, clie
 export class ManagedStockVkSubmitter {
   readonly #options: ManagedStockVkSubmitterOptions;
   readonly #policy: ApprovedTaskPolicy;
-  readonly #leases = new Map<string, Readonly<{ lease: ManagedStockVkLease; command: WorkerCommand }>>();
+  readonly #leases = new Map<string, { readonly lease: ManagedStockVkLease;
+    readonly command: WorkerCommand; current: (() => void) | null }>();
 
   constructor(options: ManagedStockVkSubmitterOptions) {
     if (!options || !options.capability || typeof options.capability !== 'object' ||
@@ -69,10 +76,14 @@ export class ManagedStockVkSubmitter {
       !options.host || typeof options.host.executeCommandWithResponse !== 'function' ||
       typeof options.host.commandStatusForIntent !== 'function' ||
       typeof options.host.commandQuiescence !== 'function' ||
+      typeof options.host.acceptedCommandReceipts !== 'function' ||
+      typeof options.host.acceptedQueueInputs !== 'function' ||
+      typeof options.host.hasCommandClientIdentity !== 'function' ||
       typeof options.readStockState !== 'function' || !options.initialState ||
       typeof options.captureAuthority !== 'function' ||
       typeof options.assertAuthorityCurrent !== 'function' ||
-      typeof options.acquireLease !== 'function')
+      typeof options.acquireLease !== 'function' ||
+      typeof options.isClientReservedForNativeInput !== 'function')
       throw new TypeError('Explicit managed VK stock policy required');
     const policy = approveTaskPolicy(options.approvedTaskPolicy);
     if (policy.threadId !== options.taskId) throw new TypeError('Managed VK stock task scope differs');
@@ -87,12 +98,13 @@ export class ManagedStockVkSubmitter {
   authorizes(context: Readonly<WorkerCommand & { ownerEpoch: string;
     backendGeneration: number; threadId: string }>): boolean {
     const pending = this.#leases.get(context.operationId);
-    if (!pending || context.ownerEpoch !== this.#options.ownerEpoch ||
+    if (!pending?.current || context.ownerEpoch !== this.#options.ownerEpoch ||
       context.backendGeneration !== this.#options.backendGeneration ||
       context.threadId !== this.#options.taskId ||
       !isDeepStrictEqual({ operationId: context.operationId, method: context.method,
         params: context.params }, pending.command)) return false;
-    try { pending.lease.assertCurrent(); return true; } catch { return false; }
+    try { pending.current(); return this.#leases.get(context.operationId) === pending; }
+    catch { return false; }
   }
 
   #command(request: SubmitTaskRequest): Readonly<{ command: WorkerCommand; beforeSend?: () => Promise<void> }> {
@@ -158,24 +170,61 @@ export class ManagedStockVkSubmitter {
     // The lease is acquired synchronously before the first await. A second
     // ingress source must see it even while beforeSend/readStockState waits.
     const lease = this.#options.acquireLease();
-    this.#leases.set(command.operationId, { lease, command });
+    const pending = { lease, command, current: null as (() => void) | null };
+    this.#leases.set(command.operationId, pending);
     let outcome: 'accepted' | 'rejected' | 'unknown' = 'rejected';
     try {
       lease.assertCurrent();
       const ticket = this.#options.captureAuthority();
+      const host = this.#options.host, key = this.#options.controlKey;
+      const receipts = structuredClone(host.acceptedCommandReceipts(key));
+      const inputs = structuredClone(host.acceptedQueueInputs(key));
+      if (!Array.isArray(receipts) || !Array.isArray(inputs) ||
+          receipts.some(receipt => !receipt ||
+            !['turn/start', 'thread/queue/add'].includes(receipt.method) ||
+            typeof receipt.receiptId !== 'string' || !receipt.receiptId) ||
+          inputs.some(input => !input || typeof input.clientUserMessageId !== 'string' ||
+            !input.clientUserMessageId || typeof input.submissionId !== 'string' || !input.submissionId)) refuse();
+      const turnIds = receipts.filter(receipt => receipt.method === 'turn/start').map(receipt => receipt.receiptId);
+      const submissionIds = receipts.filter(receipt => receipt.method === 'thread/queue/add').map(receipt => receipt.receiptId);
+      const clientIds = inputs.map(input => input.clientUserMessageId);
+      if (new Set(turnIds).size !== turnIds.length || new Set(submissionIds).size !== submissionIds.length ||
+          new Set(clientIds).size !== clientIds.length ||
+          !isDeepStrictEqual(submissionIds, inputs.map(input => input.submissionId))) refuse();
       const assertTicket = () => {
         lease.assertCurrent();
-        if (this.#options.assertAuthorityCurrent(ticket) !== true)
+        if (this.#leases.get(command.operationId) !== pending ||
+            this.#options.assertAuthorityCurrent(ticket) !== true ||
+            !isDeepStrictEqual(host.acceptedCommandReceipts(key), receipts) ||
+            !isDeepStrictEqual(host.acceptedQueueInputs(key), inputs) ||
+            this.#options.isClientReservedForNativeInput(command.params.clientUserMessageId as string) !== false)
           throw new Error('Managed VK native authority changed');
+        const own = host.commandStatusForIntent(key, command), quiet = host.commandQuiescence(key);
+        if (!Number.isSafeInteger(quiet.inFlight) || quiet.inFlight < 0) refuse();
+        if (own === null) {
+          if (quiet.inFlight !== 0 || quiet.unconfirmed !== false ||
+              host.hasCommandClientIdentity(key, command.params.clientUserMessageId as string) !== false) refuse();
+        } else if (!pending.current || own.operationId !== command.operationId || own.state !== 'dispatching' ||
+            own.ownerEpoch !== this.#options.ownerEpoch || own.backendGeneration !== this.#options.backendGeneration ||
+            own.threadId !== this.#options.taskId || own.method !== command.method ||
+            own.clientUserMessageId !== command.params.clientUserMessageId ||
+            quiet.inFlight > 1 || quiet.unconfirmed !== true) refuse();
       };
       assertTicket();
-      const read = await this.#options.readStockState(assertTicket);
+      // Queue removal is not canonical consumption. Prove every prior accepted
+      // queue client in exhaustive terminal history on this same generation.
+      const read = await this.#options.readStockState(assertTicket, clientIds);
       assertTicket();
       assertManagedStockReadParity(ticket, read, this.#options.initialState,
         this.#policy, this.#options.ownerEpoch, this.#options.backendGeneration);
+      const terminal = new Set(read.terminalTurnIds);
+      if (turnIds.some(turnId => !terminal.has(turnId))) refuse();
       lease.assertCurrent();
       await beforeSend?.();
       assertTicket();
+      // Holding admission blocks competitors, but grants no command authority
+      // until history, policy and bridge-local preparation have all completed.
+      pending.current = assertTicket;
       // From this point a durable reservation or partial stdin write can exist.
       outcome = 'unknown';
       let flight: Promise<WorkerCommandResponse>;
