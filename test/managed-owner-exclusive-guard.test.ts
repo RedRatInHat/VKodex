@@ -5,6 +5,9 @@ import { BridgeStore } from '../src/bridge/store.js';
 import { BridgeRuntime } from '../src/bridge/runtime.js';
 import { observeAppServerTaskState } from '../src/codex/app-server-task-state.js';
 import { ManagedOwnerExclusiveRouteGuard } from '../src/bridge/managed-owner-exclusive-guard.js';
+import { ManagedClaimBoundVkIngress } from '../src/bridge/managed-claim-bound-vk-ingress.js';
+import { ManagedWorkerControlRefusedError, ManagedWorkerControlUnknownError } from '../src/desktop/managed-worker-control-client.js';
+import type { ManagedOwnerIngressResolver } from '../src/bridge/managed-owner-route-resolver.js';
 import { createDesktopRouting } from '../src/desktop/desktop-routing.js';
 import type { ManagedOwnerRouteObserver } from '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { RoutedCodexTasks } from '../src/core/codex-task-router.js';
@@ -14,6 +17,196 @@ import type { BridgeChat, View } from '../src/bridge/contracts.js';
 
 const task = (sourceId = 'source-a'): TaskRef =>
   ({ hostId: 'local', threadId: 'managed-thread', sourceId });
+
+test('claimed facade classifies unavailable pre-submit admission as rejection without reserving authority', async () => {
+  for (const error of [new ManagedWorkerControlRefusedError(), new ManagedWorkerControlUnknownError(), new Error('read unavailable'), null]) {
+    const store = new BridgeStore(), operationId = randomUUID();
+    const binding = store.ensureBinding({ ...task(), title: 'prewrite fixture', workspace: 'C:\\Fixture', updatedAt: 1 });
+    const claim = store.transitionManagedOwner(store.claimManagedOwner(binding.id, { ownerEpoch: randomUUID(),
+      canonicalHome: 'C:\\Fixture', familyRoot: task().threadId }), 'ready', { backendGeneration: 1,
+      registryRevision: 3, endpointRef: randomUUID(), host: { pid: 1, birthTicks: '1' }, backend: { pid: 2, birthTicks: '2' } });
+    store.recordOperation(operationId, task());
+    let writes = 0;
+    const scope = { ownerEpoch: claim.ownerEpoch, taskId: claim.threadId, backendGeneration: 1,
+      registryRevision: 3, endpointRef: claim.evidence.endpointRef!, claimId: claim.id, claimRevision: claim.revision };
+    const resolver = { isCurrent: () => true, resolveIngress: async () => ({ kind: 'statically-qualified', claim,
+      scope, client: { ingressStatusClaimed: async () => { if (error) throw error;
+        return { ...scope, capability: 'stock-idle-queue-v2', admissionOpen: true }; },
+      submitVkClaimed: async () => { writes++; return { submissionId: 'unexpected' }; } } }),
+    resolveOutcome: async () => { throw new Error('unused'); } } as unknown as ManagedOwnerIngressResolver;
+    const ingress = new ManagedClaimBoundVkIngress(store, resolver);
+    try {
+      await assert.rejects(ingress.submitWithReceipt({ task: task(), operationId, text: 'fixture',
+        beforeSend: async () => { if (!error) store.setValue(`stream-generation:${binding.id}`, store.streamGeneration(binding.id) + 1); } }), ActionRejectedError);
+      assert.equal(store.hasManagedOperationAuthority(task(), operationId), false);
+      assert.equal(writes, 0, 'failure during read-only admission has no mutating attempt');
+    } finally { store.close(); }
+  }
+});
+
+test('original durable managed accepted receipt survives unavailable worker without a status RPC', async () => {
+  const store = new BridgeStore(), operationId = randomUUID();
+  const binding = store.ensureBinding({ ...task(), title: 'receipt fixture', workspace: 'C:\\Fixture', updatedAt: 1 });
+  const claim = store.transitionManagedOwner(store.claimManagedOwner(binding.id, { ownerEpoch: randomUUID(),
+    canonicalHome: 'C:\\Fixture', familyRoot: task().threadId }), 'ready', { backendGeneration: 1,
+    registryRevision: 3, endpointRef: randomUUID(), host: { pid: 1, birthTicks: '1' }, backend: { pid: 2, birthTicks: '2' } });
+  store.recordOperation(operationId, task());
+  store.captureManagedOperationAuthority(operationId, task(), claim, store.streamGeneration(binding.id));
+  store.rememberManagedQueueReceipt(task(), operationId, 'actual-receipt');
+  store.settlePromptDispatch(operationId, 'uncertain');
+  let reads = 0;
+  const resolver = { isCurrent: () => false, resolveIngress: async () => { throw new Error('no ingress'); },
+    resolveOutcome: async () => { reads++; return { kind: 'unavailable', claim }; } } as ManagedOwnerIngressResolver;
+  const ingress = new ManagedClaimBoundVkIngress(store, resolver);
+  try {
+    assert.deepEqual(await ingress.findQueuedSubmissionOutcome(task(), operationId), { state: 'accepted', submissionId: 'actual-receipt' });
+    assert.equal(reads, 0, 'durable ACK is already a fact, worker liveness is only needed for terminal proof');
+    assert.equal(store.managedQueueReceipt(operationId)?.state, 'accepted');
+    await assert.rejects(ingress.scanTerminalQueuedInput(task(), operationId, null));
+    assert.equal(store.managedQueueReceipt(operationId)?.state, 'accepted', 'unavailable terminal proof never clears debt');
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    for (const [state, id, turnId] of [['unknown', 'actual-receipt', null], ['accepted', '', null],
+      ['accepted', 'actual-receipt', 'foreign-terminal'], ['settled', 'actual-receipt', null]]) {
+      db.prepare('UPDATE bridge_managed_queue_receipts SET state = ?, submission_id = ?, terminal_turn_id = ? WHERE operation_id = ?')
+        .run(state, id, turnId, operationId);
+      await assert.rejects(ingress.findQueuedSubmissionOutcome(task(), operationId), /corrupt/i,
+        'corrupt persisted receipt cannot attest acceptance');
+    }
+  } finally { store.close(); }
+});
+
+test('health settles original uncertain managed dispatch after binding detaches without replay or projection', async () => {
+  const store = new BridgeStore(), operationId = randomUUID(), peerId = 2_000_000_074;
+  const desktopTask = { ...task(), title: 'original dispatch', workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(desktopTask); store.setChat(binding.id, peerId, 74);
+  const claim = store.transitionManagedOwner(store.claimManagedOwner(binding.id, { ownerEpoch: randomUUID(),
+    canonicalHome: desktopTask.workspace, familyRoot: task().threadId }), 'ready', { backendGeneration: 1,
+    registryRevision: 3, endpointRef: randomUUID(), host: { pid: 1, birthTicks: '1' }, backend: { pid: 2, birthTicks: '2' } });
+  store.recordOperation(operationId, desktopTask, 'original-inbox-fixture', binding.id, 1);
+  const authority = store.captureManagedOperationAuthority(operationId, desktopTask, claim, store.streamGeneration(binding.id));
+  store.settlePromptDispatch(operationId, 'uncertain');
+  store.stopStreaming(binding.id);
+  store.retireManagedOwner(store.transitionManagedOwner(claim, 'handoff_pending'));
+  let originalReads = 0, fallback = 0;
+  const delegate = { isReady: () => false, ensureOpen: async () => { throw new Error('no writer'); },
+    submitWithReceipt: async () => { throw new Error('no replay'); },
+    ownsOperation: (requested: TaskRef, id: string) => store.hasManagedOperationAuthority(requested, id),
+    findQueuedSubmissionOutcome: async (requested: TaskRef, id: string) => {
+      assert.deepEqual(requested, authority.claim); assert.equal(id, operationId); originalReads++;
+      store.rememberManagedQueueReceipt(requested, id, 'original-accepted');
+      return { state: 'accepted' as const, submissionId: 'original-accepted' };
+    }, scanTerminalQueuedInput: async () => ({ done: true as const, turnId: null }) };
+  const guard = new ManagedOwnerExclusiveRouteGuard(store, undefined, delegate);
+  const routed = new RoutedCodexTasks({ findAcceptedInput: async () => { fallback++; return null; },
+    findQueuedSubmissionOutcome: async () => { fallback++; return null; } } as unknown as CodexTasks, [guard]);
+  const states: TaskStateTransport = { readOnly: true, subscribe: () => { throw new Error('not used'); }, close() {} };
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }), edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, routed, chat, store, { states,
+    observe: observeAppServerTaskState, history: { enable() {}, disable() {}, poll: async () => null } }, () => 100_000);
+  try {
+    (runtime as unknown as { reconcileUncertainOperation(): void }).reconcileUncertainOperation();
+    for (let i = 0; i < 8; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(originalReads, 1);
+    assert.equal(store.operationState(operationId), 'accepted', 'original fact survives detachment');
+    assert.equal(store.queuedInputs(binding.id).length, 0, 'no projection into detached/new generation');
+    assert.equal(store.managedQueueReceipt(operationId)?.state, 'accepted', 'terminal proof remains outstanding');
+    assert.equal(fallback, 0); assert.equal(store.pendingDeliveries().length, 0);
+    const mismatched = { ...authority, claim: { ...authority.claim, sourceId: 'foreign-source' } };
+    (store as unknown as { db: import('better-sqlite3').Database }).db.prepare(
+      'UPDATE bridge_managed_operation_authorities SET authority = ? WHERE operation_id = ?')
+      .run(JSON.stringify(mismatched), operationId);
+    assert.throws(() => store.managedOperationAuthorityById(operationId), /corrupt/i,
+      'existing but mismatched original authority is never absent/legacy');
+  } finally { await runtime.stop(); guard.states.close(); store.close(); }
+});
+
+test('health reconciles original managed ACK debt after stream generation changes and claim retirement', async () => {
+  const store = new BridgeStore();
+  const desktopTask = { ...task(), title: 'receipt fixture', workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(desktopTask), operationId = randomUUID();
+  const peerId = 2_000_000_073;
+  store.setChat(binding.id, peerId, 73);
+  const claim = store.transitionManagedOwner(store.claimManagedOwner(binding.id, {
+    ownerEpoch: randomUUID(), canonicalHome: desktopTask.workspace, familyRoot: desktopTask.threadId }),
+  'ready', { backendGeneration: 1, registryRevision: 3, endpointRef: randomUUID(),
+    host: { pid: 1, birthTicks: '1' }, backend: { pid: 2, birthTicks: '2' } });
+  store.recordOperation(operationId, desktopTask);
+  const authority = store.captureManagedOperationAuthority(operationId, desktopTask, claim,
+    store.streamGeneration(binding.id));
+  // The worker accepted the wire write, but the original projection has already changed.
+  store.setValue(`stream-generation:${binding.id}`, authority.streamGeneration + 1);
+  const corruptId = randomUUID();
+  // A damaged earlier debt must not prevent independent later debt checks.
+  store.recordOperation(corruptId, desktopTask);
+  store.captureManagedOperationAuthority(corruptId, desktopTask, claim, authority.streamGeneration + 1);
+  store.rememberManagedQueueReceipt(desktopTask, corruptId, 'corrupt-receipt');
+  (store as unknown as { db: import('better-sqlite3').Database }).db.prepare(
+    'UPDATE bridge_managed_operation_authorities SET authority = ? WHERE operation_id = ?').run('{', corruptId);
+  store.rememberManagedQueueReceipt(desktopTask, operationId, 'actual-receipt');
+  store.settlePromptDispatch(operationId, 'accepted');
+  store.rememberQueuedInput(binding.id, operationId, 'actual-receipt');
+  assert.equal(store.queuedInputs(binding.id).length, 0, 'old receipt is not a new-stream queued marker');
+  store.retireManagedOwner(store.transitionManagedOwner(claim, 'handoff_pending'));
+  let scans = 0, fallback = 0, time = 100_000, terminal = false;
+  const states: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
+    readOnly: true, start: async () => {}, verifyOwner: async () => {}, close() {} }), close() {} };
+  const delegate = { isReady: () => false, ensureOpen: async () => { throw new Error('no writer'); },
+    submitWithReceipt: async () => { throw new Error('no replay'); },
+    ownsOperation: (requested: TaskRef, id: string) => store.hasManagedOperationAuthority(requested, id),
+    findQueuedSubmissionOutcome: async () => ({ state: 'accepted' as const, submissionId: 'actual-receipt' }),
+    scanTerminalQueuedInput: async (requested: TaskRef, id: string) => {
+      assert.deepEqual(requested, authority.claim); assert.equal(id, operationId); scans++;
+      return { done: true as const, turnId: terminal ? 'actual-terminal' : null };
+    } };
+  const guard = new ManagedOwnerExclusiveRouteGuard(store, undefined, delegate);
+  const routed = new RoutedCodexTasks({ listTasks: async () => [desktopTask],
+    scanTerminalQueuedInput: async () => { fallback++; throw new Error('foreign history'); } } as unknown as CodexTasks, [guard]);
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }), edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, routed, chat, store, { states,
+    observe: observeAppServerTaskState, history: { enable() {}, disable() {}, poll: async () => null } },
+  () => time, undefined, undefined, 10_000_000);
+  const drain = async () => { await runtime.tick(false);
+    for (let i = 0; i < 8; i++) await new Promise<void>(resolve => setImmediate(resolve)); };
+  try {
+    await drain();
+    assert.equal(scans, 1, 'health scans original accepted receipt independently of current projection');
+    assert.equal(store.managedQueueReceipt(operationId)?.state, 'accepted', 'negative history never clears ACK debt');
+    terminal = true; time += 60 * 60_000 + 1;
+    await drain();
+    assert.deepEqual(store.managedQueueReceipt(operationId), {
+      state: 'settled', submissionId: 'actual-receipt', turnId: 'actual-terminal' });
+    assert.equal(store.queuedInputs(binding.id).length, 0);
+    assert.equal(fallback, 0, 'retirement cannot redirect canonical proof to the current owner');
+    assert.deepEqual(store.managedOperationAuthority(desktopTask, operationId), authority);
+    time += 30_001; await drain(); assert.equal(scans, 2, 'settled debt is not scanned again');
+  } finally { await runtime.stop(); guard.states.close(); store.close(); }
+});
+
+test('sole managed guard sends foreground once and resolves original operations after claim retirement', async () => {
+  const store = new BridgeStore();
+  const binding = store.ensureBinding({ ...task(), title: 'fixture', workspace: 'C:\\Fixture', updatedAt: 1 });
+  const registering = store.claimManagedOwner(binding.id, { ownerEpoch: randomUUID(), canonicalHome: 'C:\\Fixture', familyRoot: task().threadId });
+  const claim = store.transitionManagedOwner(registering, 'ready', { backendGeneration: 1,
+    registryRevision: 3, endpointRef: randomUUID(), host: { pid: 1, birthTicks: '1' }, backend: { pid: 2, birthTicks: '2' } });
+  const operationId = randomUUID();
+  let fallback = 0, sent = 0;
+  const delegate = { isReady: () => true, ensureOpen: async () => {},
+    submitWithReceipt: async () => { sent++; return { mode: 'queue' as const, submissionId: 'actual-receipt' }; },
+    ownsOperation: (_task: TaskRef, id: string) => id === operationId,
+    findQueuedSubmissionOutcome: async () => ({ state: 'accepted' as const, submissionId: 'actual-receipt' }),
+    scanTerminalQueuedInput: async () => ({ done: true as const, turnId: 'terminal-turn' }) };
+  const guard = new ManagedOwnerExclusiveRouteGuard(store, undefined, delegate);
+  const routed = new RoutedCodexTasks({ findQueuedSubmissionOutcome: async () => { fallback++; return null; } } as unknown as CodexTasks, [guard]);
+  try {
+    assert.deepEqual(await routed.submitWithReceipt({ task: task(), operationId, text: 'fixture text' }),
+      { mode: 'queue', submissionId: 'actual-receipt' });
+    store.retireManagedOwner(store.transitionManagedOwner(claim, 'handoff_pending'));
+    assert.equal(guard.owns(task()), false, 'historical operation never captures fresh commands');
+    assert.deepEqual(await routed.findQueuedSubmissionOutcome(task(), operationId), { state: 'accepted', submissionId: 'actual-receipt' });
+    assert.deepEqual(await routed.scanTerminalQueuedInput(task(), operationId, null), { done: true, turnId: 'terminal-turn' });
+    assert.equal(fallback, 0); assert.equal(sent, 1);
+  } finally { guard.states.close(); store.close(); }
+});
 
 test('passive production routing fences every exclusive owner, not just managed claims', () => {
   const store = new BridgeStore();

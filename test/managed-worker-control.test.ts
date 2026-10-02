@@ -16,6 +16,34 @@ type VkV2ClientApi = ManagedWorkerControlClient & {
 };
 const v2Client = (client: ManagedWorkerControlClient): VkV2ClientApi => client as VkV2ClientApi;
 
+test('claim-bound ingress admits one exact ready claim and preserves its ACK after claim invalidation', async () => {
+  const epoch = randomUUID(), claimId = randomUUID(), endpointRef = randomUUID();
+  const scope = { ownerEpoch: epoch, taskId: 'own', backendGeneration: 7, registryRevision: 11, endpointRef };
+  const expected = { ...scope, claimId, claimRevision: 3 };
+  let readyRevision = 3, writes = 0;
+  const options = { ownerEpoch: epoch, taskId: 'own',
+    status: () => ({ hostState: 'running', backendGeneration: 7, nativeState: null, nativeRevision: 11 }),
+    requestStop: async () => {}, vkClaimed: {
+      isScopeCurrent: () => true,
+      isClaimCurrent: (value: typeof expected) => value.claimId === claimId && value.claimRevision === readyRevision,
+      ingressStatus: () => ({ capability: 'stock-idle-queue-v2', admissionOpen: true }),
+      submit: async () => { writes++; readyRevision = 5; return { submissionId: 'actual-queue-receipt' }; },
+    } } as unknown as ManagedWorkerControlOptions;
+  const server = new ManagedWorkerControlServer(options);
+  const cap = await server.listen(), client = await peer(cap);
+  const frame = { epoch, taskId: 'own', backendGeneration: 7, registryRevision: 11, endpointRef,
+    claimId, claimRevision: 3 };
+  try {
+    client.send({ ...frame, id: 'first', method: 'submit-vk-claimed-v1', request: {
+      operationId: randomUUID(), task: { hostId: 'local', threadId: 'own' }, text: 'fixture text' } });
+    assert.deepEqual(await client.read(), { id: 'first', result: { ...expected, submissionId: 'actual-queue-receipt' } });
+    client.send({ ...frame, id: 'stale', method: 'submit-vk-claimed-v1', request: {
+      operationId: randomUUID(), task: { hostId: 'local', threadId: 'own' }, text: 'fixture text' } });
+    assert.deepEqual(await client.read(), { id: 'stale', error: 'refused' });
+    assert.equal(writes, 1);
+  } finally { client.socket.destroy(); await server.close(); }
+});
+
 async function fakeControl(respond: (frame: Record<string, unknown>) => unknown) {
   const token = Buffer.alloc(32, 7).toString('base64url');
   const server = createServer(socket => {

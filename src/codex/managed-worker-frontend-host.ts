@@ -1,7 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { AppServerConnection } from './app-server-connection.js';
-import type { AppServerEnvelope } from './app-server-connection.js';
+import type { AppServerEnvelope, AppServerRequestOptions } from './app-server-connection.js';
 import { AppServerRequestInbox } from './app-server-request-inbox.js';
 import type { PendingRequestResponder, RequestFrame, RequestInboxOptions } from './app-server-request-inbox.js';
 import { PersistentFrontendSessions } from './persistent-frontend-session.js';
@@ -244,9 +244,9 @@ export class ManagedWorkerFrontendHost {
 
   /** Exact native result only after durable acceptance; null means unavailable. */
   executeCommandWithResponse(controlKey: object, command: WorkerCommand,
-    beforeWrite?: () => void): Promise<WorkerCommandResponse> {
+    beforeWrite?: () => void, withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<WorkerCommandResponse> {
     if (!this.#commands) throw new Error('Worker command control unavailable');
-    return this.#commands.executeWithResponse(controlKey, command, beforeWrite);
+    return this.#commands.executeWithResponse(controlKey, command, beforeWrite, withWriteGuard);
   }
 
   commandStatus(controlKey: object, operationId: string): WorkerOperation | null {

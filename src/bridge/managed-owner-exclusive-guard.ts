@@ -2,6 +2,7 @@ import type { CodexQuestions } from '../core/codex-questions.js';
 import { ActionRejectedError, type QueuedSubmissionOutcome, type SubmitTaskReceipt,
   type SubmitTaskRequest, type TaskDetails, type TaskGoal, type TaskGoalUpdate,
   type TaskRef, type TaskRenameResult } from '../core/codex-tasks.js';
+import type { QueuedInputHistoryCursor, QueuedInputHistoryScan } from '../core/codex-tasks.js';
 import type { CodexTaskOwner } from '../core/codex-task-router.js';
 import type { TaskStateOwnerRoute, TaskStateStream, TaskStateTransport } from '../core/task-state.js';
 import type { BridgeStore } from './store.js';
@@ -11,6 +12,15 @@ import { ManagedOwnerObservedTaskStateTransport,
 const refuse = (): never => {
   throw new ActionRejectedError('Управляемый маршрут задачи пока недоступен.');
 };
+/** An optional narrow same-worker delegate, never a second exclusive owner. */
+export interface ManagedOwnerIngress {
+  isReady(task: TaskRef): boolean;
+  ensureOpen(task: TaskRef): Promise<void>;
+  submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
+  ownsOperation(task: TaskRef, operationId: string): boolean;
+  findQueuedSubmissionOutcome(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
+  scanTerminalQueuedInput(task: TaskRef, operationId: string, cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan>;
+}
 
 /** A durable route claim, not an ingress or physical writer grant. It is safe
  * to register before a worker exists: every operation remains unavailable. */
@@ -19,7 +29,7 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
   readonly states: TaskStateTransport;
 
   constructor(private readonly store: Pick<BridgeStore, 'managedOwner'>,
-    observer?: ManagedOwnerRouteObserver) {
+    observer?: ManagedOwnerRouteObserver, private readonly ingress?: ManagedOwnerIngress) {
     const observations = new Set<ManagedOwnerObservedTaskStateTransport>();
     this.states = Object.freeze({
       readOnly: true as const,
@@ -53,11 +63,22 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
 
   /** BridgeStore excludes retired rows and matches host/thread/source exactly. */
   owns(task: TaskRef): boolean { return this.store.managedOwner(task) !== null; }
-  isReady(_task: TaskRef): boolean { return false; }
-  async ensureOpen(_task: TaskRef): Promise<void> { refuse(); }
-  async submitWithReceipt(_request: SubmitTaskRequest): Promise<SubmitTaskReceipt> { return refuse(); }
+  isReady(task: TaskRef): boolean { return this.owns(task) && this.ingress?.isReady(task) === true; }
+  ownsOperation(task: TaskRef, operationId: string): boolean { return this.ingress?.ownsOperation(task, operationId) === true; }
+  async ensureOpen(task: TaskRef): Promise<void> {
+    const ingress = this.ingress;
+    if (!this.owns(task) || !ingress) return refuse();
+    return ingress.ensureOpen(task);
+  }
+  async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
+    if (!this.owns(request.task) || !this.ingress) return refuse();
+    return this.ingress.submitWithReceipt(request);
+  }
   async interrupt(_task: TaskRef): Promise<void> { refuse(); }
-  async queue(_request: SubmitTaskRequest): Promise<string> { return refuse(); }
+  async queue(request: SubmitTaskRequest): Promise<string> {
+    const receipt = await this.submitWithReceipt(request);
+    return receipt.mode === 'queue' ? receipt.submissionId : refuse();
+  }
   async selectModel(_task: TaskRef, _model: string, _effort: string): Promise<void> { refuse(); }
   async renameTask(_task: TaskRef, _title: string): Promise<TaskRenameResult> { return refuse(); }
   async moveTask(_task: TaskRef, _projectId: string | null): Promise<void> { refuse(); }
@@ -68,10 +89,20 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
   async answerQuestions(_task: TaskRef, _question: CodexQuestions,
     _answers: Readonly<Record<string, string>>, _operationId: string,
     _beforeSend: () => Promise<void>): Promise<void> { refuse(); }
-  async findAcceptedInput(_task: TaskRef, _operationId: string): Promise<string | null> { return refuse(); }
-  async findQueuedSubmission(_task: TaskRef, _operationId: string): Promise<string | null> { return refuse(); }
-  async findQueuedSubmissionOutcome(_task: TaskRef, _operationId: string): Promise<QueuedSubmissionOutcome | null> {
-    return refuse();
+  async findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
+    return this.ownsOperation(task, operationId) ? null : refuse();
+  }
+  async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
+    const result = await this.findQueuedSubmissionOutcome(task, operationId);
+    return result?.state === 'accepted' ? result.submissionId : null;
+  }
+  async findQueuedSubmissionOutcome(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null> {
+    if (!this.ownsOperation(task, operationId) || !this.ingress) return refuse();
+    return this.ingress.findQueuedSubmissionOutcome(task, operationId);
+  }
+  async scanTerminalQueuedInput(task: TaskRef, operationId: string, cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
+    if (!this.ownsOperation(task, operationId) || !this.ingress) return refuse();
+    return this.ingress.scanTerminalQueuedInput(task, operationId, cursor);
   }
   async inspectTask(_task: TaskRef): Promise<TaskDetails> { return refuse(); }
   async archiveTask(_task: TaskRef): Promise<void> { refuse(); }

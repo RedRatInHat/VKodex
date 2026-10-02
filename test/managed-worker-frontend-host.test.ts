@@ -1464,3 +1464,51 @@ test('accepted duplicate validates intent but does not recheck the scoped lease 
     assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
   } finally { await f.managed.stop('test-cleanup'); }
 });
+
+test('host actual-write wrapper refuses before entry and leaves the backend usable', async () => {
+  const f = commandFixture(); await f.managed.start();
+  try {
+    const outcome = await f.managed.executeCommandWithResponse(f.controlKey, f.command,
+      undefined, () => { throw new Error('claim changed before write'); });
+    assert.equal(outcome.operation.state, 'rejected');
+    assert.equal(outcome.response, null);
+    assert.equal(f.child.messages.some(frame => frame.method === 'turn/start'), false);
+    assert.equal(f.managed.metadata.state, 'running');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: false });
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('host preserves late acceptance after the write-scoped claim predicate changes', async () => {
+  const f = commandFixture(15); await f.managed.start();
+  let claimCurrent = true, wrappers = 0;
+  const beforeWrite = () => { if (!claimCurrent) throw new Error('claim retired'); };
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command, beforeWrite,
+      write => { wrappers++; beforeWrite(); write(); claimCurrent = false; });
+    const frame = await sentMutation(f.child);
+    assert.equal((await pending).operation.state, 'unknown');
+    f.child.send({ id: frame.id, result: { turn: { id: 'accepted-after-claim-change' } } });
+    assert.equal(f.managed.commandStatus(f.controlKey, f.command.operationId)?.state, 'accepted');
+    const duplicate = await f.managed.executeCommandWithResponse(f.controlKey, f.command,
+      beforeWrite, () => { assert.fail('accepted intent must not write twice'); });
+    assert.equal(duplicate.operation.receiptId, 'accepted-after-claim-change');
+    assert.deepEqual(duplicate.response, { turn: { id: 'accepted-after-claim-change' } });
+    assert.equal(wrappers, 1);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
+test('host post-write wrapper ambiguity retains unknown until exact late receipt', async () => {
+  const f = commandFixture(); await f.managed.start();
+  try {
+    const pending = f.managed.executeCommandWithResponse(f.controlKey, f.command, undefined,
+      write => { write(); throw new Error('claim commit ambiguous'); });
+    const frame = await sentMutation(f.child);
+    assert.equal((await pending).operation.state, 'unknown');
+    assert.deepEqual(f.managed.commandQuiescence(f.controlKey), { inFlight: 0, unconfirmed: true });
+    f.child.send({ id: frame.id, result: { turn: { id: 'exact-late-proof' } } });
+    assert.equal(f.managed.commandStatus(f.controlKey, f.command.operationId)?.receiptId, 'exact-late-proof');
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    assert.equal(f.managed.metadata.state, 'running');
+  } finally { await f.managed.stop('test-cleanup'); }
+});

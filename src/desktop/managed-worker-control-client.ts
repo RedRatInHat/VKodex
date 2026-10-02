@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { connect } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
-import type { SubmitTaskRequest } from '../core/codex-tasks.js';
+import type { SubmitTaskRequest, QueuedInputHistoryCursor, QueuedInputHistoryScan } from '../core/codex-tasks.js';
 import { validManagedVkControlRequest, type ManagedWorkerControlStatus,
   validManagedWorkerHandoffProof, validNativeCliCanaryEvidence,
   validManagedWorkerVkScope, managedWorkerVkScopeKeys,
+  validManagedWorkerClaimedVkScope, type ManagedWorkerClaimedVkScope,
+  validManagedQueueCursor, validManagedQueueScan,
   type ManagedWorkerHandoffScope,
   type ManagedWorkerControlHandoffProof, type ManagedWorkerVkStatus,
   type ManagedWorkerVkScope, type ManagedWorkerScopedVkIngressStatus,
@@ -42,7 +44,7 @@ export interface ManagedWorkerScopedControlStatus extends ManagedWorkerControlSt
 type Method = 'status' | 'submit-vk-v1' | 'vk-submission-status-v1' |
   'vk-submission-status-by-id-v1' | 'revoke-ingress-v1' | 'qualify-handoff-v1' |
   'cli-canary-evidence-v1' | 'vk-ingress-status-v2' | 'submit-vk-v2' |
-  'vk-submission-status-by-id-v2';
+  'vk-submission-status-by-id-v2' | 'vk-terminal-input-scan-v2' | 'vk-ingress-status-claimed-v1' | 'submit-vk-claimed-v1';
 const object = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
@@ -75,7 +77,7 @@ export class ManagedWorkerControlClient {
     const id = randomUUID();
     const frame = JSON.stringify({ id, epoch: scope.ownerEpoch,
       ...(method === 'status' ? {} : { taskId: scope.taskId }), method, ...payload }) + '\n';
-    if (Buffer.byteLength(frame, 'utf8') > 128 * 1024)
+    if (Buffer.byteLength(frame, 'utf8') > (method === 'vk-terminal-input-scan-v2' ? 2 * 1024 * 1024 : 128 * 1024))
       throw refused();
     return new Promise((resolve, reject) => {
       const socket = connect(scope.port, scope.host);
@@ -93,7 +95,7 @@ export class ManagedWorkerControlClient {
       socket.on('connect', () => socket.write(JSON.stringify({ token: scope.token }) + '\n'));
       socket.on('data', (chunk: Buffer) => {
         buffer += decoder.write(chunk);
-        if (Buffer.byteLength(buffer, 'utf8') > 8192) {
+        if (Buffer.byteLength(buffer, 'utf8') > (method === 'vk-terminal-input-scan-v2' ? 2 * 1024 * 1024 : 8192)) {
           end(unknown()); return;
         }
         while (buffer.includes('\n')) {
@@ -191,6 +193,40 @@ export class ManagedWorkerControlClient {
     return Object.freeze({ ...captured, submissionId: result.submissionId });
   }
 
+  async ingressStatusClaimed(expected: ManagedWorkerClaimedVkScope):
+    Promise<ManagedWorkerClaimedVkScope & { capability: 'stock-idle-queue-v2'; admissionOpen: boolean }> {
+    const captured = this.#captureClaimed(expected);
+    const result = await this.#call('vk-ingress-status-claimed-v1', {
+      ...this.#vkScopePayload(captured), claimId: captured.claimId, claimRevision: captured.claimRevision });
+    if (!this.#claimedReply(result, captured, ['capability', 'admissionOpen']) ||
+      result.capability !== 'stock-idle-queue-v2' || typeof result.admissionOpen !== 'boolean')
+      throw new ManagedWorkerControlUnknownError();
+    return Object.freeze({ ...captured, capability: 'stock-idle-queue-v2', admissionOpen: result.admissionOpen });
+  }
+
+  async submitVkClaimed(expected: ManagedWorkerClaimedVkScope, request: SubmitTaskRequest):
+    Promise<ManagedWorkerClaimedVkScope & { submissionId: string }> {
+    const captured = this.#captureClaimed(expected);
+    if (!validManagedVkControlRequest(request, captured.taskId)) throw new ManagedWorkerControlRefusedError();
+    const result = await this.#call('submit-vk-claimed-v1', { ...this.#vkScopePayload(captured),
+      claimId: captured.claimId, claimRevision: captured.claimRevision, request });
+    if (!this.#claimedReply(result, captured, ['submissionId']) || typeof result.submissionId !== 'string' ||
+      !result.submissionId || result.submissionId.length > 256 || /[\u0000-\u001f\u007f]/u.test(result.submissionId))
+      throw new ManagedWorkerControlUnknownError();
+    return Object.freeze({ ...captured, submissionId: result.submissionId });
+  }
+
+  #captureClaimed(expected: ManagedWorkerClaimedVkScope): ManagedWorkerClaimedVkScope {
+    if (!validManagedWorkerClaimedVkScope(expected) || expected.ownerEpoch !== this.#options.ownerEpoch ||
+      expected.taskId !== this.#options.taskId) throw new ManagedWorkerControlRefusedError();
+    return Object.freeze({ ...expected });
+  }
+  #claimedReply(result: unknown, expected: ManagedWorkerClaimedVkScope, keys: readonly string[]):
+    result is Record<string, unknown> {
+    return this.#scopedVkReply(result, expected, ['claimId', 'claimRevision', ...keys]) &&
+      result.claimId === expected.claimId && result.claimRevision === expected.claimRevision;
+  }
+
   async vkSubmissionStatusByOperationIdV2(expected: ManagedWorkerVkScope,
     operationId: string): Promise<ManagedWorkerScopedVkStatus | null> {
     const captured = this.#captureVkScope(expected);
@@ -212,6 +248,15 @@ export class ManagedWorkerControlClient {
     return Object.freeze({ ownerEpoch: expected.ownerEpoch, taskId: expected.taskId,
       backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision,
       endpointRef: expected.endpointRef });
+  }
+  async scanTerminalQueuedInputV2(expected: ManagedWorkerVkScope, operationId: string,
+    cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
+    const captured = this.#captureVkScope(expected);
+    if (!uuid.test(operationId) || !validManagedQueueCursor(cursor)) throw new ManagedWorkerControlRefusedError();
+    const result = await this.#call('vk-terminal-input-scan-v2', { ...this.#vkScopePayload(captured), operationId, cursor });
+    if (!this.#scopedVkReply(result, captured, ['scan']) || !validManagedQueueScan(result.scan))
+      throw new ManagedWorkerControlUnknownError();
+    return structuredClone(result.scan);
   }
 
   #vkScopePayload(expected: ManagedWorkerVkScope): Readonly<Record<string, unknown>> {

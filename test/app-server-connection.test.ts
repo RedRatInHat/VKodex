@@ -1485,3 +1485,84 @@ test("a timed-out read does not disconnect unrelated profile work", async () => 
     assert.equal(child.messages.filter(message => message.method === "initialize").length, 1);
   } finally { clearInterval(keepAlive); await connection.close(); }
 });
+
+test('actual-write guard encloses only synchronous stdin write and preserves the ACK', async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const order: string[] = [];
+  try {
+    const session = await connection.initializedSession();
+    child.stdin.on('data', () => order.push('write'));
+    await connection.request('turn/start', {}, { mutating: true, expectedGeneration: session.generation,
+      withWriteGuard: write => { order.push('enter'); write(); order.push('leave'); },
+      onResponseEnvelope: () => order.push('ack'),
+    });
+    assert.deepEqual(order, ['enter', 'write', 'leave', 'ack']);
+  } finally { await connection.close(); }
+});
+
+test('actual-write guard refuses absent or async callbacks without retiring the writer', async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    const session = await connection.initializedSession();
+    let refusals = 0;
+    for (const withWriteGuard of [() => {}, async (write: () => void) => { await Promise.resolve(); write(); },
+      (write: () => void) => { queueMicrotask(write); }]) {
+      await assert.rejects(connection.request('turn/start', {}, {
+        mutating: true, expectedGeneration: session.generation, withWriteGuard,
+        onBeforeWriteRefused: () => { refusals++; },
+      }));
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(refusals, 3);
+    assert.equal(child.messages.some(message => message.method === 'turn/start'), false);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+    assert.deepEqual(await connection.request('model/list'), { ok: true });
+  } finally { await connection.close(); }
+});
+
+test('synchronous wire ACK stays ordered after actual-write transaction release', async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const order: string[] = [];
+  try {
+    const session = await connection.initializedSession();
+    child.respond = () => null;
+    child.stdin.on('data', () => {
+      const frame = child.messages.at(-1)!;
+      child.send({ id: frame.id, result: { turn: { id: 'sync-ack' } } });
+      child.send({ method: 'turn/started', params: { threadId: 'own' } });
+    });
+    connection.onNotification(() => order.push('notification'));
+    await connection.request('turn/start', {}, { mutating: true, expectedGeneration: session.generation,
+      withWriteGuard: write => { order.push('enter'); write(); order.push('release'); },
+      onResponseEnvelope: () => order.push('ack'),
+    });
+    assert.deepEqual(order, ['enter', 'release', 'ack', 'notification']);
+  } finally { await connection.close(); }
+});
+
+test('duplicate callback or post-write guard failure is uncertain, writes once and keeps late ACK', async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === 'initialize' ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  try {
+    const session = await connection.initializedSession();
+    let refusals = 0, receipts = 0;
+    for (const withWriteGuard of [(write: () => void) => { write(); write(); },
+      (write: () => void) => { write(); throw new Error('commit ambiguous'); }]) {
+      await assert.rejects(connection.request('turn/start', {}, {
+        mutating: true, expectedGeneration: session.generation, withWriteGuard,
+        onBeforeWriteRefused: () => { refusals++; },
+        onLateResponseEnvelope: () => { receipts++; },
+      }), AppServerUncertainError);
+      const id = child.messages.filter(message => message.method === 'turn/start').at(-1)!.id;
+      child.send({ id, result: { turn: { id: 'late' } } });
+    }
+    assert.equal(refusals, 0);
+    assert.equal(receipts, 2);
+    assert.equal(child.messages.filter(message => message.method === 'turn/start').length, 2);
+    assert.equal(connection.isSessionCurrent(session.generation), true);
+  } finally { await connection.close(); }
+});

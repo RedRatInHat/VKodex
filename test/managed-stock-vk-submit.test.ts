@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
+import { ActionRejectedError } from '../src/core/codex-tasks.js';
+import { ManagedWorkerIdleProofRefusedError } from '../src/desktop/managed-worker-bootstrap.js';
 import { managedStockCommandId } from '../src/desktop/managed-native-stock-queue-adapter.js';
 import { ManagedStockVkSubmitter, managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
 import type { WorkerCommand } from '../src/codex/managed-worker-command-dispatcher.js';
@@ -50,25 +52,33 @@ function qualifiedAdmissionFixture() {
         unconfirmed: state.operation?.state === 'dispatching' }),
       acceptedCommandReceipts: () => state.receipts, acceptedQueueInputs: () => state.inputs,
       hasCommandClientIdentity: () => state.workerIdentity,
-      executeCommandWithResponse: async (_key, command, beforeWrite) => {
+      executeCommandWithResponse: async (_key, command, beforeWrite, withWriteGuard) => {
         state.dispatches++;
         state.operation = { operationId: command.operationId,
           clientUserMessageId: request.operationId, method: command.method,
           fingerprint: 'a'.repeat(64), ownerEpoch: epoch, backendGeneration: 1,
           threadId: taskId, revision: 1, state: 'dispatching', receiptId: null, rejectionCode: null };
-        try { state.beforeWire(); beforeWrite?.(); }
-        catch {
+        const beforeWrites = state.writes;
+        try {
+          state.beforeWire(); beforeWrite?.();
+          const write = () => { state.writes++; };
+          if (withWriteGuard) withWriteGuard(write); else write();
+        }
+        catch (error) {
+          if (state.writes !== beforeWrites) {
+            state.operation = { ...state.operation, state: 'unknown', revision: 2 };
+            throw error;
+          }
           state.operation = { ...state.operation, state: 'rejected', revision: 2, rejectionCode: null };
           return { operation: state.operation, response: null };
         }
-        state.writes++;
         state.operation = { ...state.operation, state: 'accepted', revision: 2,
           receiptId: 'unit-submission' };
         return { operation: state.operation, response: { submissionId: 'unit-submission' } };
       },
     },
   });
-  return { submitter, request, capability, state, scope: () => {
+  return { submitter, request, capability, state, read, scope: () => {
     assert.ok(state.command);
     return { ...state.command, ownerEpoch: epoch, backendGeneration: 1, threadId: taskId };
   } };
@@ -82,6 +92,62 @@ test('VK command identity is stable but distinct from native stock identity', ()
     managedStockCommandId(epoch, taskId, clientId));
   assert.notEqual(managedVkStockCommandId(epoch, taskId, clientId),
     managedVkStockCommandId(epoch, taskId, randomUUID()));
+});
+
+test('VK submitter forwards trusted actual-write wrapper after the scoped fence', async () => {
+  const f = qualifiedAdmissionFixture(); let current = true, wraps = 0;
+  const order: string[] = [];
+  const outcome = await f.submitter.submit(f.capability, f.request, () => {
+    if (!current) throw new Error('scope retired');
+    order.push('scope');
+  }, write => {
+    wraps++; order.push('guard');
+    assert.equal(order.at(-2), 'scope');
+    assert.equal(f.state.writes, 0);
+    write();
+    assert.equal(f.state.writes, 1);
+    current = false;
+  });
+  assert.equal(wraps, 1);
+  assert.equal(outcome.submissionId, 'unit-submission');
+  assert.deepEqual(f.state.finishes, ['accepted']);
+  assert.equal(f.submitter.pending, 0);
+});
+
+test('VK submitter claim wrapper refusal before entry releases rejected admission', async () => {
+  const f = qualifiedAdmissionFixture();
+  await assert.rejects(f.submitter.submit(f.capability, f.request, undefined,
+    () => { throw new Error('claim revoked before write'); }));
+  assert.equal(f.state.writes, 0);
+  assert.deepEqual(f.state.finishes, ['rejected']);
+  assert.equal(f.submitter.pending, 0);
+});
+
+for (const phase of ['history-read', 'idle-proof', 'read-parity', 'authority-ticket', 'local-preparation'] as const) {
+  test(`VK pre-reservation ${phase} refusal is definitive and leaves no worker operation`, async () => {
+    const f = qualifiedAdmissionFixture();
+    f.state.beforeRead = async () => {
+      if (phase === 'history-read') throw new Error('private history failure');
+      if (phase === 'idle-proof') throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
+      if (phase === 'read-parity') Object.assign(f.read, { model: 'foreign-model' });
+      if (phase === 'authority-ticket') f.state.nativeReserved = true;
+    };
+    await assert.rejects(f.submitter.submit(f.capability, { ...f.request,
+      beforeSend: async () => { if (phase === 'local-preparation') throw new Error('private local failure'); },
+    }), error => error instanceof ActionRejectedError && !error.message.includes('private'));
+    assert.equal(f.state.dispatches, 0); assert.equal(f.state.writes, 0);
+    assert.equal(f.state.operation, null); assert.deepEqual(f.state.finishes, ['rejected']);
+    assert.equal(f.submitter.pending, 0);
+  });
+}
+
+test('VK entered-write wrapper failure keeps unknown ownership and is not normalised to rejection', async () => {
+  const f = qualifiedAdmissionFixture(), failure = new Error('post-write uncertainty');
+  await assert.rejects(f.submitter.submit(f.capability, f.request, undefined,
+    write => { write(); throw failure; }), error => error === failure && !(error instanceof ActionRejectedError));
+  assert.equal(f.state.dispatches, 1); assert.equal(f.state.writes, 1);
+  assert.equal(f.state.operation?.state, 'unknown'); assert.deepEqual(f.state.finishes, ['unknown']);
+  assert.equal(f.submitter.pending, 1);
 });
 
 test('held VK admission lease does not grant a write before history qualification', async () => {
@@ -109,7 +175,7 @@ test('held VK admission lease does not grant a write before history qualificatio
   });
   const result = assert.rejects(submitter.submit(capability, {
     operationId: randomUUID(), task: { hostId: 'local', threadId: taskId }, text: 'PUBLIC_VK',
-  }), /history unavailable/);
+  }), ActionRejectedError);
   try {
     assert.ok(command);
     assert.equal(submitter.pending, 1, 'the admission lease is already held');

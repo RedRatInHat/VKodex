@@ -10,9 +10,11 @@ import type { StockReadState } from './managed-worker-bootstrap.js';
 import type { NativeProjectionState } from '../codex/managed-native-projection.js';
 import type { ManagedNativeStockQueueAuthority } from './managed-worker-native-owner.js';
 import { assertManagedStockReadParity } from './managed-stock-queue-runtime.js';
+import type { AppServerRequestOptions } from '../codex/app-server-connection.js';
 
 type Host = Readonly<{
-  executeCommandWithResponse(key: object, command: WorkerCommand, beforeWrite?: () => void): Promise<WorkerCommandResponse>;
+  executeCommandWithResponse(key: object, command: WorkerCommand, beforeWrite?: () => void,
+    withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<WorkerCommandResponse>;
   commandStatusForIntent(key: object, command: WorkerCommand): WorkerOperation | null;
   commandQuiescence(key: object): WorkerCommandQuiescence;
   acceptedCommandReceipts(key: object): ReadonlyArray<Readonly<{ method: WorkerCommand['method']; receiptId: string }>>;
@@ -159,9 +161,11 @@ export class ManagedStockVkSubmitter {
   }
 
   async submit(capability: object, request: SubmitTaskRequest,
-    assertScopeCurrent?: () => void): Promise<Readonly<{ submissionId: string }>> {
+    assertScopeCurrent?: () => void,
+    withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<Readonly<{ submissionId: string }>> {
     if (capability !== this.#options.capability) refuse();
     if (assertScopeCurrent !== undefined && typeof assertScopeCurrent !== 'function') refuse();
+    if (withWriteGuard !== undefined && typeof withWriteGuard !== 'function') refuse();
     // Trusted in-process scope only; never a serialized caller assertion. It
     // stays bound to this operation through preparation and actual wire write.
     const assertScope = (): void => {
@@ -246,7 +250,7 @@ export class ManagedStockVkSubmitter {
       let flight: Promise<WorkerCommandResponse>;
       try {
         flight = this.#options.host.executeCommandWithResponse(this.#options.controlKey,
-          command, assertTicket);
+          command, assertTicket, withWriteGuard);
       } catch (error) {
         // The dispatcher reserves synchronously before creating its RPC
         // promise. A null exact row plus no flight proves this invocation did
@@ -273,6 +277,13 @@ export class ManagedStockVkSubmitter {
       if (!operation.receiptId) throw new UncertainActionError();
       outcome = 'accepted';
       return { submissionId: operation.receiptId };
+    } catch (error) {
+      // Preparation has no worker reservation or write until dispatch begins.
+      // Generic idle/history/parity/authority failures here are definitive
+      // refusals, so control must not tell the caller that input was uncertain.
+      // Once dispatch begins, preserve unknown and any actual durable receipt.
+      if (outcome === 'rejected') refuse();
+      throw error;
     } finally {
       lease.finish(outcome);
       if (outcome !== 'unknown') this.#leases.delete(command.operationId);

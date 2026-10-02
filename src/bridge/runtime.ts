@@ -66,6 +66,8 @@ export class BridgeRuntime {
   private queueReconciliation: Promise<void> | null = null;
   private lastQueueReconciliationAt = 0;
   private queueReconciliationCursor = 0;
+  private managedReceiptReconciliation: Promise<void> | null = null;
+  private lastManagedReceiptReconciliationAt = 0;
   private stageMaintenance: Promise<void> | null = null;
   private lastStageMaintenanceAt = 0;
   private stageMaintenanceLastAttemptAt = 0;
@@ -271,6 +273,32 @@ export class BridgeRuntime {
     const operation = this.store.uncertainPromptOperations(this.now(), 1)[0];
     if (!operation) return;
     this.store.markOperationChecked(operation.id, this.now());
+    let original: import('./store.js').ManagedOperationAuthority | null;
+    try { original = this.store.managedOperationAuthorityById(operation.id); }
+    catch { return; } // A damaged original scope cannot authorize the current route.
+    if (original) {
+      if (!this.desktop.findQueuedSubmissionOutcome || original.bindingId !== operation.bindingId ||
+        original.taskKey !== operation.taskKey) return;
+      const captured = original;
+      const work = Promise.resolve().then(() => this.desktop.findQueuedSubmissionOutcome!(captured.claim, operation.id)).then(outcome => {
+        if (this.stopped || !outcome || outcome.state === 'unknown') return;
+        this.store.atomic(() => {
+          if (this.store.operationState(operation.id) !== 'uncertain') return;
+          if (outcome.state === 'accepted') this.store.rememberManagedQueueReceipt(captured.claim, operation.id, outcome.submissionId);
+          this.store.settlePromptDispatch(operation.id, outcome.state === 'accepted' ? 'accepted' : 'rejected');
+          const current = this.store.getBinding(captured.bindingId);
+          if (!current?.attached || taskKey(current) !== captured.taskKey ||
+            this.store.streamGeneration(current.id) !== captured.streamGeneration) return;
+          if (outcome.state === 'accepted') {
+            this.store.rememberQueuedInput(current.id, operation.id, outcome.submissionId);
+            this.files?.markQueued(current.id, operation.id);
+            this.files?.finish(current.id, operation.id, 'accepted');
+          } else this.files?.finish(current.id, operation.id, 'rejected');
+        });
+      }).catch(() => {}).finally(() => { if (this.operationReconciliation === work) this.operationReconciliation = null; });
+      this.operationReconciliation = work;
+      return;
+    }
     const binding = this.store.getBinding(operation.bindingId);
     if (!binding || !binding.attached || binding.peerId === null || taskKey(binding) !== operation.taskKey) return;
     const work = (async () => {
@@ -376,6 +404,70 @@ export class BridgeRuntime {
     })
       .finally(() => { if (this.queueReconciliation === work) this.queueReconciliation = null; });
     this.queueReconciliation = work;
+  }
+
+  /** A late ACK belongs to its original worker even if the VK projection was
+   * rebound before the ACK arrived. Current queued-input markers cannot enumerate
+   * that debt; never acquire the current owner or replay a write to resolve it. */
+  private reconcileManagedQueueReceipt(): void {
+    if (this.stopped || !this.desktop.scanTerminalQueuedInput || this.managedReceiptReconciliation ||
+      !intervalElapsed(this.now(), this.lastManagedReceiptReconciliationAt, 30_000)) return;
+    let selected: { authority: import('./store.js').ManagedOperationAuthority; submissionId: string;
+      checkpointKey: string; checkpoint: QueueHistoryProgress | null } | null = null;
+    for (const receipt of this.store.pendingManagedQueueReceipts(this.now())) {
+      const checkpointKey = `managed-queue-history:${receipt.authority.operationId}`;
+      const saved = this.store.getValue<QueueHistoryProgress>(checkpointKey);
+      const checkpoint = saved && typeof saved === 'object' && saved.taskKey === receipt.authority.taskKey &&
+        Number.isSafeInteger(saved.nextAt) && saved.nextAt >= 0 ? saved : null;
+      // Rotate deferred receipts too, so a batch of negative scans cannot starve
+      // newer accepted operations outside this bounded batch.
+      this.store.markManagedQueueReceiptChecked(receipt.authority.operationId, this.now());
+      if (checkpoint && checkpoint.nextAt > this.now() && checkpoint.lastAttemptAt <= this.now()) continue;
+      selected = { ...receipt, checkpointKey, checkpoint }; break;
+    }
+    if (!selected) return;
+    const { authority, submissionId, checkpointKey, checkpoint } = selected;
+    const attemptAt = this.now(), pages = Math.min(5_000, Math.max(0, checkpoint?.pages ?? 0));
+    const previous = checkpoint?.lastCompletedNoTerminalProofAt;
+    const lastCompletedNoTerminalProofAt = typeof previous === 'number' && Number.isSafeInteger(previous) && previous >= 0 ? previous : null;
+    this.lastManagedReceiptReconciliationAt = attemptAt;
+    const save = (value: Omit<QueueHistoryProgress, 'taskKey' | 'lastAttemptAt'>) =>
+      this.store.setValue(checkpointKey, { ...value, taskKey: authority.taskKey, lastAttemptAt: attemptAt } satisfies QueueHistoryProgress);
+    save({ cursor: checkpoint?.cursor ?? null, pages, lastFailure: checkpoint?.lastFailure ?? null,
+      lastCompletedNoTerminalProofAt, nextAt: attemptAt });
+    const work = Promise.resolve().then(() => this.desktop.scanTerminalQueuedInput!(authority.claim,
+      authority.operationId, checkpoint?.cursor ?? null)).then(result => {
+      if (this.stopped) return;
+      this.store.atomic(() => {
+        const receipt = this.store.managedQueueReceipt(authority.operationId);
+        if (receipt?.state !== 'accepted' || receipt.submissionId !== submissionId) return;
+        if (!result.done) {
+          save({ cursor: result.cursor, pages: Math.min(5_000, Math.max(0, result.cursor.pages)),
+            lastFailure: null, lastCompletedNoTerminalProofAt, nextAt: this.now() + 30_000 });
+        } else if (result.turnId) {
+          this.store.settleManagedQueueReceipt(authority.operationId, submissionId, result.turnId);
+          this.store.setValue(checkpointKey, null);
+          const binding = this.store.getBinding(authority.bindingId);
+          if (binding?.attached && taskKey(binding) === authority.taskKey &&
+            this.store.streamGeneration(binding.id) === authority.streamGeneration) {
+            this.store.settleQueuedInput(binding.id, authority.operationId);
+            this.files?.associateTurn(binding.id, authority.operationId, result.turnId, true);
+          }
+        } else save({ cursor: null, pages, lastFailure: null,
+          lastCompletedNoTerminalProofAt: this.now(), nextAt: this.now() + 60 * 60_000 });
+      });
+    }).catch(error => {
+      if (this.stopped || this.store.managedQueueReceipt(authority.operationId)?.state !== 'accepted') return;
+      save({ cursor: null, pages, lastFailure: error instanceof MutableQueuedInputTurnError ? 'active_turn'
+        : error instanceof QueueHistoryReadError ? `history_${error.reason}`
+          : error instanceof DesktopUnavailableError ? 'history_unavailable' : 'scan_error',
+      // Authenticated managed control deliberately omits native error bodies,
+      // so an active turn can arrive as an unclassified scan refusal. Keep the
+      // retry short and bounded (one original-worker read per tick interval).
+      lastCompletedNoTerminalProofAt, nextAt: this.now() + 30_000 });
+    }).catch(() => { /* A diagnostic/checkpoint write failure must not kill the bridge or erase the ACK. */ })
+      .finally(() => { if (this.managedReceiptReconciliation === work) this.managedReceiptReconciliation = null; });
+    this.managedReceiptReconciliation = work;
   }
 
   async handle(input: BridgeInput): Promise<void> {
@@ -805,6 +897,7 @@ export class BridgeRuntime {
     if (!this.stopped && intervalElapsed(now, this.lastHealthAt, this.healthIntervalMs))
       void this.checkHealth().catch(() => {});
     if (this.stopped) return Promise.resolve();
+    try { this.reconcileManagedQueueReceipt(); } catch { /* Preserve original debt on unavailable journal. */ }
     this.updateStartedAt = this.now();
     try { this.update(); }
     catch (error) { return Promise.reject(error); }
@@ -1153,6 +1246,8 @@ export class BridgeRuntime {
     // Deliver buffered incoming text before closing its native connection.
     await this.manager.idle();
     await this.operationReconciliation?.catch(() => {});
+    await this.queueReconciliation?.catch(() => {});
+    await this.managedReceiptReconciliation?.catch(() => {});
     await this.connections.stop();
     await Promise.allSettled(this.connecting.values());
     this.unsubscribeCreation?.(); this.unsubscribeCreation = null;
