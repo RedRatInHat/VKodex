@@ -84,7 +84,30 @@ export interface ManagedWorkerControlOptions {
     status: (request: SubmitTaskRequest) => ManagedWorkerVkStatus | null;
     statusByOperationId: (operationId: string) => ManagedWorkerVkStatus | null;
   }>;
+  /** Separate opt-in protocol. The trusted predicate reads the actual ready
+   * registry identity; generic nativeRevision is not an authority revision. */
+  readonly vkV2?: Readonly<{
+    isScopeCurrent: (expected: ManagedWorkerVkScope) => boolean;
+    ingressStatus: (expected: ManagedWorkerVkScope) => ManagedWorkerVkIngressStatus;
+    submit: (expected: ManagedWorkerVkScope, request: SubmitTaskRequest) =>
+      Promise<Readonly<{ submissionId: string }>>;
+    statusByOperationId: (expected: ManagedWorkerVkScope, operationId: string) => ManagedWorkerVkStatus | null;
+  }>;
 }
+export interface ManagedWorkerVkScope extends ManagedWorkerHandoffScope {
+  readonly ownerEpoch: string;
+  readonly taskId: string;
+  readonly endpointRef: string;
+}
+export interface ManagedWorkerVkIngressStatus {
+  readonly capability: 'stock-idle-queue-v2';
+  readonly admissionOpen: boolean;
+}
+export interface ManagedWorkerScopedVkIngressStatus extends ManagedWorkerVkScope, ManagedWorkerVkIngressStatus {}
+export interface ManagedWorkerScopedVkReceipt extends ManagedWorkerVkScope {
+  readonly submissionId: string;
+}
+export interface ManagedWorkerScopedVkStatus extends ManagedWorkerVkScope, ManagedWorkerVkStatus {}
 export interface ManagedWorkerHandoffScope {
   readonly backendGeneration: number;
   readonly registryRevision: number;
@@ -126,6 +149,28 @@ const text = (value: unknown, max: number): value is string => typeof value === 
   value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const positive = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+export const managedWorkerVkScopeKeys = Object.freeze([
+  'ownerEpoch', 'taskId', 'backendGeneration', 'registryRevision', 'endpointRef',
+] as const);
+export function validManagedWorkerVkScope(value: unknown): value is ManagedWorkerVkScope {
+  if (!exactPlain(value, managedWorkerVkScopeKeys) ||
+    !managedWorkerVkScopeKeys.every(key => Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, 'value')))
+    return false;
+  return typeof value.ownerEpoch === 'string' && uuid.test(value.ownerEpoch) &&
+    text(value.taskId, 256) && positive(value.backendGeneration) && positive(value.registryRevision) &&
+    typeof value.endpointRef === 'string' && uuid.test(value.endpointRef);
+}
+/** Accidental asynchronous authorization is never authority. Observe rejected
+ * promises without awaiting them or leaking an unhandled rejection. */
+function currentVkScope(options: NonNullable<ManagedWorkerControlOptions['vkV2']>,
+  expected: ManagedWorkerVkScope): boolean {
+  try {
+    const result: unknown = options.isScopeCurrent(expected);
+    if (result === true) return true;
+    void Promise.resolve(result).catch(() => {});
+  } catch { /* Not current. */ }
+  return false;
+}
 const hexSha256 = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9]{64}$/u.test(v);
 const ticks = (v: unknown): v is string => typeof v === 'string' && /^[1-9][0-9]*$/u.test(v);
 const handoffScope = (v: unknown): v is ManagedWorkerHandoffScope => object(v) &&
@@ -321,6 +366,9 @@ export class ManagedWorkerControlServer {
         options.cliCanaryEvidence !== undefined && typeof options.cliCanaryEvidence !== 'function' ||
         options.vk !== undefined && (!options.vk || typeof options.vk.submit !== 'function' ||
           typeof options.vk.status !== 'function' || typeof options.vk.statusByOperationId !== 'function') ||
+        options.vkV2 !== undefined && (!options.vkV2 ||
+          typeof options.vkV2.isScopeCurrent !== 'function' || typeof options.vkV2.ingressStatus !== 'function' ||
+          typeof options.vkV2.submit !== 'function' || typeof options.vkV2.statusByOperationId !== 'function') ||
         options.handoff !== undefined && (!options.handoff ||
           typeof options.handoff.revoke !== 'function' ||
           typeof options.handoff.qualify !== 'function') ||
@@ -331,6 +379,7 @@ export class ManagedWorkerControlServer {
     this.#options = Object.freeze({ ...options, authTimeoutMs: timeout,
       authenticatedIdleTimeoutMs: idleTimeout,
       ...(options.vk ? { vk: Object.freeze({ ...options.vk }) } : {}),
+      ...(options.vkV2 ? { vkV2: Object.freeze({ ...options.vkV2 }) } : {}),
       ...(options.handoff ? { handoff: Object.freeze({ ...options.handoff }) } : {}) });
     this.#token = Buffer.from(token);
     this.#idleTimeout = idleTimeout;
@@ -390,24 +439,80 @@ export class ManagedWorkerControlServer {
         const id = frame.id;
         const vkMethod = frame.method === 'submit-vk-v1' || frame.method === 'vk-submission-status-v1' ||
           frame.method === 'vk-submission-status-by-id-v1';
+        const vkV2Method = frame.method === 'vk-ingress-status-v2' || frame.method === 'submit-vk-v2' ||
+          frame.method === 'vk-submission-status-by-id-v2';
         const handoffMethod = frame.method === 'revoke-ingress-v1' || frame.method === 'qualify-handoff-v1';
         const cliCanaryMethod = frame.method === 'cli-canary-evidence-v1';
-        if (!(handoffMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+        if (!(vkV2Method ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+          'backendGeneration', 'registryRevision', 'endpointRef',
+          ...(frame.method === 'submit-vk-v2' ? ['request'] :
+            frame.method === 'vk-submission-status-by-id-v2' ? ['operationId'] : [])]) :
+          handoffMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           'backendGeneration', 'registryRevision']) : vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           frame.method === 'vk-submission-status-by-id-v1' ? 'operationId' : 'request']) :
           cliCanaryMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method']) :
           exact(frame, ['id', 'epoch', 'method'])) || frame.epoch !== this.#options.ownerEpoch ||
             vkMethod && (frame.taskId !== this.#options.taskId || !this.#options.vk) ||
+            vkV2Method && (frame.taskId !== this.#options.taskId || !this.#options.vkV2) ||
             cliCanaryMethod && (frame.taskId !== this.#options.taskId || !this.#options.cliCanaryEvidence) ||
             handoffMethod && (frame.taskId !== this.#options.taskId || !this.#options.handoff ||
               !positive(frame.backendGeneration) || !positive(frame.registryRevision)) ||
             !['status', 'diagnose-v1', 'stop', 'cli-canary-evidence-v1', 'submit-vk-v1', 'vk-submission-status-v1',
               'vk-submission-status-by-id-v1', 'revoke-ingress-v1',
-              'qualify-handoff-v1'].includes(String(frame.method)) ||
+              'qualify-handoff-v1', 'vk-ingress-status-v2', 'submit-vk-v2',
+              'vk-submission-status-by-id-v2'].includes(String(frame.method)) ||
             ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
+        if (vkV2Method) {
+          const expected = Object.freeze({ ownerEpoch: frame.epoch as string,
+            taskId: frame.taskId as string, backendGeneration: frame.backendGeneration as number,
+            registryRevision: frame.registryRevision as number, endpointRef: frame.endpointRef as string });
+          const options = this.#options.vkV2!;
+          const lookup = frame.method === 'vk-submission-status-by-id-v2';
+          if (!validManagedWorkerVkScope(expected) ||
+            frame.method === 'submit-vk-v2' && !validManagedVkControlRequest(frame.request, expected.taskId) ||
+            lookup && (typeof frame.operationId !== 'string' || !uuid.test(frame.operationId))) {
+            send({ id, error: 'refused' }); continue;
+          }
+          if (!currentVkScope(options, expected)) {
+            send({ id, error: lookup ? 'status-unavailable' : 'refused' }); continue;
+          }
+          if (frame.method === 'submit-vk-v2') {
+            outstanding++;
+            const request = frame.request as SubmitTaskRequest;
+            void Promise.resolve().then(() => {
+              if (!currentVkScope(options, expected)) throw new ActionRejectedError('Managed VK scope changed');
+              return options.submit(expected, request);
+            }).then(result => {
+              if (!exactPlain(result, ['submissionId']) || !text(result.submissionId, 256)) throw new Error();
+              // Receipt attests the captured admission, not a newly discovered owner.
+              // A post-ACK scope change must not erase an accepted operation.
+              send({ id, result: { ...expected, submissionId: result.submissionId } });
+            }, error => send({ id, error: error instanceof ActionRejectedError ? 'rejected' : 'unknown' }))
+              .catch(() => send({ id, error: 'unknown' })).finally(() => { outstanding--; });
+          } else {
+            try {
+              if (lookup) {
+                const status = options.statusByOperationId(expected, frame.operationId as string);
+                // A mistakenly async read hook remains invalid. Observe its
+                // rejection synchronously so refusal cannot crash the daemon.
+                void Promise.resolve(status).catch(() => {});
+                if (!validVkStatus(status) || !currentVkScope(options, expected)) throw new Error();
+                send({ id, result: { ...expected, ...(status === null ? { status: null } : status) } });
+              } else {
+                const status = options.ingressStatus(expected);
+                void Promise.resolve(status).catch(() => {});
+                if (!exactPlain(status, ['capability', 'admissionOpen']) ||
+                  status.capability !== 'stock-idle-queue-v2' || typeof status.admissionOpen !== 'boolean' ||
+                  !currentVkScope(options, expected)) throw new Error();
+                send({ id, result: { ...expected, ...status } });
+              }
+            } catch { send({ id, error: 'status-unavailable' }); }
+          }
+          continue;
+        }
         if (cliCanaryMethod) {
           outstanding++;
           void Promise.resolve().then(() => this.#options.cliCanaryEvidence!()).then(result => {

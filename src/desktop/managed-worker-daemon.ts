@@ -16,8 +16,10 @@ import { bootstrapManagedWorker,
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata,
   type ManagedWorkerNativeOwnerOptions } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
+  validManagedWorkerVkScope,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
-  type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope } from './managed-worker-control.js';
+  type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope,
+  type ManagedWorkerVkScope, type ManagedWorkerVkIngressStatus } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
 import { assertManagedWorkerClaimCurrent, dispatchWithManagedWorkerClaim } from
   './managed-worker-claim-readback.js';
@@ -34,7 +36,7 @@ import { ManagedStockVkSubmitter, managedVkStockCommandId,
   type ManagedStockVkLease } from './managed-stock-vk-submit.js';
 import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server.js';
 import { deriveManagedTaskStateToken } from './managed-worker-task-state-token.js';
-import type { SubmitTaskRequest } from '../core/codex-tasks.js';
+import { ActionRejectedError, type SubmitTaskRequest } from '../core/codex-tasks.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 import { assertControlledNativeCliSourceScope, assertControlledNativeCliSourceScopeCurrent,
   verifyControlledNativeCliSourceScope,
@@ -215,6 +217,7 @@ export class ManagedWorkerDaemon {
   #reconnectPending = false;
   #reconnectDelayMs = 1_000;
   #currentOwner: (() => boolean) | null = null;
+  #vkScopeCurrent: ((expected: ManagedWorkerVkScope) => boolean) | null = null;
   #cliEvidencePending = false;
 
   constructor(options: ManagedWorkerDaemonOptions) {
@@ -514,6 +517,47 @@ export class ManagedWorkerDaemon {
     return this.#vkSubmitter.submit(capability, request);
   }
 
+  /** Scope is captured per invocation and rechecked by the submitter at the
+   * actual write boundary. A revoked admission still permits an exact known
+   * receipt lookup; it never grants a lease for a fresh write. */
+  async submitVkScoped(capability: object, expected: ManagedWorkerVkScope,
+    request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+    const captured = this.#captureVkScope(capability, expected);
+    return this.#vkSubmitter!.submit(capability, request, () => this.#assertVkScopeCurrent(captured));
+  }
+
+  vkIngressStatusScoped(capability: object, expected: ManagedWorkerVkScope): ManagedWorkerVkIngressStatus {
+    this.#captureVkScope(capability, expected);
+    return Object.freeze({ capability: 'stock-idle-queue-v2',
+      admissionOpen: !this.#ingressRevoked && this.#admissionOpen && this.#headlessPending === 0 });
+  }
+
+  /** Absence is authoritative only in this still-current captured registry
+   * scope. A changed scope throws; it is never reported as an absent row. */
+  vkSubmissionStatusByOperationIdScoped(capability: object, expected: ManagedWorkerVkScope,
+    operationId: string): ManagedWorkerVkStatus | null {
+    const captured = this.#captureVkScope(capability, expected);
+    const row = this.vkSubmissionStatusByOperationId(capability, operationId);
+    this.#assertVkScopeCurrent(captured);
+    return this.#vkControlStatus(row);
+  }
+
+  #captureVkScope(capability: object, expected: ManagedWorkerVkScope): ManagedWorkerVkScope {
+    if (!this.#vkSubmitter || capability !== this.#options.nativeStockQueue?.headlessVk?.capability ||
+      !validManagedWorkerVkScope(expected)) throw new ActionRejectedError('Managed VK scope unavailable');
+    const captured = Object.freeze({ ownerEpoch: expected.ownerEpoch, taskId: expected.taskId,
+      backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision,
+      endpointRef: expected.endpointRef });
+    this.#assertVkScopeCurrent(captured);
+    return captured;
+  }
+
+  #assertVkScopeCurrent(expected: ManagedWorkerVkScope): void {
+    let current = false;
+    try { current = this.#vkScopeCurrent?.(expected) === true; } catch { /* Refuse stale authority. */ }
+    if (!current) throw new ActionRejectedError('Managed VK scope unavailable');
+  }
+
   /** Read-only exact-intent lookup remains available for late response
    * reconciliation even when fresh command admission has closed. */
   vkSubmissionStatus(capability: object, request: SubmitTaskRequest) {
@@ -716,6 +760,12 @@ export class ManagedWorkerDaemon {
           same(observe(this.#self!.pid), this.#self) &&
           same(observe(this.#backend!.pid), this.#backend) && ownerCurrent();
       };
+      this.#vkScopeCurrent = expected => expected.ownerEpoch === manifest.epoch &&
+        expected.taskId === manifest.taskId && expected.endpointRef === this.#endpointRef &&
+        this.#host?.metadata.state === 'running' && this.#host.metadata.taskId === manifest.taskId &&
+        this.#host.metadata.backendGeneration === expected.backendGeneration &&
+        (this.#owner?.metadata.state === 'connected' || this.#owner?.metadata.state === 'disconnected') &&
+        handoffScopeCurrent(expected);
       this.#control = (this.#options.dependencies?.createControl ??
         (options => new ManagedWorkerControlServer(options)))({
         ownerEpoch: manifest.epoch, taskId: manifest.taskId,
@@ -755,7 +805,16 @@ export class ManagedWorkerDaemon {
             return proof;
           },
         } } : {}),
-        ...(this.#options.nativeStockQueue?.headlessVk ? { vk: {
+        ...(this.#options.nativeStockQueue?.headlessVk ? { vkV2: {
+          isScopeCurrent: (expected: ManagedWorkerVkScope) => this.#vkScopeCurrent?.(expected) === true,
+          ingressStatus: (expected: ManagedWorkerVkScope) => this.vkIngressStatusScoped(
+            this.#options.nativeStockQueue!.headlessVk!.capability, expected),
+          submit: (expected: ManagedWorkerVkScope, request: SubmitTaskRequest) => this.submitVkScoped(
+            this.#options.nativeStockQueue!.headlessVk!.capability, expected, request),
+          statusByOperationId: (expected: ManagedWorkerVkScope, operationId: string) =>
+            this.vkSubmissionStatusByOperationIdScoped(
+              this.#options.nativeStockQueue!.headlessVk!.capability, expected, operationId),
+        }, vk: {
           submit: (request: SubmitTaskRequest) => this.submitVk(
             this.#options.nativeStockQueue!.headlessVk!.capability, request),
           status: (request: SubmitTaskRequest) => this.#vkControlStatus(this.vkSubmissionStatus(
