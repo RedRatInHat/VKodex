@@ -639,6 +639,39 @@ test("requests without expected generation retain ordinary reconnect behavior", 
   } finally { await connection.close(); }
 });
 
+test("current initialized session is a synchronous non-starting live snapshot", async () => {
+  const children: AppServerChild[] = [];
+  const connection = new AppServerConnection(() => {
+    const child = new AppServerChild(); children.push(child); return child.asChild();
+  });
+  const readCurrent = (): { generation: number; initializeResult: JsonObject } | null =>
+    (connection as unknown as { currentInitializedSession?: () => { generation: number; initializeResult: JsonObject } | null })
+      .currentInitializedSession?.() ?? null;
+  try {
+    assert.equal(readCurrent(), null);
+    assert.equal(children.length, 0, "a cold snapshot read must not launch the App Server");
+
+    const first = await connection.initializedSession();
+    assert.deepEqual(readCurrent(), first, "the synchronous accessor must reflect the completed handshake");
+    const observed = readCurrent();
+    assert.ok(observed);
+    observed.initializeResult.serverInfo = { name: "caller mutation" };
+    assert.deepEqual(readCurrent(), first, "returned snapshots must not mutate the live handshake receipt");
+
+    children[0]!.disconnect();
+    assert.equal(readCurrent(), null, "a disconnected generation must not remain visible");
+    await connection.start();
+    const second = await connection.initializedSession();
+    assert.ok(second.generation > first.generation);
+    assert.deepEqual(readCurrent(), second);
+    assert.equal(connection.isSessionCurrent(first.generation), false);
+
+    await connection.close();
+    assert.equal(readCurrent(), null, "a stopped connection must not expose its previous session");
+    assert.equal(children.length, 2);
+  } finally { await connection.close(); }
+});
+
 test("failed initialization does not expose a session receipt or a live generation", async () => {
   const child = new AppServerChild();
   child.respond = message => ({ id: message.id, error: { code: -32600 } });

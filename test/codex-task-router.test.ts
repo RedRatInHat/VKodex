@@ -49,6 +49,45 @@ test("command router uses exactly the configured source owner", async () => {
   assert.deepEqual(f.calls, ["owner:submit", "base:submitWithReceipt", "owner:interrupt", "base:interrupt", "owner:model", "base:model"]);
 });
 
+test("configured legacy owner is not a ready adapter without its actual session probe", async () => {
+  const f = fixture();
+  let baseProbes = 0, ownerProbes = 0;
+  (f.base as CodexTasks).ownerAdapterStatus = async () => { baseProbes++; return "ready"; };
+  assert.equal(await f.routed.ownerAdapterStatus(work), "unknown");
+  assert.equal(baseProbes, 0, "a different native client cannot attest the original writer");
+  f.owner.ownerAdapterStatus = async () => { ownerProbes++; return "ready"; };
+  assert.equal(await f.routed.ownerAdapterStatus(work), "ready");
+  assert.equal(ownerProbes, 1);
+  assert.equal(baseProbes, 0);
+});
+
+test("legacy drain proof and refusal never fall back to another owner", async () => {
+  const f = fixture();
+  let released = 0;
+  assert.equal(await f.routed.drainIdleExecution(work, () => { released++; }), "unavailable");
+  assert.equal(f.routed.executionDrainSupported(work), false);
+  f.owner.drainIdleExecution = async (_task, beforeRelease) => { beforeRelease(); return "waiting-unload"; };
+  assert.equal(f.routed.executionDrainSupported(work), true);
+  assert.equal(await f.routed.drainIdleExecution(work, () => { released++; }), "waiting-unload");
+  assert.equal(released, 1);
+  f.owner.submitWithReceipt = async () => { throw new ActionRejectedError("draining"); };
+  f.base.submitConnectedWithReceipt = async () => { assert.fail("drain refusal must not escape to native"); };
+  await assert.rejects(f.routed.submitWithReceipt({ task: work, text: "must not dispatch", operationId: "drain-op" }), ActionRejectedError);
+  assert.deepEqual(f.calls, []);
+});
+
+test("restoring a drain fences only the exact nonexclusive owner with no base fallback", () => {
+  const f = fixture(); let restored = 0;
+  f.owner.restoreExecutionDrain = task => { assert.deepEqual(task, work); restored++; };
+  f.routed.restoreExecutionDrain(work);
+  f.routed.restoreExecutionDrain(primary);
+  assert.equal(restored, 1);
+  const exclusive = { ...f.owner, routingPolicy: "exclusive" as const };
+  new RoutedCodexTasks(f.base, [exclusive, f.owner]).restoreExecutionDrain(work);
+  assert.equal(restored, 1, "independent managed/exclusive executors are not a legacy drain target");
+  assert.deepEqual(f.calls, []);
+});
+
 test("metadata and goals use the selected profile owner", async () => {
   const f = fixture();
   assert.deepEqual(await f.routed.renameTask(work, "Renamed"), { liveTitleUpdated: true });

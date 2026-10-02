@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { buildCodexEnvironment } from "../agents/codex/codex-environment.js";
 import { ActionRejectedError, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskDetails, type TaskGoal,
-  type TaskGoalUpdate, type TaskRef, type TaskRenameResult } from "../core/codex-tasks.js";
+  type TaskGoalUpdate, type TaskRef, type TaskRenameResult, type ExecutionDrainResult } from "../core/codex-tasks.js";
 import type { CodexQuestions } from "../core/codex-questions.js";
 import type { TaskState, TaskStateStream, TaskStateTransport } from "../core/task-state.js";
 import { AppServerConnection, type AppServerRpc } from "./app-server-connection.js";
@@ -9,6 +9,7 @@ import { nativeCodexPath } from "./native-cli.js";
 import { AppServerTaskExecutor } from "./app-server-task-executor.js";
 import { AppServerTaskStateTransport, observeAppServerTaskState, type AppServerStreamDiagnostic } from "./app-server-task-state.js";
 import { createDetachedProfileConnection, detachedProfileDirectory } from "./detached-profile-capability.js";
+import { LegacyExecutionLifecycle } from "./legacy-execution-lifecycle.js";
 
 /** One explicit task owner: one CODEX_HOME, one long-lived App Server connection. */
 export class AppServerProfileOwner {
@@ -18,14 +19,18 @@ export class AppServerProfileOwner {
   private readonly executor: AppServerTaskExecutor;
   private readonly nativeStates: AppServerTaskStateTransport;
   private readonly unsubscribeQuestions: () => void;
+  private readonly rpc: AppServerRpc;
+  private readonly lifecycle: LegacyExecutionLifecycle;
 
-  constructor(readonly sourceId: string, private readonly rpc: AppServerRpc,
+  constructor(readonly sourceId: string, rpc: AppServerRpc,
     private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
     private readonly detachedThreadIds?: ReadonlySet<string>,
     onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {}) {
     if (detachedThreadIds) this.routingPolicy = "exclusive";
-    this.executor = new AppServerTaskExecutor(rpc);
-    this.nativeStates = new AppServerTaskStateTransport(rpc,
+    this.lifecycle = new LegacyExecutionLifecycle(rpc);
+    this.rpc = this.lifecycle.rpc;
+    this.executor = new AppServerTaskExecutor(this.rpc);
+    this.nativeStates = new AppServerTaskStateTransport(this.rpc,
       threadId => this.executor.questionSnapshot(threadId),
       (task, release) => this.executor.release(task, release),
       (task, result) => { this.executor.acceptResumedTask(task, result); },
@@ -34,6 +39,7 @@ export class AppServerProfileOwner {
     this.states = {
       subscribe: (task, onState, onError) => {
         this.assertOwner(task);
+        this.lifecycle.assertAdmission(task);
         return this.nativeStates.subscribe(task, onState, onError);
       },
       close: () => this.nativeStates.close(),
@@ -48,38 +54,68 @@ export class AppServerProfileOwner {
   private assertOwner(task: TaskRef): void {
     if (!this.owns(task)) throw new ActionRejectedError("Задача относится к другому аккаунту Codex.");
   }
+  private async command<T>(task: TaskRef, work: () => Promise<T>, currentWorkControl = false): Promise<T> {
+    this.assertOwner(task);
+    const finish = this.lifecycle.beginCommand(task, currentWorkControl);
+    try { return await work(); } finally { finish(); }
+  }
+  async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing" | "unknown"> {
+    this.assertOwner(task);
+    if (this.lifecycle.isDraining(task)) return "unknown"; // Avoid activity that can extend the native unload grace period.
+    const session = this.rpc.currentInitializedSession?.();
+    if (!session) return "unknown";
+    try {
+      const result = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false },
+        { expectedGeneration: session.generation, timeoutMs: 5_000 });
+      const thread = result.thread;
+      return thread && typeof thread === "object" && !Array.isArray(thread)
+        && (thread as Record<string, unknown>).id === task.threadId ? "ready" : "unknown";
+    } catch { return "unknown"; }
+  }
+  drainIdleExecution(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult> {
+    this.assertOwner(task);
+    // Detached/shared executors use their own contract; never drain them through legacy health.
+    if (this.routingPolicy === "exclusive") return Promise.resolve("unavailable");
+    return this.lifecycle.drain(task, beforeRelease, () => this.executor.executionSnapshot(task),
+      () => this.nativeStates.subscriptionSnapshot(task));
+  }
+  restoreExecutionDrain(task: TaskRef): void {
+    this.assertOwner(task);
+    if (this.routingPolicy !== "exclusive") this.lifecycle.restore(task);
+  }
 
   ensureOpen(task: TaskRef): Promise<void> {
-    this.assertOwner(task); return this.executor.ensureOpen(task);
+    return this.command(task, () => this.executor.ensureOpen(task));
   }
 
   submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
-    this.assertOwner(request.task); return this.executor.submitWithReceipt(request);
+    this.assertOwner(request.task);
+    return this.command(request.task, () => this.executor.submitWithReceipt(request));
   }
-  interrupt(task: TaskRef): Promise<void> { this.assertOwner(task); return this.executor.interrupt(task); }
-  queue(request: SubmitTaskRequest): Promise<string> { this.assertOwner(request.task); return this.executor.queue(request); }
+  interrupt(task: TaskRef): Promise<void> { return this.command(task, () => this.executor.interrupt(task), true); }
+  queue(request: SubmitTaskRequest): Promise<string> { return this.command(request.task, () => this.executor.queue(request)); }
   selectModel(task: TaskRef, model: string, effort: string): Promise<void> {
-    this.assertOwner(task); return this.executor.selectModel(task, model, effort);
+    return this.command(task, () => this.executor.selectModel(task, model, effort));
   }
   renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
-    this.assertOwner(task); return this.executor.renameTask(task, title);
+    return this.command(task, () => this.executor.renameTask(task, title));
   }
   async moveTask(task: TaskRef, projectId: string | null): Promise<void> {
     this.assertOwner(task);
-    if (projectId === null) return this.executor.assignProject(task, null);
+    if (projectId === null) return this.command(task, () => this.executor.assignProject(task, null));
     if (!this.resolveProject) throw new ActionRejectedError("Назначение проекта недоступно для этого владельца Codex.");
     const resolved = await this.resolveProject(projectId);
     if ((resolved.sourceId ?? "") !== this.sourceId) throw new ActionRejectedError("Нельзя перенести задачу между разными каталогами CODEX_HOME.");
-    return this.executor.assignProject(task, resolved.rawProjectId);
+    return this.command(task, () => this.executor.assignProject(task, resolved.rawProjectId));
   }
   getGoal(task: TaskRef): Promise<TaskGoal | null> { this.assertOwner(task); return this.executor.getGoal(task); }
-  setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> { this.assertOwner(task); return this.executor.setGoal(task, update); }
-  clearGoal(task: TaskRef): Promise<boolean> { this.assertOwner(task); return this.executor.clearGoal(task); }
+  setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> { return this.command(task, () => this.executor.setGoal(task, update)); }
+  clearGoal(task: TaskRef): Promise<boolean> { return this.command(task, () => this.executor.clearGoal(task), true); }
   archiveTask(task: TaskRef): Promise<void> {
-    this.assertOwner(task); return this.executor.archiveIdle(task);
+    return this.command(task, () => this.executor.archiveIdle(task));
   }
   archiveRetryReady(task: TaskRef): Promise<boolean> {
-    this.assertOwner(task); return this.executor.archiveRetryReady(task);
+    return this.command(task, () => this.executor.archiveRetryReady(task));
   }
   pendingQuestions(task: TaskRef): Promise<readonly CodexQuestions[]> {
     this.assertOwner(task); return this.executor.pendingQuestions(task);
@@ -119,11 +155,11 @@ export class AppServerProfileOwner {
   }
   answerQuestions(task: TaskRef, question: CodexQuestions, answers: Readonly<Record<string, string>>,
     operationId: string, beforeSend: () => Promise<void>): Promise<void> {
-    this.assertOwner(task); return this.executor.answerQuestions(task, question, answers, operationId, beforeSend);
+    return this.command(task, () => this.executor.answerQuestions(task, question, answers, operationId, beforeSend), true);
   }
 
   async close(): Promise<void> {
-    this.unsubscribeQuestions(); this.nativeStates.close(); this.executor.close(); await this.rpc.close();
+    this.unsubscribeQuestions(); this.nativeStates.close(); this.executor.close(); this.lifecycle.close(); await this.rpc.close();
   }
 }
 

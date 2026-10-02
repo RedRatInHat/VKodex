@@ -114,6 +114,8 @@ export type AppServerServerRequestHandler = (request: AppServerServerRequest,
 
 export interface AppServerRpc {
   start(): Promise<void>;
+  /** Snapshot only: must never launch or initialize a replacement backend. */
+  currentInitializedSession?(): AppServerInitializedSession | null;
   request(method: string, params?: JsonObject, options?: AppServerRequestOptions): Promise<JsonObject>;
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void;
   onDisconnect?(listener: (error: Error) => void): () => void;
@@ -203,6 +205,11 @@ export class AppServerConnection implements AppServerRpc {
     const session = this.initialized;
     if (!session || !this.isSessionCurrent(session.generation)) throw new AppServerUnavailableError();
     return structuredClone(session);
+  }
+
+  currentInitializedSession(): AppServerInitializedSession | null {
+    const session = this.initialized;
+    return session && this.isSessionCurrent(session.generation) ? structuredClone(session) : null;
   }
 
   isSessionCurrent(generation: number): boolean {

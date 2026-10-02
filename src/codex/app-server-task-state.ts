@@ -385,6 +385,10 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   private closed = false;
   private readonly startWaiters: Array<() => void> = [];
   private activeStarts = 0;
+  private consumerRevision = 0;
+  subscriptionSnapshot(task: TaskRef): { readonly count: number; readonly revision: number } {
+    return { count: this.streams.get(taskKey(task))?.consumers.size ?? 0, revision: this.consumerRevision };
+  }
   constructor(private readonly rpc: AppServerRpc,
     private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => [],
     private readonly onTaskClose: (task: TaskRef, release: Promise<void> | null) => void = () => {},
@@ -414,6 +418,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
       start: async () => {
         if (closed || this.closed) throw new AppServerUnavailableError("Подписка наблюдения закрыта.");
         const entry = joined ??= this.streams.get(key) ?? this.createSharedStream(key, task);
+        if (!entry.consumers.has(consumer)) this.consumerRevision++;
         entry.consumers.add(consumer);
         consumer.started = true;
         if (entry.error) throw entry.error;
@@ -438,6 +443,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
         closed = true;
         const entry = joined;
         if (!entry) return;
+        this.consumerRevision++;
         entry.consumers.delete(consumer);
         if (!entry.consumers.size) this.retire(key, entry);
       },
