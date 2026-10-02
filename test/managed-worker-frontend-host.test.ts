@@ -1069,6 +1069,35 @@ test('command quiescence is authenticated, read-only and distinguishes in-flight
   } finally { await f.managed.stop('test-cleanup'); }
 });
 
+test('command client identity lookup is authenticated, bounded and read-only across acceptance', async () => {
+  const f = commandFixture(2000); await f.managed.start();
+  let authorizationCalls = 0;
+  f.authority.onAuthorize = () => { authorizationCalls++; };
+  const clientId = f.command.params.clientUserMessageId as string;
+  try {
+    assert.equal(f.managed.hasCommandClientIdentity(f.controlKey, clientId), false);
+    assert.throws(() => f.managed.hasCommandClientIdentity({}, clientId), /control/i);
+    for (const invalid of ['', ' leading', 'trailing ', 'bad\nvalue', 'x'.repeat(129)]) {
+      assert.throws(() => f.managed.hasCommandClientIdentity(f.controlKey, invalid), /client/i);
+    }
+    assert.equal(authorizationCalls, 0);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 0);
+
+    const pending = f.managed.executeCommand(f.controlKey, f.command);
+    const request = await sentMutation(f.child);
+    const authorizedWrites = authorizationCalls;
+    assert.equal(f.managed.hasCommandClientIdentity(f.controlKey, clientId), true);
+    assert.ok(authorizedWrites > 0);
+    assert.equal(authorizationCalls, authorizedWrites);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+    f.child.send({ id: request.id, result: { turn: { id: 'identity-receipt' } } });
+    assert.equal((await pending).state, 'accepted');
+    assert.equal(f.managed.hasCommandClientIdentity(f.controlKey, clientId), true);
+    assert.equal(authorizationCalls, authorizedWrites);
+    assert.equal(f.child.messages.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { await f.managed.stop('test-cleanup'); }
+});
+
 test('request quiescence is control-key scoped and generation fenced', async () => {
   const f = commandFixture(2000); await f.managed.start();
   try {

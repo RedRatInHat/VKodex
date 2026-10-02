@@ -153,6 +153,7 @@ function incomingFailureCategory(error: unknown): IpcRequestFailureCategory {
     case 'Native repeated admission refused: request ingress changed':
       return 'owner-refused';
     case 'Native stock queue refuses direct start':
+    case 'Managed stock direct start unavailable':
       return 'direct-stock-start-refused';
     case 'Managed native stock queue request refused':
       return 'queue-gate-refused';

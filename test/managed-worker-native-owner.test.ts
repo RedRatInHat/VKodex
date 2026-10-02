@@ -375,7 +375,8 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
   isOwnerCurrent: () => boolean = () => true,
   stock = false,
   stockHooks: { confirmOwner?: (qualified: boolean) => boolean | Promise<boolean>;
-    baseline?: () => boolean | Promise<boolean> } = {},
+    baseline?: () => boolean | Promise<boolean>;
+    stockStartFactory?: ManagedWorkerNativeOwnerOptions['stockStartFactory'] } = {},
   qualifyFirstTurn?: NonNullable<ManagedWorkerNativeOwnerOptions['qualifyFirstTurn']>,
   refusalOnlyProbe = false) {
   const child = new Child(), adapterKey = {}, controlKey = {}, ownerEpoch = randomUUID();
@@ -422,6 +423,7 @@ async function fixture(readInitialState: () => Promise<NativeProjectionState> = 
     ...(intentStore ? { intentStore, composerDefaults: () => ({ taskId, cwd: 'C:/own' }) } : {}),
     ...(qualifyContinuation ? { qualifyContinuation } : {}),
     ...(qualifyFirstTurn ? { qualifyFirstTurn } : {}),
+    ...(stockHooks.stockStartFactory ? { stockStartFactory: stockHooks.stockStartFactory } : {}),
     ...(refusalOnlyProbe ? { refusalOnlyProbe: true } as never : {}),
     clientFactory: handler => new DesktopIpcClient(() => {
       if (broker.destroyed) { broker = new Broker(); brokers.push(broker); }
@@ -739,6 +741,97 @@ test('queue ingress survives EOF, while explicit unfollow or re-follow revokes i
   }
 });
 
+for (const disposition of ['unfollow', 'refollow'] as const)
+  test(`stock direct preparation loses its original follower grant on ${disposition}`, async () => {
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let settled = 0;
+    const f = await fixture(async () => state(), undefined, undefined, true,
+      undefined, () => true, true, { stockStartFactory: () => ({
+        async prepare(scope) {
+          entered(); await waiting;
+          const request = (scope.request.params.turnStart as IpcObject).request as IpcObject;
+          return { params: { threadId: taskId, clientUserMessageId: request.clientUserMessageId,
+            input: request.input, cwd: 'C:/own', model: 'fixture-model', effort: 'low' },
+          uiParams: null, localMetadata: null, assertCurrent() {}, settle() { settled++; } };
+        },
+      }) });
+    try {
+      f.child.onFrame = frame => { if (frame.method === 'turn/start')
+        queueMicrotask(() => f.child.reply(frame.id, { turn: { id: 'unexpected-turn' } })); };
+      await f.owner.start(); followQueue(f.broker);
+      await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+      const requestId = `stock-direct-${disposition}`;
+      f.broker.send({ type: 'request', requestId, sourceClientId: 'follower', hostId: 'local',
+        targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+        params: { conversationId: taskId, turnStart: { request: { threadId: taskId,
+          clientUserMessageId: randomUUID(), input: [{ type: 'text', text: 'fixture' }] },
+        context: { inheritThreadSettings: true } } } });
+      await started;
+      followQueue(f.broker, 'follower', disposition === 'refollow');
+      await new Promise(resolve => setImmediate(resolve));
+      release();
+      const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+        frame.requestId === requestId);
+      assert.equal(reply.resultType, 'error', 'a replacement follower lease cannot authorize the old request');
+      assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+      assert.equal(f.intentStore!.list().length, 0);
+      assert.equal(f.host.operationCounts(f.controlKey).operations, 0);
+      assert.equal(settled, 1);
+    } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+  });
+
+test('stock deferred preparation survives transport EOF and reconnect retrieves one actual receipt', async () => {
+  let release!: () => void, entered!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let prepares = 0, settled = 0;
+  const f = await fixture(async () => state(), undefined, undefined, true,
+    undefined, () => true, true, { stockStartFactory: () => ({
+      async prepare(scope) {
+        prepares++; entered(); await waiting;
+        const request = (scope.request.params.turnStart as IpcObject).request as IpcObject;
+        return { params: { threadId: taskId, clientUserMessageId: request.clientUserMessageId,
+          input: request.input, cwd: 'C:/own', model: 'fixture-model', effort: 'low' },
+        uiParams: null, localMetadata: null, assertCurrent() {}, settle() { settled++; } };
+      },
+    }) });
+  try {
+    f.child.onFrame = frame => { if (frame.method === 'turn/start') {
+      assert.equal(f.owner.metadata.state, 'disconnected');
+      queueMicrotask(() => f.child.reply(frame.id,
+        { turn: { id: 'stock-eof-turn', status: 'inProgress', extra: true } }));
+    } };
+    await f.owner.start(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    const request = { type: 'request', requestId: 'stock-eof-original', sourceClientId: 'follower',
+      hostId: 'local', targetClientId: 'owner-peer', method: 'thread-follower-start-turn', version: 2,
+      params: { conversationId: taskId, turnStart: { request: { threadId: taskId,
+        clientUserMessageId: randomUUID(), input: [{ type: 'text', text: 'fixture' }] },
+      context: { inheritThreadSettings: true } } } };
+    f.broker.send(request); await started;
+    f.broker.emit('close'); f.broker.destroy();
+    assert.equal(f.owner.metadata.state, 'disconnected');
+    release();
+    await waitUntil(() => f.owner.metadata.pendingNativeOperations === 0);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1,
+      'transport EOF alone must not revoke already admitted stock preparation');
+    const stored = f.intentStore!.list()[0]!;
+    assert.equal(f.host.commandStatusForIntent(f.controlKey, stored.intent.command)?.receiptId, 'stock-eof-turn');
+    assert.equal(settled, 1);
+    await f.owner.reconnect(); followQueue(f.broker);
+    await waitFrame(f.broker.frames, frame => frame.method === 'thread-queued-followups-changed');
+    f.broker.send({ ...request, requestId: 'stock-eof-duplicate' });
+    const reply = await waitFrame(f.broker.frames, frame => frame.type === 'response' &&
+      frame.requestId === 'stock-eof-duplicate');
+    assert.equal(reply.resultType, 'success');
+    assert.deepEqual((reply.result as IpcObject).result,
+      { turn: { id: 'stock-eof-turn', status: 'inProgress', extra: true } });
+    assert.equal(prepares, 1); assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 1);
+  } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); f.intentStore?.close(); }
+});
+
 test('native queue hydrates each follower separately and consumes the authoritative user item', async () => {
   const f = await fixture(async () => state(), () => false, () => true,
     false, undefined, () => true, true);
@@ -937,7 +1030,7 @@ test('bounded queue event tail retires only native owner when attribution stalls
   } finally { release(); f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 
-test('semantic fence ignores usage-only changes but advances for turn events and reconnect', async () => {
+test('semantic fence advances for turn events, not usage or transport-only reconnect', async () => {
   const f = await fixture();
   try {
     await f.owner.start();
@@ -952,9 +1045,9 @@ test('semantic fence ignores usage-only changes but advances for turn events and
     assert.equal(f.owner.metadata.semanticRevision, initial + 1);
     f.broker.destroy(); await new Promise(resolve => setImmediate(resolve));
     const disconnected = f.owner.metadata.semanticRevision;
-    assert.ok(disconnected > initial + 1);
+    assert.equal(disconnected, initial + 1);
     await f.owner.reconnect();
-    assert.ok(f.owner.metadata.semanticRevision > disconnected);
+    assert.equal(f.owner.metadata.semanticRevision, disconnected);
   } finally { f.owner.close(); await f.host.stop('test-cleanup'); }
 });
 

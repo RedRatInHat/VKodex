@@ -55,8 +55,10 @@ export interface ManagedWorkerBootstrap {
     Promise<Readonly<{ turnCount: number; latestTurnId: string | null }>>;
   /** Actual current policy on the same loaded worker; no turn/model write. */
   qualifyContinuation(ownerFence: () => ContinuationOwnerFence): Promise<QualifiedContinuationEvidence>;
-  /** Exhaustive current terminal/idle stock evidence on this same worker; no writes. */
-  readStockState(assertCurrent: () => void): Promise<StockReadState>;
+  /** Exhaustive current terminal/idle stock evidence on this same worker; no
+   * writes. Prior accepted queue clients must each join one canonical user item. */
+  readStockState(assertCurrent: () => void,
+    expectedQueueClientIds?: readonly string[]): Promise<StockReadState>;
 }
 export interface StockReadState {
   readonly threadId: string;
@@ -358,6 +360,32 @@ async function noGoalOrQueue(client: ReadClient, taskId: string): Promise<void> 
   if (goal.goal !== null || !Array.isArray(queue.data) || queue.data.length !== 0 || queue.nextCursor !== null)
     fail('goal-or-queue-not-empty');
 }
+function queueClientSnapshot(value: readonly string[]): readonly string[] {
+  const clients = jsonCopy(value);
+  if (!Array.isArray(clients) || clients.some(id => typeof id !== 'string' || !id) ||
+      new Set(clients).size !== clients.length) fail('invalid-expected-queue-clients');
+  return Object.freeze(clients);
+}
+/** Call only after exhaustive, stable terminal history has been established.
+ * An empty upstream queue or an assistant echo is not consumption evidence. */
+function assertTerminalQueueClients(turns: readonly Row[], clients: readonly string[]): void {
+  if (clients.length === 0) return;
+  const expected = new Set(clients), counts = new Map<string, number>();
+  const canonicalClients = new Map<string, string>();
+  for (const turn of turns) for (const item of turn.items as unknown[]) {
+    if (!object(item) || item.type !== 'userMessage' ||
+        typeof item.clientId !== 'string' || !expected.has(item.clientId)) continue;
+    if (typeof item.id !== 'string' || !item.id)
+      throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
+    const canonicalClient = canonicalClients.get(item.id);
+    if (canonicalClient !== undefined && canonicalClient !== item.clientId)
+      throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
+    canonicalClients.set(item.id, item.clientId);
+    counts.set(item.clientId, (counts.get(item.clientId) ?? 0) + 1);
+  }
+  if (clients.some(id => counts.get(id) !== 1))
+    throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
+}
 function qualifiedStart(start: Row, taskId: string, cwd: string,
   policy?: ApprovedTaskPolicy): void {
   if (policy) { assertEffectiveResume(policy, start); return; }
@@ -582,9 +610,7 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
     const expected = jsonCopy(expectedTurnIds);
     if (!Array.isArray(expected) || expected.some(id => typeof id !== 'string' || !id) ||
       new Set(expected).size !== expected.length) fail('invalid-expected-turn-ids');
-    const queueClients = jsonCopy(expectedQueueClientIds);
-    if (!Array.isArray(queueClients) || queueClients.some(id => typeof id !== 'string' || !id) ||
-        new Set(queueClients).size !== queueClients.length) fail('invalid-expected-queue-clients');
+    const queueClients = queueClientSnapshot(expectedQueueClientIds);
     return withIdleReader(async reader => {
       const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
@@ -606,16 +632,7 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
         fail('idle-history-unstable-or-nonterminal');
       const terminalIds = new Set(turns.map(turn => turn.id));
       if (expected.some(id => !terminalIds.has(id))) throw new ManagedWorkerIdleProofRefusedError();
-      if (queueClients.length) {
-        const clientCounts = new Map<string, number>();
-        for (const turn of turns) for (const item of turn.items as unknown[]) {
-          if (!object(item) || item.type !== 'userMessage') continue;
-          if (typeof item.clientId === 'string' && item.clientId.length > 0)
-            clientCounts.set(item.clientId, (clientCounts.get(item.clientId) ?? 0) + 1);
-        }
-        if (queueClients.some(id => clientCounts.get(id) !== 1))
-          throw new ManagedWorkerIdleProofRefusedError('accepted-queue-input-not-terminal');
-      }
+      assertTerminalQueueClients(turns, queueClients);
       return Object.freeze({ turnCount: turns.length, latestTurnId: turns.at(-1)?.id as string | undefined ?? null });
     });
   };
@@ -651,8 +668,10 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
         historyDigest: after.historyDigest, effective, composerDefaults: defaults });
     }, checkOwner);
   };
-  const readStockState = async (assertCurrent: () => void): Promise<StockReadState> => {
+  const readStockState = async (assertCurrent: () => void,
+    expectedQueueClientIds: readonly string[] = []): Promise<StockReadState> => {
     if (typeof assertCurrent !== 'function') fail('stock-current-fence-required');
+    const queueClients = queueClientSnapshot(expectedQueueClientIds);
     return withReader(async reader => {
       const first = threadOf(await reader.request('thread/read', { threadId: taskId, includeTurns: true }),
         taskId, cwd, ['idle']);
@@ -671,6 +690,7 @@ export async function bootstrapManagedWorker(options: ManagedWorkerBootstrapOpti
               terminalStatuses.has(observed.status as string) && observed.status === turn.status &&
               observed.id === turn.id;
           })) fail('stock-history-unstable-or-nonterminal');
+      assertTerminalQueueClients(turns, queueClients);
       if (typeof last.model !== 'string' || !last.model ||
           typeof last.modelProvider !== 'string' || !last.modelProvider ||
           !(last.reasoningEffort === null || typeof last.reasoningEffort === 'string') ||

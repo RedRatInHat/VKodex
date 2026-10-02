@@ -306,6 +306,12 @@ export class ManagedWorkerFrontendHost {
     return this.#commands.acceptedQueueInputs(controlKey);
   }
 
+  /** Read-only durable identity lookup for collision preflight; returns no row data. */
+  hasCommandClientIdentity(controlKey: object, clientUserMessageId: string): boolean {
+    if (!this.#commands) throw new Error('Worker command control unavailable');
+    return this.#commands.hasCommandClientIdentity(controlKey, clientUserMessageId);
+  }
+
   /** Read-only pending server-request evidence for the live generation. An
    * answered request remains counted until its responseWritten receipt. */
   requestQuiescence(controlKey: object): Readonly<{ generation: number; unresolved: number }> {

@@ -182,6 +182,13 @@ export class ManagedWorkerOperationJournal {
       submissionId: row.receipt_id! })));
   }
 
+  /** Read-only indexed existence check across every durable mutation state and method. */
+  hasClientUserMessageId(clientUserMessageId: string): boolean {
+    const id = bounded(clientUserMessageId, "client user message ID", 128);
+    return this.db.prepare(`SELECT 1 FROM managed_worker_operations
+      WHERE client_user_message_id=? LIMIT 1`).get(id) !== undefined;
+  }
+
   get(operationId: string): WorkerOperation | null {
     const id = validUuid(operationId, "operation ID");
     const row = this.db.prepare("SELECT * FROM managed_worker_operations WHERE operation_id=?").get(id) as OperationRow | undefined;

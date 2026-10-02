@@ -9,7 +9,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { ManagedWorkerFrontendHost } from '../src/codex/managed-worker-frontend-host.js';
 import { ManagedWorkerNativeStartHandler } from '../src/desktop/managed-worker-native-start.js';
-import type { NativeStartAuthority } from '../src/desktop/managed-worker-native-start.js';
+import type { NativeStartAuthority, StockNativeStartAdmission } from '../src/desktop/managed-worker-native-start.js';
 import { NativeStartIntentStore } from '../src/codex/native-start-intent-store.js';
 import { prepareNativeFollowerStart } from '../src/codex/native-follower-start.js';
 import type { QualifiedContinuationEvidence } from '../src/desktop/managed-worker-bootstrap.js';
@@ -120,6 +120,274 @@ function continuationFixture(f: Awaited<ReturnType<typeof fixture>>): {
       taskId: f.taskId, cwd: 'C:/native-test', summary: null, personality: 'pragmatic' } };
   return { request, evidence };
 }
+
+test('stock direct hook cannot be bypassed by an ordinary native envelope', async () => {
+  const f = await fixture(100);
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-direct-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId,
+    encryptionKey: randomBytes(32) });
+  let preparations = 0;
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store,
+    stockStart: { async prepare() { preparations++; throw new Error('stock proof unavailable'); } },
+  });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal), /stock proof unavailable/);
+    assert.equal(preparations, 1);
+    assert.equal(store.list().length, 0);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock direct admission preserves actual turn receipt and durable duplicate across policy drift', async () => {
+  const f = await fixture();
+  Object.assign(f.authority.snapshot, { currentPermissions: { activePermissionProfile: { id: ':danger-full-access' },
+    sandboxPolicy: { type: 'dangerFullAccess' }, approvalPolicy: 'never', approvalsReviewer: 'user',
+    runtimeWorkspaceRoots: ['C:/native-test'] } });
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-receipt-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  const phases: string[] = [];
+  let preparations = 0, settled = 0;
+  const stockStart: StockNativeStartAdmission = { async prepare(scope) {
+    preparations++;
+    assert.equal(scope.previousIntent, null);
+    return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+      uiParams: null, localMetadata: { forwardedUpstream: { turnTrigger: false } },
+      assertCurrent(phase) { phases.push(phase); }, settle() { settled++; } };
+  } };
+  const make = () => new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store, stockStart });
+  let handler = make();
+  try {
+    const pending = handler.handle(f.request, new AbortController().signal);
+    const frame = await waitFrame(f.child.frames, value => value.method === 'turn/start');
+    assert.equal((frame.params as IpcObject).permissions, ':danger-full-access');
+    assert.equal(store.list().length, 1);
+    const result = { turn: { id: 'actual-stock-direct-turn', status: 'inProgress' } };
+    f.child.reply(frame.id, result);
+    assert.deepEqual(await pending, { result });
+    assert.deepEqual(phases, ['before-intent', 'before-reservation', 'before-write']);
+    assert.equal(settled, 1);
+    handler.close(); handler = make();
+    Object.assign(f.authority, { authorityRevision: 2 });
+    Object.assign(f.authority.snapshot, { latestModel: 'changed-after-acceptance' });
+    assert.deepEqual(await handler.handle({ ...f.request, requestId: 'after-reconnect' },
+      new AbortController().signal), { result });
+    assert.equal(preparations, 1);
+    assert.equal(settled, 1);
+    assert.equal(f.child.frames.filter(value => value.method === 'turn/start').length, 1);
+    const changed = structuredClone(f.request);
+    ((changed.params.turnStart as IpcObject).request as IpcObject).input = [
+      { type: 'text', text: 'different', text_elements: [] }];
+    await assert.rejects(handler.handle(changed, new AbortController().signal));
+    assert.equal(preparations, 1);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock fence refusal at write retains rejection and never falls back or replays', async () => {
+  const f = await fixture();
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-fence-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let preparations = 0, settled = 0;
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store, stockStart: { async prepare(scope) {
+      preparations++;
+      return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+        uiParams: null, localMetadata: null, assertCurrent(phase) {
+          if (phase === 'before-write') throw new Error('stock owner revoked');
+        }, settle() { settled++; } };
+    } } });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    const intent = store.list()[0]!;
+    assert.equal(f.host.commandStatus(f.controlKey, intent.operationId)?.state, 'rejected');
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    assert.equal(preparations, 1);
+    assert.equal(settled, 1);
+    assert.equal(f.child.frames.filter(value => value.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock prepare deferred across follower, authority, and adapter revocation cannot persist or write', async () => {
+  const f = await fixture();
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-revoked-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let entered!: () => void, release!: () => void;
+  const preparing = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => f.state.authorized, intentStore: store,
+    stockStart: { async prepare(scope) {
+      entered(); await gate;
+      return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+        uiParams: null, localMetadata: null, assertCurrent() {
+          if (!f.state.authorized) throw new Error('stock follower revoked');
+        }, settle() {} };
+    } } });
+  try {
+    const pending = handler.handle(f.request, new AbortController().signal);
+    await preparing;
+    f.state.authorized = false;
+    Object.assign(f.authority, { authorityRevision: f.authority.authorityRevision + 1 });
+    handler.close();
+    release();
+    await assert.rejects(pending);
+    assert.equal(store.list().length, 0);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock timeout unknown duplicate refuses without reprepare or rewrite and changed body collides', async () => {
+  const f = await fixture(40);
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-unknown-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let preparations = 0, settles = 0;
+  const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store, stockStart: { async prepare(scope) {
+      preparations++;
+      return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+        uiParams: null, localMetadata: null, assertCurrent() {}, settle() { settles++; } };
+    } } });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal), /receipt unavailable/);
+    const frameCount = f.child.frames.filter(frame => frame.method === 'turn/start').length;
+    assert.equal(frameCount, 1);
+    assert.equal(store.list().length, 1);
+    await assert.rejects(handler.handle({ ...f.request, requestId: 'exact-unknown-retry' },
+      new AbortController().signal));
+    assert.equal(preparations, 1);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, frameCount);
+    const changed = structuredClone(f.request);
+    ((changed.params.turnStart as IpcObject).request as IpcObject).input = [
+      { type: 'text', text: 'different body', text_elements: [] }];
+    await assert.rejects(handler.handle(changed, new AbortController().signal));
+    assert.equal(preparations, 1);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, frameCount);
+    assert.equal(settles, 1);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
+
+test('stock asynchronous currentness callbacks fail closed before intent and at write', async t => {
+  for (const phase of ['before-intent', 'before-write'] as const) {
+    await t.test(`${phase} promise result is refused`, async () => {
+      const f = await fixture();
+      const store = new NativeStartIntentStore({ filePath: path.join(
+        mkdtempSync(path.join(tmpdir(), 'vkodex-stock-async-fence-')), 'intents.sqlite'),
+        ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+      const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+        taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+        authorizeFollower: () => true, intentStore: store, stockStart: { async prepare(scope) {
+          return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+            uiParams: null, localMetadata: null,
+            assertCurrent(current) {
+              if (current === phase) return Promise.resolve(false) as unknown as void;
+            }, settle() {} };
+        } } });
+      try {
+        await assert.rejects(handler.handle(f.request, new AbortController().signal));
+        assert.equal(store.list().length, phase === 'before-intent' ? 0 : 1);
+        assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+      } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+    });
+    await t.test(`${phase} rejected promise is refused without unhandled rejection`, async () => {
+      const f = await fixture();
+      const store = new NativeStartIntentStore({ filePath: path.join(
+        mkdtempSync(path.join(tmpdir(), 'vkodex-stock-async-reject-')), 'intents.sqlite'),
+        ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+      const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+        taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+        authorizeFollower: () => true, intentStore: store, stockStart: { async prepare(scope) {
+          return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+            uiParams: null, localMetadata: null,
+            assertCurrent(current) {
+              if (current === phase) return Promise.reject(new Error('async stock fence failure')) as unknown as void;
+            }, settle() {} };
+        } } });
+      try {
+        await assert.rejects(handler.handle(f.request, new AbortController().signal));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(store.list().length, phase === 'before-intent' ? 0 : 1);
+        assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+      } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+    });
+  }
+});
+
+test('stock settle exceptions cannot replace the actual accepted receipt', async t => {
+  for (const settle of [
+    () => { throw new Error('settle threw'); },
+    () => Promise.reject(new Error('settle rejected')),
+  ]) {
+    await t.test('accepted receipt survives failed settle', async () => {
+      const f = await fixture();
+      const store = new NativeStartIntentStore({ filePath: path.join(
+        mkdtempSync(path.join(tmpdir(), 'vkodex-stock-settle-')), 'intents.sqlite'),
+        ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+      const handler = new ManagedWorkerNativeStartHandler({ host: f.host, controlKey: f.controlKey,
+        taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+        authorizeFollower: () => true, intentStore: store, stockStart: { async prepare(scope) {
+          return { params: prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params),
+            uiParams: null, localMetadata: null, assertCurrent() {}, settle };
+        } } });
+      try {
+        const pending = handler.handle(f.request, new AbortController().signal);
+        const wire = await waitFrame(f.child.frames, frame => frame.method === 'turn/start');
+        const receipt = { turn: { id: 'accepted-despite-settle-failure', status: 'inProgress' } };
+        f.child.reply(wire.id, receipt);
+        assert.deepEqual(await pending, { result: receipt });
+        await new Promise(resolve => setImmediate(resolve));
+      } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+    });
+  }
+});
+
+test('stock intent-only admission preserves original intent when compiled candidate changes', async () => {
+  const f = await fixture();
+  const store = new NativeStartIntentStore({ filePath: path.join(
+    mkdtempSync(path.join(tmpdir(), 'vkodex-stock-candidate-drift-')), 'intents.sqlite'),
+    ownerEpoch: f.ownerEpoch, backendGeneration: 1, threadId: f.taskId, encryptionKey: randomBytes(32) });
+  let compilations = 0;
+  const stockStart: StockNativeStartAdmission = { async prepare(scope) {
+    compilations++;
+    const params = prepareNativeFollowerStart(scope.authority.snapshot, scope.request.params);
+    if (compilations > 1) params.serviceTier = 'candidate-drift';
+    return { params, uiParams: null, localMetadata: null,
+      assertCurrent(phase) { if (phase === 'before-write' && compilations === 1) throw new Error('stop before write'); },
+      settle() {} };
+  } };
+  const host = { get metadata() { return f.host.metadata; },
+    commandStatusForIntent: f.host.commandStatusForIntent.bind(f.host),
+    executeCommandWithResponse: async () => { throw new Error('simulated pre-dispatch interruption'); } };
+  let handler = new ManagedWorkerNativeStartHandler({ host, controlKey: f.controlKey,
+    taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+    authorizeFollower: () => true, intentStore: store, stockStart });
+  try {
+    await assert.rejects(handler.handle(f.request, new AbortController().signal));
+    const original = store.list()[0]!;
+    assert.equal(f.host.commandStatusForIntent(f.controlKey, original.intent.command), null);
+    assert.equal(original.intent.command.params.stockCandidateMarker, undefined);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+    handler.close();
+    handler = new ManagedWorkerNativeStartHandler({ host, controlKey: f.controlKey,
+      taskId: f.taskId, ownerEpoch: f.ownerEpoch, authority: () => f.authority,
+      authorizeFollower: () => true, intentStore: store, stockStart });
+    await assert.rejects(handler.handle({ ...f.request, requestId: 'candidate-drift-retry' },
+      new AbortController().signal));
+    assert.equal(compilations, 2);
+    assert.deepEqual(store.get(original.operationId)?.intent, original.intent);
+    assert.equal(f.child.frames.filter(frame => frame.method === 'turn/start').length, 0);
+  } finally { handler.close(); store.close(); await f.host.stop('test-cleanup'); }
+});
 
 test('Composer intent survives adapter recreation and first-turn eligibility loss without a second write', async () => {
   const f = await fixture();

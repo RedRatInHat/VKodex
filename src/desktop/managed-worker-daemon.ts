@@ -26,6 +26,7 @@ import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js'
 import { assertManagedStockSettingsPolicy, createManagedStockSettingsInitializer,
   type ManagedStockSettingsInitializer } from './managed-stock-settings-initializer.js';
 import { createManagedStockQueueRuntimeFactory } from './managed-stock-queue-runtime.js';
+import { ManagedStockNativeStart } from './managed-stock-native-start.js';
 import { confirmManagedNativeOwner } from './managed-native-owner-confirmation.js';
 import { managedStockCommandId } from './managed-native-stock-queue-adapter.js';
 import { OneShotComposerCommandGate } from './one-shot-composer-command.js';
@@ -782,12 +783,14 @@ export class ManagedWorkerDaemon {
           return this.#cliQualifier.qualify(resume);
         },
       }) : null;
+      let stockDirect: ManagedStockNativeStart | null = null;
       const policy = (scope: Readonly<WorkerCommandScope & WorkerCommand>): boolean => {
         if (this.#options.refusalOnlyProbe) return false;
         if (this.#ingressRevoked || !ownerCurrent() || scope.ownerEpoch !== manifest.epoch ||
           scope.backendGeneration !== this.#generation || scope.threadId !== manifest.taskId) return false;
         if (this.#options.nativeStockQueue) {
           if (this.#vkSubmitter?.authorizes(scope) === true) return true;
+          if (stockDirect?.authorizes(scope) === true) return true;
           const p = scope.params;
           if (!stockInitialized || scope.method !== 'thread/queue/add' ||
               p.threadId !== manifest.taskId || typeof p.clientUserMessageId !== 'string' ||
@@ -941,14 +944,17 @@ export class ManagedWorkerDaemon {
         } catch { return false; }
       };
       const stock = this.#options.nativeStockQueue;
-      const stockFactory = stock && initialized ? createManagedStockQueueRuntimeFactory({
+      const stockRuntimeOptions = stock && initialized ? {
         journalPath: path.join(state.privateDirectory, 'native-stock.sqlite'),
         sourceGeneration: stock.sourceGeneration, bootstrap: this.#bootstrap,
         initialized, approvedTaskPolicy: manifest.approvedTaskPolicy!,
         assertControlledNativeBaseline: stock.assertControlledNativeBaseline,
         confirmNativeOwner: confirmStockOwner, isOwnerCurrent: ownerCurrent,
         admissionOpen: () => !this.#ingressRevoked && this.#admissionOpen && this.#headlessPending === 0,
-      }) : undefined;
+        isClientReservedOutsideQueue: (clientId: string) =>
+          this.#intentStore?.getByClientUserMessageId(clientId) != null,
+      } : undefined;
+      const stockFactory = stockRuntimeOptions ? createManagedStockQueueRuntimeFactory(stockRuntimeOptions) : undefined;
       let stockAuthority: Pick<Parameters<NonNullable<typeof stockFactory>>[0],
         'captureAuthority' | 'assertCurrent'> | null = null;
       const queueAdapterFactory = stockFactory ?
@@ -971,6 +977,11 @@ export class ManagedWorkerDaemon {
             oneShotGate!.note(command, phase, passed),
           onFirstTurnAttemptSettled: (command: WorkerCommand) => oneShotGate!.settle(command) } : {}),
         ...(queueAdapterFactory ? { queueAdapterFactory } : {}),
+        ...(stockRuntimeOptions ? { stockStartFactory: context => {
+          if (stockDirect) throw new Error('Stock direct admission already created');
+          stockDirect = new ManagedStockNativeStart(stockRuntimeOptions, context);
+          return stockDirect;
+        } } : {}),
         ...(this.#options.refusalOnlyProbe || manifest.approvedTaskPolicy ? {} : {
           qualifyContinuation: (fence: () => ContinuationOwnerFence) => this.#bootstrap!.qualifyContinuation(fence),
         }),
