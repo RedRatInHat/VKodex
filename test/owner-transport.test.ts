@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import test from "node:test";
-import { OwnerTransport, OwnerTransportError } from "../src/desktop/owner-transport.js";
+import { OwnerTransport, OwnerTransportError, type OwnerReceiptTrace } from "../src/desktop/owner-transport.js";
 import { archiveThroughOwner, inspectThroughOwner, serveOwnerChannel } from "../src/desktop/owner-channel.js";
 import { ProfileDesktopMetadata, unownedArchiveReady } from "../src/desktop/metadata.js";
 import { UncertainActionError } from "../src/desktop/contracts.js";
-import { ownerEnvironment, resolveOwnerExecutable } from "../src/desktop/owner-launcher.js";
+import { createOwnerReceiptTraceSink, ownerEnvironment, resolveOwnerExecutable } from "../src/desktop/owner-launcher.js";
 import { comparablePath } from "../src/desktop/paths.js";
 
 test("an unowned archive retry requires an unloaded task and terminal latest turn", () => {
@@ -51,7 +51,8 @@ test("owner launcher preserves native IDE authentication and integration environ
   });
 });
 type Message = Record<string, any>;
-function fixture(overrides: Record<string, (m: Message) => unknown> = {}, timeout = 1000) {
+function fixture(overrides: Record<string, (m: Message) => unknown> = {}, timeout = 1000,
+  onReceiptTrace?: (event: Readonly<OwnerReceiptTrace>) => void) {
   const nativeInput = new PassThrough(), nativeOutput = new PassThrough(), clientInput = new PassThrough(), clientOutput = new PassThrough();
   const requests: Message[] = [], received: Message[] = [];
   const write = (stream: PassThrough, m: Message) => stream.write(JSON.stringify(m) + "\n");
@@ -61,7 +62,7 @@ function fixture(overrides: Record<string, (m: Message) => unknown> = {}, timeou
       while ((end = buffer.indexOf("\n")) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); fn(JSON.parse(line)); }
     });
   };
-  const transport = new OwnerTransport(nativeInput, nativeOutput, clientInput, clientOutput, timeout);
+  const transport = new OwnerTransport(nativeInput, nativeOutput, clientInput, clientOutput, timeout, onReceiptTrace);
   listen(clientOutput, m => received.push(m));
   listen(nativeInput, m => {
     requests.push(m);
@@ -77,6 +78,173 @@ function fixture(overrides: Record<string, (m: Message) => unknown> = {}, timeou
     initialize() { write(clientInput, { id: 1, method: "initialize", params: {} }); write(clientInput, { method: "initialized" }); },
     send(m: Message) { write(clientInput, m); }, native(m: Message) { write(nativeOutput, m); } };
 }
+
+test("receipt trace correlates native writes and user items without payload or RPC IDs", () => {
+  const trace: Readonly<OwnerReceiptTrace>[] = [];
+  const userId = "33333333-3333-4333-8333-333333333333";
+  const turnId = "44444444-4444-4444-8444-444444444444";
+  const itemId = "55555555-5555-4555-8555-555555555555";
+  const f = fixture({ "turn/start": () => ({ turn: { id: turnId }, secret: "RESPONSE_PRIVATE" }) },
+    1000, event => trace.push(event));
+  f.initialize();
+  f.send({ id: "PRIVATE_RPC_ID", method: "turn/start", params: { threadId,
+    clientUserMessageId: userId, input: [{ type: "text", text: "PROMPT_PRIVATE" }] } });
+  f.native({ method: "item/completed", params: { threadId, turnId,
+    item: { type: "userMessage", id: itemId, clientId: userId,
+      content: [{ type: "text", text: "PROMPT_PRIVATE" }] } } });
+  const dispatch = trace.find(e => e.phase === "request-observed")!;
+  const reply = trace.find(e => e.phase === "frontend-write-buffered")!;
+  const receipt = trace.find(e => e.phase === "native-user-message-observed")!;
+  assert.equal(dispatch.method, "turn/start");
+  assert.equal(dispatch.threadId, threadId);
+  assert.equal(dispatch.clientUserMessageId, userId);
+  assert.equal(reply.requestSequence, dispatch.requestSequence);
+  assert.equal(reply.turnId, turnId);
+  assert.equal(reply.outcome, "success");
+  assert.equal(receipt.clientUserMessageId, userId);
+  assert.equal(receipt.itemId, itemId);
+  assert.equal(receipt.turnId, turnId);
+  assert.equal(receipt.nativeMethod, "item/completed");
+  assert.ok(reply.elapsedMs! >= 0);
+  assert.equal(trace.some(e => e.phase === "backend-write-buffered"), true);
+  assert.equal(trace.some(e => e.phase === "native-response-observed"), true);
+  assert.equal(trace.some(e => e.phase === "frontend-user-message-buffered" && e.itemId === itemId), true);
+  assert.ok(trace.every(e => e.transportInstance === dispatch.transportInstance));
+  assert.deepEqual(trace.map(e => e.eventSequence), trace.map((_, index) => index + 1));
+  assert.ok(trace.every(e => Object.isFrozen(e)));
+  const metadata = JSON.stringify(trace);
+  for (const privateValue of ["PROMPT_PRIVATE", "RESPONSE_PRIVATE", "PRIVATE_RPC_ID"])
+    assert.equal(metadata.includes(privateValue), false);
+  assert.equal(f.received.find(m => m.id === "PRIVATE_RPC_ID")?.result.secret, "RESPONSE_PRIVATE");
+  f.transport.close();
+});
+
+test("receipt trace failure and non-UUID metadata never alter native forwarding", () => {
+  const events: Readonly<OwnerReceiptTrace>[] = [];
+  const f = fixture({ "turn/start": () => ({ turn: { id: "PRIVATE_TURN_ID" } }) },
+    1000, event => { events.push(event); throw new Error("diagnostic sink failed"); });
+  f.initialize();
+  f.send({ id: 3, method: "turn/start", params: { threadId: "PRIVATE_THREAD_ID",
+    clientUserMessageId: "PRIVATE_CLIENT_ID", input: [{ type: "text", text: "PRIVATE_INPUT" }] } });
+  assert.equal(f.received.at(-1)?.id, 3);
+  assert.equal(f.received.at(-1)?.result.turn.id, "PRIVATE_TURN_ID");
+  assert.equal(f.requests.at(-1)?.params.clientUserMessageId, "PRIVATE_CLIENT_ID");
+  assert.ok(events.length > 0);
+  assert.equal(JSON.stringify(events).includes("PRIVATE_"), false);
+  f.transport.close();
+});
+
+test("receipt trace distinguishes an active-writer rejection without exposing error text", () => {
+  const trace: Readonly<OwnerReceiptTrace>[] = [];
+  const f = fixture({ "thread/resume": m => {
+    f.native({ id: m.id, error: { code: -32600,
+      message: "PRIVATE_LOCATION thread already has an active writer PRIVATE_INPUT" } });
+    return undefined;
+  } }, 1000, event => trace.push(event));
+  f.initialize(); f.send({ id: 7, method: "thread/resume", params: { threadId } });
+  const rejected = trace.find(e => e.phase === "frontend-write-buffered")!;
+  assert.equal(rejected.outcome, "error");
+  assert.equal(rejected.errorCode, -32600);
+  assert.equal(rejected.errorCategory, "active-writer-conflict");
+  assert.equal(JSON.stringify(trace).includes("PRIVATE_"), false);
+  assert.equal(f.received.at(-1)?.error.code, -32600);
+  f.transport.close();
+});
+
+test("receipt trace stderr sink is disabled by default and bounded without blocking transport", () => {
+  const trace: Readonly<OwnerReceiptTrace>[] = [];
+  const f = fixture({}, 1000, event => trace.push(event));
+  f.send({ id: 8, method: "thread/read", params: { threadId } });
+  const lines: string[] = [];
+  const output = { writableLength: 0, on: () => undefined,
+    write: (line: string) => { lines.push(line); return true; } };
+  assert.equal(createOwnerReceiptTraceSink(false, output), undefined);
+  const sink = createOwnerReceiptTraceSink(true, output)!;
+  output.writableLength = 256 * 1024;
+  sink(trace[0]!);
+  assert.equal(lines.length, 0);
+  output.writableLength = 0;
+  sink(trace[0]!);
+  assert.equal(lines.length, 1);
+  const event = JSON.parse(lines[0]!.slice("VKodex receipt trace ".length));
+  assert.equal(event.sinkDroppedEvents, 1);
+  assert.equal(event.threadId, threadId);
+  assert.equal(event.pid, process.pid);
+  const throwingSink = createOwnerReceiptTraceSink(true, { writableLength: 0, on: () => undefined,
+    write: () => { throw new Error("PRIVATE_LOG_FAILURE"); } })!;
+  assert.doesNotThrow(() => throwingSink(trace[0]!));
+  f.transport.close();
+});
+
+test("receipt trace contains asynchronous stderr failure and disables further writes", async () => {
+  const events: Readonly<OwnerReceiptTrace>[] = [];
+  const f = fixture({}, 1000, event => events.push(event));
+  f.send({ id: 4, method: "thread/read", params: { threadId } });
+  let writes = 0;
+  const output = new Writable({ write(_chunk, _encoding, callback) {
+    writes++;
+    setImmediate(() => callback(new Error("PRIVATE_ASYNC_ERROR")));
+  } });
+  const sink = createOwnerReceiptTraceSink(true, output)!;
+  sink(events[0]!);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  sink(events[0]!);
+  assert.equal(writes, 1);
+  assert.equal(f.received.at(-1)?.id, 4);
+  f.transport.close();
+});
+
+test("receipt trace capture ends with unresolved metadata and caps long-running streams", () => {
+  const trace: Readonly<OwnerReceiptTrace>[] = [];
+  const f = fixture({ "turn/start": () => undefined }, 1000, event => trace.push(event));
+  f.send({ id: 1, method: "turn/start", params: { threadId } });
+  for (let i = 0; i < 10_005; i++) f.native({ method: "item/completed", params: { threadId,
+    item: { type: "userMessage", id: "55555555-5555-4555-8555-555555555555" } } });
+  assert.equal(f.received.length, 10_005);
+  assert.equal(trace.length, 10_000);
+  f.transport.close();
+  assert.equal(trace.length, 10_001);
+  assert.equal(trace.at(-1)?.phase, "capture-ended");
+  assert.equal(trace.at(-1)?.unresolvedRequests, 1);
+  assert.equal(trace.at(-1)?.droppedEvents, 10_005 * 2 + 2 - 10_000);
+});
+
+test("receipt trace preserves receipt-before-ACK and typed IDs under protocol backpressure", async () => {
+  const nativeInput = new PassThrough(), nativeOutput = new PassThrough(), clientInput = new PassThrough();
+  const received: Message[] = [], trace: Readonly<OwnerReceiptTrace>[] = [];
+  let releaseWrite: (() => void) | undefined;
+  const clientOutput = new Writable({ highWaterMark: 1, write(chunk, _encoding, done) {
+    received.push(JSON.parse(chunk.toString()));
+    releaseWrite = () => { releaseWrite = undefined; done(); };
+  } });
+  const transport = new OwnerTransport(nativeInput, nativeOutput, clientInput, clientOutput, 1000,
+    event => trace.push(event));
+  const requests: Message[] = [];
+  nativeInput.setEncoding("utf8");
+  nativeInput.on("data", (line: string) => requests.push(JSON.parse(line)));
+  const userId = "33333333-3333-4333-8333-333333333333";
+  const receipt = { method: "item/completed", params: { threadId,
+    item: { type: "userMessage", id: "55555555-5555-4555-8555-555555555555", clientId: userId,
+      content: [{ type: "text", text: "PRIVATE_INPUT" }] } } };
+  clientInput.write(JSON.stringify({ id: 0, method: "turn/start", params: { threadId, clientUserMessageId: userId } }) + "\n");
+  clientInput.write(JSON.stringify({ id: "0", method: "thread/queue/add", params: { threadId } }) + "\n");
+  nativeOutput.write(JSON.stringify(receipt) + "\n");
+  assert.equal(nativeOutput.isPaused(), true);
+  nativeOutput.write(JSON.stringify({ id: requests[1]!.id, result: { id: "PRIVATE_STOCK_ID" } }) + "\n");
+  nativeOutput.write(JSON.stringify({ id: requests[0]!.id, result: { turn: { id: "PRIVATE_TURN_ID" } } }) + "\n");
+  for (let i = 0; i < 3; i++) {
+    assert.ok(releaseWrite);
+    releaseWrite();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(received, [receipt, { id: "0", result: { id: "PRIVATE_STOCK_ID" } },
+    { id: 0, result: { turn: { id: "PRIVATE_TURN_ID" } } }]);
+  assert.equal(trace.filter(e => e.phase === "frontend-write-buffered").length, 2);
+  assert.ok(trace.findIndex(e => e.phase === "native-user-message-observed")
+    < trace.findIndex(e => e.phase === "native-response-observed"));
+  assert.equal(JSON.stringify(trace).includes("PRIVATE_"), false);
+  transport.close();
+});
 
 test("VS Code readiness is confirmed by a native response without initialized notification", async () => {
   const f = fixture();
