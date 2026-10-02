@@ -8,8 +8,10 @@ const id = (value: unknown): string | null => typeof value === "string" && value
 const scopeId = (value: unknown): string | null => typeof value === "string" && value.length > 0
   && value.length <= 256 && !/[\s\x00-\x1f\x7f]/u.test(value) ? value : null;
 const MAX_TASK_REVISIONS = 4096;
+const UNLOAD_READBACK_INTERVAL_MS = 31 * 60_000;
 interface Drain { generation: number; state: ExecutionDrainResult | "checking"; unloaded: boolean;
-  release: Promise<unknown> | null; restored?: true; assertRelease?: () => void }
+  release: Promise<ObjectValue> | null; restored?: true; assertRelease?: () => void;
+  nextRefreshAt?: number; refresh?: Promise<ExecutionDrainResult> }
 interface WorkReceipt { readonly turnId?: string; readonly clientId?: string }
 
 // Pinned native notifications with an explicit threadId and no family-topology
@@ -40,7 +42,7 @@ export class LegacyExecutionLifecycle {
   private readonly taskRevisions = new Map<string, number>();
   private readonly unsubscribe: () => void;
 
-  constructor(private readonly original: AppServerRpc) {
+  constructor(private readonly original: AppServerRpc, private readonly now: () => number = () => performance.now()) {
     this.unsubscribe = original.onNotification(event => this.observe(event));
     this.rpc = {
       start: () => original.start(),
@@ -172,7 +174,7 @@ export class LegacyExecutionLifecycle {
     this.changed(threadId && scopeValid && taskNotifications.has(event.method) ? threadId : null);
     if (!threadId) return;
     const drain = this.drains.get(threadId);
-    if (event.method === "thread/closed" && drain && this.current(drain.generation)) {
+    if (event.method === "thread/closed" && scopeValid && drain && this.current(drain.generation)) {
       drain.unloaded = true;
       if (drain.state === "waiting-unload" || drain.state === "unavailable") drain.state = "released";
     }
@@ -210,12 +212,48 @@ export class LegacyExecutionLifecycle {
       return matches.length === 1 && object(matches[0]) && ["completed", "failed", "interrupted"].includes(String(matches[0].status));
     });
   }
+  private async refreshWaiting(task: TaskRef, drain: Drain,
+    local: () => { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending?: boolean },
+    subscription: () => { readonly count: number; readonly revision: number }): Promise<ExecutionDrainResult> {
+    const generation = drain.generation;
+    const scoped = subscription();
+    const revision = this.revision;
+    const unscopedRevision = this.unscopedRevision;
+    const safe = () => this.drains.get(task.threadId) === drain && drain.state === "waiting-unload"
+      && this.current(generation) && subscription().count === 0 && subscription().revision === scoped.revision
+      && !local().blocked && !local().releasePending
+      && !this.busy.has(task.threadId) && !this.unknown.has(task.threadId)
+      && !this.busy.has("__unscoped_server_request__") && !this.unknown.has("__unscoped_server_request__")
+      && !this.changedSince([task.threadId], revision, unscopedRevision);
+    if (!safe()) return !this.current(generation) || this.drains.get(task.threadId) !== drain
+      ? "unavailable" : drain.state === "released" ? "released" : "waiting-unload";
+    drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;
+    try {
+      const response = await this.original.request("thread/read", { threadId: task.threadId, includeTurns: false },
+        { expectedGeneration: generation, timeoutMs: 5_000,
+          assertBeforeWrite: () => { if (!safe()) throw new AppServerUnavailableError(); } });
+      const thread = object(response.thread) ? response.thread : null;
+      if (safe() && thread?.id === task.threadId && object(thread.status) && thread.status.type === "notLoaded") {
+        drain.unloaded = true;
+        drain.state = "released";
+      }
+    } catch { /* A failed metadata read cannot prove unload. */ }
+    if (!this.current(generation) || this.drains.get(task.threadId) !== drain) return "unavailable";
+    return drain.state === "released" ? "released" : "waiting-unload";
+  }
   async drain(task: TaskRef, beforeRelease: () => void,
     local: () => { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending?: boolean },
     subscription: () => { readonly count: number; readonly revision: number }): Promise<ExecutionDrainResult> {
     const existing = this.drains.get(task.threadId);
-    if (existing) return !this.current(existing.generation) ? "unavailable"
-      : existing.state === "checking" ? "blocked" : existing.state;
+    if (existing) {
+      if (!this.current(existing.generation)) return "unavailable";
+      if (existing.state !== "waiting-unload") return existing.state === "checking" ? "blocked" : existing.state;
+      if (existing.refresh) return existing.refresh;
+      if (existing.nextRefreshAt === undefined || this.now() < existing.nextRefreshAt) return "waiting-unload";
+      const refresh = this.refreshWaiting(task, existing, local, subscription);
+      existing.refresh = refresh;
+      try { return await refresh; } finally { if (existing.refresh === refresh) delete existing.refresh; }
+    }
     const session = this.original.currentInitializedSession?.();
     if (!session || this.acquired.get(task.threadId) !== session.generation) return "unavailable";
     const generation = session.generation;
@@ -259,8 +297,10 @@ export class LegacyExecutionLifecycle {
       closing = true;
       beforeRelease(); // No await: exact binding/stream validation and close are atomic with admission revocation.
       if (!drain.release || subscription().count !== 0) { drain.state = "unavailable"; return "unavailable"; }
-      await drain.release;
+      const release = await drain.release;
       drain.state = !this.current(generation) ? "unavailable" : drain.unloaded ? "released" : "waiting-unload";
+      if (drain.state === "waiting-unload" && release.status === "unsubscribed")
+        drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;
       return drain.state;
     } catch { drain.state = closing && drain.unloaded && this.current(generation) ? "released" : "unavailable"; return drain.state; }
     finally { if (!closing) this.drains.delete(task.threadId); }

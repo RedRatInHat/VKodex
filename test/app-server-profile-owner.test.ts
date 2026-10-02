@@ -12,7 +12,7 @@ class Rpc implements AppServerRpc {
   readonly calls: string[] = []; readonly resumeTimeouts: number[] = [];
   readonly requests: Array<{ method: string; params: JsonObject; options?: AppServerRequestOptions }> = [];
   closed = 0; starts = 0; projectId: string | null = null; waitResume: Promise<void> | null = null;
-  waitUnsubscribe: Promise<void> | null = null; failUnsubscribe = false;
+  waitUnsubscribe: Promise<void> | null = null; failUnsubscribe = false; unsubscribeStatus = "unsubscribed";
   threadStatus: "idle" | "active" | "notLoaded" | "systemError" = "idle";
   generation = 1; sessionAvailable = true;
   threadListResponse: JsonObject = { data: [], nextCursor: null };
@@ -52,7 +52,7 @@ class Rpc implements AppServerRpc {
     if (method === "thread/unsubscribe") {
       if (this.waitUnsubscribe) await this.waitUnsubscribe;
       if (this.failUnsubscribe) throw new Error("release result unknown");
-      return { status: "unsubscribed" };
+      return { status: this.unsubscribeStatus };
     }
     if (method === "turn/start") {
       this.onTurnStart?.();
@@ -142,6 +142,257 @@ test("publishing drain is not starved by another task's progress on the same pro
         assert.equal(releases, 1, "unload confirmation must not repeat the release");
       } finally { stream.close(); await owner.close(); }
     });
+});
+
+test("a missed close is recovered from the original Publishing owner's notLoaded read", async t => {
+  for (const shape of ["MS/Steam historical queued receipt", "android terminal turn receipt"] as const)
+    await t.test(shape, async () => {
+      const rpc = new Rpc(); let now = 0;
+      const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+      const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+      if (shape === "MS/Steam historical queued receipt") {
+        await owner.queue({ operationId: "publishing-receipt", task: taskRef, text: "synthetic publishing request" });
+        rpc.turnsListResponse = { data: [{ id: "terminal-queued-turn", status: "completed",
+          items: [{ type: "userMessage", clientId: "publishing-receipt" }] }], nextCursor: null };
+      } else {
+        await owner.submitWithReceipt({ operationId: "publishing-receipt", task: taskRef, text: "synthetic publishing request" });
+        rpc.turnsListResponse = { data: [{ id: "turn", status: "completed", items: [] }], nextCursor: null };
+      }
+      let releases = 0;
+      const close = () => { releases++; stream.close(); };
+      try {
+        assert.equal(await drainIdle(owner, close), "waiting-unload");
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const before = rpc.requests.length;
+        rpc.threadStatus = "notLoaded";
+        now = 31 * 60_000 - 1;
+        assert.equal(await drainIdle(owner, close), "waiting-unload");
+        assert.equal(rpc.requests.length, before);
+        now++;
+        assert.equal(await drainIdle(owner, close), "released");
+        assert.deepEqual(rpc.requests.slice(before).map(request => request.method), ["thread/read"]);
+        assert.deepEqual(rpc.requests.at(-1)?.params, { threadId: taskRef.threadId, includeTurns: false });
+        assert.equal(rpc.requests.at(-1)?.options?.expectedGeneration, 1);
+        assert.equal(releases, 1);
+        assert.equal(rpc.starts, 0);
+      } finally { stream.close(); await owner.close(); }
+    });
+});
+
+test("waiting-unload readback accepts only exact notLoaded and retains a 31-minute retry interval", async () => {
+  const rpc = new Rpc(); let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  let releases = 0; const close = () => { releases++; stream.close(); };
+  try {
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const start = rpc.requests.length;
+    const responses: JsonObject[] = [
+      { thread: { id: taskRef.threadId, status: { type: "idle" } } },
+      { thread: { id: taskRef.threadId, status: { type: "active" } } },
+      { thread: { id: taskRef.threadId, status: { type: "systemError" } } },
+      { thread: { id: "other-thread", status: { type: "notLoaded" } } },
+      { thread: { id: taskRef.threadId, status: {} } },
+    ];
+    for (const response of responses) {
+      rpc.threadReadResponses.set(taskRef.threadId, response);
+      now += 31 * 60_000;
+      assert.equal(await drainIdle(owner, close), "waiting-unload");
+      const count = rpc.requests.length;
+      for (let i = 0; i < 5; i++) assert.equal(await drainIdle(owner, close), "waiting-unload");
+      assert.equal(rpc.requests.length, count, "maintenance calls cannot hot poll");
+    }
+    rpc.threadReadResponses.set(taskRef.threadId,
+      { thread: { id: taskRef.threadId, status: { type: "notLoaded" } } });
+    now += 31 * 60_000;
+    assert.equal(await drainIdle(owner, close), "released");
+    assert.deepEqual(rpc.requests.slice(start).map(request => request.method), Array(6).fill("thread/read"));
+    assert.equal(releases, 1);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("concurrent waiting-unload drains share one read and a changed generation cannot release", async () => {
+  const rpc = new Rpc(); let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  const close = () => stream.close();
+  try {
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    now = 31 * 60_000;
+    let resume!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    rpc.pauseMethod = "thread/read"; rpc.pauseGate = gate; rpc.onPausedRequest = entered;
+    rpc.threadStatus = "notLoaded";
+    const start = rpc.requests.length;
+    const first = drainIdle(owner, close);
+    await paused;
+    const second = drainIdle(owner, close);
+    assert.equal(rpc.requests.slice(start).filter(request => request.method === "thread/read").length, 1);
+    rpc.generation++;
+    resume();
+    assert.deepEqual(await Promise.all([first, second]), ["unavailable", "unavailable"]);
+    assert.equal(await drainIdle(owner, close), "unavailable");
+    assert.equal(rpc.starts, 0);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("readback cadence begins at the successful unsubscribe acknowledgment", async () => {
+  const rpc = new Rpc(); let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  let acknowledge!: () => void;
+  rpc.waitUnsubscribe = new Promise<void>(resolve => { acknowledge = resolve; });
+  const close = () => stream.close();
+  try {
+    const pending = drainIdle(owner, close);
+    while (!rpc.calls.includes("thread/unsubscribe")) await new Promise<void>(resolve => setImmediate(resolve));
+    now = 10 * 60_000;
+    acknowledge();
+    assert.equal(await pending, "waiting-unload");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    rpc.threadStatus = "notLoaded";
+    const start = rpc.requests.length;
+    now = 31 * 60_000;
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    assert.equal(rpc.requests.length, start);
+    now = 41 * 60_000;
+    assert.equal(await drainIdle(owner, close), "released");
+    assert.deepEqual(rpc.requests.slice(start).map(request => request.method), ["thread/read"]);
+  } finally { acknowledge(); stream.close(); await owner.close(); }
+});
+
+test("failed unsubscribe and restored generation-zero fences never read back", async () => {
+  const rpc = new Rpc(); rpc.failUnsubscribe = true;
+  let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  try {
+    assert.equal(await drainIdle(owner, () => stream.close()), "unavailable");
+    const start = rpc.requests.length;
+    now = 100 * 60_000;
+    assert.equal(await drainIdle(owner, () => assert.fail("release must not repeat")), "unavailable");
+    assert.equal(rpc.requests.length, start);
+  } finally { stream.close(); await owner.close(); }
+  const restoredRpc = new Rpc();
+  const restored = new AppServerProfileOwner("work", restoredRpc, undefined, undefined, undefined, () => now);
+  try {
+    restored.restoreExecutionDrain(taskRef);
+    assert.equal(await drainIdle(restored, () => assert.fail("restored fence cannot release")), "unavailable");
+    assert.deepEqual(restoredRpc.requests, []);
+  } finally { await restored.close(); }
+});
+
+test("a skipped or malformed unsubscribe acknowledgment never enables readback", async t => {
+  for (const status of ["skipped", "unexpected"] as const) await t.test(status, async () => {
+    const rpc = new Rpc(); rpc.unsubscribeStatus = status;
+    let now = 0;
+    const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+    const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+    try {
+      assert.equal(await drainIdle(owner, () => stream.close()), "unavailable");
+      const start = rpc.requests.length;
+      now = 100 * 60_000;
+      assert.equal(await drainIdle(owner, () => assert.fail("release must not repeat")), "unavailable");
+      assert.equal(rpc.requests.length, start);
+    } finally { stream.close(); await owner.close(); }
+  });
+});
+
+test("target and unscoped events during readback invalidate absence proof", async t => {
+  for (const notification of [
+    { method: "thread/status/changed", params: { threadId: taskRef.threadId, status: { type: "active" } } },
+    { method: "unrecognized/native", params: {} },
+  ]) await t.test(notification.method, async () => {
+    const rpc = new Rpc(); let now = 0;
+    const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+    const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+    const close = () => stream.close();
+    try {
+      assert.equal(await drainIdle(owner, close), "waiting-unload");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      now = 31 * 60_000; rpc.threadStatus = "notLoaded";
+      let resume!: () => void;
+      let entered!: () => void;
+      rpc.pauseMethod = "thread/read";
+      rpc.pauseGate = new Promise<void>(resolve => { resume = resolve; });
+      const paused = new Promise<void>(resolve => { entered = resolve; });
+      rpc.onPausedRequest = entered;
+      const pending = drainIdle(owner, close);
+      await paused;
+      rpc.notify(notification);
+      resume();
+      assert.equal(await pending, "waiting-unload");
+      rpc.pauseMethod = null; rpc.pauseGate = null;
+      now += 31 * 60_000;
+      assert.equal(await drainIdle(owner, close), "released");
+    } finally { stream.close(); await owner.close(); }
+  });
+});
+
+test("readback failure retains waiting and backs off", async () => {
+  const rpc = new Rpc(); let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  const close = () => stream.close();
+  try {
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    let attempts = 0;
+    rpc.onRequest = method => { if (method === "thread/read" && ++attempts === 1) throw new Error("read failed"); };
+    now = 31 * 60_000;
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    now += 60_000;
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    assert.equal(attempts, 1);
+    rpc.threadStatus = "notLoaded";
+    now = 62 * 60_000;
+    assert.equal(await drainIdle(owner, close), "released");
+    assert.equal(attempts, 2);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("a same-generation closed notification wins while readback is pending", async () => {
+  const rpc = new Rpc(); let now = 0;
+  const owner = new AppServerProfileOwner("work", rpc, undefined, undefined, undefined, () => now);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  const close = () => stream.close();
+  try {
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    now = 31 * 60_000;
+    let resume!: () => void;
+    let entered!: () => void;
+    rpc.pauseMethod = "thread/read";
+    rpc.pauseGate = new Promise<void>(resolve => { resume = resolve; });
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    rpc.onPausedRequest = entered;
+    const pending = drainIdle(owner, close);
+    await paused;
+    rpc.notify({ method: "thread/closed", params: { threadId: taskRef.threadId } });
+    resume();
+    assert.equal(await pending, "released");
+    assert.equal(await drainIdle(owner, close), "released");
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("a conflicting thread identity in a closed notification cannot release the drain", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  const close = () => stream.close();
+  try {
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    rpc.notify({ method: "thread/closed", params: { threadId: taskRef.threadId,
+      thread: { id: "conflicting-thread" } } });
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    rpc.notify({ method: "thread/closed", params: { threadId: "bad thread id" } });
+    assert.equal(await drainIdle(owner, close), "waiting-unload");
+    rpc.notify({ method: "thread/closed", params: { threadId: taskRef.threadId } });
+    assert.equal(await drainIdle(owner, close), "released");
+  } finally { stream.close(); await owner.close(); }
 });
 
 test("another task's subscription start and close during discovery cannot starve idle drain", async () => {
