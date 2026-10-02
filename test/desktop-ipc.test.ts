@@ -643,6 +643,38 @@ test("restart recovery does not resume a turn still active in a UI owner", async
   assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
 });
 
+for (const [threadId, title] of [
+  ["01a07930-dbba-77c2-8910-17bd61638e6f", "RaceLineCalc : work new 5 - MS/Steam publishing"],
+  ["01a06325-d3d0-7052-b495-371fcb7a2887", "RaceLineCalc : work new 5 - android publishing"],
+] as const) test(`reconcile-only restart never reacquires or continues ${title}`, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-publishing-no-replay-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  let ticks = 0; let profileReads = 0; let submissions = 0; let scalarProbes = 0;
+  const s = runtimeSetup(t, undefined, undefined, async () => { scalarProbes++; return "idle"; });
+  const binding = s.store.ensureBinding({ hostId: "local", threadId, title, sourceId: "primary", workspace: "/fixture", updatedAt: 1 });
+  const peerId = s.peerId + 1;
+  s.store.setChat(binding.id, peerId, 18);
+  s.store.setValue(`task-details:${binding.id}`, { status: "running" });
+  s.store.setValue(`activity:${binding.id}`, { turnId: "captured-publishing-turn" });
+  const intent = await captureRestartIntent(s.store, root, 1234, 5000, "reconcile-only");
+  const recoveryKey = JSON.stringify([peerId, `restart-recovery:${intent.id}:${binding.id}`]);
+  s.store.claimInput(recoveryKey);
+  const uncertain = threadId === "01a06325-d3d0-7052-b495-371fcb7a2887";
+  s.store.finishInput(recoveryKey, uncertain);
+  s.runtime.tick = async () => { ticks++; };
+  s.desktop.inspectTask = async () => { profileReads++; return { status: "interrupted" } as never; };
+  s.runtime.handle = async () => { submissions++; };
+
+  const outcome = await s.runtime.recoverRestartIntent(root).then(() => null, (error: unknown) => error);
+
+  assert.deepEqual({ ticks, profileReads, submissions, scalarProbes },
+    { ticks: 0, profileReads: 0, submissions: 0, scalarProbes: 0 });
+  assert.match(String(outcome), /waiting for 1 Codex task owner/i);
+  assert.deepEqual(await readRestartIntent(root), intent);
+  assert.equal(s.store.pendingDeliveries().some(item => item.view.text.includes("запрос на продолжение")), false);
+  assert.equal(s.store.inputState(recoveryKey), uncertain ? "uncertain" : "done");
+});
+
 function readyManagedRestartOwner(store: BridgeStore, bindingId: string, threadId: string, ownerEpoch: string): void {
   const evidence = { backendGeneration: 1, registryRevision: 1,
     endpointRef: "123e4567-e89b-42d3-a456-426614174010",
@@ -651,6 +683,112 @@ function readyManagedRestartOwner(store: BridgeStore, bindingId: string, threadI
     { ownerEpoch, canonicalHome: "C:\\ManagedOwnerFixture", familyRoot: threadId, evidence });
   store.transitionManagedOwner(registering, "ready", evidence);
 }
+
+for (const proof of ["active", "settled", "unknown", "unclaimed"] as const) {
+  test(`reconcile-only managed restart requires an exact ${proof} proof without profile actions`, async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-reconcile-"));
+    t.after(async () => { await rm(root, { recursive: true, force: true }); });
+    let proofs = 0;
+    const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+      async () => { proofs++; return proof; });
+    s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+    s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+    readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, "123e4567-e89b-42d3-a456-426614174000");
+    const intent = await captureRestartIntent(s.store, root, 1234, 5000, "reconcile-only");
+    s.runtime.tick = async () => assert.fail("No recovery maintenance");
+    s.desktop.inspectTask = async () => assert.fail("No profile inspection");
+    s.runtime.handle = async () => assert.fail("No synthetic dispatch");
+
+    if (proof === "active" || proof === "settled") {
+      await s.runtime.recoverRestartIntent(root);
+      assert.equal(await readRestartIntent(root), null);
+    } else {
+      await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+      assert.deepEqual(await readRestartIntent(root), intent);
+    }
+    assert.equal(proofs, 1);
+  });
+}
+
+for (const mutation of ["detached-before-proof", "stream-during-proof", "peer-during-proof", "claim-aba-during-proof", "claim-at-archive"] as const) {
+  test(`reconcile-only restart retains original work after ${mutation}`, async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-reconcile-scope-"));
+    t.after(async () => { await rm(root, { recursive: true, force: true }); });
+    let proofs = 0;
+    const changeClaim = () => {
+      const owner = s.store.managedOwner(s.binding);
+      assert.ok(owner);
+      const unavailable = s.store.transitionManagedOwner(owner, "unavailable");
+      s.store.transitionManagedOwner(unavailable, "ready");
+    };
+    const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+      async () => {
+        proofs++;
+        if (mutation === "stream-during-proof") s.store.setValue(`stream-generation:${s.binding.id}`, 1);
+        if (mutation === "peer-during-proof") s.store.setChat(s.binding.id, s.peerId + 1, 18);
+        if (mutation === "claim-aba-during-proof") changeClaim();
+        return "active";
+      });
+    s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+    s.store.setValue(`activity:${s.binding.id}`, { turnId: "fixture-turn" });
+    readyManagedRestartOwner(s.store, s.binding.id, s.binding.threadId, "123e4567-e89b-42d3-a456-426614174000");
+    const intent = await captureRestartIntent(s.store, root, 1234, 5000, "reconcile-only");
+    if (mutation === "detached-before-proof") s.store.setAttached(s.binding.id, false);
+    if (mutation === "claim-at-archive") {
+      const atomic = s.store.atomic.bind(s.store);
+      let changed = false;
+      s.store.atomic = operation => {
+        if (!changed) { changed = true; changeClaim(); }
+        return atomic(operation);
+      };
+    }
+    s.runtime.tick = async () => assert.fail("No recovery maintenance");
+    s.desktop.inspectTask = async () => assert.fail("No profile inspection");
+    s.runtime.handle = async () => assert.fail("No synthetic dispatch");
+
+    await assert.rejects(s.runtime.recoverRestartIntent(root), /waiting for 1 Codex task owner/i);
+
+    assert.equal(proofs, mutation === "detached-before-proof" ? 0 : 1);
+    assert.deepEqual(await readRestartIntent(root), intent);
+  });
+}
+
+test("reconcile-only recovery is single-flight and rechecks all claims at archival", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-reconcile-singleflight-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let proofs = 0;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => {
+      proofs++;
+      if (proofs === 1) { entered(); await gate; }
+      else {
+        const previous = s.store.managedOwner(s.binding);
+        assert.ok(previous);
+        s.store.transitionManagedOwner(previous, "unavailable");
+      }
+      return "active";
+    });
+  const second = s.store.ensureBinding({ hostId: "local", threadId: "fixture-task-two", title: "Second", workspace: "/fixture", updatedAt: 1 });
+  s.store.setChat(second.id, s.peerId + 1, 18);
+  for (const binding of [s.binding, second]) {
+    s.store.setValue(`task-details:${binding.id}`, { status: "running" });
+    s.store.setValue(`activity:${binding.id}`, { turnId: "fixture-turn" });
+    readyManagedRestartOwner(s.store, binding.id, binding.threadId, "123e4567-e89b-42d3-a456-426614174000");
+  }
+  const intent = await captureRestartIntent(s.store, root, 1234, 5000, "reconcile-only");
+  const first = s.runtime.recoverRestartIntent(root);
+  const outcome = assert.rejects(first, /waiting for 1 Codex task owner/i);
+  await started;
+  assert.equal(s.runtime.recoverRestartIntent(root), first);
+  release();
+  await outcome;
+  assert.equal(proofs, 2);
+  assert.deepEqual(await readRestartIntent(root), intent);
+});
 
 test("managed restart recovery keeps an active intent when its exact managed turn is unknown", async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-managed-restart-unknown-"));

@@ -14,7 +14,7 @@ import type { BridgeHealthSnapshot } from "./contracts.js";
 import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
-import { archiveRestartIntent, readRestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
+import { archiveRestartIntent, archiveRestartIntentSync, readRestartIntent, type RestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
 import { comparablePath } from "../core/paths.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 import { MutableQueuedInputTurnError, QueueHistoryReadError } from "../desktop/input-reconciliation.js";
@@ -447,14 +447,64 @@ export class BridgeRuntime {
     } catch (error) { finish(); throw error; }
   }
 
-  /**
-   * Replays only the synthetic, durable recovery inputs captured before a
-   * controlled bridge restart. Existing VK inbox state remains the authority:
-   * calling this again after a crash cannot submit the same recovery turn twice.
-   */
-  async recoverRestartIntent(dataDir: string): Promise<void> {
+  private restartRecovery: Promise<void> | null = null;
+
+  /** V1 retains the explicitly requested continuation behavior. V2 only
+   * reconciles exact managed turns, never authorizing profile acquisition or input. */
+  recoverRestartIntent(dataDir: string): Promise<void> {
+    if (this.restartRecovery) return this.restartRecovery;
+    const work = this.recoverRestartIntentOnce(dataDir);
+    this.restartRecovery = work;
+    void work.then(() => { if (this.restartRecovery === work) this.restartRecovery = null; },
+      () => { if (this.restartRecovery === work) this.restartRecovery = null; });
+    return work;
+  }
+
+  private async reconcileRestartIntent(dataDir: string, intent: RestartIntent): Promise<void> {
+    const pending: RestartTaskSnapshot[] = [];
+    const verified: { snapshot: RestartTaskSnapshot; peerId: number }[] = [];
+    const matches = (snapshot: RestartTaskSnapshot, peerId: number): boolean => {
+      const binding = this.store.getBinding(snapshot.bindingId);
+      const claim = binding && this.store.managedOwner(binding);
+      return !this.stopped && !!binding && binding.attached && binding.peerId === peerId &&
+        sameTask(binding, snapshot) && this.store.streamGeneration(binding.id) === snapshot.generation &&
+        claim?.state === "ready" && claim.ownerEpoch === snapshot.ownerEpoch &&
+        claim.id === snapshot.ownerClaimId && claim.revision === snapshot.ownerClaimRevision;
+    };
+    for (const snapshot of intent.tasks) {
+      const binding = this.store.getBinding(snapshot.bindingId);
+      // Native scalar status cannot identify the captured turn. Keep that work
+      // unresolved, even if a previous synthetic input is marked settled.
+      if (!binding || binding.peerId === null || !snapshot.activeTurnId || !snapshot.ownerEpoch ||
+        !snapshot.ownerClaimId || snapshot.ownerClaimRevision === undefined ||
+        !matches(snapshot, binding.peerId) || !this.inspectManagedRestartTurn) {
+        pending.push(snapshot); continue;
+      }
+      const peerId = binding.peerId;
+      try {
+        const proof = await this.inspectManagedRestartTurn(binding, snapshot);
+        if ((proof === "active" || proof === "settled") && matches(snapshot, peerId)) {
+          verified.push({ snapshot, peerId }); continue;
+        }
+      } catch { /* An unknown original turn never authorizes a replacement. */ }
+      pending.push(snapshot);
+    }
+    if (pending.length) throw new Error(`Restart recovery is waiting for ${pending.length} Codex task owner(s)`);
+    // Pin every local claim through the actual archive write, not only before
+    // it. No asynchronous work runs under this brief bridge transaction.
+    this.store.atomic(() => {
+      for (const { snapshot, peerId } of verified) if (!matches(snapshot, peerId)) pending.push(snapshot);
+      if (pending.length) throw new Error(`Restart recovery is waiting for ${pending.length} Codex task owner(s)`);
+      archiveRestartIntentSync(dataDir, intent);
+    });
+  }
+
+  private async recoverRestartIntentOnce(dataDir: string): Promise<void> {
     const intent = await readRestartIntent(dataDir);
     if (!intent || this.stopped) return;
+    // This branch precedes recovery's tick/profile inspection. Runtime startup
+    // has its own maintenance; this is not a whole-process ingress fence.
+    if (intent.version === 2) return this.reconcileRestartIntent(dataDir, intent);
     // Refresh the durable task snapshot before deciding whether a turn truly
     // needs continuation; the value in SQLite is the pre-restart state.
     await this.tick(false);

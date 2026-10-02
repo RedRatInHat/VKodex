@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { loadDesktopBridgeConfig } from "../bridge/config.js";
-import { captureRestartIntentFromDatabase, restartIntentPath } from "./restart-intent.js";
+import { captureRestartIntentFromDatabase, parseRestartRecoveryPolicy, restartIntentPath } from "./restart-intent.js";
 
 interface RuntimeState { readonly status?: string; readonly pid?: number; readonly startedAt?: number }
 
@@ -13,6 +13,7 @@ const readState = async (path: string): Promise<RuntimeState | null> => {
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 async function main(): Promise<void> {
+  const recoveryPolicy = parseRestartRecoveryPolicy(process.argv.slice(2));
   const config = loadDesktopBridgeConfig();
   const runtimeStatePath = statePath(config.dataDir);
   const current = await readState(runtimeStatePath);
@@ -21,7 +22,8 @@ async function main(): Promise<void> {
     throw new Error("VKodex bridge is not running; no controlled restart was attempted.");
   }
   const oldPid: number = pid;
-  const intent = await captureRestartIntentFromDatabase(`${config.dataDir.replace(/[\\/]$/u, "")}/vkodex.sqlite`, config.dataDir, oldPid);
+  const intent = await captureRestartIntentFromDatabase(`${config.dataDir.replace(/[\\/]$/u, "")}/vkodex.sqlite`, config.dataDir, oldPid,
+    Date.now(), recoveryPolicy);
   process.stdout.write(`Captured ${intent.tasks.length} active task(s) in ${restartIntentPath(config.dataDir)}.\n`);
   process.kill(oldPid, "SIGTERM");
   const deadline = Date.now() + 120_000;
@@ -36,7 +38,7 @@ async function main(): Promise<void> {
   const recoveryDeadline = Date.now() + 120_000;
   while (Date.now() < recoveryDeadline) {
     if (!existsSync(restartIntentPath(config.dataDir))) {
-      process.stdout.write(`VKodex restarted with PID ${replacement.pid}; active tasks were handed to restart recovery.\n`);
+      process.stdout.write(`VKodex restarted with PID ${replacement.pid}; restart recovery completed (${recoveryPolicy}).\n`);
       return;
     }
     await sleep(1_000);
