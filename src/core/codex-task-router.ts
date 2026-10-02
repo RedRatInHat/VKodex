@@ -15,6 +15,8 @@ export interface CodexTaskOwner {
   drainIdleExecution?(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult>;
   restoreExecutionDrain?(task: TaskRef): void;
   owns(task: TaskRef): boolean;
+  /** Original immutable operation route, independent of fresh command ownership. */
+  ownsOperation?(task: TaskRef, operationId: string): boolean;
   /** Ensure this owner's route is ready without starting a turn. */
   ensureOpen?(task: TaskRef): Promise<void>;
   submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt>;
@@ -52,6 +54,11 @@ export class RoutedCodexTasks implements CodexTasks {
     if (exclusive.length > 1) throw new ActionRejectedError("Для задачи найдено несколько исключительных владельцев.");
     return exclusive[0] ?? this.owners.find(owner => owner.routingPolicy !== "exclusive" && owner.owns(task));
   }
+  private operationOwner(task: TaskRef, operationId: string): CodexTaskOwner | undefined {
+    const original = this.owners.filter(owner => owner.ownsOperation?.(task, operationId) === true);
+    if (original.length > 1) throw new ActionRejectedError("Неоднозначный исходный исполнитель операции.");
+    return original[0] ?? this.owner(task);
+  }
   private refuseExclusive(task: TaskRef): void {
     if (this.owner(task)?.routingPolicy === "exclusive")
       this.unsupportedExclusive();
@@ -81,7 +88,7 @@ export class RoutedCodexTasks implements CodexTasks {
     }
   }
   async findAcceptedInput(task: TaskRef, operationId: string): Promise<string | null> {
-    const owner = this.owner(task);
+    const owner = this.operationOwner(task, operationId);
     if (owner) {
       try {
         const accepted = await owner.findAcceptedInput(task, operationId);
@@ -95,7 +102,7 @@ export class RoutedCodexTasks implements CodexTasks {
   async scanTerminalQueuedInput(task: TaskRef, clientId: string,
     cursor: import("./codex-tasks.js").QueuedInputHistoryCursor | null):
     Promise<import("./codex-tasks.js").QueuedInputHistoryScan> {
-    const owner = this.owner(task);
+    const owner = this.operationOwner(task, clientId);
     if (owner?.routingPolicy === "exclusive" && !owner.scanTerminalQueuedInput)
       throw new DesktopUnavailableError("Сверка терминальной истории недоступна для этого исполнителя.");
     if (owner?.scanTerminalQueuedInput) return owner.scanTerminalQueuedInput(task, clientId, cursor);
@@ -104,7 +111,7 @@ export class RoutedCodexTasks implements CodexTasks {
     return this.base.scanTerminalQueuedInput(task, clientId, cursor);
   }
   async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
-    const owner = this.owner(task);
+    const owner = this.operationOwner(task, operationId);
     if (owner) {
       const queued = await owner.findQueuedSubmission?.(task, operationId) ?? null;
       if (owner.routingPolicy === "exclusive" || queued) return queued;
@@ -112,7 +119,7 @@ export class RoutedCodexTasks implements CodexTasks {
     return this.base.findQueuedSubmission?.(task, operationId) ?? null;
   }
   async findQueuedSubmissionOutcome(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null> {
-    const owner = this.owner(task);
+    const owner = this.operationOwner(task, operationId);
     if (owner) {
       const outcome = await owner.findQueuedSubmissionOutcome?.(task, operationId) ?? null;
       if (owner.routingPolicy === "exclusive" || outcome) return outcome;

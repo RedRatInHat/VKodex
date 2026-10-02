@@ -80,6 +80,9 @@ export interface AppServerRequestOptions {
   readonly onLateResponseEnvelope?: (envelope: AppServerResponseEnvelope) => void;
   /** Synchronous authority fence after start() and immediately before wire write. */
   readonly assertBeforeWrite?: () => void;
+  /** Trusted synchronous authority transaction around the actual stdin write.
+   * Must invoke write exactly once and return void; never spans RPC/ACK waits. */
+  readonly withWriteGuard?: (write: () => void) => void;
   /** Called only when that final fence throws before ID allocation or any wire
    * attempt. The original refusal remains the request error. */
   readonly onBeforeWriteRefused?: () => void;
@@ -173,6 +176,7 @@ export class AppServerConnection implements AppServerRpc {
   private stopped = false;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly lateResponseReceipts = new Map<number, LateResponseReceipt>();
+  private guardedInbound: Array<{ child: AppServerWireEndpoint; generation: number; chunk: string }> | null = null;
   private readonly pendingServerRequests = new Map<string | number, PendingServerRequest>();
   private readonly notificationListeners = new Set<(notification: AppServerEnvelope) => void>();
   private readonly disconnectListeners = new Set<(error: Error) => void>();
@@ -298,6 +302,58 @@ export class AppServerConnection implements AppServerRpc {
         rejectionMethod: ["initialize", "turn/start", "turn/steer", "thread/queue/add", "thread/settings/update"].includes(method)
           ? method as NonNullable<AppServerRejectedError["requestMethod"]> : null,
         onResponseEnvelope: options.onResponseEnvelope });
+      if (options.withWriteGuard !== undefined) {
+        let enteredWrite = false, wireFailed = false, callbackInvoked = false, invalid = false, active = true;
+        const heldInbound: NonNullable<AppServerConnection['guardedInbound']> = [];
+        this.guardedInbound = heldInbound;
+        try {
+          const guard = options.withWriteGuard;
+          if (typeof guard !== 'function' || Object.prototype.toString.call(guard) === '[object AsyncFunction]')
+            throw new TypeError('Actual-write guard must be synchronous');
+          // Serialize before taking the authority transaction. Only the actual
+          // synchronous write and its immediate availability checks are guarded.
+          const frame = `${JSON.stringify({ id, method, params })}\n`;
+          const returned: unknown = guard(() => {
+            // A retained callback is permanently inert after guard exit. The
+            // original request already refused a wrapper that omitted its call;
+            // do not let a detached promise crash the backend event loop.
+            if (!active) return;
+            if (callbackInvoked) { invalid = true; throw new TypeError('Actual-write callback must run once'); }
+            callbackInvoked = true;
+            if (this.child !== child || this.generation !== generation || child.stdin.destroyed ||
+                child.stdin.writableEnded || !child.stdin.writable ||
+                options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))
+              throw new AppServerUnavailableError();
+            enteredWrite = true;
+            try { child.stdin.write(frame); }
+            catch (error) { wireFailed = true; throw error; }
+          });
+          if (returned !== undefined) {
+            void Promise.resolve(returned).catch(() => {});
+            throw new TypeError('Actual-write guard must return void');
+          }
+          if (!callbackInvoked || invalid || wireFailed) throw new TypeError('Actual-write guard did not complete once');
+        } catch (error) {
+          clearTimeout(timer); this.pending.delete(id);
+          if (!enteredWrite) {
+            try { options.onBeforeWriteRefused?.(); } catch { /* preserve refusal */ }
+            reject(error);
+          } else {
+            reject(options.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());
+            if (!wireFailed && options.mutating && options.expectedGeneration === generation &&
+                this.isSessionCurrent(generation) && options.onLateResponseEnvelope) {
+              this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope });
+              if (this.lateResponseReceipts.size > MAX_LATE_RESPONSE_RECEIPTS)
+                this.lateResponseReceipts.delete(this.lateResponseReceipts.keys().next().value!);
+            }
+            if (wireFailed) this.failConnection(child, generation, new AppServerUnavailableError(), id);
+          }
+        } finally {
+          active = false; this.guardedInbound = null;
+        }
+        for (const incoming of heldInbound) this.receive(incoming.child, incoming.generation, incoming.chunk);
+        return;
+      }
       try { this.write(child, { id, method, params }); }
       catch {
         clearTimeout(timer); this.pending.delete(id);
@@ -314,6 +370,10 @@ export class AppServerConnection implements AppServerRpc {
 
   private receive(child: AppServerWireEndpoint, generation: number, chunk: string): void {
     if (this.child !== child || this.generation !== generation) return;
+    // A synchronous test/local wire can respond inside stdin.write. Finish the
+    // authority transaction before processing ACKs, preserving wire ordering
+    // with all following notifications and server requests.
+    if (this.guardedInbound) { this.guardedInbound.push({ child, generation, chunk }); return; }
     let start = 0;
     while (start < chunk.length && this.child === child && this.generation === generation) {
       const end = chunk.indexOf("\n", start);

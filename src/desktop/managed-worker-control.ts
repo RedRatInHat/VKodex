@@ -2,7 +2,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
-import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest } from '../core/codex-tasks.js';
+import { ActionRejectedError, UncertainActionError, type SubmitTaskRequest,
+  type QueuedInputHistoryCursor, type QueuedInputHistoryScan } from '../core/codex-tasks.js';
 import type { IpcRequestFailureCategory } from './ipc-client.js';
 import type { ComposerIngressDiagnosis } from './managed-worker-native-owner.js';
 import type { NativeCliCanaryEvidence } from './managed-worker-daemon.js';
@@ -92,7 +93,22 @@ export interface ManagedWorkerControlOptions {
     submit: (expected: ManagedWorkerVkScope, request: SubmitTaskRequest) =>
       Promise<Readonly<{ submissionId: string }>>;
     statusByOperationId: (expected: ManagedWorkerVkScope, operationId: string) => ManagedWorkerVkStatus | null;
+    scanTerminalQueuedInput?: (expected: ManagedWorkerVkScope, operationId: string,
+      cursor: QueuedInputHistoryCursor | null) => Promise<QueuedInputHistoryScan>;
   }>;
+  /** New writes require both immutable worker identity and the exact ready bridge claim.
+   * Read-only receipt recovery deliberately remains on original-worker v2. */
+  readonly vkClaimed?: Readonly<{
+    isScopeCurrent: (expected: ManagedWorkerVkScope) => boolean;
+    isClaimCurrent: (expected: ManagedWorkerClaimedVkScope) => boolean;
+    ingressStatus: (expected: ManagedWorkerClaimedVkScope) => ManagedWorkerVkIngressStatus;
+    submit: (expected: ManagedWorkerClaimedVkScope, request: SubmitTaskRequest) =>
+      Promise<Readonly<{ submissionId: string }>>;
+  }>;
+}
+export interface ManagedWorkerClaimedVkScope extends ManagedWorkerVkScope {
+  readonly claimId: string;
+  readonly claimRevision: number;
 }
 export interface ManagedWorkerVkScope extends ManagedWorkerHandoffScope {
   readonly ownerEpoch: string;
@@ -159,6 +175,42 @@ export function validManagedWorkerVkScope(value: unknown): value is ManagedWorke
   return typeof value.ownerEpoch === 'string' && uuid.test(value.ownerEpoch) &&
     text(value.taskId, 256) && positive(value.backendGeneration) && positive(value.registryRevision) &&
     typeof value.endpointRef === 'string' && uuid.test(value.endpointRef);
+}
+export function validManagedWorkerClaimedVkScope(value: unknown): value is ManagedWorkerClaimedVkScope {
+  const keys = [...managedWorkerVkScopeKeys, 'claimId', 'claimRevision'];
+  if (!exactPlain(value, keys) || !keys.every(key =>
+    Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, 'value'))) return false;
+  const worker = Object.fromEntries(managedWorkerVkScopeKeys.map(key => [key, value[key]]));
+  return validManagedWorkerVkScope(worker) && typeof value.claimId === 'string' && uuid.test(value.claimId) &&
+    Number.isSafeInteger(value.claimRevision) && (value.claimRevision as number) >= 1;
+}
+function currentClaimedScope(options: NonNullable<ManagedWorkerControlOptions['vkClaimed']>,
+  expected: ManagedWorkerClaimedVkScope): boolean {
+  try {
+    const worker = Object.fromEntries(managedWorkerVkScopeKeys.map(key => [key, expected[key]])) as
+      unknown as ManagedWorkerVkScope;
+    const workerResult: unknown = options.isScopeCurrent(worker);
+    if (workerResult !== true) { void Promise.resolve(workerResult).catch(() => {}); return false; }
+    const claimResult: unknown = options.isClaimCurrent(expected);
+    if (claimResult === true) return true;
+    void Promise.resolve(claimResult).catch(() => {});
+  } catch { /* No current write authority. */ }
+  return false;
+}
+export function validManagedQueueCursor(value: unknown): value is QueuedInputHistoryCursor | null {
+  if (value === null) return true;
+  if (!exactPlain(value, ['scanVersion', 'headDigest', 'cursor', 'seenCursors', 'pages']) ||
+    value.scanVersion !== 3 || typeof value.headDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(value.headDigest) ||
+    !text(value.cursor, 1024) || !positive(value.pages) || value.pages > 5000 ||
+    !denseArray(value.seenCursors, 5000) || value.seenCursors.length !== value.pages ||
+    !value.seenCursors.every(item => text(item, 1024) && Buffer.byteLength(item) <= 1024) ||
+    new Set(value.seenCursors).size !== value.pages || value.seenCursors.at(-1) !== value.cursor ||
+    value.seenCursors.reduce<number>((sum, item) => sum + Buffer.byteLength(item as string), 0) > 1024 * 1024) return false;
+  return true;
+}
+export function validManagedQueueScan(value: unknown): value is QueuedInputHistoryScan {
+  return exactPlain(value, ['done', 'turnId']) && value.done === true && (value.turnId === null || text(value.turnId, 256)) ||
+    exactPlain(value, ['done', 'cursor']) && value.done === false && value.cursor !== null && validManagedQueueCursor(value.cursor);
 }
 /** Accidental asynchronous authorization is never authority. Observe rejected
  * promises without awaiting them or leaking an unhandled rejection. */
@@ -368,7 +420,11 @@ export class ManagedWorkerControlServer {
           typeof options.vk.status !== 'function' || typeof options.vk.statusByOperationId !== 'function') ||
         options.vkV2 !== undefined && (!options.vkV2 ||
           typeof options.vkV2.isScopeCurrent !== 'function' || typeof options.vkV2.ingressStatus !== 'function' ||
-          typeof options.vkV2.submit !== 'function' || typeof options.vkV2.statusByOperationId !== 'function') ||
+          typeof options.vkV2.submit !== 'function' || typeof options.vkV2.statusByOperationId !== 'function' ||
+          options.vkV2.scanTerminalQueuedInput !== undefined && typeof options.vkV2.scanTerminalQueuedInput !== 'function') ||
+        options.vkClaimed !== undefined && (!options.vkClaimed ||
+          typeof options.vkClaimed.isScopeCurrent !== 'function' || typeof options.vkClaimed.isClaimCurrent !== 'function' ||
+          typeof options.vkClaimed.ingressStatus !== 'function' || typeof options.vkClaimed.submit !== 'function') ||
         options.handoff !== undefined && (!options.handoff ||
           typeof options.handoff.revoke !== 'function' ||
           typeof options.handoff.qualify !== 'function') ||
@@ -380,6 +436,7 @@ export class ManagedWorkerControlServer {
       authenticatedIdleTimeoutMs: idleTimeout,
       ...(options.vk ? { vk: Object.freeze({ ...options.vk }) } : {}),
       ...(options.vkV2 ? { vkV2: Object.freeze({ ...options.vkV2 }) } : {}),
+      ...(options.vkClaimed ? { vkClaimed: Object.freeze({ ...options.vkClaimed }) } : {}),
       ...(options.handoff ? { handoff: Object.freeze({ ...options.handoff }) } : {}) });
     this.#token = Buffer.from(token);
     this.#idleTimeout = idleTimeout;
@@ -421,9 +478,11 @@ export class ManagedWorkerControlServer {
     socket.on('data', (chunk: Buffer) => {
       if (this.#closed) { socket.destroy(); return; }
       buffer += decoder.write(chunk);
-      if (Buffer.byteLength(buffer) > (authenticated ? 128 * 1024 : 8192)) { socket.destroy(); return; }
+      const scanBudget = authenticated && buffer.includes('"method":"vk-terminal-input-scan-v2"');
+      if (Buffer.byteLength(buffer) > (scanBudget ? 2 * 1024 * 1024 : authenticated ? 128 * 1024 : 8192)) { socket.destroy(); return; }
       while (!socket.destroyed && buffer.includes('\n')) {
         const end = buffer.indexOf('\n'); let frame: unknown;
+        const frameBytes = Buffer.byteLength(buffer.slice(0, end));
         try { frame = JSON.parse(buffer.slice(0, end)); } catch { socket.destroy(); return; }
         buffer = buffer.slice(end + 1);
         if (!object(frame)) { socket.destroy(); return; }
@@ -440,13 +499,19 @@ export class ManagedWorkerControlServer {
         const vkMethod = frame.method === 'submit-vk-v1' || frame.method === 'vk-submission-status-v1' ||
           frame.method === 'vk-submission-status-by-id-v1';
         const vkV2Method = frame.method === 'vk-ingress-status-v2' || frame.method === 'submit-vk-v2' ||
-          frame.method === 'vk-submission-status-by-id-v2';
+          frame.method === 'vk-submission-status-by-id-v2' || frame.method === 'vk-terminal-input-scan-v2';
+        if (frameBytes > 128 * 1024 && frame.method !== 'vk-terminal-input-scan-v2') { socket.destroy(); return; }
+        const vkClaimedMethod = frame.method === 'vk-ingress-status-claimed-v1' || frame.method === 'submit-vk-claimed-v1';
         const handoffMethod = frame.method === 'revoke-ingress-v1' || frame.method === 'qualify-handoff-v1';
         const cliCanaryMethod = frame.method === 'cli-canary-evidence-v1';
-        if (!(vkV2Method ? exact(frame, ['id', 'epoch', 'taskId', 'method',
+        if (!(vkClaimedMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method', 'backendGeneration',
+          'registryRevision', 'endpointRef', 'claimId', 'claimRevision',
+          ...(frame.method === 'submit-vk-claimed-v1' ? ['request'] : [])]) :
+          vkV2Method ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           'backendGeneration', 'registryRevision', 'endpointRef',
           ...(frame.method === 'submit-vk-v2' ? ['request'] :
-            frame.method === 'vk-submission-status-by-id-v2' ? ['operationId'] : [])]) :
+            frame.method === 'vk-submission-status-by-id-v2' ? ['operationId'] :
+              frame.method === 'vk-terminal-input-scan-v2' ? ['operationId', 'cursor'] : [])]) :
           handoffMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           'backendGeneration', 'registryRevision']) : vkMethod ? exact(frame, ['id', 'epoch', 'taskId', 'method',
           frame.method === 'vk-submission-status-by-id-v1' ? 'operationId' : 'request']) :
@@ -454,30 +519,73 @@ export class ManagedWorkerControlServer {
           exact(frame, ['id', 'epoch', 'method'])) || frame.epoch !== this.#options.ownerEpoch ||
             vkMethod && (frame.taskId !== this.#options.taskId || !this.#options.vk) ||
             vkV2Method && (frame.taskId !== this.#options.taskId || !this.#options.vkV2) ||
+            vkClaimedMethod && (frame.taskId !== this.#options.taskId || !this.#options.vkClaimed) ||
             cliCanaryMethod && (frame.taskId !== this.#options.taskId || !this.#options.cliCanaryEvidence) ||
             handoffMethod && (frame.taskId !== this.#options.taskId || !this.#options.handoff ||
               !positive(frame.backendGeneration) || !positive(frame.registryRevision)) ||
             !['status', 'diagnose-v1', 'stop', 'cli-canary-evidence-v1', 'submit-vk-v1', 'vk-submission-status-v1',
               'vk-submission-status-by-id-v1', 'revoke-ingress-v1',
               'qualify-handoff-v1', 'vk-ingress-status-v2', 'submit-vk-v2',
-              'vk-submission-status-by-id-v2'].includes(String(frame.method)) ||
+              'vk-submission-status-by-id-v2', 'vk-terminal-input-scan-v2', 'vk-ingress-status-claimed-v1', 'submit-vk-claimed-v1'].includes(String(frame.method)) ||
             ids.has(id) || ids.size >= 1024 || outstanding >= 16) {
           send({ id, error: 'refused' }); continue;
         }
         ids.add(id);
+        if (vkClaimedMethod) {
+          const expected = Object.freeze({ ownerEpoch: frame.epoch as string, taskId: frame.taskId as string,
+            backendGeneration: frame.backendGeneration as number, registryRevision: frame.registryRevision as number,
+            endpointRef: frame.endpointRef as string, claimId: frame.claimId as string, claimRevision: frame.claimRevision as number });
+          const options = this.#options.vkClaimed!;
+          if (!validManagedWorkerClaimedVkScope(expected) ||
+            frame.method === 'submit-vk-claimed-v1' && !validManagedVkControlRequest(frame.request, expected.taskId) ||
+            !currentClaimedScope(options, expected)) { send({ id, error: 'refused' }); continue; }
+          if (frame.method === 'submit-vk-claimed-v1') {
+            outstanding++;
+            void Promise.resolve().then(() => {
+              if (!currentClaimedScope(options, expected)) throw new ActionRejectedError('Managed claim changed');
+              return options.submit(expected, frame.request as SubmitTaskRequest);
+            }).then(result => {
+              if (!exactPlain(result, ['submissionId']) || !text(result.submissionId, 256)) throw new Error();
+              // A returned real receipt belongs to the captured write. Claim revocation cannot erase it.
+              send({ id, result: { ...expected, submissionId: result.submissionId } });
+            }, error => send({ id, error: error instanceof ActionRejectedError ? 'rejected' : 'unknown' }))
+              .catch(() => send({ id, error: 'unknown' })).finally(() => { outstanding--; });
+          } else {
+            try {
+              const status = options.ingressStatus(expected);
+              void Promise.resolve(status).catch(() => {});
+              if (!exactPlain(status, ['capability', 'admissionOpen']) || status.capability !== 'stock-idle-queue-v2' ||
+                typeof status.admissionOpen !== 'boolean' || !currentClaimedScope(options, expected)) throw new Error();
+              send({ id, result: { ...expected, ...status } });
+            } catch { send({ id, error: 'status-unavailable' }); }
+          }
+          continue;
+        }
         if (vkV2Method) {
           const expected = Object.freeze({ ownerEpoch: frame.epoch as string,
             taskId: frame.taskId as string, backendGeneration: frame.backendGeneration as number,
             registryRevision: frame.registryRevision as number, endpointRef: frame.endpointRef as string });
           const options = this.#options.vkV2!;
           const lookup = frame.method === 'vk-submission-status-by-id-v2';
+          const scan = frame.method === 'vk-terminal-input-scan-v2';
           if (!validManagedWorkerVkScope(expected) ||
             frame.method === 'submit-vk-v2' && !validManagedVkControlRequest(frame.request, expected.taskId) ||
-            lookup && (typeof frame.operationId !== 'string' || !uuid.test(frame.operationId))) {
+            (lookup || scan) && (typeof frame.operationId !== 'string' || !uuid.test(frame.operationId)) ||
+            scan && (!options.scanTerminalQueuedInput || !validManagedQueueCursor(frame.cursor))) {
             send({ id, error: 'refused' }); continue;
           }
           if (!currentVkScope(options, expected)) {
-            send({ id, error: lookup ? 'status-unavailable' : 'refused' }); continue;
+            send({ id, error: lookup || scan ? 'status-unavailable' : 'refused' }); continue;
+          }
+          if (scan) {
+            outstanding++;
+            void Promise.resolve().then(() => options.scanTerminalQueuedInput!(expected, frame.operationId as string,
+              frame.cursor as QueuedInputHistoryCursor | null)).then(result => {
+              if (!validManagedQueueScan(result) || !currentVkScope(options, expected)) throw new Error();
+              send({ id, result: { ...expected, scan: result } });
+            }, () => send({ id, error: 'status-unavailable' })).catch(() => send({ id, error: 'status-unavailable' }))
+              .finally(() => { outstanding--; });
+            continue;
           }
           if (frame.method === 'submit-vk-v2') {
             outstanding++;

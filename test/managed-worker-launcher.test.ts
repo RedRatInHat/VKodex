@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import { launchManagedWorker, ManagedWorkerLaunchError } from '../src/desktop/ma
 import { buildManagedWorkerEnvironment, buildDetachedWorkerSpawnOptions } from '../src/desktop/managed-worker-environment.js';
 import { approveTaskPolicy } from '../src/codex/managed-task-policy.js';
 import { BridgeStore } from '../src/bridge/store.js';
+import * as claimReadback from '../src/desktop/managed-worker-claim-readback.js';
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), 'vkodex-launcher-'));
@@ -428,4 +429,176 @@ test('a spawned process without usable identity has unknown outcome, not a retry
     assert.equal(error.outcome, 'unknown'); return true;
   });
   assert.equal(detached, true);
+});
+
+function readyClaimFixture() {
+  const { root, options } = fixture();
+  const registry = new ManagedWorkerRegistry(options.registryPath);
+  const host = { pid: 101, birthTicks: '123' }, backend = { pid: 102, birthTicks: '124', generation: 1 };
+  let ready = registry.reserve(root, 'own-task');
+  ready = registry.registerHost(ready, host);
+  ready = registry.registerBackend(ready, host, backend);
+  ready = registry.markReady(ready, host, backend, randomUUID());
+  registry.close();
+  const storePath = path.join(root, 'bridge.sqlite'), store = new BridgeStore(storePath);
+  const binding = store.ensureBinding({ hostId: 'local', threadId: 'own-task', sourceId: 'source',
+    title: 'Ready fixture', workspace: root, updatedAt: 1 });
+  const claim = store.transitionManagedOwner(store.claimManagedOwner(binding.id, {
+    ownerEpoch: ready.epoch, canonicalHome: ready.canonicalHome, familyRoot: ready.familyRoot }), 'ready', {
+    registryRevision: ready.revision, backendGeneration: backend.generation,
+    endpointRef: ready.endpointRef!, host, backend: { pid: backend.pid, birthTicks: backend.birthTicks },
+  });
+  return { store, ready, claim, reference: { storePath, bindingId: binding.id, claimId: claim.id } };
+}
+
+test('ready claim guard locks exact readback through synchronous write and then releases it', () => {
+  const f = readyClaimFixture(); let writes = 0;
+  const competing = new DatabaseConstructor(f.reference.storePath);
+  competing.pragma('busy_timeout = 0');
+  try {
+    claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready, 'own-task', 'source',
+      f.claim.revision, () => {
+        assert.throws(() => competing.prepare('UPDATE managed_owner_bindings SET revision = revision + 1 WHERE id = ?')
+          .run(f.claim.id), /locked/u);
+        writes++;
+      });
+    assert.equal(writes, 1);
+    assert.equal(competing.prepare('UPDATE managed_owner_bindings SET revision = revision + 1 WHERE id = ?')
+      .run(f.claim.id).changes, 1);
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    assert.equal(writes, 1);
+  } finally { competing.close(); f.store.close(); }
+});
+
+test('ready claim guard refuses every stale worker or bridge identity before write', () => {
+  const fields = ['id', 'binding_id', 'host_id', 'thread_id', 'source_id', 'owner_epoch',
+    'canonical_home', 'family_root', 'state', 'revision', 'backend_generation', 'registry_revision',
+    'endpoint_ref', 'host_pid', 'host_birth', 'backend_pid', 'backend_birth'];
+  for (const field of fields) {
+    const f = readyClaimFixture(); const db = new DatabaseConstructor(f.reference.storePath);
+    try {
+      db.pragma('foreign_keys = OFF');
+      const value = ['revision', 'backend_generation', 'registry_revision', 'host_pid', 'backend_pid'].includes(field)
+        ? 999 : field === 'state' ? 'unavailable' : 'foreign';
+      db.prepare(`UPDATE managed_owner_bindings SET ${field} = ? WHERE id = ?`).run(value, f.claim.id);
+      let writes = 0;
+      assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+        'own-task', 'source', f.claim.revision, () => { writes++; }),
+      error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched', field);
+      assert.equal(writes, 0, field);
+    } finally { db.close(); f.store.close(); }
+  }
+  for (const [field, value] of [['attached', 0], ['host_id', 'remote'], ['thread_id', 'foreign'], ['source_id', 'foreign']] as const) {
+    const f = readyClaimFixture(); const db = new DatabaseConstructor(f.reference.storePath);
+    try {
+      db.prepare(`UPDATE bridge_bindings SET ${field} = ? WHERE id = ?`).run(value, f.reference.bindingId);
+      assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+        'own-task', 'source', f.claim.revision, () => { assert.fail('must not write'); }),
+      error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    } finally { db.close(); f.store.close(); }
+  }
+});
+
+test('ready guard rejects async write before entry and classifies write failure unknown', () => {
+  const f = readyClaimFixture(); let writes = 0;
+  try {
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, async () => { writes++; }),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    assert.equal(writes, 0);
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; throw new Error('write failed'); }),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'unknown');
+    assert.equal(writes, 1);
+    // Ready readback must never relax the revision-zero launch path.
+    assert.throws(() => claimReadback.readManagedWorkerClaim({ storePath: f.reference.storePath,
+      bindingId: f.reference.bindingId }, f.ready, 'own-task'));
+  } finally { f.store.close(); }
+});
+
+test('ready guard close ambiguity is unknown after callback, not-dispatched before callback', () => {
+  const f = readyClaimFixture(); let writes = 0;
+  const prototype = DatabaseConstructor.prototype;
+  const close = prototype.close;
+  prototype.close = function () { close.call(this); throw new Error('close ambiguous'); };
+  try {
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'unknown');
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'wrong-source', f.claim.revision, () => { writes++; }),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    assert.equal(writes, 1);
+  } finally { prototype.close = close; f.store.close(); }
+});
+
+test('ready operation guard refuses stale original stream generation with unchanged claim revision', () => {
+  const f = readyClaimFixture(), operationId = randomUUID();
+  const task = { hostId: 'local', threadId: 'own-task', sourceId: 'source' };
+  const db = new DatabaseConstructor(f.reference.storePath); let writes = 0;
+  try {
+    f.store.recordOperation(operationId, task);
+    f.store.captureManagedOperationAuthority(operationId, task, f.claim, 0);
+    db.prepare('INSERT INTO bridge_values(key, value) VALUES (?, ?)').run(
+      `stream-generation:${f.reference.bindingId}`, JSON.stringify(1));
+    assert.equal(f.store.managedOwner(task)?.revision, f.claim.revision);
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }, operationId),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    assert.equal(writes, 0);
+  } finally { db.close(); f.store.close(); }
+});
+
+test('ready operation guard refuses missing and malformed immutable authority before write', () => {
+  const f = readyClaimFixture(), operationId = randomUUID();
+  const task = { hostId: 'local', threadId: 'own-task', sourceId: 'source' };
+  const db = new DatabaseConstructor(f.reference.storePath); let writes = 0;
+  const refuse = () => assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference,
+    f.ready, 'own-task', 'source', f.claim.revision, () => { writes++; }, operationId),
+  error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+  try {
+    f.store.recordOperation(operationId, task);
+    refuse();
+    const authority = f.store.captureManagedOperationAuthority(operationId, task, f.claim, 0);
+    for (const malformed of ['not-json', JSON.stringify({ ...authority, schemaVersion: 2 }),
+      JSON.stringify({ ...authority, operationId: randomUUID() }),
+      JSON.stringify({ ...authority, taskKey: 'foreign' }),
+      JSON.stringify({ ...authority, bindingId: randomUUID() }),
+      JSON.stringify({ ...authority, streamGeneration: -1 }),
+      JSON.stringify({ ...authority, streamGeneration: null }),
+      JSON.stringify({ ...authority, claim: { ...authority.claim, revision: authority.claim.revision + 1 } }),
+      JSON.stringify({ ...authority, claim: { ...authority.claim, evidence: { ...authority.claim.evidence,
+        host: { pid: authority.claim.evidence.host!.pid, birthTicks: '999' } } } })]) {
+      db.prepare('UPDATE bridge_managed_operation_authorities SET authority = ? WHERE operation_id = ?')
+        .run(malformed, operationId);
+      refuse();
+    }
+    assert.equal(writes, 0);
+  } finally { db.close(); f.store.close(); }
+});
+
+test('ready operation guard accepts the immutable original scope in sending and uncertain states', () => {
+  const f = readyClaimFixture(), operationId = randomUUID();
+  const task = { hostId: 'local', threadId: 'own-task', sourceId: 'source' };
+  const db = new DatabaseConstructor(f.reference.storePath); let writes = 0;
+  try {
+    f.store.recordOperation(operationId, task);
+    f.store.captureManagedOperationAuthority(operationId, task, f.claim, 0);
+    claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }, operationId);
+    f.store.finishOperation(operationId, 'uncertain');
+    claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }, operationId);
+    assert.equal(writes, 2);
+    // Readback must neither rewrite original authority nor rebind its generation.
+    assert.equal(f.store.managedOperationAuthority(task, operationId)?.streamGeneration, 0);
+    db.prepare('UPDATE bridge_managed_operation_authorities SET task_key = ? WHERE operation_id = ?')
+      .run('foreign', operationId);
+    assert.throws(() => claimReadback.withReadyManagedWorkerClaimDispatch(f.reference, f.ready,
+      'own-task', 'source', f.claim.revision, () => { writes++; }, operationId),
+    error => error instanceof claimReadback.ManagedWorkerClaimDispatchError && error.outcome === 'not-dispatched');
+    assert.equal(writes, 2);
+  } finally { db.close(); f.store.close(); }
 });

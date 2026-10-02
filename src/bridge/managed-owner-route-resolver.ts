@@ -4,13 +4,15 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import DatabaseConstructor from 'better-sqlite3';
 import type { TaskRef } from '../core/codex-tasks.js';
+import { comparablePath } from '../core/paths.js';
 import type { TaskStateTransport } from '../core/task-state.js';
-import type { BridgeStore, ManagedOwnerBinding, ManagedOwnerProcessIdentity } from './store.js';
+import type { BridgeStore, ManagedOperationAuthority, ManagedOwnerBinding, ManagedOwnerProcessIdentity } from './store.js';
 import { ManagedWorkerStateTransport } from '../codex/managed-worker-state-transport.js';
 import { ManagedWorkerControlClient, type ManagedWorkerScopedControlStatus } from
   '../desktop/managed-worker-control-client.js';
 import type { ManagedWorkerControlHandoffProof, ManagedWorkerHandoffScope } from
   '../desktop/managed-worker-control.js';
+import type { ManagedWorkerClaimedVkScope, ManagedWorkerVkScope } from '../desktop/managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type LoadManagedWorkerPrivateStateOptions } from
   '../desktop/managed-worker-private-state.js';
 import { deriveManagedTaskStateToken } from '../desktop/managed-worker-task-state-token.js';
@@ -33,6 +35,7 @@ const identity = (value: unknown, backend: boolean): value is Row =>
 export interface ManagedOwnerRouteResolverOptions {
   readonly store: Pick<BridgeStore, 'managedOwner'>;
   readonly privateBaseDirectory: string;
+  readonly bridgeStorePath?: string;
   /** Test seam only; production uses DPAPI and the protected filesystem. */
   readonly privateStateOptions?: PrivateStateDependencies;
   /** Test seam only; production queries both same-machine PID birth identities. */
@@ -51,6 +54,22 @@ export type ManagedOwnerHandoffResolution =
   | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding;
       revokeIngress: (expected: ManagedWorkerHandoffScope) => Promise<ManagedWorkerHandoffScope>;
       qualify: (expected: ManagedWorkerHandoffScope) => Promise<ManagedWorkerControlHandoffProof> }>;
+export type ManagedOwnerIngressResolution =
+  | Readonly<{ kind: 'unclaimed' }>
+  | Readonly<{ kind: 'unavailable'; claim: ManagedOwnerBinding }>
+  | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding; scope: ManagedWorkerClaimedVkScope;
+      client: Pick<ManagedWorkerControlClient, 'ingressStatusClaimed' | 'submitVkClaimed' |
+        'vkSubmissionStatusByOperationIdV2' | 'scanTerminalQueuedInputV2'> }>;
+export interface ManagedOwnerIngressResolver {
+  isCurrent(claim: ManagedOwnerBinding): boolean;
+  resolveIngress(task: TaskRef): Promise<ManagedOwnerIngressResolution>;
+  resolveOutcome(authority: ManagedOperationAuthority): Promise<ManagedOwnerOutcomeResolution>;
+}
+export type ManagedOwnerOutcomeResolution =
+  | Readonly<{ kind: 'unclaimed' }>
+  | Readonly<{ kind: 'unavailable'; claim: ManagedOwnerBinding }>
+  | Readonly<{ kind: 'statically-qualified'; claim: ManagedOwnerBinding; scope: ManagedWorkerVkScope;
+      client: Pick<ManagedWorkerControlClient, 'vkSubmissionStatusByOperationIdV2' | 'scanTerminalQueuedInputV2'> }>;
 
 interface RegistryReadyRow {
   epoch: string; revision: number; canonical_home: string; family_root: string; state: string;
@@ -139,6 +158,7 @@ export class ManagedOwnerRouteResolver {
     if (!options?.store || typeof options.store.managedOwner !== 'function' ||
       !path.isAbsolute(options.privateBaseDirectory)) throw new TypeError('Invalid managed owner resolver options');
     this.options = { store: options.store, privateBaseDirectory: options.privateBaseDirectory,
+      ...(options.bridgeStorePath ? { bridgeStorePath: options.bridgeStorePath } : {}),
       ...(options.privateStateOptions ? { privateStateOptions: options.privateStateOptions } : {}),
       observeProcess: options.observeProcess ?? readWindowsProcessIdentity };
   }
@@ -155,18 +175,25 @@ export class ManagedOwnerRouteResolver {
   }
 
   async resolve(task: TaskRef): Promise<ManagedOwnerRouteResolution> {
-    return this.#resolve(task, false) as Promise<ManagedOwnerRouteResolution>;
+    return this.#resolve(task, 'observe') as Promise<ManagedOwnerRouteResolution>;
   }
 
   /** Separately expose only the revoke/quiescence path to the handoff coordinator.
    * Normal read-only observers never receive a mutating control capability. */
   async resolveHandoff(task: TaskRef): Promise<ManagedOwnerHandoffResolution> {
-    return this.#resolve(task, true) as Promise<ManagedOwnerHandoffResolution>;
+    return this.#resolve(task, 'handoff') as Promise<ManagedOwnerHandoffResolution>;
+  }
+  async resolveIngress(task: TaskRef): Promise<ManagedOwnerIngressResolution> {
+    return this.#resolve(task, 'ingress') as Promise<ManagedOwnerIngressResolution>;
+  }
+  async resolveOutcome(authority: ManagedOperationAuthority): Promise<ManagedOwnerOutcomeResolution> {
+    return this.#resolve(authority.claim, 'outcome', authority.claim) as Promise<ManagedOwnerOutcomeResolution>;
   }
 
-  async #resolve(task: TaskRef, handoff: boolean): Promise<ManagedOwnerRouteResolution | ManagedOwnerHandoffResolution> {
+  async #resolve(task: TaskRef, mode: 'observe' | 'handoff' | 'ingress' | 'outcome', original?: ManagedOwnerBinding):
+    Promise<ManagedOwnerRouteResolution | ManagedOwnerHandoffResolution | ManagedOwnerIngressResolution | ManagedOwnerOutcomeResolution> {
     const scoped = { hostId: task.hostId, threadId: task.threadId, sourceId: task.sourceId ?? '' };
-    const claim = this.options.store.managedOwner(scoped);
+    const claim = original ?? this.options.store.managedOwner(scoped);
     if (!claim) return { kind: 'unclaimed' };
     const unavailable = () => ({ kind: 'unavailable' as const, claim });
     if (claim.state !== 'ready' || claim.hostId !== scoped.hostId ||
@@ -186,6 +213,12 @@ export class ManagedOwnerRouteResolver {
         manifest.familyRoot !== claim.familyRoot ||
         privateState.privateDirectory !== path.join(this.options.privateBaseDirectory, claim.ownerEpoch))
         return unavailable();
+      if (mode === 'ingress' || mode === 'outcome') {
+        const trusted = manifest.managedOwnerClaim;
+        if (!this.options.bridgeStorePath || !trusted || trusted.claimId !== claim.id ||
+          trusted.bindingId !== claim.bindingId || comparablePath(path.resolve(trusted.storePath)) !==
+          comparablePath(path.resolve(this.options.bridgeStorePath))) return unavailable();
+      }
       const home = canonicalHome(manifest.home);
       if (home !== claim.canonicalHome) return unavailable();
       const registry = await registryReadyRow(manifest.registryPath, home, claim.familyRoot);
@@ -205,7 +238,7 @@ export class ManagedOwnerRouteResolver {
       if (!liveHost || !liveBackend ||
         !sameIdentity(evidence.host, liveHost.pid, liveHost.birthTicks) ||
         !sameIdentity(evidence.backend, liveBackend.pid, liveBackend.birthTicks)) return unavailable();
-      if (!this.isCurrent(claim)) return unavailable();
+      if (mode !== 'outcome' && !this.isCurrent(claim)) return unavailable();
       const freshRegistry = await registryReadyRow(manifest.registryPath, home, claim.familyRoot);
       if (!isDeepStrictEqual(freshRegistry, registry)) return unavailable();
       const controlEndpoint = endpoint.control as { host: '127.0.0.1'; port: number };
@@ -214,9 +247,22 @@ export class ManagedOwnerRouteResolver {
         port: controlEndpoint.port,
         token: Buffer.from(privateState.keys.controlToken, 'base64').toString('base64url'),
         ownerEpoch: claim.ownerEpoch, taskId: scoped.threadId });
-      if (handoff) return Object.freeze({ kind: 'statically-qualified' as const, claim,
+      if (mode === 'handoff') return Object.freeze({ kind: 'statically-qualified' as const, claim,
         revokeIngress: (expected: ManagedWorkerHandoffScope) => control.revokeIngress(expected),
         qualify: (expected: ManagedWorkerHandoffScope) => control.qualifyHandoff(expected) });
+      if (mode === 'outcome') return Object.freeze({ kind: 'statically-qualified' as const, claim,
+        scope: Object.freeze({ ownerEpoch: claim.ownerEpoch, taskId: claim.threadId, backendGeneration: evidence.backendGeneration,
+          registryRevision: evidence.registryRevision, endpointRef: evidence.endpointRef }),
+        client: Object.freeze({ vkSubmissionStatusByOperationIdV2: control.vkSubmissionStatusByOperationIdV2.bind(control),
+          scanTerminalQueuedInputV2: control.scanTerminalQueuedInputV2.bind(control) }) });
+      if (mode === 'ingress') return Object.freeze({ kind: 'statically-qualified' as const, claim,
+        scope: Object.freeze({ ownerEpoch: claim.ownerEpoch, taskId: claim.threadId,
+          backendGeneration: evidence.backendGeneration, registryRevision: evidence.registryRevision,
+          endpointRef: evidence.endpointRef, claimId: claim.id, claimRevision: claim.revision }),
+        client: Object.freeze({ ingressStatusClaimed: control.ingressStatusClaimed.bind(control),
+          submitVkClaimed: control.submitVkClaimed.bind(control),
+          vkSubmissionStatusByOperationIdV2: control.vkSubmissionStatusByOperationIdV2.bind(control),
+          scanTerminalQueuedInputV2: control.scanTerminalQueuedInputV2.bind(control) }) });
       const states = new ManagedWorkerStateTransport({ hostId: scoped.hostId,
         sourceId: scoped.sourceId, taskId: scoped.threadId,
         ownerEpoch: claim.ownerEpoch, backendGeneration: evidence.backendGeneration,

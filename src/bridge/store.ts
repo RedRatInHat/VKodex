@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
@@ -77,6 +78,15 @@ export interface ManagedOwnerBinding {
   }>;
   readonly createdAt: number;
   readonly updatedAt: number;
+}
+/** Immutable original authority. Contains identity metadata only, never tokens or input text. */
+export interface ManagedOperationAuthority {
+  readonly schemaVersion: 1;
+  readonly operationId: string;
+  readonly taskKey: string;
+  readonly bindingId: string;
+  readonly streamGeneration: number;
+  readonly claim: ManagedOwnerBinding;
 }
 interface ManagedOwnerBindingRow {
   id: string; binding_id: string; host_id: string; thread_id: string; source_id: string;
@@ -273,6 +283,15 @@ export class BridgeStore {
         writer_pid INTEGER NOT NULL, writer_birth TEXT NOT NULL, abandoned_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS bridge_operations (id TEXT PRIMARY KEY, task_key TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS bridge_managed_operation_authorities (
+        operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id), task_key TEXT NOT NULL,
+        binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), authority TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS bridge_managed_queue_receipts (
+        operation_id TEXT PRIMARY KEY REFERENCES bridge_managed_operation_authorities(operation_id),
+        submission_id TEXT NOT NULL, state TEXT NOT NULL, last_checked_at INTEGER,
+        terminal_turn_id TEXT
+      );
       CREATE TABLE IF NOT EXISTS bridge_operation_inputs (
         operation_id TEXT PRIMARY KEY REFERENCES bridge_operations(id),
         binding_id TEXT NOT NULL REFERENCES bridge_bindings(id), inbox_key TEXT NOT NULL, inbox_keys TEXT,
@@ -1214,6 +1233,102 @@ export class BridgeStore {
         .run(id, bindingId, inboxKey, JSON.stringify([inboxKey]), now);
     });
   }
+  /** Once reserved, even an absent worker row is not permission to replay. */
+  captureManagedOperationAuthority(operationId: string, task: TaskRef, claim: ManagedOwnerBinding,
+    expectedGeneration: number): ManagedOperationAuthority {
+    return this.atomic(() => {
+      if (this.hasManagedOperationAuthority(task, operationId)) throw new Error("Managed operation already scoped");
+      const binding = this.getBinding(claim.bindingId), current = this.managedOwner(task);
+      if (!binding?.attached || !this.isOwnOperation(operationId, task) || taskKey(binding) !== taskKey(task) ||
+        this.operationState(operationId) !== "sending" || claim.state !== "ready" || !isDeepStrictEqual(current, claim))
+        throw new Error("Managed operation authority unavailable");
+      if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 ||
+        this.streamGeneration(binding.id) !== expectedGeneration) throw new Error("Managed operation generation changed");
+      const authority: ManagedOperationAuthority = { schemaVersion: 1, operationId, taskKey: taskKey(task),
+        bindingId: binding.id, streamGeneration: expectedGeneration, claim: structuredClone(claim) };
+      this.db.prepare("INSERT INTO bridge_managed_operation_authorities(operation_id, task_key, binding_id, authority) VALUES (?, ?, ?, ?)")
+        .run(operationId, authority.taskKey, binding.id, JSON.stringify(authority));
+      return structuredClone(authority);
+    });
+  }
+  hasManagedOperationAuthority(task: TaskRef, operationId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM bridge_managed_operation_authorities WHERE operation_id = ? AND task_key = ?")
+      .get(operationId, taskKey(task));
+  }
+  managedOperationAuthority(task: TaskRef, operationId: string): ManagedOperationAuthority | null {
+    const row = this.db.prepare("SELECT authority, binding_id FROM bridge_managed_operation_authorities WHERE operation_id = ? AND task_key = ?")
+      .get(operationId, taskKey(task)) as { authority: string; binding_id: string } | undefined;
+    if (!row) return null;
+    const value = JSON.parse(row.authority) as ManagedOperationAuthority;
+    if (!value || value.schemaVersion !== 1 || value.operationId !== operationId || value.taskKey !== taskKey(task) ||
+      value.bindingId !== row.binding_id || !Number.isSafeInteger(value.streamGeneration) || value.streamGeneration < 0 ||
+      !value.claim || value.claim.bindingId !== value.bindingId || taskKey(value.claim) !== value.taskKey ||
+      value.claim.state !== "ready" || !this.isOwnOperation(operationId, task)) throw new Error("Managed operation authority corrupted");
+    return structuredClone(value);
+  }
+  managedOperationAuthorityById(operationId: string): ManagedOperationAuthority | null {
+    const row = this.db.prepare('SELECT authority FROM bridge_managed_operation_authorities WHERE operation_id = ?')
+      .get(operationId) as { authority: string } | undefined;
+    if (!row) return null;
+    const value = JSON.parse(row.authority) as ManagedOperationAuthority;
+    if (!value?.claim || value.operationId !== operationId) throw new Error('Managed operation authority corrupted');
+    const scoped = this.managedOperationAuthority(value.claim, operationId);
+    if (!scoped) throw new Error('Managed operation authority corrupted');
+    return scoped;
+  }
+  rememberManagedQueueReceipt(task: TaskRef, operationId: string, submissionId: string): void {
+    if (typeof submissionId !== "string" || !submissionId || submissionId.length > 256 || /[\u0000-\u001f\u007f]/u.test(submissionId))
+      throw new Error("Invalid managed queue receipt");
+    this.atomic(() => {
+      if (!this.managedOperationAuthority(task, operationId)) throw new Error("Original queue authority unavailable");
+      const known = this.db.prepare("SELECT submission_id FROM bridge_managed_queue_receipts WHERE operation_id = ?")
+        .get(operationId) as { submission_id: string } | undefined;
+      if (known && known.submission_id !== submissionId) throw new Error("Managed receipt conflict");
+      this.db.prepare("INSERT OR IGNORE INTO bridge_managed_queue_receipts(operation_id, submission_id, state) VALUES (?, ?, 'accepted')")
+        .run(operationId, submissionId);
+    });
+  }
+  pendingManagedQueueReceipts(now = Date.now()): readonly { authority: ManagedOperationAuthority; submissionId: string }[] {
+    const rows = this.db.prepare(`SELECT r.operation_id, a.authority, r.submission_id FROM bridge_managed_queue_receipts r
+      JOIN bridge_managed_operation_authorities a ON a.operation_id = r.operation_id
+      WHERE r.state = 'accepted' AND (r.last_checked_at IS NULL OR r.last_checked_at > ? OR r.last_checked_at <= ?)
+      ORDER BY r.last_checked_at, r.rowid LIMIT 32`).all(now, now - 30_000) as { operation_id: string; authority: string; submission_id: string }[];
+    return rows.flatMap(row => {
+      try {
+        const parsed = JSON.parse(row.authority) as ManagedOperationAuthority;
+        if (parsed.operationId !== row.operation_id) throw new Error('Original queue authority mismatch');
+        const authority = this.managedOperationAuthority(parsed.claim, row.operation_id);
+        if (!authority) throw new Error("Original queue authority unavailable");
+        const receipt = this.managedQueueReceipt(row.operation_id);
+        if (!receipt || receipt.state !== 'accepted' || receipt.submissionId !== row.submission_id) throw new Error('Managed receipt corrupted');
+        return [{ authority, submissionId: row.submission_id }];
+      } catch {
+        // Preserve the damaged original evidence; isolate/back off this row so
+        // healthy accepted debts can still be checked. Never reroute or replay it.
+        this.markManagedQueueReceiptChecked(row.operation_id, now);
+        this.setValue(`managed-queue-debt-error:${row.operation_id}`, { at: now, failure: 'receipt_or_authority_corrupted' });
+        return [];
+      }
+    });
+  }
+  managedQueueReceipt(operationId: string): { submissionId: string; state: 'accepted' | 'settled'; turnId: string | null } | null {
+    const row = this.db.prepare("SELECT submission_id AS submissionId, state, terminal_turn_id AS turnId FROM bridge_managed_queue_receipts WHERE operation_id = ?")
+      .get(operationId) as { submissionId: string; state: 'accepted' | 'settled'; turnId: string | null } | undefined;
+    if (!row) return null;
+    const validId = (id: unknown): id is string => typeof id === 'string' && !!id && id.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(id);
+    if (!validId(row.submissionId) || (row.state !== 'accepted' && row.state !== 'settled') ||
+      (row.state === 'accepted' ? row.turnId !== null : !validId(row.turnId))) throw new Error('Managed receipt corrupted');
+    return row;
+  }
+  markManagedQueueReceiptChecked(operationId: string, now = Date.now()): void {
+    this.db.prepare("UPDATE bridge_managed_queue_receipts SET last_checked_at = ? WHERE operation_id = ? AND state = 'accepted'")
+      .run(now, operationId);
+  }
+  settleManagedQueueReceipt(operationId: string, submissionId: string, turnId: string): void {
+    if (typeof turnId !== "string" || !turnId || turnId.length > 256 || /[\u0000-\u001f\u007f]/u.test(turnId)) throw new Error("Invalid terminal receipt");
+    this.db.prepare("UPDATE bridge_managed_queue_receipts SET state = 'settled', terminal_turn_id = ? WHERE operation_id = ? AND submission_id = ? AND state = 'accepted'")
+      .run(turnId, operationId, submissionId);
+  }
   beginPromptDispatch(id: string, task: TaskRef, inboxKeys: readonly string[], bindingId: string, now = Date.now()): void {
     if (!inboxKeys.length) throw new Error("Prompt dispatch requires an inbox key");
     this.atomic(() => {
@@ -1306,6 +1421,10 @@ export class BridgeStore {
     this.setValue(`accepted-turns:${bindingId}`, this.acceptedTurns(bindingId).filter(turn => turn.turnId !== turnId));
   }
   rememberQueuedInput(bindingId: string, operationId: string, queuedId: string, now = Date.now()): void {
+    const binding = this.getBinding(bindingId);
+    const authority = binding && this.managedOperationAuthority(binding, operationId);
+    // The receipt remains in the original operation journal; do not project it into a rebound stream.
+    if (authority && (authority.bindingId !== bindingId || authority.streamGeneration !== this.streamGeneration(bindingId))) return;
     const queued = this.queuedInputs(bindingId).filter(item => item.operationId !== operationId);
     this.setValue(`queued-inputs:${bindingId}`, [...queued, { operationId, queuedId, acceptedAt: now }]);
   }

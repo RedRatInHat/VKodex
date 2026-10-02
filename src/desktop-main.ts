@@ -21,6 +21,7 @@ import { createAppServerProfileOwner, createDetachedAppServerProfileOwner } from
 import { observeAppServerTaskState } from "./codex/app-server-task-state.js";
 import { inspectThroughOwner } from "./desktop/owner-channel.js";
 import { ManagedOwnerRouteResolver } from "./bridge/managed-owner-route-resolver.js";
+import { ManagedClaimBoundVkIngress } from "./bridge/managed-claim-bound-vk-ingress.js";
 import { inspectManagedRestartTurn } from "./bridge/managed-owner-observed-task-state-transport.js";
 import { createDesktopRouting } from "./desktop/desktop-routing.js";
 import { sameTask } from "./core/codex-tasks.js";
@@ -79,9 +80,11 @@ const desktopStates = new DesktopTaskStateTransport();
 // The private base is reserved for managed workers; an absent endpoint or
 // unqualified claim stays exclusive but unavailable. No worker is launched here.
 const managedResolver = new ManagedOwnerRouteResolver({ store,
+  bridgeStorePath: path.resolve(config.dataDir, "vkodex.sqlite"),
   privateBaseDirectory: path.resolve(config.dataDir, "managed-workers") });
 const { tasks, states, passiveStates } = createDesktopRouting(desktop, desktopStates, appServerOwners, store,
-  managedResolver, async task => (await inspectThroughOwner(catalog.sourceHome(task), task.threadId)) !== null);
+  managedResolver, async task => (await inspectThroughOwner(catalog.sourceHome(task), task.threadId)) !== null,
+  new ManagedClaimBoundVkIngress(store, managedResolver));
 const observe = (state: import("./core/task-state.js").TaskState,
   previous: import("./core/task-observation.js").TaskObservationCheckpoint | null, now?: number,
   options?: import("./core/task-observation.js").TaskObservationOptions) => state.kind === "app-server"

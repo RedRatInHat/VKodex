@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
-import type { AppServerConnection, AppServerResponseEnvelope } from './app-server-connection.js';
+import type { AppServerConnection, AppServerResponseEnvelope, AppServerRequestOptions } from './app-server-connection.js';
 import { ManagedWorkerOperationJournal } from './managed-worker-operation-journal.js';
 import type { WorkerOperation, WorkerMutationMethod, SettingsOperation } from './managed-worker-operation-journal.js';
 import type { HomogeneousQueueSettings } from './homogeneous-queue-policy.js';
@@ -324,8 +324,8 @@ export class ManagedWorkerCommandDispatcher {
   }
 
   executeWithResponse(key: object, value: WorkerCommand,
-    beforeWrite?: () => void): Promise<WorkerCommandResponse> {
-    const work = this.#execute(key, value, true, beforeWrite);
+    beforeWrite?: () => void, withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<WorkerCommandResponse> {
+    const work = this.#execute(key, value, true, beforeWrite, withWriteGuard);
     return work.then(operation => {
       const current = this.#journal.get(operation.operationId) ?? operation;
       const cached = current.state === 'accepted' ? this.#responses.get(operation.operationId) : null;
@@ -335,10 +335,12 @@ export class ManagedWorkerCommandDispatcher {
   }
 
   #execute(key: object, value: WorkerCommand, awaitDuplicate: boolean,
-    beforeWrite?: () => void): Promise<WorkerOperation> {
+    beforeWrite?: () => void, withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<WorkerOperation> {
     this.#authenticate(key);
     if (beforeWrite !== undefined && typeof beforeWrite !== 'function')
       throw new TypeError('Scoped before-write callback must be a function');
+    if (withWriteGuard !== undefined && typeof withWriteGuard !== 'function')
+      throw new TypeError('Actual-write guard must be a function');
     // Owner callbacks must not recursively admit either this or a different
     // operation before the outer reservation/write has been fenced.
     if (this.#checkingPolicy || this.#confirmingSettings) throw new Error('Reentrant worker command admission');
@@ -367,7 +369,7 @@ export class ManagedWorkerCommandDispatcher {
     authorize();
     const reservation = this.#journal.reserve(intent);
     if (!reservation.created) return Promise.resolve(reservation.operation);
-    const work = this.#dispatch(command, authorize);
+    const work = this.#dispatch(command, authorize, withWriteGuard);
     this.#inFlight.set(command.operationId, work);
     void work.then(() => this.#inFlight.delete(command.operationId),
       () => this.#inFlight.delete(command.operationId));
@@ -430,13 +432,15 @@ export class ManagedWorkerCommandDispatcher {
     }
   }
 
-  async #dispatch(command: WorkerCommand, authorize: () => void): Promise<WorkerOperation> {
+  async #dispatch(command: WorkerCommand, authorize: () => void,
+    withWriteGuard?: AppServerRequestOptions['withWriteGuard']): Promise<WorkerOperation> {
     const receipt = (envelope: AppServerResponseEnvelope) => this.#receipt(command, envelope);
     let refusedBeforeWrite = false;
     try {
       await this.backend.request(command.method, structuredClone(command.params), {
         mutating: true, expectedGeneration: this.#scope.backendGeneration,
         assertBeforeWrite: authorize, onBeforeWriteRefused: () => { refusedBeforeWrite = true; },
+        ...(withWriteGuard ? { withWriteGuard } : {}),
         onResponseEnvelope: receipt, onLateResponseEnvelope: receipt,
       });
     } catch { /* RPC failure never justifies replay or stopping the worker. */ }

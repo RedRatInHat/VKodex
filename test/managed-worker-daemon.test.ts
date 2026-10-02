@@ -11,6 +11,13 @@ import path from 'node:path';
 import WebSocket from 'ws';
 import { ManagedWorkerRegistry } from '../src/codex/managed-worker-registry.js';
 import { BridgeStore } from '../src/bridge/store.js';
+import { ManagedClaimBoundVkIngress } from '../src/bridge/managed-claim-bound-vk-ingress.js';
+import type { CodexTasks } from '../src/core/codex-tasks.js';
+import { BridgeRuntime } from '../src/bridge/runtime.js';
+import { createDesktopRouting } from '../src/desktop/desktop-routing.js';
+import { observeAppServerTaskState } from '../src/codex/app-server-task-state.js';
+import { deriveManagedTaskStateToken } from '../src/desktop/managed-worker-task-state-token.js';
+import type { BridgeChat } from '../src/bridge/contracts.js';
 import { ManagedWorkerOperationJournal } from '../src/codex/managed-worker-operation-journal.js';
 import Database from 'better-sqlite3';
 import { DesktopIpcClient, encodeFrame, FrameDecoder } from '../src/desktop/ipc-client.js';
@@ -18,7 +25,7 @@ import { ManagedWorkerDaemon } from '../src/desktop/managed-worker-daemon.js';
 import { OneShotComposerCommandGate, oneShotComposerCommandAuthorized } from '../src/desktop/one-shot-composer-command.js';
 import type { ManagedWorkerDaemonOptions } from '../src/desktop/managed-worker-daemon.js';
 import { ManagedWorkerControlServer } from '../src/desktop/managed-worker-control.js';
-import { ManagedWorkerControlClient, ManagedWorkerControlUnknownError } from
+import { ManagedWorkerControlClient, ManagedWorkerControlRefusedError, ManagedWorkerControlUnknownError } from
   '../src/desktop/managed-worker-control-client.js';
 import { ManagedWorkerStateTransport } from '../src/codex/managed-worker-state-transport.js';
 import { managedVkStockCommandId } from '../src/desktop/managed-stock-vk-submit.js';
@@ -1390,6 +1397,226 @@ test('scoped headless VK binds admission and accepted receipts to the exact regi
   }
 });
 
+async function readyClaimedPolicyFixture(claimedProtocol: boolean) {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false }, 'normal', true,
+    null, { capability, sourceId: 'daemon-fixture', ...(claimedProtocol ? { protocol: 'claim-bound-v1' as const } : {}) });
+  assert.ok(own.managedOwnerClaim);
+  const store = new BridgeStore(own.managedOwnerClaim.storePath);
+  const registry = new ManagedWorkerRegistry(own.registryPath);
+  const row = registry.get(own.home, 'own-family'); registry.close();
+  assert.ok(row?.host && row.backend && row.endpointRef);
+  const task = { hostId: 'local', threadId: own.taskId, sourceId: 'daemon-fixture' };
+  const claim = store.transitionManagedOwner(store.managedOwner(task)!, 'ready', {
+    registryRevision: row.revision, backendGeneration: row.backend.generation, endpointRef: row.endpointRef,
+    host: row.host, backend: { pid: row.backend.pid, birthTicks: row.backend.birthTicks } });
+  const scope = { ownerEpoch: row.epoch, taskId: own.taskId, backendGeneration: row.backend.generation,
+    registryRevision: row.revision, endpointRef: row.endpointRef };
+  const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory, 'endpoint.v1.json'), 'utf8'));
+  const client = new ManagedWorkerControlClient({ ...endpoint.control,
+    token: Buffer.alloc(32, 3).toString('base64url'), ownerEpoch: row.epoch, taskId: own.taskId });
+  return { ...own, capability, store, task, claim, scope, client,
+    async close() {
+      store.close();
+      if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+        own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+      await (own.control as ManagedWorkerControlServer | null)?.close();
+    } };
+}
+
+test('claimed policy worker refuses fresh v1 and v2 submits while ready and after claim ABA or retirement', async () => {
+  const f = await readyClaimedPolicyFixture(true);
+  let claim = f.claim;
+  const request = () => ({ operationId: randomUUID(), task: f.task, text: 'PUBLIC_LEGACY_PROTOCOL_REFUSAL' });
+  const originalClaimScope = { ...f.scope, claimId: claim.id, claimRevision: claim.revision };
+  try {
+    assert.equal((await f.client.ingressStatusClaimed(originalClaimScope)).admissionOpen, true);
+    for (const phase of ['ready', 'ABA', 'retired']) {
+      if (phase === 'ABA') {
+        claim = f.store.transitionManagedOwner(f.store.transitionManagedOwner(claim, 'unavailable'), 'ready');
+        await assert.rejects(f.client.ingressStatusClaimed(originalClaimScope));
+        await assert.rejects(f.client.submitVkClaimed(originalClaimScope, request()),
+          'stale claimed admission cannot survive a ready-unavailable-ready ABA');
+        assert.equal((await f.client.ingressStatusClaimed({ ...f.scope, claimId: claim.id,
+          claimRevision: claim.revision })).admissionOpen, true);
+      } else if (phase === 'retired') {
+        f.store.retireManagedOwner(f.store.transitionManagedOwner(claim, 'handoff_pending'));
+        await assert.rejects(f.client.ingressStatusClaimed({ ...f.scope, claimId: claim.id,
+          claimRevision: claim.revision }));
+        await assert.rejects(f.client.submitVkClaimed({ ...f.scope, claimId: claim.id,
+          claimRevision: claim.revision }, request()), 'retired claimed admission cannot submit fresh input');
+      }
+      assert.equal((await f.client.ingressStatusV2(f.scope)).admissionOpen, false, phase);
+      const requests = [request(), request(), request(), request()];
+      await assert.rejects(f.client.submitVk(requests[0]!), phase);
+      await assert.rejects(f.client.submitVkV2(f.scope, requests[1]!), phase);
+      await assert.rejects(f.daemon.submitVk(f.capability, requests[2]!), phase);
+      await assert.rejects(f.daemon.submitVkScoped(f.capability, f.scope, requests[3]!), phase);
+      for (const input of requests) assert.equal(await f.client.vkSubmissionStatusByOperationIdV2(
+        f.scope, input.operationId), null, 'refused fresh legacy input has no durable worker operation');
+      assert.equal(f.backend.queueWrites, 0, phase); assert.equal(f.backend.writes, 0, phase);
+    }
+  } finally { await f.close(); }
+});
+
+test('legacy policy worker has no claimed admission and claimed facade never downgrades', async () => {
+  const f = await readyClaimedPolicyFixture(false);
+  const claimedScope = { ...f.scope, claimId: f.claim.id, claimRevision: f.claim.revision };
+  let claimedProbes = 0, claimedSubmits = 0, legacyCalls = 0;
+  const facade = new ManagedClaimBoundVkIngress(f.store, {
+    isCurrent: captured => f.store.managedOwner(f.task)?.revision === captured.revision,
+    resolveIngress: async () => ({ kind: 'statically-qualified' as const, claim: f.claim, scope: claimedScope,
+      client: {
+        ingressStatusClaimed: expected => { claimedProbes++; return f.client.ingressStatusClaimed(expected); },
+        submitVkClaimed: (expected, request) => { claimedSubmits++; return f.client.submitVkClaimed(expected, request); },
+        vkSubmissionStatusByOperationIdV2: (expected, id) => f.client.vkSubmissionStatusByOperationIdV2(expected, id),
+        scanTerminalQueuedInputV2: (expected, id, cursor) => f.client.scanTerminalQueuedInputV2(expected, id, cursor),
+        // Trap capabilities available on the legacy worker. Their presence is
+        // never permission to downgrade the sole claim-bound facade.
+        ingressStatusV2: async () => { legacyCalls++; return f.client.ingressStatusV2(f.scope); },
+        submitVkV2: async () => { legacyCalls++; throw new Error('legacy v2 fallback'); },
+        submitVk: async () => { legacyCalls++; throw new Error('legacy v1 fallback'); },
+      } }),
+    resolveOutcome: async () => ({ kind: 'unavailable' as const, claim: f.claim }),
+  });
+  try {
+    assert.equal((await f.client.ingressStatusV2(f.scope)).admissionOpen, true,
+      'the fixture exposes working legacy admission');
+    await assert.rejects(f.client.ingressStatusClaimed(claimedScope));
+    await assert.rejects(f.client.submitVkClaimed(claimedScope,
+      { operationId: randomUUID(), task: f.task, text: 'PUBLIC_CLAIMED_ON_LEGACY' }));
+    await assert.rejects(facade.ensureOpen(f.task));
+    const operationId = randomUUID(); f.store.recordOperation(operationId, f.task);
+    await assert.rejects(facade.submitWithReceipt({ operationId, task: f.task, text: 'PUBLIC_NO_DOWNGRADE' }));
+    assert.equal(claimedProbes, 2); assert.equal(claimedSubmits, 0); assert.equal(legacyCalls, 0);
+    assert.equal(f.store.hasManagedOperationAuthority(f.task, operationId), false);
+    assert.equal(f.backend.queueWrites, 0); assert.equal(f.backend.writes, 0);
+  } finally { await f.close(); }
+});
+
+test('claimed control rejects non-idle preparation definitively with no worker reservation or write', async () => {
+  const f = await readyClaimedPolicyFixture(true), operationId = randomUUID();
+  const claimedScope = { ...f.scope, claimId: f.claim.id, claimRevision: f.claim.revision };
+  const journal = new Database(path.join(f.privateDirectory, 'operations.sqlite'), { readonly: true, fileMustExist: true });
+  try {
+    f.store.recordOperation(operationId, f.task);
+    f.store.captureManagedOperationAuthority(operationId, f.task, f.claim, f.store.streamGeneration(f.claim.bindingId));
+    assert.equal((await f.client.ingressStatusClaimed(claimedScope)).admissionOpen, true);
+    const beforeReads = f.backend.methods.filter(method => method === 'thread/read').length;
+    f.backend.readStatusOverride = 'inProgress';
+    await assert.rejects(f.client.submitVkClaimed(claimedScope,
+      { operationId, task: f.task, text: 'PUBLIC_NON_IDLE_REFUSAL' }), ManagedWorkerControlRefusedError);
+    assert.ok(f.backend.methods.filter(method => method === 'thread/read').length > beforeReads,
+      'control refusal follows the real same-worker idle read');
+    assert.deepEqual(journal.prepare('SELECT COUNT(*) AS count FROM managed_worker_operations').get(), { count: 0 });
+    assert.equal(await f.client.vkSubmissionStatusByOperationIdV2(f.scope, operationId), null);
+    assert.equal(f.backend.queueWrites, 0); assert.equal(f.backend.writes, 0);
+    f.backend.readStatusOverride = null;
+    assert.equal((await f.client.ingressStatusClaimed(claimedScope)).admissionOpen, true,
+      'definite prewrite refusal releases admission');
+  } finally { journal.close(); await f.close(); }
+});
+
+test('sole claimed foreground path retains original ACK and terminal proof across ready claim ABA', async () => {
+  const capability = {};
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: 'daemon-fixture', protocol: 'claim-bound-v1' }, undefined, true);
+  assert.ok(own.managedOwnerClaim);
+  const store = new BridgeStore(own.managedOwnerClaim.storePath);
+  const registry = new ManagedWorkerRegistry(own.registryPath);
+  const row = registry.get(own.home, 'own-family'); registry.close();
+  assert.ok(row?.host && row.backend && row.endpointRef);
+  const desktopTask = { hostId: 'local', threadId: own.taskId, sourceId: 'daemon-fixture',
+    title: 'Daemon fixture', workspace: own.home, updatedAt: 1 };
+  const binding = store.getBinding(own.managedOwnerClaim.bindingId)!;
+  const peerId = 2_000_000_071;
+  store.setChat(binding.id, peerId, 71);
+  const pending = store.managedOwner(desktopTask)!;
+  let claim = store.transitionManagedOwner(pending, 'ready', { registryRevision: row.revision,
+    backendGeneration: row.backend.generation, endpointRef: row.endpointRef,
+    host: row.host, backend: { pid: row.backend.pid, birthTicks: row.backend.birthTicks } });
+  const scope = { ownerEpoch: row.epoch, taskId: own.taskId, backendGeneration: row.backend.generation,
+    registryRevision: row.revision, endpointRef: row.endpointRef };
+  const endpoint = JSON.parse(await readFile(path.join(own.privateDirectory, 'endpoint.v1.json'), 'utf8'));
+  const client = new ManagedWorkerControlClient({ ...endpoint.control,
+    token: Buffer.alloc(32, 3).toString('base64url'), ownerEpoch: row.epoch, taskId: own.taskId });
+  const states = new ManagedWorkerStateTransport({ hostId: 'local', sourceId: 'daemon-fixture', taskId: own.taskId,
+    ownerEpoch: row.epoch, backendGeneration: row.backend.generation, port: endpoint.taskState.port,
+    token: deriveManagedTaskStateToken(Buffer.alloc(32, 3).toString('base64'), row.epoch, own.taskId, row.backend.generation) });
+  const current = (captured: typeof claim) => store.managedOwner(desktopTask)?.revision === captured.revision;
+  const ingressResolver = { isCurrent: current,
+    resolveIngress: async () => ({ kind: 'statically-qualified' as const, claim, scope: {
+      ...scope, claimId: claim.id, claimRevision: claim.revision }, client }),
+    resolveOutcome: async (authority: import('../src/bridge/store.js').ManagedOperationAuthority) => ({
+      kind: 'statically-qualified' as const, claim: authority.claim, scope, client }) };
+  const observer = { isCurrent: current, resolve: async () => ({ kind: 'statically-qualified' as const,
+    claim, controlStatus: () => client.status(), states }) };
+  let fallbackWrites = 0;
+  const base = { listTasks: async () => [desktopTask], findQueuedSubmissionOutcome: async () => {
+    fallbackWrites++; return null; }, submitWithReceipt: async () => { fallbackWrites++; throw new Error('No fallback'); } } as unknown as CodexTasks;
+  const routed = createDesktopRouting(base, states, [], store, observer, undefined,
+    new ManagedClaimBoundVkIngress(store, ingressResolver));
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }), edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  let time = 100_000;
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, routed.tasks, chat, store, {
+    states: routed.states, passiveStates: routed.passiveStates!, observe: observeAppServerTaskState,
+    history: { enable() {}, disable() {}, poll: async () => null } }, () => time, undefined, undefined, 10_000_000);
+  const resumes = own.backend.methods.filter(method => method === 'thread/resume').length;
+  try {
+    own.backend.holdQueueReply = true;
+    const input = runtime.handle({ eventId: 'claimed-foreground', peerId, senderId: 101, text: 'PUBLIC_CLAIMED_FIXTURE' });
+    for (let i = 0; i < 300 && !own.backend.heldQueueReply; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(own.backend.heldQueueReply, 'TaskManager reached real same-worker queue/add');
+    const params = own.backend.heldQueueReply.params as Record<string, unknown>;
+    const operationId = params.clientUserMessageId as string;
+    const original = store.managedOperationAuthority(desktopTask, operationId);
+    assert.ok(original, 'original authority committed before submit socket');
+    assert.equal(original.claim.revision, claim.revision);
+    const other = new BridgeStore(own.managedOwnerClaim.storePath);
+    try { claim = other.transitionManagedOwner(other.transitionManagedOwner(claim, 'unavailable'), 'ready'); }
+    finally { other.close(); }
+    own.backend.answerHeldQueue();
+    await input;
+    assert.equal(store.operationState(operationId), 'accepted', 'claim ABA after actual write cannot erase ACK');
+    assert.equal(store.queuedInputs(binding.id).length, 1);
+    assert.equal(own.backend.queueWrites, 1); assert.equal(own.backend.writes, 0);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, resumes);
+    assert.equal(own.backend.methods.filter(method => method === 'initialize').length, 1);
+    store.retireManagedOwner(store.transitionManagedOwner(claim, 'handoff_pending'));
+    assert.deepEqual(await routed.tasks.findQueuedSubmissionOutcome!(desktopTask, operationId),
+      { state: 'accepted', submissionId: 'submission-1' });
+    own.backend.stockHistory = [{ id: 'claimed-terminal', status: 'completed', items: [{
+      id: 'claimed-user', type: 'userMessage', clientId: operationId, content: params.input }] }];
+    assert.deepEqual(await routed.tasks.scanTerminalQueuedInput!(desktopTask, operationId, null),
+      { done: true, turnId: 'claimed-terminal' });
+    assert.equal(fallbackWrites, 0, 'original read-only reconciliation precedes current route selection');
+    assert.deepEqual(store.managedOperationAuthority(desktopTask, operationId), original);
+    // The actual authenticated scanner omits native error bodies. Its active
+    // turn refusal must still get a bounded short retry, not a one-hour stall.
+    store.setValue(`stream-generation:${binding.id}`, original.streamGeneration + 1);
+    own.backend.stockHistory[0]!.status = 'inProgress';
+    await runtime.tick(false);
+    for (let i = 0; i < 100 && !store.getValue<Record<string, unknown>>(`managed-queue-history:${operationId}`)?.lastFailure; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const checkpoint = store.getValue<{ nextAt: number; lastFailure: string }>(`managed-queue-history:${operationId}`);
+    assert.equal(checkpoint?.lastFailure, 'scan_error', 'actual control/client scan refusal reached health');
+    assert.equal(checkpoint?.nextAt, time + 30_000);
+    assert.equal(store.managedQueueReceipt(operationId)?.state, 'accepted');
+    own.backend.stockHistory[0]!.status = 'completed'; time += 30_001;
+    await runtime.tick(false);
+    for (let i = 0; i < 100 && store.managedQueueReceipt(operationId)?.state !== 'settled'; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(store.managedQueueReceipt(operationId), { state: 'settled',
+      submissionId: 'submission-1', turnId: 'claimed-terminal' });
+    assert.equal(own.backend.queueWrites, 1, 'terminal recovery never writes a continuation');
+  } finally {
+    await runtime.stop(); routed.states.close(); states.close(); store.close();
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
 test('scoped headless VK refuses mismatched or changed scope without wire writes', async () => {
   const capability = {}, operationId = randomUUID();
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },
@@ -2230,14 +2457,14 @@ class Backend extends EventEmitter {
           this.holdIdOnlyResume = false; this.heldIdOnlyResume = frame.id; continue;
         }
         queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
-          result: this.answer(method) }) + '\n'));
+          result: this.answer(method, frame.params as Record<string, unknown>) }) + '\n'));
       }
     });
     this.stdin.on('finish', () => {
       this.exitCode = 0; this.emit('exit', 0, null); this.emit('close', 0, null);
     });
   }
-  answer(method: string): Record<string, unknown> {
+  answer(method: string, params?: Record<string, unknown>): Record<string, unknown> {
     const thread = () => ({ id: this.taskId, sessionId: this.taskId,
       createdAt: 100, updatedAt: 101, cwd: this.cwd,
       model: 'gpt-5.6-sol', modelProvider: 'openai', reasoningEffort: this.stock ? 'medium' : 'low',
@@ -2250,7 +2477,7 @@ class Backend extends EventEmitter {
     if (method === 'thread/read') return { thread: this.failBootstrap && this.resumed ?
       { ...thread(), status: { type: 'inProgress' } } : thread() };
     if (method === 'thread/turns/list') return { data: this.terminalTurns().map(turn =>
-      ({ ...turn, itemsView: 'full' })), nextCursor: null };
+      ({ ...turn, itemsView: params?.itemsView ?? 'full' })), nextCursor: null };
     if (method === 'thread/goal/get') return { goal: this.goalOverride };
     if (method === 'thread/queue/list') return { data: this.queueEntries, nextCursor: null };
     if (method === 'thread/resume') {
@@ -2387,7 +2614,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   startup: 'normal' | 'bootstrap-fail' | 'policy-mismatch' |
     'control-bind-fail' | 'endpoint-collision' = 'normal',
   stock = false, stockFailure: 'baseline' | 'discovery' | 'notice' | 'policy' | null = null,
-  headlessVk?: Readonly<{ capability: object; sourceId: string }>, backendTimeoutMs?: number,
+  headlessVk?: Readonly<{ capability: object; sourceId: string; protocol?: 'claim-bound-v1' }>, backendTimeoutMs?: number,
   nativeTaskState = false, handoffCapability?: object,
   oneShotFirstComposer?: NonNullable<ManagedWorkerDaemonOptions['oneShotFirstComposer']>,
   nativeCliWebSocket?: NonNullable<ManagedWorkerDaemonOptions['nativeCliWebSocket']>,
@@ -2561,7 +2788,7 @@ async function readyFixture(family: { allow: boolean; beforeReturn?: () => void;
   }
   else await assert.rejects(daemon.start(), /startup unavailable/);
   return { daemon, backend, brokers, probeBrokers, handlerErrors, reserved, home, taskId, registryPath,
-    privateDirectory, launches, observations, control, creationJournal, cliOptions };
+    privateDirectory, launches, observations, control, creationJournal, cliOptions, managedOwnerClaim };
 }
 
 test('backend spawn specification strips synthetic bridge hooks and retains TLS and proxy settings', () => {

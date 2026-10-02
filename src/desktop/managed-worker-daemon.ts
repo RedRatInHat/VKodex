@@ -16,12 +16,13 @@ import { bootstrapManagedWorker,
 import { ManagedWorkerNativeOwner, type ManagedWorkerNativeOwnerMetadata,
   type ManagedWorkerNativeOwnerOptions } from './managed-worker-native-owner.js';
 import { ManagedWorkerControlServer, ManagedWorkerStopRefusedError,
-  validManagedWorkerVkScope,
+  validManagedWorkerVkScope, validManagedWorkerClaimedVkScope, type ManagedWorkerClaimedVkScope,
   type ManagedWorkerControlOptions, type ManagedWorkerControlDiagnosis,
   type ManagedWorkerVkStatus, type ManagedWorkerHandoffScope,
   type ManagedWorkerVkScope, type ManagedWorkerVkIngressStatus } from './managed-worker-control.js';
 import { loadManagedWorkerPrivateState, type ManagedWorkerPrivateState } from './managed-worker-private-state.js';
-import { assertManagedWorkerClaimCurrent, dispatchWithManagedWorkerClaim } from
+import { assertManagedWorkerClaimCurrent, dispatchWithManagedWorkerClaim,
+  withReadyManagedWorkerClaimDispatch } from
   './managed-worker-claim-readback.js';
 import { readWindowsProcessIdentity } from './windows-process-identity.js';
 import { buildBackendWorkerSpawnOptions } from './managed-worker-environment.js';
@@ -36,7 +37,9 @@ import { ManagedStockVkSubmitter, managedVkStockCommandId,
   type ManagedStockVkLease } from './managed-stock-vk-submit.js';
 import { ManagedWorkerTaskStateServer } from './managed-worker-task-state-server.js';
 import { deriveManagedTaskStateToken } from './managed-worker-task-state-token.js';
-import { ActionRejectedError, type SubmitTaskRequest } from '../core/codex-tasks.js';
+import { ActionRejectedError, type SubmitTaskRequest, type QueuedInputHistoryCursor,
+  type QueuedInputHistoryScan } from '../core/codex-tasks.js';
+import { scanTerminalQueuedInputTurn } from './input-reconciliation.js';
 import type { DesktopIpcClient, IpcRequestHandler } from './ipc-client.js';
 import { assertControlledNativeCliSourceScope, assertControlledNativeCliSourceScopeCurrent,
   verifyControlledNativeCliSourceScope,
@@ -83,7 +86,7 @@ export interface ManagedWorkerDaemonOptions {
       backendGeneration: number; sourceGeneration: string }>) => boolean | Promise<boolean>;
     createProbeClient: () => DesktopIpcClient;
     /** Internal capability only. No daemon control or native IPC route is added. */
-    headlessVk?: Readonly<{ capability: object; sourceId: string }>;
+    headlessVk?: Readonly<{ capability: object; sourceId: string; protocol?: 'claim-bound-v1' }>;
     /** In-process, opt-in handoff admission fence; never exposed on control. */
     handoffCapability?: object;
   }>;
@@ -218,6 +221,7 @@ export class ManagedWorkerDaemon {
   #reconnectDelayMs = 1_000;
   #currentOwner: (() => boolean) | null = null;
   #vkScopeCurrent: ((expected: ManagedWorkerVkScope) => boolean) | null = null;
+  #claimedWire: ((expected: ManagedWorkerClaimedVkScope, write: () => void, operationId?: string) => void) | null = null;
   #cliEvidencePending = false;
 
   constructor(options: ManagedWorkerDaemonOptions) {
@@ -261,7 +265,9 @@ export class ManagedWorkerDaemon {
       stock.handoffCapability !== undefined && (!stock.handoffCapability ||
         typeof stock.handoffCapability !== 'object') ||
       stock.headlessVk !== undefined && (!object(stock.headlessVk) ||
-        !isDeepStrictEqual(Object.keys(stock.headlessVk).sort(), ['capability', 'sourceId']) ||
+        !isDeepStrictEqual(Object.keys(stock.headlessVk).sort(), ['capability', 'sourceId',
+          ...(stock.headlessVk.protocol === undefined ? [] : ['protocol'])].sort()) ||
+        stock.headlessVk.protocol !== undefined && stock.headlessVk.protocol !== 'claim-bound-v1' ||
         !stock.headlessVk.capability || typeof stock.headlessVk.capability !== 'object' ||
         typeof stock.headlessVk.sourceId !== 'string' ||
         stock.headlessVk.sourceId.length > 256 || /[\x00-\x1f\x7f]/u.test(stock.headlessVk.sourceId))))
@@ -512,6 +518,7 @@ export class ManagedWorkerDaemon {
 
   /** Capability-bound queue ingress, also exposed only by opt-in private control. */
   submitVk(capability: object, request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+    if (this.#claimedWire) return Promise.reject(new ActionRejectedError('Claim-bound input protocol required'));
     if (!this.#vkSubmitter || this.#state !== 'ready' || this.#ingressRevoked)
       return Promise.reject(new Error('Managed VK stock ingress unavailable'));
     return this.#vkSubmitter.submit(capability, request);
@@ -522,8 +529,43 @@ export class ManagedWorkerDaemon {
    * receipt lookup; it never grants a lease for a fresh write. */
   async submitVkScoped(capability: object, expected: ManagedWorkerVkScope,
     request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+    if (this.#claimedWire) throw new ActionRejectedError('Claim-bound input protocol required');
     const captured = this.#captureVkScope(capability, expected);
     return this.#vkSubmitter!.submit(capability, request, () => this.#assertVkScopeCurrent(captured));
+  }
+  async submitVkClaimed(capability: object, expected: ManagedWorkerClaimedVkScope,
+    request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+    if (!validManagedWorkerClaimedVkScope(expected)) throw new ActionRejectedError('Managed claim unavailable');
+    const captured = Object.freeze({ ...expected });
+    const worker = this.#captureVkScope(capability, { ownerEpoch: captured.ownerEpoch, taskId: captured.taskId,
+      backendGeneration: captured.backendGeneration, registryRevision: captured.registryRevision, endpointRef: captured.endpointRef });
+    const current = () => {
+      this.#assertVkScopeCurrent(worker);
+      if (!this.#claimedWire) throw new ActionRejectedError('Managed claim unavailable');
+      try { this.#claimedWire(captured, () => {}); }
+      catch { throw new ActionRejectedError('Managed claim unavailable'); }
+    };
+    current();
+    return this.#vkSubmitter!.submit(capability, request, current, write => {
+      if (!this.#claimedWire) throw new ActionRejectedError('Managed claim unavailable');
+      this.#claimedWire(captured, () => { this.#assertVkScopeCurrent(worker); write(); }, request.operationId);
+    });
+  }
+  async scanTerminalVkInputScoped(capability: object, expected: ManagedWorkerVkScope, operationId: string,
+    cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan> {
+    const captured = this.#captureVkScope(capability, expected);
+    const known = this.vkSubmissionStatusByOperationIdScoped(capability, captured, operationId);
+    if (known?.state !== 'accepted' || !this.#host || !this.#vkControlKey)
+      throw new Error('Managed queue receipt unavailable');
+    const host = this.#host, key = this.#vkControlKey;
+    const result = await scanTerminalQueuedInputTurn(captured.taskId, operationId, async params => {
+      this.#assertVkScopeCurrent(captured);
+      const page = await host.ownerRead(key, captured.backendGeneration, 'thread/turns/list', params);
+      this.#assertVkScopeCurrent(captured);
+      return page;
+    }, cursor);
+    this.#assertVkScopeCurrent(captured);
+    return result;
   }
 
   vkIngressStatusScoped(capability: object, expected: ManagedWorkerVkScope): ManagedWorkerVkIngressStatus {
@@ -766,6 +808,19 @@ export class ManagedWorkerDaemon {
         this.#host.metadata.backendGeneration === expected.backendGeneration &&
         (this.#owner?.metadata.state === 'connected' || this.#owner?.metadata.state === 'disconnected') &&
         handoffScopeCurrent(expected);
+      if (this.#options.nativeStockQueue?.headlessVk?.protocol === 'claim-bound-v1') {
+        if (!manifest.managedOwnerClaim) throw new Error('Claim-bound worker metadata unavailable');
+        const reference = Object.freeze({ ...manifest.managedOwnerClaim });
+        const sourceId = this.#options.nativeStockQueue.headlessVk.sourceId;
+        this.#claimedWire = (expected, write, operationId) => {
+          if (!validManagedWorkerClaimedVkScope(expected) || expected.claimId !== reference.claimId ||
+            !this.#attempt || this.#attempt.revision !== expected.registryRevision ||
+            this.#attempt.epoch !== expected.ownerEpoch || expected.taskId !== manifest.taskId ||
+            this.#attempt.backend?.generation !== expected.backendGeneration || this.#attempt.endpointRef !== expected.endpointRef)
+            throw new ActionRejectedError('Managed claim unavailable');
+          withReadyManagedWorkerClaimDispatch(reference, this.#attempt, manifest.taskId, sourceId, expected.claimRevision, write, operationId);
+        };
+      }
       this.#control = (this.#options.dependencies?.createControl ??
         (options => new ManagedWorkerControlServer(options)))({
         ownerEpoch: manifest.epoch, taskId: manifest.taskId,
@@ -807,14 +862,28 @@ export class ManagedWorkerDaemon {
         } } : {}),
         ...(this.#options.nativeStockQueue?.headlessVk ? { vkV2: {
           isScopeCurrent: (expected: ManagedWorkerVkScope) => this.#vkScopeCurrent?.(expected) === true,
-          ingressStatus: (expected: ManagedWorkerVkScope) => this.vkIngressStatusScoped(
-            this.#options.nativeStockQueue!.headlessVk!.capability, expected),
+          ingressStatus: (expected: ManagedWorkerVkScope) => {
+            const status = this.vkIngressStatusScoped(this.#options.nativeStockQueue!.headlessVk!.capability, expected);
+            return this.#claimedWire ? { ...status, admissionOpen: false } : status;
+          },
           submit: (expected: ManagedWorkerVkScope, request: SubmitTaskRequest) => this.submitVkScoped(
             this.#options.nativeStockQueue!.headlessVk!.capability, expected, request),
           statusByOperationId: (expected: ManagedWorkerVkScope, operationId: string) =>
             this.vkSubmissionStatusByOperationIdScoped(
               this.#options.nativeStockQueue!.headlessVk!.capability, expected, operationId),
-        }, vk: {
+          scanTerminalQueuedInput: (expected: ManagedWorkerVkScope, operationId: string, cursor: QueuedInputHistoryCursor | null) =>
+            this.scanTerminalVkInputScoped(this.#options.nativeStockQueue!.headlessVk!.capability, expected, operationId, cursor),
+        }, ...(this.#claimedWire ? { vkClaimed: {
+          isScopeCurrent: (expected: ManagedWorkerVkScope) => this.#vkScopeCurrent?.(expected) === true,
+          isClaimCurrent: (expected: ManagedWorkerClaimedVkScope) => {
+            try { if (!this.#claimedWire) return false; this.#claimedWire(expected, () => {}); return true; } catch { return false; }
+          },
+          ingressStatus: (expected: ManagedWorkerClaimedVkScope) => this.vkIngressStatusScoped(
+            this.#options.nativeStockQueue!.headlessVk!.capability, { ownerEpoch: expected.ownerEpoch, taskId: expected.taskId,
+              backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision, endpointRef: expected.endpointRef }),
+          submit: (expected: ManagedWorkerClaimedVkScope, request: SubmitTaskRequest) => this.submitVkClaimed(
+            this.#options.nativeStockQueue!.headlessVk!.capability, expected, request),
+        } } : {}), vk: {
           submit: (request: SubmitTaskRequest) => this.submitVk(
             this.#options.nativeStockQueue!.headlessVk!.capability, request),
           status: (request: SubmitTaskRequest) => this.#vkControlStatus(this.vkSubmissionStatus(
