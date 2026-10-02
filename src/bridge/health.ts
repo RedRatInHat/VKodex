@@ -198,6 +198,8 @@ export class BridgeHealthMonitor {
     const stagedPilot = runtime.stagedFilePilot ?? STAGED_FILE_PILOT_DISABLED;
     checks.push({ name: "stage_pilot", state: "ok", detail: stagedPilot.mode === "single-chat"
       ? `Изолированная staging-пилот включена только для VK peer ${stagedPilot.peerId}; автоматическая уборка staged-копий отключена.`
+      : stagedPilot.mode === "all-chats"
+        ? "Подготовка неизменных staged-копий включена для всех бесед; автоматическая уборка staged-копий отключена."
       : "Изолированная staging-пилот отключена; новые файлы отправляются из исходных байтов, автоматическая уборка staged-копий отключена." });
     const pendingAge = stageStorage.oldestPendingAt === null ? 0 : Math.max(0, checkedAt - stageStorage.oldestPendingAt);
     const atStageQuota = stageStorage.chargedBytes >= 2 * 1024 * 1024 * 1024 || stageStorage.chargedCount >= 2_048;
