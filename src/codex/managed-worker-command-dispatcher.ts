@@ -223,6 +223,10 @@ export class ManagedWorkerCommandDispatcher {
     this.#authenticate(key);
     return this.#journal.acceptedQueueInputs();
   }
+  hasCommandClientIdentity(key: object, clientUserMessageId: string): boolean {
+    this.#authenticate(key);
+    return this.#journal.hasClientUserMessageId(clientUserMessageId);
+  }
   /**
    * Read-only attested lookup for an immutable native intent. It never calls
    * authorization, reserves a journal row, or writes to the backend.

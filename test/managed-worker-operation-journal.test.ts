@@ -12,7 +12,7 @@ function fixture() {
   const dir = mkdtempSync(path.join(tmpdir(), "vkodex-owner-op-journal-"));
   return { filePath: path.join(dir, "operations.sqlite"), ownerEpoch: randomUUID(), backendGeneration: 7, threadId: "thread-1" };
 }
-function intent(operationId = randomUUID(), clientUserMessageId = randomUUID()) {
+function intent(operationId: string = randomUUID(), clientUserMessageId: string = randomUUID()) {
   return { operationId, clientUserMessageId, method: "turn/start" as const, fingerprint };
 }
 
@@ -184,6 +184,35 @@ test('accepted queue input identities survive reopen without being treated as tu
     assert.equal(Object.isFrozen(inputs), true);
     assert.equal(Object.isFrozen(inputs[0]), true);
     assert.equal(reopened.hasUnconfirmed(), true);
+  } finally { reopened.close(); }
+});
+
+test('client identity existence is bounded, indexed metadata across durable methods and states', () => {
+  const scope = fixture(), journal = new ManagedWorkerOperationJournal(scope);
+  const queueId: string = 'q'.repeat(128), directId: string = randomUUID();
+  try {
+    assert.equal(journal.hasClientUserMessageId('not-present'), false);
+    assert.equal(journal.hasClientUserMessageId(queueId), false);
+    const queued = journal.reserve({ ...intent(randomUUID(), queueId), method: 'thread/queue/add' }).operation;
+    assert.equal(queued.state, 'dispatching');
+    assert.equal(journal.hasClientUserMessageId(queueId), true);
+    const unknown = journal.markUnknown(queued);
+    assert.equal(journal.hasClientUserMessageId(queueId), true);
+    journal.accept(unknown, 'stock-receipt');
+    assert.equal(journal.hasClientUserMessageId(queueId), true);
+
+    const rejected = journal.reserve(intent(randomUUID(), directId)).operation;
+    journal.rejectBeforeWrite(rejected);
+    assert.equal(journal.hasClientUserMessageId(directId), true);
+    for (const invalid of ['', ' leading', 'trailing ', 'bad\nvalue', 'x'.repeat(129)]) {
+      assert.throws(() => journal.hasClientUserMessageId(invalid), /client/i);
+    }
+  } finally { journal.close(); }
+  const reopened = new ManagedWorkerOperationJournal(scope);
+  try {
+    assert.equal(reopened.hasClientUserMessageId(queueId), true);
+    assert.equal(reopened.hasClientUserMessageId(directId), true);
+    assert.equal(reopened.hasClientUserMessageId('not-present'), false);
   } finally { reopened.close(); }
 });
 

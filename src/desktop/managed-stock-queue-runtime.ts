@@ -67,6 +67,7 @@ export interface ManagedStockQueueRuntimeOptions {
   readonly confirmNativeOwner: (scope: OwnerScope) => boolean | Promise<boolean>;
   readonly isOwnerCurrent: () => boolean;
   readonly admissionOpen: () => boolean;
+  readonly isClientReservedOutsideQueue?: (clientId: string) => boolean;
 }
 
 /** Opt-in cold-created, homogeneous queue route on the NativeOwner's one worker.
@@ -154,6 +155,9 @@ export function createManagedStockQueueRuntimeFactory(options: ManagedStockQueue
     const adapterOptions: ManagedNativeStockQueueAdapterOptions = {
       taskId, ownerEpoch, backendGeneration: generation, sourceGeneration,
       journalPath, controlKey, host,
+      ...(options.isClientReservedOutsideQueue ? {
+        isClientReservedOutsideQueue: options.isClientReservedOutsideQueue,
+      } : {}),
       assertInitialNativeQueueBaseline: async observed => {
         if (!isDeepStrictEqual(observed, scope) || !current()) return false;
         if (await discover(Object.freeze({ taskId, ownerEpoch })) !== true || !current()) return false;

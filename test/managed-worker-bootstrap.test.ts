@@ -328,6 +328,39 @@ test('idle proof joins accepted queue client IDs to exactly one terminal user me
   } finally { await fixture.close(); }
 });
 
+test('stock admission joins prior accepted queue clients to unique terminal canonical items', async () => {
+  const fixture = new BackendFixture(); await fixture.listen();
+  try {
+    const bootstrap = await bootstrapManagedWorker(options(fixture));
+    const read = bootstrap.readStockState;
+    const user = (clientId: string) => ({ id: `item-${clientId}`, type: 'userMessage',
+      clientId, content: [{ type: 'text', text: 'fixture only' }] });
+    const methodsBefore = fixture.methods.length;
+    await assert.rejects(read(() => {}, ['accepted-but-missing']),
+      /accepted-queue-input-not-terminal/);
+    fixture.turns = [{ id: 'terminal', status: 'completed', items: [user('accepted')] }];
+    assert.deepEqual((await read(() => {}, ['accepted'])).terminalTurnIds, ['terminal']);
+    fixture.turns = [
+      { id: 'terminal-a', status: 'completed', items: [{ ...user('accepted-a'), id: 'same-canonical-item' }] },
+      { id: 'terminal-b', status: 'completed', items: [{ ...user('accepted-b'), id: 'same-canonical-item' }] },
+    ];
+    await assert.rejects(read(() => {}, ['accepted-a', 'accepted-b']),
+      /accepted-queue-input-not-terminal/);
+    fixture.turns = [{ id: 'terminal', status: 'completed', items: [user('accepted')] }];
+    fixture.turns.push({ id: 'second-terminal', status: 'completed', items: [user('accepted')] });
+    await assert.rejects(read(() => {}, ['accepted']), /accepted-queue-input-not-terminal/);
+    fixture.turns = [{ id: 'terminal', status: 'completed', items: [
+      { ...user('accepted'), id: '' }] }];
+    await assert.rejects(read(() => {}, ['accepted']), /accepted-queue-input-not-terminal/);
+    fixture.turns = [{ id: 'terminal', status: 'completed', items: [
+      { id: 'response-echo', type: 'agentMessage', clientId: 'accepted', text: 'not a user item' }] }];
+    await assert.rejects(read(() => {}, ['accepted']), /accepted-queue-input-not-terminal/);
+    await assert.rejects(read(() => {}, ['accepted', 'accepted']), /invalid-expected-queue-clients/);
+    assert.ok(fixture.methods.slice(methodsBefore).every(method =>
+      !['thread/resume', 'turn/start', 'thread/queue/add'].includes(method)));
+  } finally { await fixture.close(); }
+});
+
 test('pre-resume history, pending queue/goal, unknown status and mismatched cwd fail closed', async () => {
   for (const mutation of ['history', 'queue', 'goal', 'cwd', 'unknown-status']) {
     const fixture = new BackendFixture(); await fixture.listen();

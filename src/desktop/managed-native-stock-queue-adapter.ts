@@ -14,7 +14,8 @@ type Entry = JsonObject & { id: string };
 export type ManagedNativeStockPublish = ConstructorParameters<typeof NativeStockAdmission<Entry, Qualification>>[0]['publish'];
 type Publish = ManagedNativeStockPublish;
 type Host = { executeCommandWithResponse(controlKey: object, command: WorkerCommand,
-  beforeWrite?: () => void): Promise<WorkerCommandResponse> };
+  beforeWrite?: () => void): Promise<WorkerCommandResponse>;
+  hasCommandClientIdentity?(controlKey: object, clientId: string): boolean };
 export interface ManagedNativeStockQueueAdapterOptions {
   readonly taskId: string;
   readonly ownerEpoch: string;
@@ -23,6 +24,8 @@ export interface ManagedNativeStockQueueAdapterOptions {
   readonly journalPath: string;
   readonly controlKey: object;
   readonly host: Host;
+  /** Direct intent-only IDs must not become new queue operations. */
+  readonly isClientReservedOutsideQueue?: (clientId: string) => boolean;
   /** Must prove this native FWE queue began empty under controlled creation;
    * stock thread/queue/list alone is insufficient. Required even for [] replay. */
   readonly assertInitialNativeQueueBaseline: (scope: { taskId: string; ownerEpoch: string;
@@ -145,6 +148,9 @@ export class ManagedNativeStockQueueAdapter {
             .update(canonical(snapshot)).digest('hex') };
         },
         prepareEntry: (entry, qualification) => {
+          if (options.isClientReservedOutsideQueue?.(entry.id) === true ||
+              options.host.hasCommandClientIdentity?.(controlKey, entry.id) === true &&
+              this.#journal.lookupIncomingIdentities({ ids: [entry.id] }).items[0] === null) fail();
           const prepared = prepareNativeStockTextEntry(entry, qualification,
             taskId, ownerEpoch);
           return { input: prepared.queueAdd.input,
@@ -314,6 +320,14 @@ export class ManagedNativeStockQueueAdapter {
     if (this.#closed || this.#faulted || this.#pendingClaims.size !== 0 ||
         this.#earlyItems.size !== 0) fail();
     return this.#journal.quiescence();
+  }
+
+  /** Indexed metadata-only collision check, including consumed/unknown IDs. */
+  hasClientIdentity(clientId: string): boolean {
+    if (this.#closed || this.#faulted || typeof clientId !== 'string' || !clientId ||
+        clientId.length > 128) fail();
+    return this.#pendingClaims.has(clientId) || this.#earlyItems.has(clientId) ||
+      this.#journal.lookupIncomingIdentities({ ids: [clientId] }).items[0] !== null;
   }
 
   close(): void { if (!this.#closed) { this.#closed = true; this.#journal.close(); } }

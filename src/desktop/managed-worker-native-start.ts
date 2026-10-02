@@ -19,6 +19,19 @@ export interface NativeStartAuthority {
   /** Explicit opt-in to the qualified first-turn Composer contract. */
   readonly composer?: { readonly snapshot: IpcObject; readonly defaults: IpcObject | null } | null;
 }
+export interface PreparedStockNativeStart {
+  readonly params: IpcObject;
+  readonly uiParams: IpcObject | null;
+  readonly localMetadata: IpcObject | null;
+  /** Ephemeral same-owner/settings/history fence, never written into an intent. */
+  assertCurrent(phase: 'before-intent' | 'before-reservation' | 'before-write'): void;
+  /** Retire this attempt's command grant, not its durable worker outcome. */
+  settle(): void;
+}
+export interface StockNativeStartAdmission {
+  prepare(scope: Readonly<{ request: IpcIncomingRequest; authority: NativeStartAuthority;
+    operationId: string; previousIntent: NativeStartIntent | null }>): Promise<PreparedStockNativeStart>;
+}
 interface Options {
   readonly host: Pick<ManagedWorkerFrontendHost, 'metadata' | 'executeCommandWithResponse'> &
     Partial<Pick<ManagedWorkerFrontendHost, 'commandStatusForIntent'>>;
@@ -30,6 +43,9 @@ interface Options {
    * is routing data, not authentication or proof of writer ownership. */
   readonly authorizeFollower: (request: Readonly<IpcIncomingRequest>, authority: NativeStartAuthority) => boolean;
   readonly intentStore?: NativeStartIntentStore;
+  /** Exclusive stock-policy compiler/admission for ordinary AND extended input.
+   * It must not fall through to the legacy read-only compiler. */
+  readonly stockStart?: StockNativeStartAdmission;
   /** Qualifies current policy on the same already-loaded worker. Only its
    * fenced ID-only resume/read is allowed; never create or replace a worker. */
   readonly qualifyContinuation?: (authority: NativeStartAuthority) => Promise<QualifiedContinuationEvidence>;
@@ -46,6 +62,22 @@ interface Remembered extends NativeStartIntent { readonly bytes: number }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const object = (v: unknown): v is IpcObject => !!v && typeof v === 'object' && !Array.isArray(v);
 const refused = () => new Error('Native worker start is not authorized or representable');
+function suppressDeferred(value: unknown): void {
+  if (value !== undefined) void Promise.resolve(value).catch(() => {});
+}
+function stockFence(stock: PreparedStockNativeStart,
+  phase: Parameters<PreparedStockNativeStart['assertCurrent']>[0]): void {
+  const result: unknown = stock.assertCurrent(phase);
+  // A TypeScript void callback can still be async. Qualification at reservation
+  // and RPC write must finish synchronously, never become an unawaited proof.
+  if (result !== undefined) { suppressDeferred(result); throw refused(); }
+}
+function settleStock(stock: PreparedStockNativeStart | null): void {
+  // Cleanup must not replace a real accepted receipt, rejection, or unknown
+  // outcome with a local callback failure. The worker ledger remains canonical.
+  try { if (stock && typeof stock.settle === 'function') suppressDeferred(stock.settle()); }
+  catch { /* Ephemeral cleanup does not change the durable operation outcome. */ }
+}
 
 /** Direct follower v2 start handler for an existing native projection owner.
  * Does not advertise ownership, create IPC clients, schedule FWE queues, or
@@ -66,6 +98,10 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
         typeof options.host?.executeCommandWithResponse !== 'function' ||
         options.onAccepted !== undefined && typeof options.onAccepted !== 'function' ||
         options.qualifyContinuation !== undefined && typeof options.qualifyContinuation !== 'function' ||
+        options.stockStart !== undefined && (!options.intentStore ||
+          typeof options.stockStart.prepare !== 'function' ||
+          typeof options.host.commandStatusForIntent !== 'function' ||
+          options.qualifyContinuation !== undefined || options.qualifyFirstTurn !== undefined) ||
         options.qualifyFirstTurn !== undefined &&
           (typeof options.qualifyFirstTurn !== 'function' ||
             typeof options.host.commandStatusForIntent !== 'function') ||
@@ -151,111 +187,141 @@ export class ManagedWorkerNativeStartHandler implements IpcRequestHandler {
     const persisted = this.#options.intentStore?.get(operationId);
     const previous = persisted?.intent ?? this.#commands.get(operationId);
     if (previous && !isDeepStrictEqual(previous.envelope, envelope)) throw refused();
-    let intent: NativeStartIntent;
-    if (previous) intent = previous;
-    else {
-      // An extended Composer context must never fall back to the ordinary
-      // compiler and lose local metadata or explicit permission settings.
-      const context = start.context;
-      const ordinary = object(context) && Object.keys(context).every(key => key === 'inheritThreadSettings');
-      let compiled: ReturnType<typeof compileNativeReadOnlyComposerStart> | null;
-      if (ordinary) compiled = null;
-      else if (!authority.composer || !this.#options.intentStore) throw refused();
+    let stock: PreparedStockNativeStart | null = null;
+    try {
+      let intent: NativeStartIntent;
+      // Only an actual worker ledger row permits retrieval without new admission.
+      // A persisted native intent alone must pass its original authority fence.
+      const known = previous && typeof this.#options.host.commandStatusForIntent === 'function' &&
+        this.#options.host.commandStatusForIntent(this.#options.controlKey, previous.command) !== null;
+      if (this.#options.stockStart && !known) {
+        if (previous) this.#sameAuthority(request, previous.admission as unknown as NativeStartAuthority);
+        stock = await this.#options.stockStart.prepare({ request: structuredClone(request),
+          authority: structuredClone(authority), operationId,
+          previousIntent: previous ? structuredClone(previous) : null });
+        this.#sameAuthority(request, authority);
+        if (!stock || !object(stock.params) || stock.params.threadId !== this.#options.taskId ||
+            stock.params.clientUserMessageId !== clientId ||
+            stock.uiParams !== null && !object(stock.uiParams) ||
+            stock.localMetadata !== null && !object(stock.localMetadata) ||
+            typeof stock.assertCurrent !== 'function' || typeof stock.settle !== 'function') throw refused();
+        const candidate: NativeStartIntent = { envelope: structuredClone(envelope),
+          command: { operationId, method: 'turn/start', params: structuredClone(stock.params) },
+          admission: structuredClone(authority) as unknown as IpcObject,
+          uiParams: structuredClone(stock.uiParams), localMetadata: structuredClone(stock.localMetadata) };
+        if (previous && !isDeepStrictEqual(candidate, previous)) throw refused();
+        intent = previous ?? candidate;
+        stockFence(stock, 'before-intent');
+      } else if (previous) intent = previous;
       else {
-        const turns = authority.composer.snapshot.turns;
-        if (!Array.isArray(turns) || turns.length === 0) {
-          compiled = compileNativeReadOnlyComposerStart(authority.composer.snapshot, envelope, authority.composer.defaults);
-        } else {
-          if (!this.#options.qualifyContinuation || authority.semanticRevision === undefined || this.#qualifyingContinuation)
-            throw refused();
-          this.#qualifyingContinuation = true;
-          try {
-            const evidence = await this.#options.qualifyContinuation(structuredClone(authority));
-            if (!evidence || typeof evidence !== 'object' || !evidence.owner || typeof evidence.owner !== 'object' ||
-                evidence.owner.ownerEpoch !== authority.ownerEpoch ||
-                evidence.owner.backendGeneration !== authority.backendGeneration ||
-                evidence.owner.threadId !== this.#options.taskId ||
-                evidence.owner.semanticRevision !== authority.semanticRevision) throw refused();
-            // The qualifier is asynchronous. Re-capture before any durable
-            // native intent record or worker command can be made.
-            this.#sameAuthority(request, authority);
-            compiled = compileNativeReadOnlyContinuationComposerStart(authority.composer.snapshot, envelope, evidence);
-          } finally { this.#qualifyingContinuation = false; }
+        // An extended Composer context must never fall back to the ordinary
+        // compiler and lose local metadata or explicit permission settings.
+        const context = start.context;
+        const ordinary = object(context) && Object.keys(context).every(key => key === 'inheritThreadSettings');
+        let compiled: ReturnType<typeof compileNativeReadOnlyComposerStart> | null;
+        if (ordinary) compiled = null;
+        else if (!authority.composer || !this.#options.intentStore) throw refused();
+        else {
+          const turns = authority.composer.snapshot.turns;
+          if (!Array.isArray(turns) || turns.length === 0) {
+            compiled = compileNativeReadOnlyComposerStart(authority.composer.snapshot, envelope, authority.composer.defaults);
+          } else {
+            if (!this.#options.qualifyContinuation || authority.semanticRevision === undefined || this.#qualifyingContinuation)
+              throw refused();
+            this.#qualifyingContinuation = true;
+            try {
+              const evidence = await this.#options.qualifyContinuation(structuredClone(authority));
+              if (!evidence || typeof evidence !== 'object' || !evidence.owner || typeof evidence.owner !== 'object' ||
+                  evidence.owner.ownerEpoch !== authority.ownerEpoch ||
+                  evidence.owner.backendGeneration !== authority.backendGeneration ||
+                  evidence.owner.threadId !== this.#options.taskId ||
+                  evidence.owner.semanticRevision !== authority.semanticRevision) throw refused();
+              // The qualifier is asynchronous. Re-capture before any durable
+              // native intent record or worker command can be made.
+              this.#sameAuthority(request, authority);
+              compiled = compileNativeReadOnlyContinuationComposerStart(authority.composer.snapshot, envelope, evidence);
+            } finally { this.#qualifyingContinuation = false; }
+          }
+        }
+        intent = { envelope: structuredClone(envelope),
+          command: { operationId, method: 'turn/start',
+            params: compiled?.request ?? prepareNativeFollowerStart(authority.snapshot, envelope) },
+          admission: structuredClone(authority) as unknown as IpcObject,
+          uiParams: compiled?.uiParams ?? null, localMetadata: compiled?.localMetadata ?? null };
+      }
+      const command = intent.command;
+      const storedAdmission = intent.admission as unknown as NativeStartAuthority;
+      const firstComposer = intent.uiParams !== null &&
+        Array.isArray(storedAdmission.composer?.snapshot.turns) &&
+        storedAdmission.composer.snapshot.turns.length === 0;
+      // A bounded first-turn route must not silently use the ordinary compiler
+      // or admit a continuation under a callback intended for an empty task.
+      if (this.#options.qualifyFirstTurn && !firstComposer) throw refused();
+      let firstTurnFenceCalls = 0;
+      const commandBytes = Buffer.byteLength(JSON.stringify(command));
+      if (commandBytes > 32 * 1024 * 1024) throw refused();
+      const bytes = Buffer.byteLength(JSON.stringify(intent));
+      // A durable exact duplicate does not requalify. The dispatcher returns its
+      // prior receipt without calling beforeWrite; intent-only records still
+      // invoke beforeWrite against their original stored admission below.
+      this.#sameAuthority(request, authority);
+      if (signal.aborted) throw refused();
+      // Record the original settings resolution for retransmission. The worker's
+      // durable ledger is authoritative if this bounded memory cache is gone.
+      if (!previous) {
+        // Failure to durably preserve intent prevents the native write entirely.
+        this.#options.intentStore?.reserve(operationId, clientId, intent);
+        this.#commands.set(operationId, { ...structuredClone(intent), bytes });
+        this.#bytes += bytes;
+        while (this.#commands.size > 128 || this.#bytes > 64 * 1024 * 1024) {
+          const oldest = this.#commands.keys().next().value!;
+          this.#bytes -= this.#commands.get(oldest)!.bytes;
+          this.#commands.delete(oldest);
         }
       }
-      intent = { envelope: structuredClone(envelope),
-        command: { operationId, method: 'turn/start',
-          params: compiled?.request ?? prepareNativeFollowerStart(authority.snapshot, envelope) },
-        admission: structuredClone(authority) as unknown as IpcObject,
-        uiParams: compiled?.uiParams ?? null, localMetadata: compiled?.localMetadata ?? null };
-    }
-    const command = intent.command;
-    const storedAdmission = intent.admission as unknown as NativeStartAuthority;
-    const firstComposer = intent.uiParams !== null &&
-      Array.isArray(storedAdmission.composer?.snapshot.turns) &&
-      storedAdmission.composer.snapshot.turns.length === 0;
-    // A bounded first-turn route must not silently use the ordinary compiler
-    // or admit a continuation under a callback intended for an empty task.
-    if (this.#options.qualifyFirstTurn && !firstComposer) throw refused();
-    let firstTurnFenceCalls = 0;
-    const commandBytes = Buffer.byteLength(JSON.stringify(command));
-    if (commandBytes > 32 * 1024 * 1024) throw refused();
-    const bytes = Buffer.byteLength(JSON.stringify(intent));
-    // A durable exact duplicate does not requalify. The dispatcher returns its
-    // prior receipt without calling beforeWrite; intent-only records still
-    // invoke beforeWrite against their original stored admission below.
-    this.#sameAuthority(request, authority);
-    if (signal.aborted) throw refused();
-    // Record the original settings resolution for retransmission. The worker's
-    // durable ledger is authoritative if this bounded memory cache is gone.
-    if (!previous) {
-      // Failure to durably preserve intent prevents the native write entirely.
-      this.#options.intentStore?.reserve(operationId, clientId, intent);
-      this.#commands.set(operationId, { ...structuredClone(intent), bytes });
-      this.#bytes += bytes;
-      while (this.#commands.size > 128 || this.#bytes > 64 * 1024 * 1024) {
-        const oldest = this.#commands.keys().next().value!;
-        this.#bytes -= this.#commands.get(oldest)!.bytes;
-        this.#commands.delete(oldest);
+      let prequalified = false;
+      let stockFenceCalls = 0;
+      if (firstComposer && this.#options.qualifyFirstTurn &&
+          !this.#options.host.commandStatusForIntent!(this.#options.controlKey, command)) {
+        this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-reservation');
+        firstTurnFenceCalls = 1;
+        prequalified = true;
       }
-    }
-    let prequalified = false;
-    if (firstComposer && this.#options.qualifyFirstTurn &&
-        !this.#options.host.commandStatusForIntent!(this.#options.controlKey, command)) {
-      this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-reservation');
-      firstTurnFenceCalls = 1;
-      prequalified = true;
-    }
-    let outcome: Awaited<ReturnType<ManagedWorkerFrontendHost['executeCommandWithResponse']>>;
-    try {
-      outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
-        () => {
-          this.#sameAuthority(request, storedAdmission);
-          if (!firstComposer || !this.#options.qualifyFirstTurn) return;
-          // The dispatcher invokes this callback once before its journal
-          // reservation and once at the actual RPC write. Phase one already
-          // ran before entering it, so only the latter is a new qualification.
-          if (++firstTurnFenceCalls === 2) return;
-          if (firstTurnFenceCalls !== 3) throw refused();
-          this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-write');
-        });
-    } finally {
-      if (prequalified) this.#options.onFirstTurnAttemptSettled?.(command);
-    }
-    // This signal only gates delivery. Never interrupt an accepted model turn.
-    if (signal.aborted) throw new Error('Native response delivery disconnected; worker outcome retained');
-    const current = this.#capture(request);
-    if (current.ownerEpoch !== authority.ownerEpoch || current.backendGeneration !== authority.backendGeneration)
-      throw refused();
-    const op = outcome.operation, result = outcome.response;
-    if (op.state !== 'accepted' || op.operationId !== operationId || op.method !== 'turn/start' ||
-        op.ownerEpoch !== authority.ownerEpoch || op.backendGeneration !== authority.backendGeneration ||
-        op.threadId !== this.#options.taskId || op.clientUserMessageId !== clientId ||
-        !object(result) || !object(result.turn) || typeof result.turn.id !== 'string' ||
-        !result.turn.id || result.turn.id !== op.receiptId)
-      throw new Error('Actual native start receipt unavailable; do not replay the command');
-    this.#options.onAccepted?.();
-    return { result: structuredClone(result) };
+      let outcome: Awaited<ReturnType<ManagedWorkerFrontendHost['executeCommandWithResponse']>>;
+      try {
+        outcome = await this.#options.host.executeCommandWithResponse(this.#options.controlKey, command,
+          () => {
+            this.#sameAuthority(request, storedAdmission);
+            if (stock) {
+              if (++stockFenceCalls > 2) throw refused();
+              stockFence(stock, stockFenceCalls === 1 ? 'before-reservation' : 'before-write');
+            }
+            if (!firstComposer || !this.#options.qualifyFirstTurn) return;
+            // The dispatcher invokes this callback once before its journal
+            // reservation and once at the actual RPC write. Phase one already
+            // ran before entering it, so only the latter is a new qualification.
+            if (++firstTurnFenceCalls === 2) return;
+            if (firstTurnFenceCalls !== 3) throw refused();
+            this.#options.qualifyFirstTurn(request, storedAdmission, command, 'before-write');
+          });
+      } finally {
+        if (prequalified) this.#options.onFirstTurnAttemptSettled?.(command);
+      }
+      // This signal only gates delivery. Never interrupt an accepted model turn.
+      if (signal.aborted) throw new Error('Native response delivery disconnected; worker outcome retained');
+      const current = this.#capture(request);
+      if (current.ownerEpoch !== authority.ownerEpoch || current.backendGeneration !== authority.backendGeneration)
+        throw refused();
+      const op = outcome.operation, result = outcome.response;
+      if (op.state !== 'accepted' || op.operationId !== operationId || op.method !== 'turn/start' ||
+          op.ownerEpoch !== authority.ownerEpoch || op.backendGeneration !== authority.backendGeneration ||
+          op.threadId !== this.#options.taskId || op.clientUserMessageId !== clientId ||
+          !object(result) || !object(result.turn) || typeof result.turn.id !== 'string' ||
+          !result.turn.id || result.turn.id !== op.receiptId)
+        throw new Error('Actual native start receipt unavailable; do not replay the command');
+      this.#options.onAccepted?.();
+      return { result: structuredClone(result) };
+    } finally { settleStock(stock); }
   }
 
   /** Retire this adapter, not its worker. Transport EOF alone is not retirement. */

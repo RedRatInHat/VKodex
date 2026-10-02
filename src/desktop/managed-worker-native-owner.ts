@@ -10,7 +10,7 @@ import { DesktopIpcClient } from './ipc-client.js';
 import type { IpcComposerIngressMethod, IpcComposerIngressOutcome, IpcIncomingRequest,
   IpcObject, IpcRequestFailureCategory, IpcRequestHandler } from './ipc-client.js';
 import { ManagedWorkerNativeStartHandler } from './managed-worker-native-start.js';
-import type { NativeStartAuthority } from './managed-worker-native-start.js';
+import type { NativeStartAuthority, StockNativeStartAdmission } from './managed-worker-native-start.js';
 import type { ContinuationOwnerFence, QualifiedContinuationEvidence } from './managed-worker-bootstrap.js';
 import { ManagedNativeStockQueueAdapter, type ManagedNativeStockPublish } from './managed-native-stock-queue-adapter.js';
 import type { NativeStockQueueQuiescence } from '../codex/native-stock-queue-journal.js';
@@ -18,7 +18,7 @@ import type { NativeStockQueueQuiescence } from '../codex/native-stock-queue-jou
 type Host = Pick<ManagedWorkerFrontendHost, 'metadata' | 'observeNotifications' | 'executeCommandWithResponse' |
   'observePendingRequests' | 'createRequestResponder' | 'commandStatusForIntent'> &
   Partial<Pick<ManagedWorkerFrontendHost, 'commandQuiescence' | 'requestQuiescence' |
-    'acceptedCommandReceipts' | 'acceptedQueueInputs'>>;
+    'acceptedCommandReceipts' | 'acceptedQueueInputs' | 'hasCommandClientIdentity'>>;
 type OwnerState = 'new' | 'bootstrapping' | 'connected' | 'disconnected' | 'failed' | 'closed';
 type StartupStage = 'not-started' | 'observing' | 'reading-initial' | 'validating-initial' |
   'checking-boundary' | 'connecting' | 'ready';
@@ -37,9 +37,9 @@ function bootstrapCategory(method: unknown): BootstrapCategory {
   if (typeof method === 'string' && method.startsWith('item/')) return 'item';
   return 'other';
 }
-type Grant = Readonly<{ requestId: string; sourceClientId: string }>;
-type QueueGrant = { readonly requestId: string; readonly sourceClientId: string;
+type Grant = { readonly requestId: string; readonly sourceClientId: string;
   readonly lease: object; revoked: boolean };
+type QueueGrant = Grant;
 export type ComposerIngressCounts = Readonly<{ seen: number; handled: number;
   refused: number; lastAtMs: number }>;
 export type ComposerIngressDiagnosis = Readonly<{
@@ -126,6 +126,9 @@ export interface ManagedWorkerNativeOwnerOptions {
   readonly clientFactory?: (handler: IpcRequestHandler) => DesktopIpcClient;
   /** Explicit previously qualified native queue adapter; never enabled by default. */
   readonly queueAdapterFactory?: (context: Readonly<ManagedNativeStockQueueContext>) => ManagedNativeStockQueueAdapter;
+  /** Same-worker stock direct start. Exclusive with the legacy canary compilers. */
+  readonly stockStartFactory?: (context: Readonly<ManagedNativeStockQueueContext &
+    { queueAdapter: ManagedNativeStockQueueAdapter }>) => StockNativeStartAdmission;
   /** Observation-only owner for isolated IPC method diagnosis. Never grants a
    * Composer, queue, settings, or request-response mutation. */
   readonly refusalOnlyProbe?: true;
@@ -207,6 +210,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
   #client: DesktopIpcClient | null = null;
   #startHandler: ManagedWorkerNativeStartHandler | null = null;
   #queueAdapter: ManagedNativeStockQueueAdapter | null = null;
+  #stockStart: StockNativeStartAdmission | null = null;
   // Serialize the whole native admission lifetime, including baseline reads
   // before the stock journal reserves an operation. The dispatcher serializes
   // wire writes, but it cannot order reservations made in other journals.
@@ -249,10 +253,14 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
             typeof options.host.acceptedCommandReceipts !== 'function') ||
         (options.clientFactory !== undefined && typeof options.clientFactory !== 'function') ||
         (options.queueAdapterFactory !== undefined && typeof options.queueAdapterFactory !== 'function') ||
+        options.stockStartFactory !== undefined && (typeof options.stockStartFactory !== 'function' ||
+          !options.queueAdapterFactory || !options.intentStore || options.qualifyContinuation !== undefined ||
+          options.qualifyFirstTurn !== undefined || !options.host.hasCommandClientIdentity) ||
         options.refusalOnlyProbe !== undefined &&
           (options.refusalOnlyProbe !== true || options.intentStore !== undefined ||
             options.composerDefaults !== undefined || options.qualifyFirstTurn !== undefined ||
-            options.qualifyContinuation !== undefined || options.queueAdapterFactory !== undefined)) throw refuse();
+            options.qualifyContinuation !== undefined || options.queueAdapterFactory !== undefined ||
+            options.stockStartFactory !== undefined)) throw refuse();
     this.#options = Object.freeze({ ...options });
   }
 
@@ -689,6 +697,12 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         host: this.#options.host, controlKey: this.#options.controlKey,
         taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
         authority: () => this.#authority(),
+        ...(this.#options.stockStartFactory ? { stockStart: {
+          prepare: scope => {
+            if (!this.#stockStart) throw refuse();
+            return this.#stockStart.prepare(scope);
+          },
+        } } : {}),
         ...(this.#options.qualifyContinuation ? {
           qualifyContinuation: (authority: NativeStartAuthority) => this.#qualifyContinuation(authority),
         } : {}),
@@ -704,9 +718,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
           } : {}),
         } : {}),
         authorizeFollower: request => {
-          const grant = this.#grants.get(request.requestId);
-          return grant?.sourceClientId === request.sourceClientId && this.#ownerCurrent() &&
-            this.#grants.get(request.requestId) === grant;
+          return this.#directGrantCurrent(request);
         },
         ...(this.#options.intentStore ? { intentStore: this.#options.intentStore,
           onAccepted: () => {
@@ -716,7 +728,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       });
       if (this.#options.queueAdapterFactory) {
         const generation = this.#generation!;
-        this.#queueAdapter = this.#options.queueAdapterFactory(Object.freeze({
+        const context = Object.freeze({
           host: this.#options.host, controlKey: this.#options.controlKey,
           taskId: this.#options.taskId, ownerEpoch: this.#options.ownerEpoch,
           backendGeneration: generation,
@@ -726,13 +738,18 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
           onFailure: () => this.#fail('queue-attribution-failed'),
           captureAuthority: () => this.#queueAuthority(),
           assertCurrent: (ticket: ManagedNativeStockQueueAuthority) => this.#queueAuthorityCurrent(ticket),
-        }));
+        });
+        this.#queueAdapter = this.#options.queueAdapterFactory(context);
+        if (this.#options.stockStartFactory) this.#stockStart = this.#options.stockStartFactory(
+          Object.freeze({ ...context, queueAdapter: this.#queueAdapter }));
       }
       this.#client = (this.#options.clientFactory ??
         (handler => new DesktopIpcClient(undefined, 15_000, handler)))(this);
       this.#client.onBroadcast(message => this.#broadcastReceived(message));
       this.#client.onDisconnect(() => {
-        if (this.#state === 'connected') { this.#state = 'disconnected'; this.#semanticRevision++; }
+        // Only the frontend transport changed. Worker/event/settings fences
+        // remain live; an admitted command is not semantically superseded.
+        if (this.#state === 'connected') this.#state = 'disconnected';
         this.#followers.clear(); // Admitted grants survive this transport EOF.
         this.#deferredBroadcasts.length = 0;
       });
@@ -758,7 +775,6 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         this.#client!.close(); throw refuse();
       }
       this.#state = 'connected';
-      this.#semanticRevision++;
       const buffered = this.#deferredBroadcasts.splice(0);
       for (const message of buffered) this.#broadcastReceived(message);
     })();
@@ -789,7 +805,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     }
     return { ownerEpoch: this.#options.ownerEpoch, backendGeneration: this.#generation,
       authorityRevision: this.#authorityRevision, snapshot: copy(this.#authoritySnapshot),
-      ...(this.#options.qualifyContinuation || this.#options.qualifyFirstTurn
+      ...(this.#options.qualifyContinuation || this.#options.qualifyFirstTurn || this.#options.stockStartFactory
         ? { semanticRevision: this.#semanticRevision } : {}),
       ...(composer === undefined ? {} : { composer }) };
   }
@@ -917,7 +933,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       const input = object(start?.request) ? start.request : null;
       const clientId = input?.clientUserMessageId;
       if (typeof clientId !== 'string' || !clientId || clientId.length > 128 ||
-          !this.#followerCurrent(request.sourceClientId) || !this.#ownerCurrent() ||
+          !this.#directGrantCurrent(request) || !this.#ownerCurrent() ||
           !['connected', 'disconnected'].includes(this.#state)) return false;
       if (handler.hasKnownWorkerOperation(clientId)) return true;
       const projection = this.#projection, host = this.#options.host;
@@ -940,8 +956,9 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         host.metadata.backendGeneration === this.#generation &&
         commands.inFlight === 0 && !commands.unconfirmed &&
         requests.generation === this.#generation && requests.unresolved === 0 &&
-        host.acceptedQueueInputs(this.#options.controlKey).length === 0 &&
-        accepted.every(receipt => receipt.method === 'turn/start' && terminal.has(receipt.receiptId));
+        (this.#stockStart !== null || host.acceptedQueueInputs(this.#options.controlKey).length === 0) &&
+        accepted.every(receipt => this.#stockStart !== null && receipt.method === 'thread/queue/add' ||
+          receipt.method === 'turn/start' && terminal.has(receipt.receiptId));
     } catch { return false; }
   }
 
@@ -977,20 +994,21 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     if (request.method !== 'thread-follower-start-turn') throw refuse();
     // Stock repeated admission owns command ordering for this opt-in route.
     // A direct start would bypass its homogeneous settings and queue journal.
-    if (this.#queueAdapter) throw new Error('Native stock queue refuses direct start');
+    if (this.#queueAdapter && !this.#stockStart) throw new Error('Native stock queue refuses direct start');
     const handler = this.#startHandler;
-    if (!this.#followerCurrent(request.sourceClientId) || !handler ||
+    const lease = this.#followers.get(request.sourceClientId);
+    if (!lease || !this.#followerCurrent(request.sourceClientId) || !handler ||
         this.#grants.size + this.#queueGrants.size >= 128 ||
         this.#grants.has(request.requestId) || this.#queueGrants.has(request.requestId)) throw refuse();
-    const grant: Grant = Object.freeze({ requestId: request.requestId,
-      sourceClientId: request.sourceClientId });
+    const grant: Grant = { requestId: request.requestId,
+      sourceClientId: request.sourceClientId, lease, revoked: false };
     this.#everAdmittedNativeMutation = true;
     this.#grants.set(request.requestId, grant);
     try {
       // The incoming IPC signal controls response delivery only. Once admitted,
       // EOF cannot revoke a native write; owner/projection revocation still can.
       return await this.#serialNativeAdmission(async () => {
-        if (!this.#directStartAdmissionCurrent(request, handler)) throw refuse();
+        if (grant.revoked || !this.#directStartAdmissionCurrent(request, handler)) throw refuse();
         return handler.handle(request, new AbortController().signal);
       });
     } finally { if (this.#grants.get(request.requestId) === grant) this.#grants.delete(request.requestId); }
@@ -1021,6 +1039,17 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     try { return lease !== undefined && this.#options.allowFollower(source) === true &&
       this.#followers.get(source) === lease && this.#state === 'connected'; }
     catch { return false; }
+  }
+
+  #directGrantCurrent(request: IpcIncomingRequest): boolean {
+    const grant = this.#grants.get(request.requestId);
+    try {
+      return grant !== undefined && grant.sourceClientId === request.sourceClientId && !grant.revoked &&
+        this.#options.allowFollower(request.sourceClientId) === true && !grant.revoked &&
+        this.#grants.get(request.requestId) === grant && this.#ownerCurrent() &&
+        ['connected', 'disconnected'].includes(this.#state) && !grant.revoked &&
+        this.#grants.get(request.requestId) === grant;
+    } catch { return false; }
   }
 
   #publishQueue(messages: readonly IpcObject[], metadata: Parameters<ManagedNativeStockPublish>[1],
@@ -1089,8 +1118,10 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
     if (message.method === 'client-status-changed') {
       const params = message.params;
       if (message.version === 0 && object(params) && params.status === 'disconnected' &&
-          typeof message.sourceClientId === 'string' && message.sourceClientId === params.clientId)
+          typeof message.sourceClientId === 'string' && message.sourceClientId === params.clientId) {
         this.#followers.delete(message.sourceClientId);
+        this.#revokeFollowerGrants(message.sourceClientId);
+      }
       return;
     }
     const params = message.params;
@@ -1102,8 +1133,7 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
       try { if (this.#options.allowFollower(source) !== true) return; } catch { return; }
       // An explicit follow starts a new source lease even after transport EOF.
       // EOF itself does not revoke already admitted work.
-      for (const grant of this.#queueGrants.values()) if (grant.sourceClientId === source)
-        grant.revoked = true;
+      this.#revokeFollowerGrants(source);
       const lease = {};
       this.#followers.set(source, lease);
       this.#sendSnapshot(source);
@@ -1117,9 +1147,13 @@ export class ManagedWorkerNativeOwner implements IpcRequestHandler {
         });
     } else {
       this.#followers.delete(source);
-      for (const grant of this.#queueGrants.values()) if (grant.sourceClientId === source)
-        grant.revoked = true;
+      this.#revokeFollowerGrants(source);
     }
+  }
+
+  #revokeFollowerGrants(source: string): void {
+    for (const grants of [this.#grants, this.#queueGrants])
+      for (const grant of grants.values()) if (grant.sourceClientId === source) grant.revoked = true;
   }
 
   /** Gateway retirement never calls host.stop or closes the native worker. */

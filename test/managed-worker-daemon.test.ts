@@ -1465,6 +1465,140 @@ test('stock daemon routes two native queue sends through one journaled backend a
   }
 });
 
+test('stock direct and native queue share one executor and preserve distinct real receipts across continuation', async () => {
+  const own = await readyFixture({ allow: true, expectedTurnCount: 3 },
+    { enabled: true, early: false }, 'normal', true);
+  const broker = own.brokers[0]!;
+  own.backend.stockHistory = [];
+  const wait = async (check: () => boolean) => {
+    const deadline = Date.now() + 12_000;
+    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(check(), JSON.stringify({ methods: own.backend.methods, errors: own.handlerErrors,
+      native: own.daemon.metadata.nativeStartup, state: own.daemon.metadata.nativeState,
+      frames: broker.frames.slice(-2) }));
+  };
+  const response = async (requestId: string) => {
+    await wait(() => broker.frames.some(frame => frame.type === 'response' && frame.requestId === requestId));
+    const frame = broker.frames.find(frame => frame.type === 'response' && frame.requestId === requestId)!;
+    assert.equal(frame.resultType, 'success', JSON.stringify({ frame, errors: own.handlerErrors }));
+    return frame.result as Record<string, unknown>;
+  };
+  const direct = (requestId: string, clientUserMessageId?: string) => {
+    const frame = composerRequest(own.taskId, own.home, requestId);
+    frame.targetClientId = broker.ownerId;
+    const start = (frame.params as Record<string, unknown>).turnStart as Record<string, unknown>;
+    const request = start.request as Record<string, unknown>;
+    request.permissions = ':danger-full-access'; request.approvalPolicy = 'never';
+    request.collaborationMode = { mode: 'default', settings: { model: 'gpt-5.6-sol',
+      reasoning_effort: 'medium', developer_instructions: null } };
+    if (clientUserMessageId !== undefined) request.clientUserMessageId = clientUserMessageId;
+    return { frame, clientId: request.clientUserMessageId as string };
+  };
+  const rejectFrame = async (frame: Record<string, unknown>, requestId: string) => {
+    broker.send(frame);
+    await wait(() => broker.frames.some(value => value.type === 'response' && value.requestId === requestId));
+    const result = broker.frames.find(value => value.type === 'response' && value.requestId === requestId)!;
+    assert.equal(result.resultType, 'error');
+  };
+  const complete = async (turnId: string, clientId: string) => {
+    const accepted = own.backend.frames.find(frame =>
+      (frame.params as Record<string, unknown> | undefined)?.clientUserMessageId === clientId);
+    assert.ok(accepted, 'canonical history must come from the actual submitted input');
+    const item = { id: `item-${clientId}`, type: 'userMessage', clientId,
+      content: structuredClone((accepted.params as Record<string, unknown>).input) };
+    const turn = { id: turnId, status: 'inProgress', items: [item], startedAt: own.backend.stockHistory!.length + 1 };
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/started',
+      params: { threadId: own.taskId, turn } }) + '\n');
+    const terminal = { ...turn, status: 'completed', completedAt: turn.startedAt + 1, itemsView: 'full' };
+    own.backend.stockHistory!.push(terminal);
+    own.backend.stdout.write(JSON.stringify({ method: 'turn/completed',
+      params: { threadId: own.taskId, turn: terminal } }) + '\n');
+    await wait(() => broker.frames.some(frame => frame.method === 'thread-stream-state-changed' &&
+        JSON.stringify(frame).includes(turnId) && JSON.stringify(frame).includes('completed')));
+  };
+  try {
+    await wait(() => broker.frames.some(frame => frame.method === 'thread-queued-followups-changed'));
+    const invalidDirect = [
+      (request: Record<string, unknown>) => { request.serviceTier = 'priority'; },
+      (request: Record<string, unknown>) => { request.collaborationMode = { mode: 'default', settings: {
+        model: 'gpt-5.6-sol', reasoning_effort: 'medium', developer_instructions: 'changed effective instructions' } }; },
+      (request: Record<string, unknown>) => { request.permissions = ':read-only'; },
+      (request: Record<string, unknown>) => { request.approvalPolicy = 'on-request'; },
+      (request: Record<string, unknown>) => { request.sandboxPolicy = { type: 'readOnly', networkAccess: false }; },
+      (_request: Record<string, unknown>, context: Record<string, unknown>) => {
+        context.responseItems = [{ type: 'message' }];
+      },
+      (_request: Record<string, unknown>, context: Record<string, unknown>) => {
+        context.attachments = [{ id: 'unqualified-attachment' }];
+      },
+      (request: Record<string, unknown>) => {
+        (request.input as Array<Record<string, unknown>>)[0]!.text_elements = [{ type: 'mention' }];
+      },
+      (request: Record<string, unknown>) => { request.unqualifiedField = true; },
+    ];
+    for (let index = 0; index < invalidDirect.length; index++) {
+      const id = `stock-invalid-direct-${index}`;
+      const invalid = direct(id).frame;
+      const params = invalid.params as Record<string, unknown>;
+      const start = params.turnStart as Record<string, unknown>;
+      const request = start.request as Record<string, unknown>;
+      const context = start.context as Record<string, unknown>;
+      invalidDirect[index]!(request, context);
+      await rejectFrame(invalid, id);
+      assert.equal(own.backend.writes, 0);
+      assert.equal(own.backend.queueWrites, 0);
+    }
+    const first = direct('stock-direct-one'); broker.send(first.frame);
+    const firstResult = await response('stock-direct-one');
+    const firstTurn = (firstResult.result as Record<string, unknown>).turn as Record<string, unknown>;
+    assert.equal(firstTurn.id, 'stock-direct-turn-1');
+    assert.equal(own.backend.writes, 1); assert.equal(own.backend.queueWrites, 0);
+    await complete(firstTurn.id as string, first.clientId);
+    const entry = stockEntry(own.home);
+    entry.id = first.clientId; // A queued client identity cannot reuse an accepted direct command.
+    await rejectFrame({ type: 'request', requestId: 'stock-queue-direct-client-collision',
+      sourceClientId: 'follower', targetClientId: broker.ownerId, hostId: 'local',
+      method: 'thread-follower-set-queued-follow-ups-state', version: 1,
+      params: { conversationId: own.taskId, state: { [own.taskId]: [entry] } } },
+    'stock-queue-direct-client-collision');
+    assert.equal(own.backend.writes, 1);
+    assert.equal(own.backend.queueWrites, 0);
+    entry.id = randomUUID();
+    broker.send({ type: 'request', requestId: 'stock-between', sourceClientId: 'follower',
+      targetClientId: broker.ownerId, hostId: 'local', method: 'thread-follower-set-queued-follow-ups-state',
+      version: 1, params: { conversationId: own.taskId, state: { [own.taskId]: [entry] } } });
+    assert.deepEqual(await response('stock-between'), { ok: true });
+    assert.equal(own.backend.queueWrites, 1);
+    await complete('stock-queued-turn', entry.id as string);
+    await rejectFrame(direct('stock-direct-queue-client-collision', entry.id as string).frame,
+      'stock-direct-queue-client-collision');
+    assert.equal(own.backend.writes, 1);
+    assert.equal(own.backend.queueWrites, 1);
+    const second = direct('stock-direct-two'); broker.send(second.frame);
+    const secondResult = await response('stock-direct-two');
+    const secondTurn = (secondResult.result as Record<string, unknown>).turn as Record<string, unknown>;
+    assert.equal(secondTurn.id, 'stock-direct-turn-2');
+    await complete(secondTurn.id as string, second.clientId);
+    broker.send({ ...first.frame, requestId: 'stock-direct-duplicate' });
+    assert.deepEqual(await response('stock-direct-duplicate'), firstResult);
+    assert.equal(own.backend.writes, 2); assert.equal(own.backend.queueWrites, 1);
+    assert.equal(own.backend.settingsWrites, 1);
+    assert.equal(own.backend.methods.filter(method => method === 'thread/resume').length, 1);
+    for (const frame of own.backend.frames.filter(frame => frame.method === 'turn/start')) {
+      const params = frame.params as Record<string, unknown>;
+      assert.equal(params.permissions, ':danger-full-access'); assert.equal(params.approvalPolicy, 'never');
+      assert.equal(params.effort, 'medium'); assert.equal(params.turnTrigger, undefined);
+      assert.equal(params.responsesapiClientMetadata, undefined);
+    }
+    assert.deepEqual((await controlStop(own.privateDirectory, own.reserved.epoch, 'stock-direct-stop')).result,
+      { stopped: true });
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
 test('stock stop refuses native intents missing from the worker journal, including a late family-proof reservation', async () => {
   for (const phase of ['reserved', 'unknown', 'accepted', 'during-family'] as const) {
     const family: { allow: boolean; beforeReturn?: () => void } = { allow: true };
@@ -1679,6 +1813,7 @@ class Backend extends EventEmitter {
   failBootstrap = false; resumeServiceTier: 'default' | null = null;
   terminalQueueClients: string[] | null = null;
   stockCompletedClients: string[] = [];
+  stockHistory: Record<string, unknown>[] | null = null;
   queueEntries: Record<string, unknown>[] = [];
   readStatusOverride: string | null = null;
   turnFailureError: Record<string, unknown> | null = null;
@@ -1699,7 +1834,8 @@ class Backend extends EventEmitter {
         if (!Object.hasOwn(frame, 'id')) continue;
         if (method === 'turn/start') { this.writes++;
           queueMicrotask(() => this.stdout.write(JSON.stringify({ id: frame.id,
-            result: { turn: { id: 'accepted-composer-turn', status: 'inProgress', extra: true } } }) + '\n'));
+            result: { turn: { id: this.stock ? `stock-direct-turn-${this.writes}` : 'accepted-composer-turn',
+              status: 'inProgress', extra: true } } }) + '\n'));
           continue; }
         if (method === 'thread/settings/update') {
           this.settingsWrites++;
@@ -1802,6 +1938,7 @@ class Backend extends EventEmitter {
     this.heldIdOnlyResume = null;
   }
   terminalTurns(): Record<string, unknown>[] {
+    if (this.stockHistory !== null) return this.stockHistory;
     if (this.stock && this.stockCompletedClients.length) return this.stockCompletedClients.map((clientId, index) =>
       ({ id: `stock-turn-${index + 1}`, status: 'completed', items: [
         { id: `stock-user-${index + 1}`, type: 'userMessage', clientId,
