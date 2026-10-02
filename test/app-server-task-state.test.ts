@@ -41,6 +41,57 @@ const resume = (turns: JsonObject[], nextCursor: string | null = null) => ({
 });
 const unsubscribed = { status: "unsubscribed" };
 
+test("subscription proof revisions are task-scoped and retain same-task consumer ABA", async () => {
+  const rpc = new FakeRpc();
+  const other = { ...resume([]), thread: { ...resume([]).thread, id: "other-task" } };
+  rpc.responses.set("thread/resume", [resume([]), other]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed, unsubscribed]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const root = transport.subscribe(task, () => {}, () => {});
+  const peer = transport.subscribe({ hostId: "h", threadId: "other-task" }, () => {}, () => {});
+  const second = transport.subscribe(task, () => {}, () => {});
+  try {
+    await root.start();
+    const proof = transport.subscriptionSnapshot(task);
+    await peer.start(); peer.close();
+    assert.deepEqual(transport.subscriptionSnapshot(task), proof,
+      "another task's consumer churn cannot invalidate this task's idle proof");
+    await second.start(); second.close();
+    const changed = transport.subscriptionSnapshot(task);
+    assert.equal(changed.count, proof.count);
+    assert.ok(changed.revision > proof.revision,
+      "the same count after same-task add/remove cannot conceal subscription replacement");
+  } finally { root.close(); peer.close(); second.close(); transport.close(); }
+});
+
+test("consumer revision cache pressure preserves retirement/reopen ABA fences", async () => {
+  const rpc = new FakeRpc();
+  rpc.responses.set("thread/resume", [resume([]), resume([])]);
+  rpc.responses.set("thread/unsubscribe", [unsubscribed, unsubscribed]);
+  const transport = new AppServerTaskStateTransport(rpc);
+  const task = { hostId: "h", threadId: "task" };
+  const root = transport.subscribe(task, () => {}, () => {});
+  const reopened = transport.subscribe(task, () => {}, () => {});
+  try {
+    await root.start();
+    const proof = transport.subscriptionSnapshot(task);
+    for (let i = 0; i < 5000; i++) {
+      const transient = transport.subscribe({ hostId: "h", threadId: `other-${i}` }, () => {}, () => {});
+      const starting = transient.start(); transient.close();
+      await assert.rejects(starting);
+    }
+    const evicted = transport.subscriptionSnapshot(task);
+    assert.equal(evicted.count, proof.count);
+    assert.ok(evicted.revision > proof.revision, "eviction must invalidate proof even if its task entry is gone");
+    root.close();
+    await reopened.start();
+    const next = transport.subscriptionSnapshot(task);
+    assert.equal(next.count, proof.count);
+    assert.ok(next.revision > evicted.revision, "retirement/reopen cannot reset the task's proof stamp");
+  } finally { root.close(); reopened.close(); transport.close(); }
+});
+
 test("accepted resume is unsubscribed even if local initialization fails", async () => {
   for (const failure of ["ownership-callback", "questions"] as const) {
     const rpc = new FakeRpc();

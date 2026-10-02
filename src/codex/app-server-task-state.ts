@@ -386,8 +386,21 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   private readonly startWaiters: Array<() => void> = [];
   private activeStarts = 0;
   private consumerRevision = 0;
+  private consumerRevisionFloor = 0;
+  private readonly consumerRevisions = new Map<string, number>();
   subscriptionSnapshot(task: TaskRef): { readonly count: number; readonly revision: number } {
-    return { count: this.streams.get(taskKey(task))?.consumers.size ?? 0, revision: this.consumerRevision };
+    const key = taskKey(task);
+    return { count: this.streams.get(key)?.consumers.size ?? 0,
+      revision: this.consumerRevisions.get(key) ?? this.consumerRevisionFloor };
+  }
+  private consumersChanged(key: string): void {
+    // Retain the stamp after retirement so a same-task close/reopen cannot ABA.
+    const revision = ++this.consumerRevision;
+    if (!this.consumerRevisions.has(key) && this.consumerRevisions.size >= 4096) {
+      this.consumerRevisions.clear();
+      this.consumerRevisionFloor = revision;
+    }
+    this.consumerRevisions.set(key, revision);
   }
   constructor(private readonly rpc: AppServerRpc,
     private readonly questions: (threadId: string) => readonly CodexQuestions[] = () => [],
@@ -418,7 +431,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
       start: async () => {
         if (closed || this.closed) throw new AppServerUnavailableError("Подписка наблюдения закрыта.");
         const entry = joined ??= this.streams.get(key) ?? this.createSharedStream(key, task);
-        if (!entry.consumers.has(consumer)) this.consumerRevision++;
+        if (!entry.consumers.has(consumer)) this.consumersChanged(key);
         entry.consumers.add(consumer);
         consumer.started = true;
         if (entry.error) throw entry.error;
@@ -443,7 +456,7 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
         closed = true;
         const entry = joined;
         if (!entry) return;
-        this.consumerRevision++;
+        this.consumersChanged(key);
         entry.consumers.delete(consumer);
         if (!entry.consumers.size) this.retire(key, entry);
       },
@@ -518,6 +531,9 @@ export class AppServerTaskStateTransport implements TaskStateTransport {
   }
   close(): void {
     this.closed = true;
-    for (const [key, entry] of this.streams) { entry.consumers.clear(); this.retire(key, entry); }
+    for (const [key, entry] of this.streams) {
+      if (entry.consumers.size) this.consumersChanged(key);
+      entry.consumers.clear(); this.retire(key, entry);
+    }
   }
 }

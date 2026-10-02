@@ -28,6 +28,7 @@ class Rpc implements AppServerRpc {
   onRequest?: (method: string) => void; beforeGuard?: (method: string) => void;
   pauseMethod: string | null = null; pauseGate: Promise<void> | null = null; onPausedRequest?: () => void;
   private readonly notifications = new Set<(notification: AppServerEnvelope) => void>();
+  serverHandler: AppServerServerRequestHandler | null = null;
   async start(): Promise<void> { this.starts++; }
   currentInitializedSession(): AppServerInitializedSession | null {
     return this.sessionAvailable ? structuredClone({ generation: this.generation,
@@ -45,7 +46,7 @@ class Rpc implements AppServerRpc {
     if (method === "thread/resume") {
       this.resumeTimeouts.push(_options?.timeoutMs ?? 30_000);
       if (this.waitResume) await this.waitResume;
-      return { thread: { id: "task", name: "Task", cwd: "D:\\w", status: { type: "idle" } },
+      return { thread: { id: String(_params.threadId ?? "task"), name: "Task", cwd: "D:\\w", status: { type: "idle" } },
         cwd: "D:\\w", model: "gpt", reasoningEffort: "high", initialTurnsPage: { data: [], nextCursor: null } };
     }
     if (method === "thread/unsubscribe") {
@@ -62,6 +63,9 @@ class Rpc implements AppServerRpc {
       }
       return { turn: { id: "turn" } };
     }
+    if (method === "thread/queue/add") return { queuedSubmission: {
+      id: "queued-submission", clientUserMessageId: _params.clientUserMessageId,
+    } };
     if (method === "thread/read") {
       const threadId = String(_params.threadId ?? "task");
       return structuredClone(this.threadReadResponses.get(threadId) ??
@@ -81,7 +85,7 @@ class Rpc implements AppServerRpc {
   onNotification(listener: (notification: AppServerEnvelope) => void): () => void {
     this.notifications.add(listener); return () => { this.notifications.delete(listener); };
   }
-  onServerRequest(_handler: AppServerServerRequestHandler | null): void {}
+  onServerRequest(handler: AppServerServerRequestHandler | null): void { this.serverHandler = handler; }
   async close(): Promise<void> { this.closed++; }
 }
 
@@ -95,6 +99,143 @@ function drainIdle(owner: AppServerProfileOwner, beforeRelease: () => void): Pro
   return drain ? drain.call(owner, taskRef, beforeRelease) : Promise.resolve("unavailable");
 }
 function isBlocked(status: DrainStatus): boolean { return status === "blocked" || status === "unavailable"; }
+
+test("publishing drain is not starved by another task's progress on the same profile", async t => {
+  for (const shape of ["MS/Steam historical queued receipt", "android terminal turn receipt"] as const)
+    await t.test(shape, async () => {
+      const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+      const stream = owner.states.subscribe(taskRef, () => {}, () => {});
+      await stream.start();
+      const operationId = "publishing-receipt";
+      if (shape === "MS/Steam historical queued receipt") {
+        await owner.queue({ operationId, task: taskRef, text: "synthetic publishing request" });
+        rpc.turnsListResponse = { data: [{ id: "terminal-queued-turn", status: "completed",
+          items: [{ type: "userMessage", clientId: operationId }] }], nextCursor: null };
+      } else {
+        await owner.submitWithReceipt({ operationId, task: taskRef, text: "synthetic publishing request" });
+        rpc.turnsListResponse = { data: [{ id: "turn", status: "completed", items: [] }], nextCursor: null };
+      }
+      const otherTaskId = "unrelated-active-task";
+      rpc.onRequest = method => {
+        if (method === "thread/read" || method === "thread/queue/list") {
+          rpc.notify({ method: "item/agentMessage/delta", params: { threadId: otherTaskId,
+            turnId: "other-turn", itemId: "other-item", delta: "synthetic progress" } });
+          rpc.notify({ method: "thread/status/changed", params: { threadId: otherTaskId,
+            status: { type: "active" } } });
+        }
+      };
+      rpc.beforeGuard = method => {
+        if (method === "thread/unsubscribe") rpc.notify({ method: "item/agentMessage/delta",
+          params: { threadId: otherTaskId, turnId: "other-turn", itemId: "other-item", delta: "last progress" } });
+      };
+      const before = rpc.calls.length;
+      let releases = 0;
+      const close = () => { releases++; stream.close(); };
+      try {
+        assert.equal(await drainIdle(owner, close), "waiting-unload");
+        assert.equal(releases, 1);
+        assert.equal(rpc.calls.slice(before).filter(method => method === "thread/unsubscribe").length, 1);
+        assert.equal(rpc.calls.slice(before).some(method =>
+          ["thread/resume", "turn/start", "turn/steer", "thread/queue/add"].includes(method)), false);
+        rpc.notify({ method: "thread/closed", params: { threadId: taskRef.threadId } });
+        assert.equal(await drainIdle(owner, close), "released");
+        assert.equal(releases, 1, "unload confirmation must not repeat the release");
+      } finally { stream.close(); await owner.close(); }
+    });
+});
+
+test("another task's subscription start and close during discovery cannot starve idle drain", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  const other = owner.states.subscribe({ ...taskRef, threadId: "unrelated-task" }, () => {}, () => {});
+  let entered!: () => void; const discovering = new Promise<void>(resolve => { entered = resolve; });
+  let resume!: () => void; const discovery = new Promise<void>(resolve => { resume = resolve; });
+  rpc.pauseMethod = "thread/list"; rpc.pauseGate = discovery; rpc.onPausedRequest = entered;
+  let releases = 0;
+  const draining = drainIdle(owner, () => { releases++; stream.close(); });
+  try {
+    await discovering;
+    await other.start(); other.close();
+    resume();
+    assert.equal(await draining, "waiting-unload");
+    assert.equal(releases, 1);
+    assert.equal(rpc.requests.filter(request => request.method === "thread/unsubscribe"
+      && request.params.threadId === taskRef.threadId).length, 1);
+  } finally { resume(); await draining; stream.close(); other.close(); await owner.close(); }
+});
+
+test("family, topology and ambiguous events remain fences during discovery and at the wire", async t => {
+  const events: Array<{ name: string; event: AppServerEnvelope }> = [
+    { name: "root progress", event: { method: "item/agentMessage/delta", params: { threadId: "task", delta: "progress" } } },
+    { name: "child discovered after event", event: { method: "thread/status/changed", params: { threadId: "child", status: { type: "active" } } } },
+    { name: "new family topology", event: { method: "thread/started", params: { thread: { id: "new-child" } } } },
+    { name: "archived topology", event: { method: "thread/archived", params: { threadId: "unrelated" } } },
+    { name: "unknown scoped method", event: { method: "future/native/event", params: { threadId: "unrelated" } } },
+    { name: "missing thread scope", event: { method: "item/agentMessage/delta", params: { itemId: "item", delta: "progress" } } },
+    { name: "blank thread scope", event: { method: "item/agentMessage/delta", params: { threadId: " " } } },
+    { name: "control character scope", event: { method: "thread/status/changed", params: { threadId: "bad\u0000id" } } },
+    { name: "oversized thread scope", event: { method: "thread/status/changed", params: { threadId: "x".repeat(1024) } } },
+    { name: "conflicting thread scope", event: { method: "thread/status/changed", params: { threadId: "unrelated", thread: { id: "task" } } } },
+  ];
+  for (const phase of ["discovery", "wire"] as const) for (const scenario of events)
+    await t.test(`${phase}: ${scenario.name}`, async () => {
+      const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+      rpc.threadListResponse = { data: [{ id: "child" }], nextCursor: null };
+      const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+      let injected = false;
+      const inject = (method: string) => {
+        if (!injected && method === (phase === "discovery" ? "thread/list" : "thread/unsubscribe")) {
+          injected = true; rpc.notify(scenario.event);
+        }
+      };
+      if (phase === "discovery") rpc.onRequest = inject; else rpc.beforeGuard = inject;
+      let releases = 0;
+      try {
+        const result = await drainIdle(owner, () => { releases++; stream.close(); });
+        assert.equal(result, phase === "discovery" ? "blocked" : "unavailable");
+        assert.equal(injected, true);
+        assert.equal(releases, phase === "discovery" ? 0 : 1);
+        assert.equal(rpc.calls.includes("thread/unsubscribe"), false,
+          "a changed family/ambiguous scope cannot write unsubscribe");
+      } finally { delete rpc.onRequest; delete rpc.beforeGuard; stream.close(); await owner.close(); }
+    });
+});
+
+test("malformed server-request scope retains the unscoped pending-write fence", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  let written!: () => void; const responseWritten = new Promise<void>(resolve => { written = resolve; });
+  try {
+    assert.ok(rpc.serverHandler);
+    await Promise.resolve().then(() => rpc.serverHandler!({ id: "synthetic-question",
+      method: "item/tool/requestUserInput", params: { threadId: " ", turnId: "other-turn", itemId: "question", questions: [] } },
+    { signal: new AbortController().signal, responseWritten })).catch(() => {});
+    let releases = 0;
+    assert.equal(await drainIdle(owner, () => { releases++; stream.close(); }), "blocked");
+    assert.equal(releases, 0, "ambiguous question scope cannot be assumed unrelated");
+  } finally { written(); await new Promise(resolve => setImmediate(resolve)); stream.close(); await owner.close(); }
+});
+
+test("revision cache pressure invalidates an in-flight proof and permits a fresh bounded proof", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  let injected = false;
+  rpc.onRequest = method => {
+    if (!injected && method === "thread/list") {
+      injected = true;
+      for (let i = 0; i < 5000; i++) rpc.notify({ method: "item/agentMessage/delta",
+        params: { threadId: `unrelated-${i}`, delta: "synthetic progress" } });
+    }
+  };
+  let releases = 0;
+  const close = () => { releases++; stream.close(); };
+  try {
+    assert.equal(await drainIdle(owner, close), "blocked", "eviction must invalidate rather than forget proof changes");
+    assert.equal(releases, 0);
+    assert.equal(await drainIdle(owner, close), "waiting-unload", "cache pressure does not permanently fence fresh proof");
+    assert.equal(releases, 1);
+  } finally { delete rpc.onRequest; stream.close(); await owner.close(); }
+});
 
 test("idle execution drain closes only the current owner stream and waits for matching unload", async () => {
   const rpc = new Rpc(); rpc.turnsListResponse = { data: [{ id: "turn", status: "completed", items: [] }], nextCursor: null };
