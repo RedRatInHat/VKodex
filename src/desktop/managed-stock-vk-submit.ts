@@ -158,9 +158,24 @@ export class ManagedStockVkSubmitter {
     return this.#known(this.#command(request).command);
   }
 
-  async submit(capability: object, request: SubmitTaskRequest): Promise<Readonly<{ submissionId: string }>> {
+  async submit(capability: object, request: SubmitTaskRequest,
+    assertScopeCurrent?: () => void): Promise<Readonly<{ submissionId: string }>> {
     if (capability !== this.#options.capability) refuse();
+    if (assertScopeCurrent !== undefined && typeof assertScopeCurrent !== 'function') refuse();
+    // Trusted in-process scope only; never a serialized caller assertion. It
+    // stays bound to this operation through preparation and actual wire write.
+    const assertScope = (): void => {
+      if (!assertScopeCurrent) return;
+      const result: unknown = assertScopeCurrent();
+      if (result !== undefined) {
+        // An async assertion cannot qualify a synchronous write fence. Observe
+        // a rejected promise without awaiting or granting it authority.
+        void Promise.resolve(result).catch(() => {});
+        refuse();
+      }
+    };
     const { command, beforeSend } = this.#command(request);
+    assertScope();
     const prior = this.#known(command);
     if (prior) {
       if (prior.state === 'accepted' && prior.receiptId) return { submissionId: prior.receiptId };
@@ -192,6 +207,7 @@ export class ManagedStockVkSubmitter {
           new Set(clientIds).size !== clientIds.length ||
           !isDeepStrictEqual(submissionIds, inputs.map(input => input.submissionId))) refuse();
       const assertTicket = () => {
+        assertScope();
         lease.assertCurrent();
         if (this.#leases.get(command.operationId) !== pending ||
             this.#options.assertAuthorityCurrent(ticket) !== true ||

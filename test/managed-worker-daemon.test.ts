@@ -1339,6 +1339,146 @@ test('headless VK admission resumes after completed VK and native direct turns w
   }
 });
 
+test('scoped headless VK binds admission and accepted receipts to the exact registry scope', async () => {
+  const capability = {}, handoffCapability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' }, undefined, false, handoffCapability);
+  type FullScope = Readonly<{ ownerEpoch: string; taskId: string; backendGeneration: number;
+    registryRevision: number; endpointRef: string }>;
+  type ScopedDaemon = {
+    vkIngressStatusScoped(capability: object, expected: FullScope):
+      { capability: string; admissionOpen: boolean };
+    submitVkScoped(capability: object, expected: FullScope, request: {
+      operationId: string; task: { hostId: 'local'; threadId: string }; text: string
+    }): Promise<{ submissionId: string }>;
+    vkSubmissionStatusByOperationIdScoped(capability: object, expected: FullScope,
+      operationId: string): { state: string; submissionId: string | null } | null;
+  };
+  const daemon = own.daemon as unknown as ScopedDaemon;
+  const registry = new ManagedWorkerRegistry(own.registryPath);
+  const row = registry.get(own.home, 'own-family'); registry.close();
+  assert.ok(row?.backend && row.endpointRef);
+  const scope: FullScope = Object.freeze({ ownerEpoch: row.epoch, taskId: own.taskId,
+    backendGeneration: row.backend.generation, registryRevision: row.revision,
+    endpointRef: row.endpointRef });
+  try {
+    assert.deepEqual(daemon.vkIngressStatusScoped(capability, scope),
+      { capability: 'stock-idle-queue-v2', admissionOpen: true });
+    const accepted = await daemon.submitVkScoped(capability, scope, {
+      operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK_SCOPED',
+    });
+    assert.equal(own.backend.queueWrites, 1);
+    assert.equal(own.backend.writes, 0, 'scoped admission must use queue/add, never turn/start');
+    own.daemon.revokeIngress(handoffCapability);
+    assert.deepEqual(daemon.vkIngressStatusScoped(capability, scope),
+      { capability: 'stock-idle-queue-v2', admissionOpen: false },
+      'the captured owner scope remains identifiable after admission is revoked');
+    const receipt = daemon.vkSubmissionStatusByOperationIdScoped(capability, scope, operationId);
+    assert.ok(receipt, 'exact accepted receipt remains queryable after revocation');
+    assert.deepEqual(await daemon.submitVkScoped(capability, scope, {
+      operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK_SCOPED',
+    }), accepted, 'an exact accepted duplicate is idempotent after revocation');
+    assert.equal(own.backend.queueWrites, 1, 'duplicate must not write again');
+    await assert.rejects(daemon.submitVkScoped(capability, scope, {
+      operationId: randomUUID(), task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK_FRESH',
+    }), 'revocation rejects new work');
+    assert.equal(own.backend.queueWrites, 1, 'fresh post-revocation work has no wire write');
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('scoped headless VK refuses mismatched or changed scope without wire writes', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' });
+  type FullScope = Readonly<{ ownerEpoch: string; taskId: string; backendGeneration: number;
+    registryRevision: number; endpointRef: string }>;
+  type ScopedDaemon = {
+    vkIngressStatusScoped(capability: object, expected: FullScope): unknown;
+    submitVkScoped(capability: object, expected: FullScope, request: {
+      operationId: string; task: { hostId: 'local'; threadId: string }; text: string;
+      beforeSend?: () => Promise<void>;
+    }): Promise<{ submissionId: string }>;
+    vkSubmissionStatusByOperationIdScoped(capability: object, expected: FullScope,
+      operationId: string): unknown;
+  };
+  const daemon = own.daemon as unknown as ScopedDaemon;
+  const registry = new ManagedWorkerRegistry(own.registryPath);
+  const row = registry.get(own.home, 'own-family'); registry.close();
+  assert.ok(row?.backend && row.endpointRef);
+  const scope: FullScope = Object.freeze({ ownerEpoch: row.epoch, taskId: own.taskId,
+    backendGeneration: row.backend.generation, registryRevision: row.revision,
+    endpointRef: row.endpointRef });
+  try {
+    const wrongEndpoint = Object.freeze({ ...scope, endpointRef: randomUUID() });
+    await assert.rejects(Promise.resolve().then(() => daemon.vkIngressStatusScoped(capability, wrongEndpoint)));
+    await assert.rejects(daemon.submitVkScoped(capability, wrongEndpoint, {
+      operationId, task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK_WRONG_SCOPE',
+    }));
+    assert.equal(own.backend.queueWrites, 0);
+
+    let beforeSendFinished = false;
+    await assert.rejects(daemon.submitVkScoped(capability, scope, {
+      operationId: randomUUID(), task: { hostId: 'local', threadId: own.taskId }, text: 'PUBLIC_VK_DRIFT',
+      beforeSend: async () => {
+        own.backend.birthDrift = true;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        beforeSendFinished = true;
+      },
+    }));
+    assert.equal(beforeSendFinished, true);
+    assert.equal(own.backend.queueWrites, 0,
+      'scope drift observed after beforeSend must fence the final worker write');
+    await assert.rejects(Promise.resolve().then(() =>
+      daemon.vkSubmissionStatusByOperationIdScoped(capability, scope, operationId)),
+    'stale scope must be unavailable, not represented as an absent operation');
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
+test('scoped headless VK never replays an operation with an unknown worker receipt', async () => {
+  const capability = {}, operationId = randomUUID();
+  const own = await readyFixture({ allow: true }, { enabled: true, early: false },
+    'normal', true, null, { capability, sourceId: '' }, 300);
+  type FullScope = Readonly<{ ownerEpoch: string; taskId: string; backendGeneration: number;
+    registryRevision: number; endpointRef: string }>;
+  type ScopedDaemon = {
+    submitVkScoped(capability: object, expected: FullScope, request: {
+      operationId: string; task: { hostId: 'local'; threadId: string }; text: string
+    }): Promise<{ submissionId: string }>;
+    vkSubmissionStatusByOperationIdScoped(capability: object, expected: FullScope,
+      operationId: string): { state: string; submissionId: string | null } | null;
+  };
+  const daemon = own.daemon as unknown as ScopedDaemon;
+  const registry = new ManagedWorkerRegistry(own.registryPath);
+  const row = registry.get(own.home, 'own-family'); registry.close();
+  assert.ok(row?.backend && row.endpointRef);
+  const scope: FullScope = Object.freeze({ ownerEpoch: row.epoch, taskId: own.taskId,
+    backendGeneration: row.backend.generation, registryRevision: row.revision,
+    endpointRef: row.endpointRef });
+  own.backend.holdQueueReply = true;
+  try {
+    const request = { operationId, task: { hostId: 'local' as const, threadId: own.taskId },
+      text: 'PUBLIC_VK_UNKNOWN' };
+    await assert.rejects(daemon.submitVkScoped(capability, scope, request));
+    assert.equal(own.backend.queueWrites, 1);
+    assert.deepEqual(daemon.vkSubmissionStatusByOperationIdScoped(capability, scope, operationId),
+      { state: 'unknown', submissionId: null });
+    await assert.rejects(daemon.submitVkScoped(capability, scope, request));
+    assert.equal(own.backend.queueWrites, 1, 'unknown receipt is never retried');
+  } finally {
+    if (own.backend.exitCode === null) { own.backend.exitCode = 1;
+      own.backend.emit('exit', 1, null); own.backend.emit('close', 1, null); }
+    await (own.control as ManagedWorkerControlServer | null)?.close();
+  }
+});
+
 test('headless VK refuses a quiet native queue client identity without a worker operation', async () => {
   const capability = {}, clientId = randomUUID();
   const own = await readyFixture({ allow: true }, { enabled: true, early: false },

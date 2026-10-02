@@ -18,6 +18,7 @@ function qualifiedAdmissionFixture() {
     operation: null as WorkerOperation | null,
     receipts: [] as { method: WorkerCommand['method']; receiptId: string }[],
     inputs: [] as { clientUserMessageId: string; submissionId: string }[],
+    beforeRead: async () => {},
     beforeWire: () => {},
   };
   const ticket: ManagedNativeStockQueueAuthority = { taskId, ownerEpoch: epoch,
@@ -41,7 +42,7 @@ function qualifiedAdmissionFixture() {
     initialState: { latestThreadSettings: {}, currentPermissions: {}, environments: [] } as never,
     captureAuthority: () => ticket, assertAuthorityCurrent: value => value === ticket,
     isClientReservedForNativeInput: () => state.nativeReserved as boolean,
-    readStockState: async assertCurrent => { assertCurrent(); return read; },
+    readStockState: async assertCurrent => { await state.beforeRead(); assertCurrent(); return read; },
     acquireLease: () => ({ assertCurrent() {}, finish: outcome => { state.finishes.push(outcome); } }),
     host: {
       commandStatusForIntent: (_key, command) => { state.command = command; return state.operation; },
@@ -204,4 +205,29 @@ test('VK native collision at the final write fence refuses an already reserved o
   assert.equal(state.operation?.state, 'rejected');
   assert.deepEqual(state.finishes, ['rejected']);
   assert.equal(submitter.pending, 0);
+});
+
+for (const phase of ['initial', 'history-read', 'local-preparation', 'actual-write'] as const) {
+  test(`VK per-call worker scope refuses a change at ${phase}`, async () => {
+    const { submitter, request, capability, state } = qualifiedAdmissionFixture();
+    let current = phase !== 'initial';
+    if (phase === 'history-read') state.beforeRead = async () => { current = false; };
+    if (phase === 'actual-write') state.beforeWire = () => { current = false; };
+    await assert.rejects(submitter.submit(capability, { ...request,
+      beforeSend: async () => { if (phase === 'local-preparation') current = false; },
+    }, () => { if (!current) throw new Error('Scoped worker identity changed'); }));
+    assert.equal(state.writes, 0);
+    assert.equal(state.dispatches, phase === 'actual-write' ? 1 : 0);
+    assert.equal(submitter.pending, 0);
+  });
+}
+
+for (const rejects of [false, true]) test(`VK per-call scope rejects an asynchronous assertion (${rejects ? 'rejected' : 'resolved'}) without an unhandled promise`, async () => {
+  const { submitter, request, capability, state } = qualifiedAdmissionFixture();
+  await assert.rejects(submitter.submit(capability, request, async () => {
+    if (rejects) throw new Error('Unqualified asynchronous scope');
+  }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.writes, 0);
+  assert.equal(state.dispatches, 0);
 });

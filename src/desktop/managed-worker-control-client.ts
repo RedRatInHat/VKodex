@@ -4,8 +4,11 @@ import { StringDecoder } from 'node:string_decoder';
 import type { SubmitTaskRequest } from '../core/codex-tasks.js';
 import { validManagedVkControlRequest, type ManagedWorkerControlStatus,
   validManagedWorkerHandoffProof, validNativeCliCanaryEvidence,
+  validManagedWorkerVkScope, managedWorkerVkScopeKeys,
   type ManagedWorkerHandoffScope,
-  type ManagedWorkerControlHandoffProof, type ManagedWorkerVkStatus } from './managed-worker-control.js';
+  type ManagedWorkerControlHandoffProof, type ManagedWorkerVkStatus,
+  type ManagedWorkerVkScope, type ManagedWorkerScopedVkIngressStatus,
+  type ManagedWorkerScopedVkReceipt, type ManagedWorkerScopedVkStatus } from './managed-worker-control.js';
 import type { NativeCliCanaryEvidence } from './managed-worker-daemon.js';
 
 export interface ManagedWorkerControlClientOptions {
@@ -38,7 +41,8 @@ export interface ManagedWorkerScopedControlStatus extends ManagedWorkerControlSt
 
 type Method = 'status' | 'submit-vk-v1' | 'vk-submission-status-v1' |
   'vk-submission-status-by-id-v1' | 'revoke-ingress-v1' | 'qualify-handoff-v1' |
-  'cli-canary-evidence-v1';
+  'cli-canary-evidence-v1' | 'vk-ingress-status-v2' | 'submit-vk-v2' |
+  'vk-submission-status-by-id-v2';
 const object = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 const hostStates = new Set(['new', 'starting', 'running', 'restarting', 'frontend-unavailable',
@@ -164,6 +168,62 @@ export class ManagedWorkerControlClient {
   async vkSubmissionStatusByOperationId(operationId: string): Promise<ManagedWorkerVkStatus | null> {
     if (!uuid.test(operationId)) throw new ManagedWorkerControlRefusedError();
     return this.#status(await this.#call('vk-submission-status-by-id-v1', { operationId }));
+  }
+
+  /** Explicit v2 only. Capture authority before opening a socket; never refresh,
+   * downgrade to v1 or replay on an uncertain outcome. */
+  async ingressStatusV2(expected: ManagedWorkerVkScope): Promise<ManagedWorkerScopedVkIngressStatus> {
+    const captured = this.#captureVkScope(expected);
+    const result = await this.#call('vk-ingress-status-v2', this.#vkScopePayload(captured));
+    if (!this.#scopedVkReply(result, captured, ['capability', 'admissionOpen']) ||
+      result.capability !== 'stock-idle-queue-v2' || typeof result.admissionOpen !== 'boolean')
+      throw new ManagedWorkerControlUnknownError();
+    return Object.freeze({ ...captured, capability: 'stock-idle-queue-v2', admissionOpen: result.admissionOpen });
+  }
+
+  async submitVkV2(expected: ManagedWorkerVkScope, request: SubmitTaskRequest): Promise<ManagedWorkerScopedVkReceipt> {
+    const captured = this.#captureVkScope(expected);
+    if (!validManagedVkControlRequest(request, captured.taskId)) throw new ManagedWorkerControlRefusedError();
+    const result = await this.#call('submit-vk-v2', { ...this.#vkScopePayload(captured), request });
+    if (!this.#scopedVkReply(result, captured, ['submissionId']) ||
+      typeof result.submissionId !== 'string' || !result.submissionId || result.submissionId.length > 256 ||
+      /[\u0000-\u001f\u007f]/u.test(result.submissionId)) throw new ManagedWorkerControlUnknownError();
+    return Object.freeze({ ...captured, submissionId: result.submissionId });
+  }
+
+  async vkSubmissionStatusByOperationIdV2(expected: ManagedWorkerVkScope,
+    operationId: string): Promise<ManagedWorkerScopedVkStatus | null> {
+    const captured = this.#captureVkScope(expected);
+    if (typeof operationId !== 'string' || !uuid.test(operationId)) throw new ManagedWorkerControlRefusedError();
+    const result = await this.#call('vk-submission-status-by-id-v2', {
+      ...this.#vkScopePayload(captured), operationId });
+    if (this.#scopedVkReply(result, captured, ['status']) && result.status === null) return null;
+    if (!this.#scopedVkReply(result, captured, ['state', 'submissionId']))
+      throw new ManagedWorkerControlUnknownError();
+    const status = this.#status({ state: result.state, submissionId: result.submissionId })!;
+    if (status.submissionId !== null && /[\u0000-\u001f\u007f]/u.test(status.submissionId))
+      throw new ManagedWorkerControlUnknownError();
+    return Object.freeze({ ...captured, ...status });
+  }
+
+  #captureVkScope(expected: ManagedWorkerVkScope): ManagedWorkerVkScope {
+    if (!validManagedWorkerVkScope(expected) || expected.ownerEpoch !== this.#options.ownerEpoch ||
+      expected.taskId !== this.#options.taskId) throw new ManagedWorkerControlRefusedError();
+    return Object.freeze({ ownerEpoch: expected.ownerEpoch, taskId: expected.taskId,
+      backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision,
+      endpointRef: expected.endpointRef });
+  }
+
+  #vkScopePayload(expected: ManagedWorkerVkScope): Readonly<Record<string, unknown>> {
+    return { backendGeneration: expected.backendGeneration, registryRevision: expected.registryRevision,
+      endpointRef: expected.endpointRef };
+  }
+
+  #scopedVkReply(result: unknown, expected: ManagedWorkerVkScope,
+    keys: readonly string[]): result is Record<string, unknown> {
+    return object(result) && Object.keys(result).length === managedWorkerVkScopeKeys.length + keys.length &&
+      [...managedWorkerVkScopeKeys, ...keys].every(key => Object.hasOwn(result, key)) &&
+      managedWorkerVkScopeKeys.every(key => result[key] === expected[key]);
   }
 
   /** Worker-local monotonic revoke. EOF/timeout is unknown, never success. */
