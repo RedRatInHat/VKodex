@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, renameSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
 import type { TaskRef } from "../core/codex-tasks.js";
@@ -18,12 +19,25 @@ export interface RestartTaskSnapshot extends TaskRef {
   readonly ownerClaimRevision?: number;
 }
 
-export interface RestartIntent {
-  readonly version: 1;
+interface RestartIntentMetadata {
   readonly id: string;
   readonly createdAt: number;
   readonly sourcePid: number;
   readonly tasks: readonly RestartTaskSnapshot[];
+}
+
+export type RestartRecoveryPolicy = "resume-interrupted" | "reconcile-only";
+export type RestartIntent = RestartIntentMetadata & (
+  { readonly version: 1 } |
+  { readonly version: 2; readonly recoveryPolicy: "reconcile-only" }
+);
+
+/** Validate before reading configuration, capturing a snapshot or signalling a process. */
+export function parseRestartRecoveryPolicy(args: readonly string[]): RestartRecoveryPolicy {
+  if (args.length === 0) return "resume-interrupted";
+  if (args.length === 2 && args[0] === "--recovery-policy" &&
+    (args[1] === "resume-interrupted" || args[1] === "reconcile-only")) return args[1];
+  throw new Error("Invalid restart recovery policy arguments");
 }
 
 const safeId = (value: unknown): value is string => typeof value === "string" && /^[a-zA-Z0-9-]{1,100}$/u.test(value);
@@ -36,7 +50,11 @@ export function restartIntentPath(dataDir: string): string {
 export function parseRestartIntent(value: unknown): RestartIntent {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid restart intent");
   const record = value as Record<string, unknown>;
-  if (record.version !== 1 || !safeId(record.id) || !Number.isSafeInteger(record.createdAt) || !Number.isSafeInteger(record.sourcePid)
+  const keys = ["version", "id", "createdAt", "sourcePid", "tasks", ...(record.version === 2 ? ["recoveryPolicy"] : [])];
+  if (Object.keys(record).some(key => !keys.includes(key))) throw new Error("Invalid restart intent");
+  if (!(record.version === 1 && record.recoveryPolicy === undefined ||
+      record.version === 2 && record.recoveryPolicy === "reconcile-only")
+    || !safeId(record.id) || !Number.isSafeInteger(record.createdAt) || !Number.isSafeInteger(record.sourcePid)
     || !Array.isArray(record.tasks) || record.tasks.length > 100) throw new Error("Invalid restart intent");
   const tasks = record.tasks.map(value => {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid restart task");
@@ -62,7 +80,9 @@ export function parseRestartIntent(value: unknown): RestartIntent {
       ...(task.sourceId ? { sourceId: task.sourceId } : {}),
     } as RestartTaskSnapshot;
   });
-  return { version: 1, id: record.id, createdAt: Number(record.createdAt), sourcePid: Number(record.sourcePid), tasks };
+  const metadata = { id: record.id, createdAt: Number(record.createdAt), sourcePid: Number(record.sourcePid), tasks };
+  return record.version === 2 ? { ...metadata, version: 2, recoveryPolicy: "reconcile-only" }
+    : { ...metadata, version: 1 };
 }
 
 export async function readRestartIntent(dataDir: string): Promise<RestartIntent | null> {
@@ -73,13 +93,30 @@ export async function readRestartIntent(dataDir: string): Promise<RestartIntent 
   }
 }
 
-async function writeRestartIntent(tasks: readonly RestartTaskSnapshot[], dataDir: string, sourcePid: number, now: number): Promise<RestartIntent> {
+/** Serializes cooperating current-version journal writers across processes.
+ * Only bounded local file operations run in this transaction, never RPC/await.
+ * Old helpers and external file edits are not covered by this protocol. */
+function withRestartIntentLock<T>(dataDir: string, work: () => T): T {
+  const db = new DatabaseConstructor(path.join(path.resolve(dataDir), "restart-intent-lock.sqlite"), { timeout: 100 });
+  try { return db.transaction(work).immediate(); }
+  finally { db.close(); }
+}
+
+async function writeRestartIntent(tasks: readonly RestartTaskSnapshot[], dataDir: string, sourcePid: number, now: number,
+  recoveryPolicy: RestartRecoveryPolicy): Promise<RestartIntent> {
+  if (recoveryPolicy !== "resume-interrupted" && recoveryPolicy !== "reconcile-only") throw new Error("Invalid restart recovery policy");
   const id = randomUUID();
-  const intent = parseRestartIntent({ version: 1, id, createdAt: now, sourcePid, tasks });
+  const intent = parseRestartIntent({ id, createdAt: now, sourcePid, tasks,
+    ...(recoveryPolicy === "reconcile-only" ? { version: 2, recoveryPolicy } : { version: 1 }) });
   const destination = restartIntentPath(dataDir);
   const temporary = path.join(path.dirname(destination), `restart-intent.${id}.pending`);
   await writeFile(temporary, `${JSON.stringify(intent, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  try { await rename(temporary, destination); }
+  try {
+    withRestartIntentLock(dataDir, () => {
+      if (existsSync(destination)) throw new Error("An unconsumed restart intent already exists");
+      renameSync(temporary, destination);
+    });
+  }
   catch (error) {
     // Preserve the complete snapshot under its unique pending name for manual
     // inspection; never overwrite an earlier unconsumed restart request.
@@ -88,7 +125,8 @@ async function writeRestartIntent(tasks: readonly RestartTaskSnapshot[], dataDir
   return intent;
 }
 
-export async function captureRestartIntent(store: BridgeStore, dataDir: string, sourcePid: number, now = Date.now()): Promise<RestartIntent> {
+export async function captureRestartIntent(store: BridgeStore, dataDir: string, sourcePid: number, now = Date.now(),
+  recoveryPolicy: RestartRecoveryPolicy = "resume-interrupted"): Promise<RestartIntent> {
   const tasks = store.bindings().flatMap(binding => {
     const details = store.getValue<{ status?: string }>(`task-details:${binding.id}`);
     if (!binding.attached || binding.peerId === null || details?.status !== "running") return [];
@@ -106,7 +144,7 @@ export async function captureRestartIntent(store: BridgeStore, dataDir: string, 
       ...(binding.sourceId ? { sourceId: binding.sourceId } : {}),
     } satisfies RestartTaskSnapshot];
   });
-  return writeRestartIntent(tasks, dataDir, sourcePid, now);
+  return writeRestartIntent(tasks, dataDir, sourcePid, now, recoveryPolicy);
 }
 
 interface RestartSnapshotRow {
@@ -124,7 +162,8 @@ interface RestartSnapshotRow {
 }
 
 /** Read one committed SQLite snapshot without opening BridgeStore or running migrations. */
-export async function captureRestartIntentFromDatabase(filename: string, dataDir: string, sourcePid: number, now = Date.now()): Promise<RestartIntent> {
+export async function captureRestartIntentFromDatabase(filename: string, dataDir: string, sourcePid: number, now = Date.now(),
+  recoveryPolicy: RestartRecoveryPolicy = "resume-interrupted"): Promise<RestartIntent> {
   const db = new DatabaseConstructor(filename, { readonly: true, fileMustExist: true, timeout: 5_000 });
   let tasks: RestartTaskSnapshot[];
   try {
@@ -159,12 +198,21 @@ export async function captureRestartIntentFromDatabase(filename: string, dataDir
       });
     }).deferred();
   } finally { db.close(); }
-  return writeRestartIntent(tasks, dataDir, sourcePid, now);
+  return writeRestartIntent(tasks, dataDir, sourcePid, now, recoveryPolicy);
+}
+
+export function archiveRestartIntentSync(dataDir: string, intent: RestartIntent): string {
+  const source = restartIntentPath(dataDir);
+  const destination = path.join(path.dirname(source), `restart-intent.completed-${intent.id}.json`);
+  withRestartIntentLock(dataDir, () => {
+    const current = parseRestartIntent(JSON.parse(readFileSync(source, "utf8")) as unknown);
+    if (JSON.stringify(current) !== JSON.stringify(intent)) throw new Error("Restart intent changed during recovery");
+    if (existsSync(destination)) throw new Error("Restart intent archive already exists");
+    renameSync(source, destination);
+  });
+  return destination;
 }
 
 export async function archiveRestartIntent(dataDir: string, intent: RestartIntent): Promise<string> {
-  const source = restartIntentPath(dataDir);
-  const destination = path.join(path.dirname(source), `restart-intent.completed-${intent.id}.json`);
-  await rename(source, destination);
-  return destination;
+  return archiveRestartIntentSync(dataDir, intent);
 }
