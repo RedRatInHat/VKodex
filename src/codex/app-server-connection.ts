@@ -22,7 +22,9 @@ export class AppServerUnavailableError extends Error {
 
 export class AppServerRejectedError extends Error {
   constructor(readonly code: number | string | null = null,
-    readonly reason: "active-writer" | null = null) {
+    readonly reason: "active-writer" | "model-not-supported-for-account" | null = null,
+    readonly backendGeneration: number | null = null,
+    readonly requestMethod: "initialize" | "turn/start" | "turn/steer" | "thread/queue/add" | "thread/settings/update" | null = null) {
     super("Codex App Server отклонил запрос."); this.name = "AppServerRejectedError";
   }
 }
@@ -121,6 +123,8 @@ export interface AppServerRpc {
 
 interface PendingRequest {
   readonly mutating: boolean;
+  readonly generation: number;
+  readonly rejectionMethod: AppServerRejectedError["requestMethod"];
   readonly resolve: (value: JsonObject) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
@@ -142,6 +146,17 @@ interface PendingServerRequest {
 const isObject = (value: unknown): value is JsonObject => value !== null && typeof value === "object" && !Array.isArray(value);
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAX_LATE_RESPONSE_RECEIPTS = 128;
+
+/** Classify only the known account rejection; discard the native body. This
+ * reports this connection's refusal, not global model/account availability. */
+function accountModelRejection(error: JsonObject): boolean {
+  const exact = (value: unknown): boolean => typeof value === "string" && value.length <= 512 &&
+    /^The '[^'\r\n]{1,128}' model is not supported when using Codex with a ChatGPT account\.$/u.test(value);
+  if (exact(error.message) || isObject(error.data) && exact(error.data.detail)) return true;
+  if (typeof error.message !== "string" || error.message.length > 8192 || !error.message.startsWith("{")) return false;
+  try { const body: unknown = JSON.parse(error.message); return isObject(body) && exact(body.detail); }
+  catch { return false; }
+}
 
 /** One restartable JSONL App Server connection owned by a single Codex profile. */
 export class AppServerConnection implements AppServerRpc {
@@ -272,7 +287,9 @@ export class AppServerConnection implements AppServerRpc {
         // Without an explicit scoped receipt callback, the late response is ignored.
       }, options.timeoutMs ?? this.defaultTimeoutMs);
       timer.unref();
-      this.pending.set(id, { mutating: options.mutating === true, resolve, reject, timer,
+      this.pending.set(id, { mutating: options.mutating === true, generation, resolve, reject, timer,
+        rejectionMethod: ["initialize", "turn/start", "turn/steer", "thread/queue/add", "thread/settings/update"].includes(method)
+          ? method as NonNullable<AppServerRejectedError["requestMethod"]> : null,
         onResponseEnvelope: options.onResponseEnvelope });
       try { this.write(child, { id, method, params }); }
       catch {
@@ -374,8 +391,8 @@ export class AppServerConnection implements AppServerRpc {
       if (isObject(value.error)) deliver({ error: value.error });
       const code = typeof error.code === "number" || typeof error.code === "string" ? error.code : null;
       const reason = typeof error.message === "string" && /already has an active writer/iu.test(error.message)
-        ? "active-writer" as const : null;
-      pending.reject(new AppServerRejectedError(code, reason)); return;
+        ? "active-writer" as const : accountModelRejection(error) ? "model-not-supported-for-account" as const : null;
+      pending.reject(new AppServerRejectedError(code, reason, pending.generation, pending.rejectionMethod)); return;
     }
     if (!isObject(value.result)) { pending.reject(new AppServerUnavailableError("Codex App Server вернул некорректный ответ.")); return; }
     deliver({ result: value.result });

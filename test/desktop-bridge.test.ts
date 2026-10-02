@@ -25,7 +25,7 @@ import { pathToFileURL } from "node:url";
 import { BridgeStore, migrateInboxJournal } from "../src/bridge/store.js";
 import { loadDesktopBridgeConfig } from "../src/bridge/config.js";
 import { ActionRejectedError, UncertainActionError, type AccountUsage, type CreateTaskRequest, type DesktopProject, type DesktopTask, type DesktopTasks, type EditLastUserTurnRequest, type GoalContinuationReceipt, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskRef, type TaskDetails, type DesktopModel, type TaskGoal, type TaskGoalUpdate, type TaskRenameResult, type TransferTaskRequest, type UsageResetOutcome } from "../src/desktop/contracts.js";
-import { taskKey } from "../src/core/codex-tasks.js";
+import { ModelUnavailableForAccountError, taskKey } from "../src/core/codex-tasks.js";
 import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendParams } from "../src/platforms/vk/desktop-gateway.js";
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { taskInput as desktopTaskInput } from "../src/core/task-input.js";
@@ -5719,6 +5719,63 @@ test("a known Codex refusal is rejected in the journal while a lost result stays
   s.store.recover();
   assert.equal(s.store.operationState(rejectedId), "rejected");
   assert.equal(s.store.operationState(uncertainId), "uncertain");
+});
+
+test("an account model refusal records exact foreground correlation without resending", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.submitWithReceipt = async request => {
+    s.desktop.submissions.push(request);
+    throw new ModelUnavailableForAccountError({ operationId: request.operationId,
+      method: "turn/start", backendGeneration: 17 });
+  };
+  await s.handle("PRIVATE_PROMPT", peerId);
+  const operationId = s.desktop.submissions[0]!.operationId;
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.operationState(operationId), "rejected");
+  const events = s.store.foregroundRejections(binding.id, binding);
+  assert.equal(events.length, 1);
+  assert.deepEqual({ ...events[0], at: 0 }, { at: 0, operationId, method: "turn/start",
+    backendGeneration: 17, reason: "model-not-supported-for-account",
+    taskFingerprint: createHash("sha256").update(taskKey(binding)).digest("hex") });
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE_PROMPT/u);
+  assert.match(s.chat.sent.at(-1)!.view.text, /для этого подключения/u);
+  s.store.recover();
+  assert.deepEqual(s.store.foregroundRejections(binding.id, binding), events);
+});
+
+test("a failed foreground diagnostic sink cannot change a definite prompt rejection", async t => {
+  const s = setup(t); s.attach();
+  s.desktop.submitWithReceipt = async request => {
+    s.desktop.submissions.push(request);
+    throw new ModelUnavailableForAccountError({ operationId: request.operationId,
+      method: "turn/steer", backendGeneration: 17 });
+  };
+  s.store.recordForegroundRejection = () => { throw new Error("PRIVATE_DIAGNOSTIC_FAILURE"); };
+  await s.handle("Prompt", peerId);
+  assert.equal(s.desktop.submissions.length, 1);
+  assert.equal(s.store.operationState(s.desktop.submissions[0]!.operationId), "rejected");
+  assert.match(s.chat.sent.at(-1)!.view.text, /для этого подключения/u);
+  assert.doesNotMatch(s.chat.sent.at(-1)!.view.text, /PRIVATE_DIAGNOSTIC_FAILURE/u);
+});
+
+test("foreground refusal diagnostics are bounded scoped and copy only safe fields", t => {
+  const s = setup(t); const binding = s.attach();
+  const foreign = { ...binding, threadId: "foreign-task" };
+  const event = { at: 100, operationId: "rejected-op", method: "turn/steer" as const,
+    backendGeneration: null, reason: "model-not-supported-for-account" as const,
+    nativeDetail: "PRIVATE_SECRET", input: "PRIVATE_PROMPT" };
+  s.store.recordForegroundRejection(binding.id, event, binding);
+  assert.deepEqual(s.store.foregroundRejections(binding.id), [], "unowned operations cannot create evidence");
+  s.store.recordOperation(event.operationId, binding, "inbox-key", binding.id);
+  s.store.finishOperation(event.operationId, "rejected");
+  s.store.recordForegroundRejection(binding.id, event, foreign);
+  assert.deepEqual(s.store.foregroundRejections(binding.id), [], "foreign task cannot borrow this operation");
+  for (let at = 0; at < 35; at++) s.store.recordForegroundRejection(binding.id, { ...event, at }, binding);
+  const events = s.store.foregroundRejections(binding.id, binding);
+  assert.equal(events.length, 32);
+  assert.equal(events[0]!.at, 3);
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE_SECRET|PRIVATE_PROMPT|nativeDetail|input/u);
+  assert.deepEqual(s.store.foregroundRejections(binding.id, foreign), []);
 });
 
 test("a lost Codex acknowledgment is confirmed from native history without resubmitting", async t => {

@@ -3,7 +3,7 @@ import test from "node:test";
 import type { AppServerEnvelope, AppServerRequestOptions, AppServerRpc, AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
 import { AppServerTaskExecutor } from "../src/codex/app-server-task-executor.js";
-import { ActionRejectedError, TaskNotOpenError, UncertainActionError, type SubmitTaskRequest } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, ModelUnavailableForAccountError, TaskNotOpenError, UncertainActionError, type SubmitTaskRequest } from "../src/core/codex-tasks.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -134,6 +134,58 @@ test("ensure open resumes a stored task without starting a model turn", async ()
     assert.equal((await executor.inspectTask(task)).status, "idle");
     assert.equal(rpc.requests.filter(item => item.method === "thread/resume").length, 1);
     assert.equal(rpc.requests.some(item => item.method === "turn/start" || item.method === "turn/steer"), false);
+  } finally { executor.close(); }
+});
+
+test("account model refusals correlate start steer and queue without a retry or model fallback", async () => {
+  for (const method of ["turn/start", "turn/steer", "thread/queue/add"] as const) {
+    const rpc = new FakeRpc();
+    if (method === "turn/steer") rpc.activeTurnId = "native-active";
+    const executor = new AppServerTaskExecutor(rpc);
+    rpc.fail = new AppServerRejectedError(-32600, "model-not-supported-for-account", 41, method);
+    rpc.failMethod = method;
+    try {
+      const submit = method === "thread/queue/add" ? executor.queue(request()) : executor.submitWithReceipt(request());
+      await assert.rejects(submit, error => {
+        assert.ok(error instanceof ModelUnavailableForAccountError);
+        assert.ok(error instanceof ActionRejectedError);
+        assert.deepEqual(error.diagnostic, { operationId: "operation-1", method, backendGeneration: 41 });
+        assert.match(error.message, /для этого подключения/u);
+        return true;
+      });
+      assert.equal(rpc.requests.filter(item => item.method === method).length, 1);
+      assert.equal(rpc.requests.some(item => item.method === "thread/settings/update"), false);
+      assert.equal(rpc.activeTurnId, method === "turn/steer" ? "native-active" : null);
+    } finally { executor.close(); }
+  }
+});
+
+test("an initialization refusal is not attributed to the requested prompt RPC", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  rpc.fail = new AppServerRejectedError(-32600, "model-not-supported-for-account", 42, "initialize");
+  rpc.failMethod = "turn/start";
+  try {
+    await assert.rejects(executor.submitWithReceipt(request()), error => {
+      assert.ok(error instanceof ActionRejectedError);
+      assert.equal(error instanceof ModelUnavailableForAccountError, false);
+      return true;
+    });
+  } finally { executor.close(); }
+});
+
+test("account model rejection context refuses runtime objects and control characters", () => {
+  for (const operationId of [42, { private: "PRIVATE_SECRET" }, "op\nsecret", "op\x7f", "a".repeat(129)])
+    assert.throws(() => new ModelUnavailableForAccountError({ operationId: operationId as string,
+      method: "turn/start", backendGeneration: 1 }), TypeError);
+});
+
+test("account model settings refusal is not treated as a transient assignment failure", async () => {
+  const rpc = new FakeRpc(); const executor = new AppServerTaskExecutor(rpc);
+  rpc.modelUpdatePlan = [new AppServerRejectedError(-32600, "model-not-supported-for-account", 41)];
+  try {
+    await assert.rejects(executor.selectModel(task, "model-b", "high"), ActionRejectedError);
+    assert.equal(rpc.requests.filter(item => item.method === "thread/settings/update").length, 1);
+    assert.equal((await executor.inspectTask(task)).model, "model-a");
   } finally { executor.close(); }
 });
 

@@ -432,6 +432,29 @@ export class ActionRejectedError extends Error {
   }
 }
 
+export interface PromptRejectionContext {
+  readonly operationId: string;
+  readonly method: "turn/start" | "turn/steer" | "thread/queue/add";
+  /** App Server connection generation; never the bridge stream generation. */
+  readonly backendGeneration: number | null;
+}
+
+/** A definite reply to this exact prompt mutation; no automatic model fallback. */
+export class ModelUnavailableForAccountError extends ActionRejectedError {
+  readonly diagnostic: PromptRejectionContext;
+  constructor(context: PromptRejectionContext) {
+    super("Codex отклонил выбранную модель для этого подключения ChatGPT. Запрос не принят; VKodex не менял модель автоматически.");
+    this.name = "ModelUnavailableForAccountError";
+    if (typeof context.operationId !== "string" || !context.operationId || context.operationId.length > 128 ||
+        /[\x00-\x1f\x7f]/u.test(context.operationId) ||
+        !["turn/start", "turn/steer", "thread/queue/add"].includes(context.method) ||
+        context.backendGeneration !== null && (!Number.isSafeInteger(context.backendGeneration) || context.backendGeneration < 1))
+      throw new TypeError("Invalid prompt rejection context");
+    this.diagnostic = Object.freeze({ operationId: context.operationId, method: context.method,
+      backendGeneration: context.backendGeneration });
+  }
+}
+
 /** The selected owner has native goal state writes but no atomic goal-turn receipt. */
 export class NativeGoalReceiptUnavailableError extends ActionRejectedError {
   constructor() {
