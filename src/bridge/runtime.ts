@@ -21,6 +21,8 @@ import { MutableQueuedInputTurnError, QueueHistoryReadError } from "../desktop/i
 
 export interface BridgeRuntimeAdapters {
   readonly states: TaskStateTransport;
+  /** Background observation only; no execution resume or writer acquisition. */
+  readonly passiveStates?: TaskStateTransport;
   readonly observe: TaskStateObserver;
   readonly history: TaskHistoryRecovery;
   readonly inspectExternalOwner?: (task: TaskRef) => Promise<"idle" | "active" | "systemError" | null>;
@@ -101,10 +103,11 @@ export class BridgeRuntime {
     const key = `task-lease:${bindingId}`;
     const previous = this.store.getValue<{ leaseSince?: number | null }>(key);
     const at = this.now();
+    const writer = mode === "attached" && !this.connections.isReadOnly(bindingId);
     this.store.setValue(key, {
-      owner: mode === "attached" ? "vkodex" : "external",
+      owner: writer ? "vkodex" : "external",
       mode,
-      leaseSince: mode === "attached" ? (typeof previous?.leaseSince === "number" ? previous.leaseSince : at) : null,
+      leaseSince: writer ? (typeof previous?.leaseSince === "number" ? previous.leaseSince : at) : null,
       lastEventAt: at,
       activeTurnId,
       generation: this.store.streamGeneration(bindingId),
@@ -113,6 +116,7 @@ export class BridgeRuntime {
 
   private readonly observeTaskState: TaskStateObserver;
   private readonly historyRecovery: TaskHistoryRecovery;
+  private readonly passiveStates: TaskStateTransport | undefined;
   private readonly inspectExternalOwner: BridgeRuntimeAdapters["inspectExternalOwner"];
   private readonly inspectManagedRestartTurn: BridgeRuntimeAdapters["inspectManagedRestartTurn"];
 
@@ -129,6 +133,8 @@ export class BridgeRuntime {
     });
     this.observeTaskState = adapters.observe;
     this.historyRecovery = adapters.history;
+    this.passiveStates = adapters.passiveStates ?? (adapters.states.readOnly === true ? adapters.states : undefined);
+    if (this.passiveStates && this.passiveStates.readOnly !== true) throw new Error("Background observation transport is not read-only");
     this.inspectExternalOwner = adapters.inspectExternalOwner;
     this.inspectManagedRestartTurn = adapters.inspectManagedRestartTurn;
     for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
@@ -624,6 +630,16 @@ export class BridgeRuntime {
 
   private releaseIdleSubscription(binding: Binding): void {
     if (this.store.getBinding(binding.id)?.attached !== true) return;
+    if (this.connections.isReadOnly(binding.id)) {
+      // A native follower holds no writer. Keep its stream so the next native
+      // input is visible without a VK message or a competing execution resume.
+      this.demanded.delete(binding.id);
+      this.pendingReacquire.delete(binding.id);
+      this.releasedIdle.delete(binding.id);
+      this.setStreamMode(binding.id, "attached");
+      this.recordLease(binding.id, "attached");
+      return;
+    }
     // Releasing the Codex writer is a normal handoff, not a loss of
     // observability. Keep tailing the append-only rollout while Desktop/VS
     // Code owns the task so direct turns still reach VK without reacquiring a
@@ -644,6 +660,7 @@ export class BridgeRuntime {
     if (details && (details.status === "running" || details.status === "approval") || this.hasPendingTaskWork(binding.id)) {
       throw new ActionRejectedError("Задача ещё выполняется, ожидает ответа или сверки результата. Дождись завершения либо используй /stop; управление не передано приложению Codex.");
     }
+    if (this.connections.isReadOnly(binding.id)) { this.releaseIdleSubscription(binding); return; }
     this.demanded.delete(binding.id);
     this.pendingReacquire.delete(binding.id);
     this.releasedIdle.add(binding.id);
@@ -833,14 +850,8 @@ export class BridgeRuntime {
       this.store.setPaused(binding.id, false);
       binding = this.store.getBinding(binding.id)!;
     }
-    // A command that was rejected before dispatch because neither the
-    // profile owner nor the active UI owner was reachable remains safe to
-    // probe. Reacquire it in the background until one route becomes
-    // available; never replay the rejected user input itself.
-    if (this.store.getValue<{ kind?: string }>(`route-failure:${binding.id}`)?.kind === "no-active-owner") {
-      this.releasedIdle.delete(binding.id);
-      this.demanded.add(binding.id);
-    }
+    // An old status or unresolved input journal does not authorize a writer
+    // resume. Background recovery always uses the passive transport below.
     // A final answer is persisted before delivery is attempted. Closing a
     // terminal subscription must not depend on VK upload/send latency; the
     // durable outbox remains independently deliverable.
@@ -863,10 +874,7 @@ export class BridgeRuntime {
       } catch { /* The creation owner may have handed off between both checks. */ }
       return;
     }
-    const storedDetails = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
-    const terminal = !storedDetails || ["idle", "failed", "interrupted", "unavailable"].includes(storedDetails.status);
-    if (!existing && (this.releasedIdle.has(binding.id) || this.streamMode(binding.id) === "detached") && !this.demanded.has(binding.id)
-      && terminal && !this.hasPendingTaskWork(binding.id)) return;
+    if (!existing && !this.passiveStates) { this.enableRolloutFallback(binding); return; }
     if (!existing && !this.connections.canAttempt(binding.id)) return;
     if (existing) { this.connections.maintain(binding.id); return; }
     if (this.connecting.size >= 6) return;
@@ -887,16 +895,18 @@ export class BridgeRuntime {
       return;
     }
     this.store.ensureBinding(task);
-    this.connectBinding(binding, task);
+    this.connectBinding(binding, task, "observe");
     this.closeInactiveSubscriptions();
   }
 
-  private connectBinding(binding: Binding, task: TaskRef): Promise<void> {
+  private connectBinding(binding: Binding, task: TaskRef, intent: "command" | "observe" = "command"): Promise<void> {
     const pending = this.connecting.get(binding.id);
     if (pending) return pending;
     const current = this.store.getBinding(binding.id);
     if (this.stopped || !current?.attached || !sameTask(current, task)) return Promise.resolve();
     if (this.matchesConnection(binding)) return Promise.resolve();
+    const transport = intent === "observe" ? this.passiveStates : undefined;
+    if (intent === "observe" && !transport) { this.enableRolloutFallback(current); return Promise.resolve(); }
     const generation = this.store.streamGeneration(binding.id);
     this.connectionGenerations.set(binding.id, generation);
     this.connectionAttempts.set(binding.id, Symbol("task-connection"));
@@ -919,8 +929,10 @@ export class BridgeRuntime {
             if (editable?.turnId) this.files?.associateTurn(binding.id, editable.operationId, editable.turnId);
             const recoverFinalTurnIds = new Set(this.store.acceptedTurns(binding.id).map(turn => turn.turnId));
             if (editable?.turnId) recoverFinalTurnIds.add(editable.turnId);
-            const reconnectingOnDemand = this.demanded.has(binding.id) || this.releasedIdle.has(binding.id);
-            const observation = this.observeTaskState(state, this.store.getValue<TaskObservationCheckpoint>(checkpointKey), this.now(), {
+            const previous = this.store.getValue<TaskObservationCheckpoint>(checkpointKey);
+            const reconnectingOnDemand = this.demanded.has(binding.id) || this.releasedIdle.has(binding.id)
+              || intent === "observe" && previous !== null;
+            const observation = this.observeTaskState(state, previous, this.now(), {
               // A task released after a completed turn must reconcile direct
               // Desktop/VS Code changes made while VKodex was detached.
               rebaseline: initial && !reconnectingOnDemand,
@@ -977,7 +989,7 @@ export class BridgeRuntime {
             && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
             this.releaseIdleSubscription(binding);
           }
-        }, failure => { if (currentGeneration()) this.subscriptionFailed(binding.id, failure); });
+        }, failure => { if (currentGeneration()) this.subscriptionFailed(binding.id, failure); }, undefined, transport);
         if (this.stopped || !currentGeneration() || !this.connections.matches(binding.id, task)) return;
         this.store.markDesktopHandoff(binding.id, task, "live", this.now());
       } catch (error) {

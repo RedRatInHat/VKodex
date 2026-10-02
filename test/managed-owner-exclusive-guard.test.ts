@@ -9,11 +9,126 @@ import { createDesktopRouting } from '../src/desktop/desktop-routing.js';
 import type { ManagedOwnerRouteObserver } from '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { RoutedCodexTasks } from '../src/core/codex-task-router.js';
 import { ActionRejectedError, type CodexTasks, type TaskRef } from '../src/core/codex-tasks.js';
-import { RoutedTaskStateTransport, type TaskStateTransport } from '../src/core/task-state.js';
+import { ObserverOnlyTaskStateTransport, RoutedTaskStateTransport, TaskStateConnections, type TaskStateTransport } from '../src/core/task-state.js';
 import type { BridgeChat, View } from '../src/bridge/contracts.js';
 
 const task = (sourceId = 'source-a'): TaskRef =>
   ({ hostId: 'local', threadId: 'managed-thread', sourceId });
+
+test('passive production routing fences every exclusive owner, not just managed claims', () => {
+  const store = new BridgeStore();
+  let subscribed = 0;
+  const native: TaskStateTransport = { readOnly: true, subscribe: requested => {
+    subscribed++;
+    return { task: requested, readOnly: true, start: async () => {}, verifyOwner: async () => {}, close() {} };
+  }, close() {} };
+  const exclusive = { routingPolicy: 'exclusive' as const, owns: (requested: TaskRef) => requested.sourceId === 'source-a',
+    states: { subscribe: native.subscribe, close() {} } } as import('../src/core/codex-task-router.js').CodexTaskOwner &
+      import('../src/core/task-state.js').TaskStateOwnerRoute;
+  const routed = createDesktopRouting({} as CodexTasks, native, [exclusive], store);
+  try {
+    assert.throws(() => routed.passiveStates!.subscribe(task(), () => {}, () => {}), ActionRejectedError);
+    assert.equal(subscribed, 0);
+    routed.passiveStates!.subscribe(task('other-source'), () => {}, () => {}).close();
+    assert.equal(subscribed, 1, 'fence is task scoped');
+  } finally { routed.states.close(); store.close(); }
+});
+
+test('passive observation retires if an exclusive claim appears before start or during a stream', async () => {
+  for (const phase of ['before-start', 'during-stream'] as const) {
+    let blocked = false, started = 0, verified = 0, closed = 0;
+    let emit!: (state: Record<string, unknown>, initial: boolean) => void;
+    const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => {
+      emit = onState;
+      return { task: requested, readOnly: true, start: async () => { started++; onState({ value: 'initial' }, true); },
+        verifyOwner: async () => { verified++; }, close() { closed++; } };
+    }, close() {} };
+    const transport = new ObserverOnlyTaskStateTransport(native, () => blocked);
+    const seen: string[] = [], errors: Error[] = [];
+    const stream = transport.subscribe(task(), state => seen.push(String(state.value)), error => errors.push(error));
+    try {
+      if (phase === 'during-stream') await stream.start();
+      blocked = true;
+      if (phase === 'before-start') await assert.rejects(stream.start(), ActionRejectedError);
+      emit({ value: 'stale' }, false);
+      emit({ value: 'stale-again' }, false);
+      await assert.rejects(stream.verifyOwner(), ActionRejectedError);
+      assert.equal(started, phase === 'before-start' ? 0 : 1);
+      assert.equal(verified, 0);
+      assert.deepEqual(seen, phase === 'before-start' ? [] : ['initial']);
+      assert.equal(errors.length, 1, 'claim loss is reported only once');
+      assert.equal(closed, 1, 'upstream is retired immediately');
+      blocked = false;
+      await assert.rejects(stream.start(), ActionRejectedError, 'retiring a claim cannot resurrect the old stream');
+    } finally { stream.close(); transport.close(); }
+    assert.equal(closed, 1);
+  }
+});
+
+test('passive start and verification recheck claims after asynchronous native work', async () => {
+  for (const phase of ['start', 'verify'] as const) {
+    let blocked = false, release!: () => void, closed = 0;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({
+      task: requested, readOnly: true, start: async () => { if (phase === 'start') await pending; },
+      verifyOwner: async () => { if (phase === 'verify') await pending; }, close() { closed++; },
+    }), close() {} };
+    const transport = new ObserverOnlyTaskStateTransport(native, () => blocked);
+    const errors: Error[] = [];
+    const stream = transport.subscribe(task(), () => {}, error => errors.push(error));
+    try {
+      if (phase === 'verify') await stream.start();
+      const work = phase === 'start' ? stream.start() : stream.verifyOwner();
+      blocked = true; release();
+      await assert.rejects(work, ActionRejectedError);
+      assert.equal(closed, 1);
+      assert.equal(errors.length, 1);
+    } finally { stream.close(); transport.close(); }
+  }
+});
+
+test('an unreadable passive claim retires the stream even if cleanup and the error observer throw', async () => {
+  let unreadable = false, closed = 0, errors = 0;
+  let emit!: (state: Record<string, unknown>, initial: boolean) => void;
+  const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => {
+    emit = onState;
+    return { task: requested, readOnly: true, start: async () => {}, verifyOwner: async () => {},
+      close() { closed++; throw new Error('fixture cleanup error'); } };
+  }, close() {} };
+  const transport = new ObserverOnlyTaskStateTransport(native, () => {
+    if (unreadable) throw new Error('fixture claim read error');
+    return false;
+  });
+  const seen: unknown[] = [];
+  const stream = transport.subscribe(task(), state => seen.push(state), () => { errors++; throw new Error('fixture observer error'); });
+  await stream.start();
+  unreadable = true;
+  assert.doesNotThrow(() => emit({ value: 'unknown-owner' }, false));
+  unreadable = false;
+  emit({ value: 'late' }, false);
+  await assert.rejects(stream.verifyOwner(), ActionRejectedError);
+  stream.close();
+  assert.deepEqual(seen, []);
+  assert.equal(closed, 1); assert.equal(errors, 1);
+});
+
+test('a synchronous native claim rejection closes its handle without breaking connection installation', async () => {
+  let blocked = false, started = 0, closed = 0;
+  const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => {
+    blocked = true;
+    onState({ value: 'stale' }, true);
+    return { task: requested, readOnly: true, start: async () => { started++; }, verifyOwner: async () => {},
+      close() { closed++; } };
+  }, close() {} };
+  const transport = new ObserverOnlyTaskStateTransport(native, () => blocked);
+  const connections = new TaskStateConnections(transport);
+  const seen: unknown[] = [];
+  await assert.rejects(connections.connect('fixture', task(), state => seen.push(state), () => {}), ActionRejectedError);
+  assert.equal(started, 0); assert.equal(closed, 1);
+  assert.equal(connections.has('fixture'), false);
+  assert.deepEqual(seen, []);
+  await connections.stop();
+});
 
 test('exact non-retired claim dynamically takes exclusive route through every health state', async () => {
   const store = new BridgeStore();
@@ -114,9 +229,9 @@ test('production composition observes only the exact ready worker and fences sta
   });
   let baseStreams = 0, profileStreams = 0, resolved = 0;
   let emit!: (state: Record<string, unknown>, initial: boolean) => void;
-  const workerStates: TaskStateTransport = { subscribe: (requested, onState) => {
+  const workerStates: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => {
     emit = onState;
-    return { task: requested, start: async () => onState({ kind: 'app-server', threadId: task().threadId }, true),
+    return { task: requested, readOnly: true, start: async () => onState({ kind: 'app-server', threadId: task().threadId }, true),
       verifyOwner: async () => {}, close: () => {} };
   }, close: () => {} };
   const observer: ManagedOwnerRouteObserver = {
@@ -179,9 +294,9 @@ test('exclusive managed observation uses the exact claim without opening a fallb
     host: { pid: 101, birthTicks: '10' }, backend: { pid: 102, birthTicks: '11' },
   });
   let emitError!: () => void; let reported = 0;
-  const workerStates: TaskStateTransport = { subscribe: (requested, _onState, onError) => {
+  const workerStates: TaskStateTransport = { readOnly: true, subscribe: (requested, _onState, onError) => {
     emitError = () => onError(new Error('private state stream failed'));
-    return { task: requested,
+    return { task: requested, readOnly: true,
     start: async () => { observed++; }, verifyOwner: async () => {}, close: () => { closed++; },
     };
   }, close: () => { closedSources++; } };
@@ -236,9 +351,9 @@ test('managed native-origin progress and final reach VK once without a second ro
     cwd: desktopTask.workspace, model: 'fixture-model', effort: 'low', runtimeStatus,
     context: null, questions: [], turns,
   });
-  const privateStates: TaskStateTransport = { subscribe: (requested, onState) => {
+  const privateStates: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => {
     emit = onState as typeof emit;
-    return { task: requested, start: async () => onState(snapshot([], 'active'), true),
+    return { task: requested, readOnly: true, start: async () => onState(snapshot([], 'active'), true),
       verifyOwner: async () => {}, close: () => {} };
   }, close: () => {} };
   const observer: ManagedOwnerRouteObserver = {
@@ -252,7 +367,7 @@ test('managed native-origin progress and final reach VK once without a second ro
     listTasks: async () => [desktopTask],
     submitWithReceipt: async () => { writes++; return { mode: 'start' as const, turnId: 'base' }; },
   } as unknown as CodexTasks;
-  const baseStates: TaskStateTransport = { subscribe: requested => {
+  const baseStates: TaskStateTransport = { readOnly: true, subscribe: requested => {
     baseStreams++;
     return { task: requested, start: async () => {}, verifyOwner: async () => {}, close: () => {} };
   }, close: () => {} };
@@ -270,7 +385,7 @@ test('managed native-origin progress and final reach VK once without a second ro
   }, async edit(_handle: unknown, view: View) { edited.push(view); }, async delete() {} } as unknown as BridgeChat;
   const history = { enable() {}, disable() {}, async poll() { return null; } };
   const runtime = new BridgeRuntime(access, routed.tasks, chat, store,
-    { states: routed.states, observe: observeAppServerTaskState, history }, () => time,
+    { states: routed.states, passiveStates: routed.passiveStates!, observe: observeAppServerTaskState, history }, () => time,
     undefined, undefined, 10_000_000);
   const drain = async () => {
     await runtime.tick(true, binding.id);

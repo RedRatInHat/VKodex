@@ -22,9 +22,10 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
     observer?: ManagedOwnerRouteObserver) {
     const observations = new Set<ManagedOwnerObservedTaskStateTransport>();
     this.states = Object.freeze({
+      readOnly: true as const,
       subscribe: (task: TaskRef, onState: Parameters<TaskStateTransport['subscribe']>[1],
         onError: Parameters<TaskStateTransport['subscribe']>[2]): TaskStateStream => {
-        if (!observer || !this.owns(task)) return { task: { ...task },
+        if (!observer || !this.owns(task)) return { task: { ...task }, readOnly: true as const,
           start: async () => refuse(), verifyOwner: async () => refuse(), close: () => {} };
         const transport = new ManagedOwnerObservedTaskStateTransport(observer, task);
         observations.add(transport);
@@ -39,7 +40,7 @@ export class ManagedOwnerExclusiveRouteGuard implements CodexTaskOwner, TaskStat
         catch (error) { close(); throw error; }
         if (closed) stream.close();
         const active = stream;
-        return { task: active.task,
+        return { task: active.task, readOnly: true as const,
           start: async timeoutMs => { try { await active.start(timeoutMs); } catch (error) { close(); throw error; } },
           verifyOwner: async timeoutMs => {
             try { await active.verifyOwner(timeoutMs); } catch (error) { close(); throw error; }

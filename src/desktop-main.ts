@@ -80,14 +80,14 @@ const desktopStates = new DesktopTaskStateTransport();
 // unqualified claim stays exclusive but unavailable. No worker is launched here.
 const managedResolver = new ManagedOwnerRouteResolver({ store,
   privateBaseDirectory: path.resolve(config.dataDir, "managed-workers") });
-const { tasks, states } = createDesktopRouting(desktop, desktopStates, appServerOwners, store,
+const { tasks, states, passiveStates } = createDesktopRouting(desktop, desktopStates, appServerOwners, store,
   managedResolver, async task => (await inspectThroughOwner(catalog.sourceHome(task), task.threadId)) !== null);
 const observe = (state: import("./core/task-state.js").TaskState,
   previous: import("./core/task-observation.js").TaskObservationCheckpoint | null, now?: number,
   options?: import("./core/task-observation.js").TaskObservationOptions) => state.kind === "app-server"
     ? observeAppServerTaskState(state, previous, now, options) : observeTaskState(state, previous, now, options);
 const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
-  { states, observe, history: new RolloutTaskHistoryRecovery(),
+  { states, ...(passiveStates ? { passiveStates } : {}), observe, history: new RolloutTaskHistoryRecovery(),
     inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId),
     inspectManagedRestartTurn: (task, snapshot) => managedResolver.owns(task)
       ? inspectManagedRestartTurn(managedResolver, task, snapshot)

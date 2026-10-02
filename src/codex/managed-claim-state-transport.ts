@@ -7,6 +7,7 @@ const stale = (): Error => new Error('Managed task-state claim is no longer curr
 /** Adds the persisted binding revision to a worker's authenticated stream.
  * The stream itself still proves the worker epoch and backend generation. */
 export class ManagedClaimStateTransport implements TaskStateTransport {
+  readonly readOnly?: true;
   readonly #transport: TaskStateTransport;
   readonly #taskKey: string;
   readonly #isCurrent: () => boolean;
@@ -18,6 +19,7 @@ export class ManagedClaimStateTransport implements TaskStateTransport {
       typeof transport.close !== 'function' || !task ||
       typeof isCurrent !== 'function') throw new TypeError('Managed claim stream requires an exact route');
     this.#transport = transport;
+    if (transport.readOnly === true) this.readOnly = true;
     this.#taskKey = taskKey(task);
     this.#isCurrent = isCurrent;
   }
@@ -55,6 +57,7 @@ export class ManagedClaimStateTransport implements TaskStateTransport {
     else this.#streams.add(active);
     return {
       task,
+      ...(active.readOnly === true ? { readOnly: true as const } : {}),
       start: async timeoutMs => {
         if (stopped || !this.#current()) { end(false); throw stale(); }
         await active!.start(timeoutMs);

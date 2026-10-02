@@ -204,6 +204,7 @@ class Server extends Duplex {
 }
 
 class FakeStateTransport implements TaskStateTransport {
+  readonly readOnly = true as const;
   subscriptions = 0;
   closed = false;
   constructor(private readonly snapshot: IpcObject) {}
@@ -212,6 +213,7 @@ class FakeStateTransport implements TaskStateTransport {
     let closed = false;
     return {
       task,
+      readOnly: true as const,
       start: async () => { if (!closed) onState(this.snapshot, true); },
       verifyOwner: async () => { if (closed) throw new Error("closed"); },
       close: () => { closed = true; },
@@ -233,7 +235,8 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   history?: TaskHistoryRecovery, fileRoot?: string,
   inspectManagedRestartTurn?: (task: import("../src/core/codex-tasks.js").TaskRef,
     snapshot: import("../src/desktop/restart-intent.js").RestartTaskSnapshot) =>
-    Promise<"unclaimed" | "active" | "settled" | "unknown">) {
+    Promise<"unclaimed" | "active" | "settled" | "unknown">,
+  passiveStates?: TaskStateTransport) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -255,6 +258,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   let now = 100_000;
   const adapters = {
     ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
+    ...(passiveStates ? { passiveStates } : {}),
     ...(inspectExternalOwner ? { inspectExternalOwner } : {}),
     ...(inspectManagedRestartTurn ? { inspectManagedRestartTurn } : {}),
   };
@@ -276,6 +280,58 @@ test("runtime schedules a fresh health check after clock rollback", async t => {
   s.advance(-1);
   await s.runtime.tick(false);
   assert.equal(checks, 2);
+});
+
+test("background recovery never starts the writer route for stale running or unresolved journal state", async t => {
+  let writerStarts = 0;
+  let passiveStarts = 0;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) {
+      return { task, start: async () => { writerStarts++; onState(state(), true); },
+        verifyOwner: async () => {}, close() {} };
+    }, close() {},
+  };
+  const passive = {
+    readOnly: true as const,
+    subscribe(task: typeof ref) {
+      return { task, readOnly: true as const, start: async () => { passiveStarts++; throw new TaskNotOpenError(); },
+        verifyOwner: async () => {}, close() {} };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer, undefined, undefined, undefined, undefined, undefined, passive);
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "attached");
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "running" });
+  s.store.recordOperation("unknown-command", s.binding, "unknown-input", s.binding.id);
+  await s.runtime.tick();
+  assert.equal(passiveStarts, 1);
+  assert.equal(writerStarts, 0);
+});
+
+test("idle native observation stays connected and is never recorded as a VK writer lease", async t => {
+  let publish!: (snapshot: IpcObject, initial: boolean) => void;
+  let closed = 0;
+  const passive = {
+    readOnly: true as const,
+    subscribe(task: typeof ref, onState: typeof publish) {
+      publish = onState;
+      return { task, readOnly: true as const, start: async () => onState(state([], "completed"), true),
+        verifyOwner: async () => {}, close() { closed++; } };
+    }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, passive, undefined, undefined, undefined, undefined, undefined, passive);
+  await s.runtime.tick();
+  assert.equal(closed, 0, "initial idle snapshot must not cancel a passive subscription");
+  assert.equal(s.store.getValue<{ owner: string }>(`task-lease:${s.binding.id}`)?.owner, "external");
+  const next = state([{ type: "userMessage", id: "native-input", clientId: "native-client", content: [{ type: "text", text: "From Desktop" }] },
+    { type: "agentMessage", id: "native-progress", phase: "commentary", text: "Native progress" }]);
+  const turn = ((next.turnHistory as IpcObject).history as IpcObject).entitiesByKey as IpcObject;
+  turn.tail = { ...(turn.tail as IpcObject), turnId: "next-native-turn", turnStartedAtMs: 101_000 };
+  s.advance(1_000);
+  publish(next, false);
+  await s.runtime.tick();
+  assert.equal(closed, 0);
+  assert.equal(s.store.getValue<{ owner: string }>(`task-lease:${s.binding.id}`)?.owner, "external");
+  assert.ok([...s.sent, ...s.store.pendingDeliveries()].some(item => item.view.text.includes("From Desktop")));
 });
 
 test("restart recovery does not resume a turn still active in a UI owner", async t => {
@@ -433,19 +489,21 @@ test("retired managed restart snapshot never falls through to Desktop continuati
   assert.equal(s.store.inputSettled(JSON.stringify([s.peerId, `restart-recovery:${intent.id}:${s.binding.id}`])), false);
 });
 
-test("a slow native resume does not stall the bridge update or start duplicate subscriptions", async t => {
+test("a slow native observer start does not stall the bridge update or start duplicate subscriptions", async t => {
   let release!: () => void;
   const resumed = new Promise<void>(resolve => { release = resolve; });
   let entered!: () => void;
   const startEntered = new Promise<void>(resolve => { entered = resolve; });
   let subscriptions = 0;
   const transport: TaskStateTransport = {
+    readOnly: true,
     subscribe(task, onState) {
       subscriptions++;
       entered();
       let closed = false;
       return {
         task,
+        readOnly: true,
         start: async () => { await resumed; if (!closed) onState(state([], "completed"), true); },
         verifyOwner: async () => { if (closed) throw new Error("closed"); },
         close: () => { closed = true; },
@@ -457,11 +515,11 @@ test("a slow native resume does not stall the bridge update or start duplicate s
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([s.runtime.tick(false), new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("bridge tick waited for native resume")), 250);
+      timer = setTimeout(() => reject(new Error("bridge tick waited for native observer")), 250);
     })]);
     clearTimeout(timer); timer = undefined;
     await Promise.race([startEntered, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("native resume was not scheduled")), 250);
+      timer = setTimeout(() => reject(new Error("native observation was not scheduled")), 250);
     })]);
     clearTimeout(timer); timer = undefined;
     await s.runtime.tick(false);
@@ -473,9 +531,10 @@ test("a slow native resume does not stall the bridge update or start duplicate s
 test("bridge publishes agent-initiated commentary without a user item or goal lookup", async t => {
   let publish!: (state: IpcObject, initial: boolean) => void;
   const transport: TaskStateTransport = {
+    readOnly: true,
     subscribe(task, onState) {
       publish = onState;
-      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+      return { task, readOnly: true, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
     },
     close() {},
   };
@@ -492,9 +551,10 @@ test("bridge publishes agent-initiated commentary without a user item or goal lo
 test("bridge releases goal continuation commentary without inventing a user request", async t => {
   let publish!: (state: IpcObject, initial: boolean) => void;
   const transport: TaskStateTransport = {
+    readOnly: true,
     subscribe(task, onState) {
       publish = onState;
-      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+      return { task, readOnly: true, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
     },
     close() {},
   };
@@ -521,9 +581,10 @@ test("bridge releases goal continuation commentary without inventing a user requ
 test("bridge publishes direct app progress with no accessible rollout and explains a late input", async t => {
   let publish!: (state: IpcObject, initial: boolean) => void;
   const transport: TaskStateTransport = {
+    readOnly: true,
     subscribe(task, onState) {
       publish = onState;
-      return { task, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
+      return { task, readOnly: true, start: async () => onState(state(), true), verifyOwner: async () => {}, close: () => {} };
     },
     close() {},
   };
@@ -576,6 +637,56 @@ const rolloutFinal = (timestamp: number, id: string, turnId: string, text: strin
   payload: { type: "message", id, role: "assistant", phase: "final_answer",
     content: [{ type: "output_text", text }], internal_chat_message_metadata_passthrough: { turn_id: turnId } },
 }) + "\n";
+
+test("periodic detached observation forwards native input before commentary without reacquiring a writer", async t => {
+  const s = runtimeSetup(t);
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-fallback-"));
+  const rolloutPath = path.join(root, "rollout.jsonl");
+  await writeFile(rolloutPath, "");
+  s.store.ensureBinding({ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath });
+  s.store.setValue(`projection:${s.binding.id}`, { since: 90_000, lastObservedAt: 100_000,
+    activeAtAttach: [], active: [], seen: {}, rolloutPath: comparablePath(rolloutPath) });
+  s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
+  s.store.setValue(`task-details:${s.binding.id}`, { title: "Fixture", status: "idle", workspace: "/fixture",
+    model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  s.desktop.listTasks = async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1, rolloutPath }];
+  await s.runtime.tick();
+  const user = JSON.stringify({ timestamp: new Date(101_000).toISOString(), type: "event_msg",
+    payload: { type: "item_completed", turn_id: "native-turn", item: { type: "UserMessage", id: "native-user",
+      client_id: "native-client", content: [{ type: "text", text: "Native request" }] } } }) + "\n";
+  const progress = JSON.parse(rolloutFinal(101_001, "native-progress", "native-turn", "Native progress"));
+  progress.payload.phase = "commentary";
+  await appendFile(rolloutPath, user + JSON.stringify(progress) + "\n");
+  s.advance(1_001);
+  await s.runtime.tick();
+  const output = [...s.sent.map(item => item.view.text), ...s.store.pendingDeliveries().map(item => item.view.text)];
+  assert.deepEqual(output.filter(text => text.includes("Native request") || text === "Native progress"),
+    ["## user request\n\nNative request", "Native progress"]);
+  assert.equal(s.server.received.some(message => String(message.method).startsWith("thread-follower")), false);
+  s.advance(1_001);
+  await s.runtime.tick();
+  assert.equal([...s.sent, ...s.store.pendingDeliveries()].filter(item => item.view.text.includes("Native request")).length, 1);
+});
+
+test("native client identity deduplicates fallback and live input without merging identical steering text", t => {
+  const s = runtimeSetup(t);
+  const mirror = new TaskMirror(s.store);
+  mirror.accept(s.binding.id, { type: "user", id: "rollout-user", turnId: "native-turn", operationId: "native-client", text: "Repeat" });
+  mirror.accept(s.binding.id, { type: "user", id: "live-user", turnId: "native-turn", operationId: "native-client", text: "Repeat" });
+  mirror.accept(s.binding.id, { type: "user", id: "second-steer", turnId: "native-turn", operationId: "different-client", text: "Repeat" });
+  mirror.accept(s.binding.id, { type: "user", id: "new-turn-user", turnId: "different-turn", operationId: "native-client", text: "Repeat" });
+  assert.deepEqual(s.store.pendingDeliveries().filter(item => item.view.text.includes("Repeat")).map(item => item.key),
+    ["rollout-user", "second-steer", "new-turn-user"].map(id => `event:${s.binding.id}:${id}:0`));
+});
+
+test("edited input suppression also remembers its native client identity across owner catch-up", t => {
+  const s = runtimeSetup(t);
+  const mirror = new TaskMirror(s.store);
+  s.store.expectEditedUser(s.binding.id, "Replacement request");
+  mirror.accept(s.binding.id, { type: "user", id: "rollout-edited-user", turnId: "edited-turn", operationId: "edited-client", text: "Replacement request" });
+  mirror.accept(s.binding.id, { type: "user", id: "live-edited-user", turnId: "edited-turn", operationId: "edited-client", text: "Replacement request" });
+  assert.equal(s.store.pendingDeliveries().some(item => item.view.text.includes("Replacement request")), false);
+});
 
 test("rollout fallback catches a final written between stream failure and the first poll", async t => {
   const s = runtimeSetup(t);
@@ -750,6 +861,7 @@ test("paginated rotation admits a contiguous anchored source but rejects a chang
 
 test("detached idle observation rebases after the existing catalog refresh discovers a rotated rollout", async t => {
   const s = runtimeSetup(t);
+  s.server.rejectDiscovery = true;
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-detached-rotation-"));
   const oldPath = path.join(root, "old.jsonl");
   const newPath = path.join(root, "new.jsonl");
@@ -1499,9 +1611,12 @@ test("a stalled fallback does not block another binding's background attach and 
       return null;
     },
   };
+  let failSurvivor!: () => void;
   const transport: TaskStateTransport = {
-    subscribe(task, onState) {
-      return { task, start: async () => { if (task.threadId === ref.threadId) started(); onState({ ...state([], "completed"), id: task.threadId }, true); },
+    readOnly: true,
+    subscribe(task, onState, onError) {
+      if (task.threadId === ref.threadId) failSurvivor = () => onError(new DesktopUnavailableError('Fixture observer disconnected'));
+      return { task, readOnly: true, start: async () => { if (task.threadId === ref.threadId) started(); onState({ ...state([], "completed"), id: task.threadId }, true); },
         verifyOwner: async () => {}, close: () => {} };
     }, close() {},
   };
@@ -1525,9 +1640,10 @@ test("a stalled fallback does not block another binding's background attach and 
   try {
     await within(pollEntered, "detached fallback poll did not start");
     await within(attachStarted, "unrelated background observer waited for fallback poll");
+    failSurvivor();
     await within(s.runtime.tick(false), "second update waited for stalled fallback");
     assert.equal(stalledPolls, 1, "the stalled fallback must remain single-flight");
-    assert.ok(survivorPolls >= 1, "released survivor must keep polling independently");
+    assert.ok(survivorPolls >= 1, "a disconnected survivor must recover independently of the stalled task");
   } finally {
     clearTimeout(timer); release(); await background;
   }
@@ -1602,7 +1718,12 @@ test("a stalled panel refresh does not block background attach or terminal relea
         } };
     }, close() {},
   };
-  const s = runtimeSetup(t, undefined, transport);
+  const passive: TaskStateTransport = { readOnly: true, subscribe: (task, onState, onError) => ({
+    ...transport.subscribe(task, onState, onError), readOnly: true,
+  }), close() {} };
+  const s = runtimeSetup(t, undefined, transport, undefined, undefined, undefined, undefined, undefined, passive);
+  // Exercise release of a foreground command stream, not a passive observer.
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> }).connectBinding(s.binding, ref);
   await s.runtime.tick();
   const previous = s.store.getValue<import("../src/core/codex-tasks.js").TaskDetails>(`task-details:${s.binding.id}`)!;
   s.store.setValue(`task-details:${s.binding.id}`, { ...previous, status: "idle" });
@@ -1638,8 +1759,9 @@ test("a stalled creator inspection does not block another binding's background o
   const inspectEntered = new Promise<void>(resolve => { entered = resolve; });
   const attachStarted = new Promise<void>(resolve => { started = resolve; });
   const transport: TaskStateTransport = {
+    readOnly: true,
     subscribe(task, onState) {
-      return { task, start: async () => { if (task.threadId === "other-observer") started();
+      return { task, readOnly: true, start: async () => { if (task.threadId === "other-observer") started();
         onState({ ...state(), id: task.threadId }, true); }, verifyOwner: async () => {}, close: () => {} };
     }, close() {},
   };
@@ -1861,6 +1983,8 @@ test("terminal observation closes its subscription even while final VK delivery 
     }, close() {},
   };
   const s = runtimeSetup(t, undefined, transport);
+  // Background recovery cannot acquire this command transport anymore.
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> }).connectBinding(s.binding, ref);
   await s.runtime.tick();
   let release!: () => void;
   const pending = new Promise<void>(resolve => { release = resolve; });
@@ -3112,12 +3236,14 @@ test("App Server creator materializes a new task with its atomic first turn", as
   assert.deepEqual(metadata, ["project:raw", "name:Created"]);
 });
 
-test("an idle lease stays detached across restart and is reacquired for a VK prompt", async t => {
+test("an idle restart observes natively without a writer lease and accepts a later VK prompt", async t => {
   const s = runtimeSetup(t);
   s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
   s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
   await s.runtime.tick();
-  assert.deepEqual(s.follows(), []);
+  assert.deepEqual(s.follows(), [true]);
+  assert.equal(s.store.getValue<{ owner: string }>(`task-lease:${s.binding.id}`)?.owner, 'external');
+  assert.equal(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))), false);
   await s.runtime.handle({ eventId: "vk-lease-reacquire", peerId: s.peerId, senderId: 101, text: "Continue" });
   await new Promise(resolve => setImmediate(resolve));
   await s.runtime.tick();

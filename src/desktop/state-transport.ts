@@ -32,6 +32,7 @@ function sameSource(a: TaskRef, b: TaskRef): boolean {
 /** The native follower identity is this IPC client, so its observers share a
  * single upstream follow for each wire task. */
 export class DesktopTaskStateTransport implements TaskStateTransport {
+  readonly readOnly = true as const;
   private readonly subscriptions = new Map<string, SharedSubscription>();
   private closed = false;
 
@@ -48,6 +49,7 @@ export class DesktopTaskStateTransport implements TaskStateTransport {
     const active = () => !closed && !this.closed && entry !== null && entry.consumers.has(consumer);
     return {
       task,
+      readOnly: true,
       start: async (timeoutMs = 5_000) => {
         if (closed || this.closed) throw unavailable();
         if (started) throw new Error("Subscription is already active");

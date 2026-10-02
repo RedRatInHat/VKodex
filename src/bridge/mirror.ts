@@ -190,6 +190,16 @@ export class TaskMirror {
           .some(({ text, menu }) => normalize(menu && text.endsWith(MENU_FOOTER) ? text.slice(0, -MENU_FOOTER.length) : text) === content)) return;
       }
       if (event.type === "user" && event.operationId && this.store.isOwnOperation(event.operationId, binding)) return;
+      if (event.type === "user" && event.operationId) {
+        // A canonical client identity correlates a rollout item with its later
+        // owner snapshot even when their item IDs differ. Never deduplicate by
+        // text: two identical steering inputs can be genuine separate requests.
+        // Mark before consuming the one-shot edit suppression, in this same
+        // transaction, so its catch-up cannot later leak another copy.
+        const clientKey = `user-client:${JSON.stringify([taskKey(binding), this.store.streamGeneration(binding.id),
+          event.turnId, event.operationId])}`;
+        if (!this.store.rememberEvent(binding.id, clientKey)) return;
+      }
       if (event.type === "user" && this.store.consumeExpectedEditedUser(binding.id, event.text)) return;
       // A direct app input recovered from the rollout may later appear with a
       // different item ID in the owner's projected stream. This is scoped to
