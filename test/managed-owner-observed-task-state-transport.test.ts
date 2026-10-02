@@ -86,6 +86,37 @@ test('lazily proves status then observes an exact loopback worker stream', async
   assert.deepEqual(seen, [true, false]); assert.equal(resolveCalls, 1); await stream.verifyOwner(); transport.close();
 });
 
+test('a qualified claim cannot start an unqualified or writer-capable private transport', async () => {
+  for (const capability of ['unknown-transport', 'unknown-stream'] as const) {
+    let subscriptions = 0, starts = 0, closed = 0, statusCalls = 0;
+    const states: TaskStateTransport = {
+      ...(capability === 'unknown-stream' ? { readOnly: true as const } : {}),
+      subscribe: requested => {
+        subscriptions++;
+        return { task: requested, start: async () => { starts++; }, verifyOwner: async () => {}, close() {} };
+      }, close() { closed++; },
+    };
+    const observed: ManagedOwnerRouteObserver = {
+      isCurrent: () => true,
+      async resolve() { return { kind: 'statically-qualified', claim, states, controlStatus: async () => {
+        statusCalls++;
+        return { ownerEpoch: epoch, taskId: task.threadId, hostState: 'running', backendGeneration: 2,
+          nativeState: 'connected', nativeRevision: 1 };
+      } }; },
+    };
+    const transport = new ManagedOwnerObservedTaskStateTransport(observed, task);
+    const seen: unknown[] = [];
+    const stream = transport.subscribe(task, value => seen.push(value), () => {});
+    await assert.rejects(stream.start(), /unavailable/u);
+    assert.equal(starts, 0);
+    assert.equal(subscriptions, capability === 'unknown-transport' ? 0 : 1);
+    assert.equal(statusCalls, capability === 'unknown-transport' ? 0 : 1);
+    assert.equal(closed, 1);
+    assert.deepEqual(seen, []);
+    transport.close();
+  }
+});
+
 test('restart inspection proves only the exact turn in the captured owner epoch', async () => {
   const turnId = randomUUID();
   const port = await loopback(socket => socket.write(line({ ...frame('snapshot', 0), state: {

@@ -219,6 +219,19 @@ function parseRecord(line: string): RolloutRecord | null {
   }
   if (record.type === "event_msg") {
     const event = payload;
+    // Only the canonical, completed native user item is an accepted input.
+    // Model-context role=user records have no such provenance and stay private.
+    if (event.type === "item_completed" && isObject(event.item) && event.item.type === "UserMessage"
+      && typeof event.item.id === "string" && event.item.id && typeof event.turn_id === "string" && event.turn_id
+      && Array.isArray(event.item.content)) {
+      const text = event.item.content.filter(isObject).filter(part => part.type === "text" && typeof part.text === "string")
+        .map(part => part.text as string).join("\n");
+      if (isAutomationHeartbeatInput(text)) return { timestamp, quietTurnId: event.turn_id };
+      if (!text) return null;
+      const clientId = typeof event.item.client_id === "string" && event.item.client_id ? event.item.client_id : null;
+      return { timestamp, event: { type: "user", id: event.item.id, turnId: event.turn_id, text,
+        ...(clientId ? { operationId: clientId } : {}) } };
+    }
     if (event.type !== "task_complete" || typeof event.turn_id !== "string") return null;
     const id = `status:${event.turn_id}`;
     return { timestamp, event: { type: "status", id, turnId: event.turn_id, status: "completed" } };

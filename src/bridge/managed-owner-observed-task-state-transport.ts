@@ -20,6 +20,7 @@ const unavailable = (): Error => new Error('Managed owner observed state is unav
  * on every frame and owner verification.
  */
 export class ManagedOwnerObservedTaskStateTransport implements TaskStateTransport {
+  readonly readOnly = true as const;
   readonly #resolver: ManagedOwnerRouteObserver;
   readonly #task: Readonly<TaskRef>;
   readonly #key: string;
@@ -64,7 +65,7 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
         this.expectedClaim !== undefined && (resolution.claim.ownerEpoch !== this.expectedClaim.epoch ||
           resolution.claim.id !== this.expectedClaim.id || resolution.claim.revision !== this.expectedClaim.revision ||
           resolution.claim.state !== 'ready') ||
-        !this.#resolver.isCurrent(resolution.claim)) {
+        !this.#resolver.isCurrent(resolution.claim) || resolution.states.readOnly !== true) {
         if (closed) pendingStates?.close();
         else close();
         throw unavailable();
@@ -82,6 +83,7 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
       pendingStates = null;
       try {
         active = fenced.subscribe(this.#task, onState, onError);
+        if (active.readOnly !== true) throw unavailable();
         await active.start(timeoutMs);
         if (closed || this.#closed || !this.#resolver.isCurrent(resolution.claim)) {
           close(); throw unavailable();
@@ -96,7 +98,7 @@ export class ManagedOwnerObservedTaskStateTransport implements TaskStateTranspor
       return started;
     };
     this.#streams.add(close);
-    return Object.freeze({ task: { ...this.#task }, start,
+    return Object.freeze({ task: { ...this.#task }, readOnly: true as const, start,
       verifyOwner: async (timeoutMs?: number): Promise<void> => {
         if (!active || closed || this.#closed) throw unavailable();
         try { await active.verifyOwner(timeoutMs); }

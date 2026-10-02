@@ -10,6 +10,60 @@ const task = (rolloutPath: string) => ({ hostId: "local", threadId: "thread", ro
 const line = (timestamp: string, item: unknown) => JSON.stringify({ timestamp, type: "response_item", payload: item }) + "\n";
 const message = (id: string, turnId: string, phase: string, text: string) => ({ type: "message", id, role: "assistant", phase,
   content: [{ type: "output_text", text }], internal_chat_message_metadata_passthrough: { turn_id: turnId } });
+const userLine = (timestamp: string, id: string, turnId: string, text: string, clientId?: string) => JSON.stringify({
+  timestamp, type: "event_msg", payload: { type: "item_completed", turn_id: turnId,
+    item: { type: "UserMessage", id, content: [{ type: "text", text }], ...(clientId ? { client_id: clientId } : {}) } },
+}) + "\n";
+
+test("detached recovery observes a native user input before its answer without a VK submit", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-"));
+  const rollout = path.join(root, "rollout.jsonl");
+  await writeFile(rollout, userLine("2026-10-02T14:00:00.000Z", "native-user", "native-turn", "Native request", "native-client")
+    + line("2026-10-02T14:00:01.000Z", message("reply", "native-turn", "commentary", "Working")));
+  const recovery = new RolloutTaskHistoryRecovery();
+  const ref = task(rollout);
+  recovery.enable("binding", Date.parse("2026-10-02T13:59:00.000Z"));
+  const first = await recovery.poll("binding", ref, null, null, new Set(), Date.parse("2026-10-02T14:00:02.000Z"));
+  assert.deepEqual(first?.events, [
+    { type: "user", id: "native-user", turnId: "native-turn", text: "Native request", operationId: "native-client" },
+    { type: "progress", id: "reply", turnId: "native-turn", text: "Working" },
+  ]);
+  assert.deepEqual((await recovery.poll("binding", ref, first!.checkpoint!, null, new Set(),
+    Date.parse("2026-10-02T14:00:03.000Z")))?.events, []);
+});
+
+test("rollout input observation requires canonical native identity and never exposes service context", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-"));
+  const rollout = path.join(root, "rollout.jsonl");
+  const canonical = JSON.parse(userLine("2026-10-02T14:00:00.000Z", "native-user", "native-turn", "Native request"));
+  const invalid = [
+    { ...canonical, payload: { ...canonical.payload, turn_id: null } },
+    { ...canonical, payload: { ...canonical.payload, item: { ...canonical.payload.item, id: null } } },
+    { ...canonical, payload: { ...canonical.payload, item: { ...canonical.payload.item, type: "DeveloperMessage" } } },
+  ];
+  await writeFile(rollout, invalid.map(record => JSON.stringify(record) + "\n").join("")
+    + line("2026-10-02T14:00:00.000Z", { type: "message", id: "model-context", role: "user",
+      content: [{ type: "input_text", text: "Service context" }],
+      internal_chat_message_metadata_passthrough: { turn_id: "native-turn" } }));
+  assert.deepEqual(await new RolloutTailer().poll(task(rollout), 0), []);
+});
+
+test("canonical rollout user identity survives a durable restart and preserves genuine repeated requests", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-"));
+  const rollout = path.join(root, "rollout.jsonl");
+  const ref = task(rollout);
+  await writeFile(rollout, userLine("2026-10-02T14:00:00.000Z", "first-user", "native-turn", "Repeat", "first-client"));
+  const first = new RolloutTailer();
+  assert.deepEqual(await first.poll(ref, 0), [
+    { type: "user", id: "first-user", turnId: "native-turn", text: "Repeat", operationId: "first-client" },
+  ]);
+  const restarted = new RolloutTailer();
+  assert.equal(await restarted.restore(ref, first.durableCursor(ref)!), true);
+  await appendFile(rollout, userLine("2026-10-02T14:00:01.000Z", "second-user", "native-turn", "Repeat", "second-client"));
+  assert.deepEqual(await restarted.poll(ref, 0), [
+    { type: "user", id: "second-user", turnId: "native-turn", text: "Repeat", operationId: "second-client" },
+  ]);
+});
 
 test("re-enabling an active rollout observer preserves its poll throttle", async () => {
   class CountingTailer extends RolloutTailer {

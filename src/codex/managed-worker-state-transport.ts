@@ -71,6 +71,7 @@ function validState(value: unknown, taskId: string): value is TaskState {
 }
 
 class ManagedWorkerStateStream implements TaskStateStream {
+  readonly readOnly = true as const;
   private socket: Socket | null = null;
   private pending = Buffer.alloc(0);
   private readonly frameDecoder = decoder;
@@ -220,6 +221,7 @@ class ManagedWorkerStateStream implements TaskStateStream {
  * exact worker epoch/task/generation; this transport never resumes a worker or
  * routes to a legacy profile on failure. */
 export class ManagedWorkerStateTransport implements TaskStateTransport {
+  readonly readOnly = true as const;
   private readonly endpoint: ManagedWorkerStateEndpoint;
   private readonly streams = new Set<ManagedWorkerStateStream>();
   private closed = false;
@@ -244,7 +246,7 @@ export class ManagedWorkerStateTransport implements TaskStateTransport {
       (task.sourceId ?? '') !== (this.endpoint.sourceId ?? '')) throw invalid('task outside exclusive scope');
     const stream = new ManagedWorkerStateStream(task, this.endpoint, onState, onError);
     this.streams.add(stream);
-    return { task, start: timeoutMs => stream.start(timeoutMs), verifyOwner: () => stream.verifyOwner(),
+    return { task, readOnly: true, start: timeoutMs => stream.start(timeoutMs), verifyOwner: () => stream.verifyOwner(),
       diagnostic: () => stream.diagnostic(), close: () => { stream.close(); this.streams.delete(stream); } };
   }
 
