@@ -218,9 +218,17 @@ export class ManagedNativeStockQueueAdapter {
         !Object.hasOwn(request.params.state, this.taskId) ||
         !Array.isArray(request.params.state[this.taskId])) fail('request-shape');
     if (this.#closed || this.#faulted || assertIngressCurrent() !== true) fail('owner-fence');
+    // Current Desktop includes this optional field even when nothing was
+    // discarded. [] is a no-op, not an upstream cancellation capability.
+    // Actual discards remain unsupported until exact stock removal receipts
+    // can be reconciled; never ACK or silently drop a requested cancellation.
+    if (Object.hasOwn(request.params, 'discardedMessageIds') &&
+        (!Array.isArray(request.params.discardedMessageIds) ||
+          request.params.discardedMessageIds.length !== 0)) fail('request-shape');
     if (Object.keys(request).some(key => !['requestId', 'sourceClientId', 'hostId',
         'method', 'version', 'params'].includes(key)) ||
-        Object.keys(request.params).some(key => !['hostId', 'conversationId', 'state'].includes(key))) fail('request-shape');
+        Object.keys(request.params).some(key =>
+          !['hostId', 'conversationId', 'state', 'discardedMessageIds'].includes(key))) fail('request-shape');
     const sourceClientId = request.sourceClientId, nativeRequestId = request.requestId;
     const snapshot = strictJson(request);
     const params = snapshot.params;
