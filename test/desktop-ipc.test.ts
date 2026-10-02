@@ -3745,6 +3745,67 @@ test("historical queue scan waits before a mutable active turn without losing th
   })), MutableQueuedInputTurnError);
 });
 
+test("historical queue scan proves an older terminal ACK before an unrelated active turn", async () => {
+  const calls: IpcObject[] = [];
+  const turns = Array.from({ length: 9 }, (_, index) => ({ id: `turn-${index}`,
+    status: index === 8 ? "inProgress" : "completed",
+    items: [{ type: "userMessage", clientId: index === 2 ? "queued-operation" : `other-${index}` }] }));
+  const list = async (params: IpcObject): Promise<IpcObject> => {
+    calls.push(params);
+    const start = Number(params.cursor ?? 0), end = start + Number(params.limit);
+    return { threadId: "thread", data: turns.slice(start, end).map(turn => ({ ...turn, itemsView: params.itemsView })),
+      nextCursor: end < turns.length ? String(end) : null };
+  };
+  assert.equal(await findRecentTerminalQueuedInputTurn("thread", "queued-operation", async params => {
+    assert.equal(params.sortDirection, "desc");
+    return { data: turns.slice(-5).reverse().map(turn => ({ ...turn, itemsView: "summary" })), nextCursor: "older" };
+  }), null, "the old ACK is outside the recent-tail shortcut");
+  assert.deepEqual(await scanTerminalQueuedInputTurn("thread", "queued-operation", list),
+    { done: true, turnId: "turn-2" });
+  assert.equal(calls.filter(call => call.itemsView === "full").length, 1,
+    "settlement still requires the exact terminal turn in full view");
+});
+
+test("historical queue scan refuses ambiguous or changed proof beside an active turn", async t => {
+  for (const failure of ["duplicate-in-active", "duplicate-in-full", "full-in-progress", "changed-full-id", "unknown-active-status"]) {
+    await t.test(failure, async () => {
+      const turns = Array.from({ length: 9 }, (_, index) => ({ id: `turn-${index}`,
+        status: index === 8 ? "inProgress" : "completed",
+        items: [{ type: "userMessage", clientId: index === 2 ? "queued-operation" : `other-${index}` }] }));
+      if (failure === "duplicate-in-active") turns[8]!.items[0]!.clientId = "queued-operation";
+      if (failure === "unknown-active-status") turns[8]!.status = "unknown";
+      const list = async (params: IpcObject): Promise<IpcObject> => {
+        const start = Number(params.cursor ?? 0), end = start + Number(params.limit);
+        const data = turns.slice(start, end).map(turn => ({ ...turn, itemsView: params.itemsView }));
+        if (params.itemsView === "full") {
+          if (failure === "full-in-progress") data[0]!.status = "inProgress";
+          if (failure === "changed-full-id") data[0]!.id = "changed-turn";
+          if (failure === "duplicate-in-full") data[0]!.items = [
+            { type: "userMessage", clientId: "queued-operation" },
+            { type: "userMessage", clientId: "queued-operation" }];
+        }
+        return { threadId: "thread", data, nextCursor: end < turns.length ? String(end) : null };
+      };
+      await assert.rejects(scanTerminalQueuedInputTurn("thread", "queued-operation", list), DesktopUnavailableError);
+    });
+  }
+});
+
+test("recent terminal queue proof refuses the same client ID in an active turn", async () => {
+  let reads = 0;
+  const turns = [
+    { id: "active", status: "inProgress", items: [{ type: "userMessage", clientId: "queued-operation" }] },
+    { id: "terminal", status: "completed", items: [{ type: "userMessage", clientId: "queued-operation" }] },
+  ];
+  await assert.rejects(findRecentTerminalQueuedInputTurn("thread", "queued-operation", async params => {
+    reads++;
+    const start = Number(params.cursor ?? 0), end = start + Number(params.limit);
+    return { data: turns.slice(start, end).map(turn => ({ ...turn, itemsView: params.itemsView })),
+      nextCursor: end < turns.length ? String(end) : null };
+  }), DesktopUnavailableError);
+  assert.equal(reads, 1, "ambiguous summary evidence must refuse before hydration");
+});
+
 test("terminal queue reconciliation restarts an unversioned legacy cursor from oldest history", async () => {
   const legacy = { headDigest: "a".repeat(64), cursor: "old-descending-page",
     seenCursors: ["old-descending-page"], pages: 1 } as unknown as

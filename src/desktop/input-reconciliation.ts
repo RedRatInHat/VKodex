@@ -87,6 +87,7 @@ export async function findRecentTerminalQueuedInputTurn(
   const page = await read(undefined, limit, "summary");
   const seen = new Set<string>();
   let candidateIndex: number | null = null;
+  let clientMatches = 0;
   for (const [index, turn] of page.data.entries()) {
     if (!isObject(turn) || turn.threadId !== undefined && turn.threadId !== threadId ||
       typeof turn.id !== "string" || !turn.id || seen.has(turn.id) ||
@@ -94,9 +95,12 @@ export async function findRecentTerminalQueuedInputTurn(
       turn.items.some(item => !isObject(item) || typeof item.type !== "string"))
       throw new DesktopUnavailableError("Codex вернул неполный ход очереди.");
     seen.add(turn.id);
-    if (!["completed", "failed", "interrupted"].includes(turn.status) ||
-      !turn.items.some(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId)) continue;
-    if (candidateIndex !== null) throw new DesktopUnavailableError("Ход очереди неоднозначен.");
+    const terminal = ["completed", "failed", "interrupted"].includes(turn.status);
+    if (!terminal && turn.status !== "inProgress")
+      throw new DesktopUnavailableError("Codex вернул неизвестное состояние хода очереди.");
+    clientMatches += turn.items.filter(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId).length;
+    if (clientMatches > 1) throw new DesktopUnavailableError("Ход очереди неоднозначен.");
+    if (!terminal || !turn.items.some(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId)) continue;
     candidateIndex = index;
   }
   if (candidateIndex === null) return null;
@@ -181,6 +185,7 @@ export async function scanTerminalQueuedInputTurn(
   const consume = async (page: Page, startCursor?: string): Promise<string | null> => {
     const turns = new Set<string>();
     let matchedIndex: number | null = null;
+    let mutable = false;
     if (page.nextCursor !== null && (!page.nextCursor || cursors.has(page.nextCursor) || page.data.length === 0 ||
       totalCursorBytes + cursorBytes(page.nextCursor) > maxCursorHistoryBytes))
       throw new DesktopUnavailableError("Codex не завершил чтение истории очереди.");
@@ -189,15 +194,20 @@ export async function scanTerminalQueuedInputTurn(
         typeof turn.id !== "string" || !turn.id || turns.has(turn.id) ||
         turn.itemsView !== "summary" || !Array.isArray(turn.items) || typeof turn.status !== "string")
         throw new DesktopUnavailableError("Codex вернул неполный ход очереди.");
-      if (!["completed", "failed", "interrupted"].includes(turn.status))
-        throw new MutableQueuedInputTurnError();
+      const terminal = ["completed", "failed", "interrupted"].includes(turn.status);
+      if (!terminal) {
+        if (turn.status !== "inProgress")
+          throw new DesktopUnavailableError("Codex вернул неизвестное состояние хода очереди.");
+        mutable = true;
+      }
       turns.add(turn.id);
       for (const item of turn.items) {
         if (!isObject(item) || typeof item.type !== "string")
           throw new DesktopUnavailableError("Codex вернул неполный элемент истории очереди.");
         if (item.type !== "userMessage" || item.clientId !== clientId) continue;
-        if (matchedIndex !== null || !["completed", "failed", "interrupted"].includes(turn.status))
+        if (matchedIndex !== null)
           throw new DesktopUnavailableError("Ход очереди неоднозначен или ещё не завершён.");
+        if (!terminal) throw new MutableQueuedInputTurnError();
         matchedIndex = index;
       }
     }
@@ -227,6 +237,12 @@ export async function scanTerminalQueuedInputTurn(
         || turn.items.filter(item => isObject(item) && item.type === "userMessage" && item.clientId === clientId).length !== 1)
         throw new DesktopUnavailableError("Codex не подтвердил точный завершённый ход очереди.");
       matched = turn.id as string;
+    }
+    // A newer active turn does not invalidate an exact terminal ACK. Without
+    // that positive proof, never advance a durable cursor through a live page.
+    if (mutable) {
+      if (matched) return matched;
+      throw new MutableQueuedInputTurnError();
     }
     pages++;
     cursor = page.nextCursor;
