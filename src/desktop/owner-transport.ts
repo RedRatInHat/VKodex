@@ -4,6 +4,38 @@ import type { Readable, Writable } from "node:stream";
 type Message = Record<string, unknown>;
 const object = (value: unknown): value is Message => !!value && typeof value === "object" && !Array.isArray(value);
 const owns = (value: Message, key: string) => Object.prototype.hasOwnProperty.call(value, key);
+const uuid = (value: unknown): string | null => typeof value === "string"
+  && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(value) ? value.toLowerCase() : null;
+const receiptMethods = new Set(["turn/start", "turn/steer", "thread/queue/add", "thread/queue/list",
+  "thread/read", "thread/resume", "thread/turns/list", "thread/loaded/list"]);
+
+/** Metadata only. Buffered writes establish neither native consumption nor UI rendering. */
+export interface OwnerReceiptTrace {
+  readonly version: 1;
+  readonly transportInstance: string;
+  readonly eventSequence: number;
+  readonly timestampMs: number;
+  readonly monotonicMs: number;
+  readonly phase: "request-observed" | "backend-write-buffered" | "native-response-observed"
+    | "frontend-write-buffered" | "native-user-message-observed" | "frontend-user-message-buffered" | "capture-ended";
+  readonly method?: string;
+  readonly nativeMethod?: "item/started" | "item/completed" | "turn/started" | "turn/completed";
+  readonly requestSequence?: number;
+  readonly threadId?: string | null;
+  readonly clientUserMessageId?: string | null;
+  readonly turnId?: string | null;
+  readonly itemId?: string | null;
+  readonly elapsedMs?: number;
+  readonly outcome?: "success" | "error";
+  readonly errorCode?: number | null;
+  readonly errorCategory?: "active-writer-conflict" | "native-error";
+  readonly droppedEvents?: number;
+  readonly callbackFailures?: number;
+  readonly unresolvedRequests?: number;
+}
+type ReceiptContext = Pick<OwnerReceiptTrace, "method" | "requestSequence" | "threadId" | "clientUserMessageId">
+  & { startedAt: number };
+type ReceiptFields = Omit<OwnerReceiptTrace, "version" | "transportInstance" | "eventSequence" | "timestampMs" | "monotonicMs">;
 
 export class OwnerTransportError extends Error {
   constructor(
@@ -16,7 +48,11 @@ export class OwnerTransportError extends Error {
 /** Experimental transport, not installed into production clients automatically.
  * One native connection and initialization. Extra requests never impersonate a second client. */
 export class OwnerTransport {
-  private readonly prefix = `vkodex-${randomUUID()}-`;
+  private readonly transportInstance = randomUUID();
+  private readonly prefix = `vkodex-${this.transportInstance}-`;
+  private traceSequence = 0;
+  private traceDropped = 0;
+  private traceFailures = 0;
   private sequence = 0;
   private initialized = false;
   private initializeAccepted = false;
@@ -28,6 +64,7 @@ export class OwnerTransport {
     reject?: (error: OwnerTransportError) => void;
     timer?: ReturnType<typeof setTimeout>;
     mutating?: boolean;
+    receipt?: ReceiptContext;
   }>();
   private readonly archiving = new Set<string>();
   private readonly archiveGroups = new Map<string, Set<string>>();
@@ -38,6 +75,7 @@ export class OwnerTransport {
     private readonly clientInput: Readable,
     private readonly clientOutput: Writable,
     private readonly timeoutMs = 30_000,
+    private readonly onReceiptTrace?: (event: Readonly<OwnerReceiptTrace>) => void,
   ) {
     this.lines(clientInput, message => this.fromClient(message));
     this.lines(nativeOutput, message => this.fromNative(message));
@@ -46,6 +84,48 @@ export class OwnerTransport {
     for (const stream of [nativeInput, nativeOutput, clientInput, clientOutput]) stream.on("error", () => this.close());
     nativeOutput.once("end", () => this.close());
     clientInput.once("end", () => { this.close(); nativeInput.end(); });
+  }
+
+  private trace(fields: ReceiptFields): void {
+    if (!this.onReceiptTrace) return;
+    // A long-running connection must not generate an unlimited diagnostic capture.
+    if (this.traceSequence >= 10_000 && fields.phase !== "capture-ended") { this.traceDropped++; return; }
+    try {
+      this.onReceiptTrace(Object.freeze({ version: 1, transportInstance: this.transportInstance,
+        eventSequence: ++this.traceSequence, timestampMs: Date.now(), monotonicMs: performance.now(), ...fields }));
+    } catch { this.traceFailures++; } // Never reach the protocol parser's close-on-error path.
+  }
+
+  private receiptContext(method: string, params: unknown): ReceiptContext | undefined {
+    if (!this.onReceiptTrace || !receiptMethods.has(method)) return undefined;
+    const values = object(params) ? params : {};
+    return { method, requestSequence: this.sequence, threadId: uuid(values.threadId),
+      clientUserMessageId: uuid(values.clientUserMessageId), startedAt: performance.now() };
+  }
+
+  private traceRequest(phase: "request-observed" | "backend-write-buffered", receipt?: ReceiptContext): void {
+    if (receipt) {
+      const { startedAt, ...fields } = receipt;
+      this.trace({ phase, ...fields, elapsedMs: performance.now() - startedAt });
+    }
+  }
+
+  private traceUserItems(message: Message, phase: "native-user-message-observed" | "frontend-user-message-buffered"): void {
+    if (!this.onReceiptTrace || !object(message.params)) return;
+    const nativeMethod = message.method;
+    const params = message.params;
+    let items: unknown[];
+    let turnId = uuid(params.turnId);
+    if (nativeMethod === "item/started" || nativeMethod === "item/completed") items = [params.item];
+    else if ((nativeMethod === "turn/started" || nativeMethod === "turn/completed") && object(params.turn)) {
+      items = Array.isArray(params.turn.items) ? params.turn.items : [];
+      turnId = uuid(params.turn.id);
+    } else return;
+    for (const item of items) {
+      if (!object(item) || item.type !== "userMessage") continue;
+      this.trace({ phase, nativeMethod,
+        threadId: uuid(params.threadId), turnId, itemId: uuid(item.id), clientUserMessageId: uuid(item.clientId) });
+    }
   }
 
   private lines(stream: Readable, receive: (message: Message) => void): void {
@@ -81,8 +161,11 @@ export class OwnerTransport {
         return;
       }
       const id = this.prefix + ++this.sequence;
-      this.pending.set(id, { clientId: message.id, initialize: message.method === "initialize" });
+      const receipt = this.receiptContext(message.method, message.params);
+      this.pending.set(id, { clientId: message.id, initialize: message.method === "initialize", ...(receipt ? { receipt } : {}) });
+      this.traceRequest("request-observed", receipt);
       this.send(this.nativeInput, { ...message, id });
+      this.traceRequest("backend-write-buffered", receipt);
     } else {
       // Server-initiated approvals and notifications retain the native IDs.
       if (message.method === "initialized" && this.initializeAccepted) this.initialized = true;
@@ -102,11 +185,26 @@ export class OwnerTransport {
         this.pending.delete(message.id);
         if (pending.timer) clearTimeout(pending.timer);
         if (owns(pending, "clientId")) {
+          let responseFields: ReceiptFields | undefined;
+          if (pending.receipt) {
+            const { startedAt, ...fields } = pending.receipt;
+            const error = object(message.error) ? message.error : null;
+            const result = object(message.result) ? message.result : null;
+            responseFields = { phase: "native-response-observed", ...fields,
+              elapsedMs: performance.now() - startedAt,
+              turnId: result && object(result.turn) ? uuid(result.turn.id) : null,
+              outcome: message.error ? "error" : "success",
+              ...(message.error ? { errorCode: error && Number.isSafeInteger(error.code) ? error.code as number : null,
+                errorCategory: error && typeof error.message === "string" && /already has an active writer/iu.test(error.message)
+                  ? "active-writer-conflict" as const : "native-error" as const } : {}) };
+            this.trace(responseFields);
+          }
           if (pending.initialize && !message.error) this.initializeAccepted = true;
           // VS Code does not send the optional initialized notification. A
           // successful subsequent IDE request proves the native session is ready.
           if (!pending.initialize && this.initializeAccepted && !message.error) this.initialized = true;
           this.send(this.clientOutput, { ...message, id: pending.clientId });
+          if (responseFields) this.trace({ ...responseFields, phase: "frontend-write-buffered" });
         } else if (message.error) pending.reject?.(new OwnerTransportError(pending.mutating ? "unknown" : "rejected", "Native owner reported an error; a mutation may have partially completed."));
         else if (!object(message.result)) pending.reject?.(new OwnerTransportError(pending.mutating ? "unknown" : "unavailable", "Invalid owner response."));
         else pending.resolve?.(message.result);
@@ -115,7 +213,9 @@ export class OwnerTransport {
       // A timed-out control response must not leak into the UI as a foreign request.
       if (message.id.startsWith(this.prefix)) return;
     }
+    this.traceUserItems(message, "native-user-message-observed");
     this.send(this.clientOutput, message);
+    this.traceUserItems(message, "frontend-user-message-buffered");
   }
 
   private request(method: string, params: Message, mutating = false): Promise<Message> {
@@ -234,6 +334,8 @@ export class OwnerTransport {
   close(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.trace({ phase: "capture-ended", droppedEvents: this.traceDropped, callbackFailures: this.traceFailures,
+      unresolvedRequests: [...this.pending.values()].filter(value => value.receipt).length });
     for (const pending of this.pending.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       pending.reject?.(new OwnerTransportError(pending.mutating ? "unknown" : "unavailable", "Owner disconnected; no automatic retry."));
