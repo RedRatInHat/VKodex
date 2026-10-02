@@ -148,6 +148,39 @@ test('stock queue reports fixed shape and baseline refusal codes before any work
   assert.equal(f.calls.length, 0);
 });
 
+test('current native empty discarded IDs preserve stock queue admission and replay identity', async t => {
+  const f = await fixture(t);
+  const initial = f.request();
+  const request = { ...initial, params: { ...initial.params, discardedMessageIds: [] } };
+  assert.deepEqual(await f.adapter.accept(request, f.ingress), { ok: true });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0]?.params.clientUserMessageId, f.entryId);
+  assert.deepEqual(await f.adapter.accept(f.request(), f.ingress), { ok: true });
+  assert.equal(f.calls.length, 1);
+  assert.equal(await f.adapter.consumeUserMessage(f.entryId, 'own-turn', () => true), true);
+  assert.deepEqual(f.published.at(-1), { ids: [], kind: 'outbox' });
+});
+
+test('native discarded IDs cannot silently cancel stock entries or mutate the journal', async t => {
+  const f = await fixture(t);
+  for (const discardedMessageIds of [[f.entryId], null, 'not-an-array', {}]) {
+    const initial = f.request();
+    await assert.rejects(f.adapter.accept({ ...initial,
+      params: { ...initial.params, discardedMessageIds } }, f.ingress),
+    error => error instanceof ManagedNativeQueueRefusal && error.code === 'request-shape');
+  }
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(f.adapter.quiescence(), { taskVersion: 0, unresolved: 0, unconsumed: 0 });
+  assert.deepEqual(f.published, []);
+  await f.adapter.accept(f.request(), f.ingress);
+  const cancellation = f.request([]);
+  await assert.rejects(f.adapter.accept({ ...cancellation,
+    params: { ...cancellation.params, discardedMessageIds: [f.entryId] } }, f.ingress),
+  error => error instanceof ManagedNativeQueueRefusal && error.code === 'request-shape');
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.adapter.quiescence().unconsumed, 1);
+});
+
 test('proven final worker pre-write refusal is durable not-written, never ACKed or republished empty', async t => {
   const f = await fixture(t, { workerPrewriteRefusal: true });
   await assert.rejects(f.adapter.accept(f.request(), f.ingress), /not written/i);
