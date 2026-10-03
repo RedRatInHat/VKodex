@@ -27,6 +27,19 @@ test("transfer project assignment uses the native source namespace, not display 
   nativeId = "unavailable-project";
   await assert.rejects(adapter.transferProjectId(sourceTask), /не найден/iu);
 });
+
+test("native project assignment acknowledgement is not rejected by display inference", async () => {
+  const target = { hostId: "local", threadId: "native-project-target", title: "Target",
+    workspace: "/workspace", updatedAt: 1, projectId: "inferred-display-project" };
+  let native: string | null = null;
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [target], listProjects: async () => [],
+    resolveProject: async () => { throw new Error("No explicit project requested"); } }, undefined,
+    { rename: async () => {}, archive: async () => {}, markdown: async () => "", assignProject: async () => {},
+      read: async () => ({ title: target.title, projectId: native }) });
+  await adapter.moveTask(target, null);
+  native = "unexpected-native-project";
+  await assert.rejects(adapter.moveTask(target, null), /не подтверждено/iu);
+});
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";

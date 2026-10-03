@@ -535,8 +535,15 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.metadata.assignProject(task, rawProjectId);
     const current = (await this.listTasks()).find(candidate => sameTask(candidate, task));
     if (!current) throw new UncertainActionError();
-    if (current.projectId !== expectedProjectId
-      || (this.metadata.read && (await this.metadata.read(task)).projectId !== rawProjectId)) {
+    // The catalog can infer a display project from the workspace even when
+    // the acknowledged native assignment is null. Prefer the exact native
+    // read for null; explicit assignments still require the expected catalog
+    // project too. Unknown native reads never use display inference as proof.
+    const confirmed = this.metadata.read
+      ? (await this.metadata.read(task)).projectId === rawProjectId
+        && (rawProjectId === null || current.projectId === expectedProjectId)
+      : current.projectId === expectedProjectId;
+    if (!confirmed) {
       throw new ProjectAssignmentUnconfirmedError();
     }
   }
