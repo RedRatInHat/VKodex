@@ -4,6 +4,8 @@ param(
   [Parameter(Mandatory = $true)][string]$HealthFile,
   [Parameter(Mandatory = $true)][string]$EntryPoint,
   [Parameter(Mandatory = $true)][string]$LogFile,
+  [string]$VersionedLauncherPath,
+  [string]$BridgeExecutable,
   [int]$PollSeconds = 20,
   [int]$StartupSeconds = 300,
   [int]$StaleSeconds = 180
@@ -29,6 +31,85 @@ function Is-FreshHealth($Child, [datetime]$Now) {
     $age = ($Now - $checkedAt).TotalSeconds
     return $age -ge -5 -and $age -le $StaleSeconds
   } catch { return $false }
+}
+
+$versionedMode = -not [string]::IsNullOrWhiteSpace($VersionedLauncherPath) -or -not [string]::IsNullOrWhiteSpace($BridgeExecutable)
+if ($versionedMode) {
+  # This parent-chain check is diagnostic only. Fresh health or a matching PID
+  # does not prove ownership release, turn completion, or permission to stop work.
+  if ([string]::IsNullOrWhiteSpace($VersionedLauncherPath) -or [string]::IsNullOrWhiteSpace($BridgeExecutable)) {
+    throw "Invalid VKodex watchdog settings."
+  }
+  foreach ($candidatePath in @($VersionedLauncherPath, $BridgeExecutable, $EntryPoint)) {
+    if (-not [IO.Path]::IsPathRooted($candidatePath) -or $candidatePath.Contains('"') -or
+        $candidatePath.Contains([char]0) -or $candidatePath.Contains("`r") -or $candidatePath.Contains("`n")) {
+      throw "Invalid VKodex watchdog settings."
+    }
+  }
+  try {
+    $launcherIdentity = [IO.Path]::GetFullPath($VersionedLauncherPath)
+    $bridgeIdentity = [IO.Path]::GetFullPath($BridgeExecutable)
+    $fixedEntryPoint = [IO.Path]::GetFullPath($EntryPoint)
+  } catch { throw "Invalid VKodex watchdog settings." }
+  $versionedEntryPattern = [regex]::Escape($fixedEntryPoint)
+  $supervisor = Get-CimInstance Win32_Process -Filter "ProcessId=$SupervisorPid"
+  if (-not $supervisor) { exit 0 }
+  $supervisorCreatedAt = $supervisor.CreationDate
+  $reportedStale = @{}
+  while ($true) {
+    Start-Sleep -Seconds $PollSeconds
+    try {
+      $supervisor = Get-CimInstance Win32_Process -Filter "ProcessId=$SupervisorPid"
+      if (-not $supervisor -or $supervisor.CreationDate -ne $supervisorCreatedAt) { break }
+      $now = Get-Date
+      $helpers = Get-CimInstance Win32_Process -Filter "ParentProcessId=$SupervisorPid" |
+        Where-Object { $_.ExecutablePath -and [string]::Equals([IO.Path]::GetFullPath([string]$_.ExecutablePath), $launcherIdentity, [StringComparison]::OrdinalIgnoreCase) }
+      $currentKeys = @{}
+      foreach ($helper in $helpers) {
+        $helperBirth = $helper.CreationDate
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($helper.ProcessId)" |
+          Where-Object { $_.ExecutablePath -and [string]::Equals([IO.Path]::GetFullPath([string]$_.ExecutablePath), $bridgeIdentity, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -match $versionedEntryPattern }
+        foreach ($child in $children) {
+          $key = "$($helper.ProcessId):$($helperBirth.ToFileTimeUtc()):$($child.ProcessId):$($child.CreationDate.ToFileTimeUtc())"
+          $currentKeys[$key] = $true
+          $age = ($now - $child.CreationDate).TotalSeconds
+          if (Is-FreshHealth $child $now) {
+            if ($reportedStale.ContainsKey($key)) {
+              Write-WatchdogLog "VKodex PID $($child.ProcessId) resumed updating health."
+              $reportedStale.Remove($key)
+            }
+            continue
+          }
+          if ($age -le $StaleSeconds) { continue }
+          $hasOwnReport = $false
+          try {
+            $report = Get-Content -LiteralPath $HealthFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $hasOwnReport = [int]$report.pid -eq [int]$child.ProcessId
+          } catch { }
+          if (-not $hasOwnReport -and $age -le $StartupSeconds) { continue }
+          if ($reportedStale.ContainsKey($key)) { continue }
+          # Recheck both generations and the exact helper -> stable-runtime parent chain.
+          $currentHelper = Get-CimInstance Win32_Process -Filter "ProcessId=$($helper.ProcessId)"
+          $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)"
+          if (-not $currentHelper -or $currentHelper.ParentProcessId -ne $SupervisorPid -or
+              $currentHelper.CreationDate -ne $helperBirth -or -not $currentHelper.ExecutablePath -or
+              -not [string]::Equals([IO.Path]::GetFullPath([string]$currentHelper.ExecutablePath), $launcherIdentity, [StringComparison]::OrdinalIgnoreCase) -or
+              -not $current -or $current.ParentProcessId -ne $helper.ProcessId -or
+              $current.CreationDate -ne $child.CreationDate -or -not $current.ExecutablePath -or
+              -not [string]::Equals([IO.Path]::GetFullPath([string]$current.ExecutablePath), $bridgeIdentity, [StringComparison]::OrdinalIgnoreCase) -or
+              $current.CommandLine -notmatch $versionedEntryPattern) { continue }
+          Write-WatchdogLog "VKodex PID $($child.ProcessId) stopped updating health; leaving it running to preserve active work. Investigate the stale health report."
+          $reportedStale[$key] = $true
+        }
+      }
+      foreach ($key in @($reportedStale.Keys)) {
+        if (-not $currentKeys.ContainsKey($key)) { $reportedStale.Remove($key) }
+      }
+    } catch {
+      Write-WatchdogLog "VKodex watchdog could not complete one poll; it will retry."
+    }
+  }
+  exit 0
 }
 
 $entryPattern = [regex]::Escape($EntryPoint)

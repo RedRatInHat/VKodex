@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { execFile } from "node:child_process";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
 import { link, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { compatibleRuntime, launchArguments, windowsRuntimePath } from "../src/desktop/runtime.js";
 import { boundedArtifactBytes, deploymentDataDirectory, deploymentValidationArguments, validateDeploymentArtifact } from "../src/desktop/deployment-artifact.js";
 import { BOOTSTRAP_FILES, deploymentBindingArguments, planDeploymentAction, validateDeploymentBinding } from "../src/desktop/deployment-binding.js";
+import { deploymentStartupEnvironment, executeDeployment } from "../src/desktop/deployment-execution.js";
 
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
@@ -393,6 +396,7 @@ test("versioned binding keeps stable runtime path and fixed bootstrap separate f
   assert.equal(plan.cwd, fixture.configurationRoot);
   assert.equal(plan.dataDirectory, fixture.descriptor.dataDirectory);
   assert.equal(plan.launcherPath, path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"));
+  assert.equal(plan.launcherSha256, fixture.manifest.files["launcher/VKodexSupervisor.exe"]!.sha256);
   assert.equal(plan.supervisorPath, path.join(fixture.bootstrapRoot, "scripts/run-windows-supervisor.ps1"));
   assert.equal(plan.watchdogPath, path.join(fixture.bootstrapRoot, "scripts/watch-windows-bridge.ps1"));
   assert.equal(plan.protocol, "deployment-plan-v1");
@@ -410,10 +414,59 @@ test("offline action planning emits fixed pinned arguments without launching or 
   const fixture = await bindingFixture();
   const action = await planDeploymentAction(fixture.bindingPath, fixture.bindingSha256);
   assert.deepEqual(action, { status: "proposed_action_not_installed", executable: path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"),
-    cwd: fixture.configurationRoot, arguments: ["--launch-binding", fixture.bindingPath, "--launch-binding-sha256", fixture.bindingSha256] });
+    cwd: fixture.configurationRoot, arguments: ["--launch-binding", fixture.bindingPath, "--launch-binding-sha256", fixture.bindingSha256, "--operation", "supervise"] });
   assert.equal(Object.isFrozen(action), true);
   assert.equal(Object.isFrozen(action.arguments), true);
   assert.deepEqual(await readdir(fixture.configurationRoot), [".env"]);
+});
+
+test("deployment parent clears case-insensitive Node and CLR startup hooks without changing unrelated environment", () => {
+  const original = { PATH: "fixture-path", BOT_DATA_DIR: "fixture-data", Node_Options: "preload-sentinel", node_path: "module-sentinel",
+    COR_ENABLE_PROFILING: "1", Cor_Profiler: "profiler-sentinel", COR_PROFILER_PATH_64: "profiler-path", APPDOMAIN_MANAGER_ASM: "assembly-sentinel" };
+  const result = deploymentStartupEnvironment(original);
+  assert.equal(result.Node_Options, undefined);
+  assert.equal(result.node_path, undefined);
+  assert.equal(result.Cor_Profiler, undefined);
+  assert.equal(result.NODE_OPTIONS, "");
+  assert.equal(result.NODE_PATH, "");
+  assert.equal(result.COR_ENABLE_PROFILING, "0");
+  assert.equal(result.COR_PROFILER, "");
+  assert.equal(result.COR_PROFILER_PATH_64, "");
+  assert.equal(result.APPDOMAIN_MANAGER_ASM, "");
+  assert.equal(result.PATH, original.PATH);
+  assert.equal(result.BOT_DATA_DIR, original.BOT_DATA_DIR);
+  assert.equal(original.COR_ENABLE_PROFILING, "1");
+});
+
+test("explicit Windows deployment verifies before spawn and uses only fixed pinned arguments", { skip: process.platform !== "win32" }, async () => {
+  const fixture = await bindingFixture();
+  const originalSpawn = childProcess.spawn;
+  const launches: unknown[][] = [];
+  try {
+    childProcess.spawn = ((...args: unknown[]) => {
+      launches.push(args);
+      const child = new EventEmitter();
+      setImmediate(() => child.emit("exit", 0));
+      return child;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    await assert.rejects(executeDeployment(fixture.bindingPath, "0".repeat(64), "supervise"));
+    assert.equal(launches.length, 0);
+    assert.equal(await executeDeployment(fixture.bindingPath, fixture.bindingSha256, "supervise"), 0);
+    assert.equal(launches.length, 1);
+    const [executable, args, options] = launches[0]!;
+    assert.equal(executable, path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"));
+    assert.deepEqual(args, ["--launch-binding", fixture.bindingPath, "--launch-binding-sha256", fixture.bindingSha256, "--operation", "supervise"]);
+    const selected = options as { cwd: string; shell: boolean; windowsHide: boolean; env: NodeJS.ProcessEnv };
+    assert.equal(selected.cwd, fixture.configurationRoot);
+    assert.equal(selected.shell, false);
+    assert.equal(selected.windowsHide, true);
+    assert.equal(selected.env.NODE_OPTIONS, "");
+    assert.equal(selected.env.COR_ENABLE_PROFILING, "0");
+    await writeFile(path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"), "changed-launcher");
+    await assert.rejects(executeDeployment(fixture.bindingPath, fixture.bindingSha256, "run-once"));
+    assert.equal(launches.length, 1);
+  } finally { childProcess.spawn = originalSpawn; syncBuiltinESMExports(); }
 });
 
 test("binding CLI argument contract accepts exactly the independent binding pin", () => {
