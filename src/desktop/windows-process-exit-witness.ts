@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -17,10 +17,32 @@ export type SelectedProcessExitObservation = Readonly<{
   readonly identitySha256: string;
   readonly exits: readonly Readonly<{ pid: number; birthTicks: string; exitTicks: string }>[];
 }> | Readonly<{ readonly kind: 'blocked' | 'unavailable' }>;
+export interface WindowsProcessCaptureTicket {
+  readonly kind: 'captured';
+  readonly identitySha256: string;
+  readonly processCount: number;
+}
+export interface WindowsProcessCaptureSession {
+  readonly ticket: WindowsProcessCaptureTicket;
+  readonly completion: Promise<SelectedProcessExitObservation>;
+  /** Revoke this invocation's sequencing ticket. The observer exits naturally. */
+  cancelObservation(): void;
+}
 const verified = new WeakSet<object>();
+const currentTickets = new WeakMap<object, { current: boolean; until: number }>();
 /** In-memory evidence from this invocation, never a deserialized receipt. */
 export function isVerifiedSelectedProcessExit(value: unknown): boolean {
   return !!value && typeof value === 'object' && verified.has(value);
+}
+/** A current, in-memory ticket from a capture session, not JSON or replayed data. */
+export function isCurrentWindowsProcessCaptureTicket(value: unknown): value is WindowsProcessCaptureTicket {
+  if (!value || typeof value !== 'object') return false;
+  const state = currentTickets.get(value);
+  if (!state || !state.current || performance.now() > state.until) {
+    if (state) state.current = false;
+    return false;
+  }
+  return true;
 }
 
 /** One monotonic preflight deadline, not a reset-on-each-read timeout.
@@ -115,6 +137,9 @@ public sealed class VKodexExitHandle : IDisposable {
   $held=New-Object 'Collections.Generic.List[VKodexExitHandle]'
   try {
     foreach($p in $scope.processes) { $held.Add([VKodexExitHandle]::new($p.pid,$p.birthTicks,$p.imagePath,$p.imageSha256)) }
+    [Console]::Out.WriteLine((@{kind='captured';challenge=$scope.challenge;identitySha256=$scopeHash;processCount=$held.Count} | ConvertTo-Json -Compress))
+    [Console]::Out.Flush()
+    if([Console]::In.ReadLine() -cne $scope.challenge) { throw 'capture-acknowledgement-invalid' }
     $clock=[Diagnostics.Stopwatch]::StartNew()
     $result=@{kind='blocked';challenge=$scope.challenge;identitySha256=$scopeHash}
     while($clock.ElapsedMilliseconds -le $scope.deadlineMs) {
@@ -127,9 +152,15 @@ public sealed class VKodexExitHandle : IDisposable {
       if(-not $live -and $clock.ElapsedMilliseconds -le $scope.deadlineMs) { $result=@{kind='selected-original-processes-gone';challenge=$scope.challenge;identitySha256=$scopeHash;exits=$exits}; break }
       [Threading.Thread]::Sleep(25)
     }
+    $result.challenge=$scope.challenge
     [Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 6 -Compress))
+    [Console]::Out.Flush()
   } finally { foreach($h in $held) { $h.Dispose() } }
-} catch { [Console]::Out.WriteLine('{"kind":"unavailable"}') }
+} catch {
+  if($scopeHash -and $scope) { [Console]::Out.WriteLine((@{kind='unavailable';challenge=$scope.challenge;identitySha256=$scopeHash} | ConvertTo-Json -Compress)) }
+  else { [Console]::Out.WriteLine('{"kind":"unavailable"}') }
+  [Console]::Out.Flush()
+}
 `;
 
 /** Observes a SELECTED original process set. Not a complete predecessor,
@@ -141,8 +172,8 @@ public sealed class VKodexExitHandle : IDisposable {
  * has a shared extra 15-second allowance; filesystem reads and pipe completion
  * are bounded at the parent too. Late preflight never starts a helper.
  */
-export async function observeSelectedWindowsProcessExits(processes: readonly SelectedProcessIdentity[], deadlineMs = 1_000):
-  Promise<SelectedProcessExitObservation> {
+export async function captureSelectedWindowsProcesses(processes: readonly SelectedProcessIdentity[], deadlineMs = 1_000):
+  Promise<WindowsProcessCaptureSession | null> {
   if (!Array.isArray(processes) || processes.length < 1 || processes.length > 16
     || !Number.isSafeInteger(deadlineMs) || deadlineMs < 0 || deadlineMs > 60_000)
     throw new TypeError('Invalid selected process observation');
@@ -161,55 +192,174 @@ export async function observeSelectedWindowsProcessExits(processes: readonly Sel
     return Object.freeze({ pid: value.pid, birthTicks: value.birthTicks, imagePath: value.imagePath, imageSha256: value.imageSha256 });
   });
   if (process.platform !== 'win32' || !process.env.SystemRoot || !path.win32.isAbsolute(process.env.SystemRoot))
-    return Object.freeze({ kind: 'unavailable' });
+    return null;
   const acquisition = new ProcessAcquisitionBudget(15_000);
   for (const value of selected) {
     try {
       const image = await acquisition.read(() => stat(value.imagePath));
       if (!image.isFile() || image.nlink !== 1 || image.size > 256 * 1024 * 1024
         || (await acquisition.read(() => realpath(value.imagePath))).toLowerCase() !== value.imagePath.toLowerCase())
-        return Object.freeze({ kind: 'unavailable' });
-    } catch { return Object.freeze({ kind: 'unavailable' }); }
+        return null;
+    } catch { return null; }
   }
   const challenge = randomUUID();
   const scope = JSON.stringify({ challenge, deadlineMs, processes: selected });
   const identitySha256 = createHash('sha256').update(scope).digest('hex');
   const systemDirectory = path.win32.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0');
-  try {
-    acquisition.assertCurrent();
-    const totalRemaining = Math.max(1, Math.ceil(acquisition.remaining()) + deadlineMs);
-    const until = performance.now() + totalRemaining;
-    const stdout = await new Promise<string>((resolve, reject) => {
-      // execFile's timeout alone may still await an inherited output pipe.
-      // Bound this invocation independently; a late callback cannot brand it.
-      const timer = setTimeout(() => reject(new Error('Observation unavailable')), totalRemaining);
-      try { execFile(path.win32.join(systemDirectory, 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-        { encoding: 'utf8', windowsHide: true, timeout: totalRemaining, maxBuffer: 16_384,
-          env: { ...deploymentStartupEnvironment(process.env), PSModulePath: path.win32.join(systemDirectory, 'Modules'),
-            VKODEX_EXIT_WITNESS_SCOPE: Buffer.from(scope).toString('base64') } },
-        (error, out, err) => { clearTimeout(timer); error || err.trim() || performance.now() > until
-          ? reject(new Error('Observation unavailable')) : resolve(out); }); }
-      catch { clearTimeout(timer); reject(new Error('Observation unavailable')); }
-    });
-    if (performance.now() > until) throw new Error();
-    const row = uniqueJson(stdout.trim()) as Record<string, unknown>;
-    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error();
-    if (Object.keys(row).length === 1 && row.kind === 'unavailable') return Object.freeze({ kind: 'unavailable' });
-    if (row.challenge !== challenge || row.identitySha256 !== identitySha256) throw new Error();
+  acquisition.assertCurrent();
+  const totalRemaining = Math.max(1, Math.ceil(acquisition.remaining()) + deadlineMs);
+  const until = performance.now() + totalRemaining;
+  let resolveSession!: (value: WindowsProcessCaptureSession | null) => void;
+  const capturedSession = new Promise<WindowsProcessCaptureSession | null>(resolve => { resolveSession = resolve; });
+  let resolveCompletion!: (value: SelectedProcessExitObservation) => void;
+  const completion = new Promise<SelectedProcessExitObservation>(resolve => { resolveCompletion = resolve; });
+  let child: ReturnType<typeof spawn> | undefined;
+  let captureSettled = false; let completionSettled = false; let cancelled = false; let helperStopRequested = false;
+  let helperExitObserved = false;
+  let captured = false; let terminal: SelectedProcessExitObservation | null = null;
+  let protocolBad = false; let stderrBytes = 0; let stdoutBytes = 0; let pending = Buffer.alloc(0);
+  let frameCount = 0; let ticketState: { current: boolean; until: number } | undefined;
+  let ticket: WindowsProcessCaptureTicket | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finishCompletion = (value: SelectedProcessExitObservation) => {
+    if (completionSettled) return;
+    completionSettled = true;
+    if (ticketState) ticketState.current = false;
+    resolveCompletion(value);
+  };
+  const finishCapture = (value: WindowsProcessCaptureSession | null) => {
+    if (captureSettled) return;
+    captureSettled = true;
+    resolveSession(value);
+  };
+  const stopOwnedObserver = () => {
+    if (!child || helperStopRequested) return;
+    helperStopRequested = true;
+    try { if (child.stdin?.writable) child.stdin.end(); } catch { /* owned observer is already closing */ }
+    try {
+      if (child.exitCode === null && child.signalCode === null && !child.killed) child.kill();
+    } catch { /* no authority over any process other than this direct child */ }
+  };
+  const fail = () => {
+    protocolBad = true;
+    if (ticketState) ticketState.current = false;
+    finishCapture(null);
+    finishCompletion(Object.freeze({ kind: 'unavailable' }));
+    stopOwnedObserver();
+  };
+  const validateTerminal = (row: Record<string, unknown>): SelectedProcessExitObservation | null => {
+    if (row.challenge !== challenge || row.identitySha256 !== identitySha256) return null;
     if (Object.keys(row).length === 3 && row.kind === 'blocked') return Object.freeze({ kind: 'blocked' });
     if (Object.keys(row).length !== 4 || row.kind !== 'selected-original-processes-gone'
-      || !Array.isArray(row.exits) || row.exits.length !== selected.length) throw new Error();
+      || !Array.isArray(row.exits) || row.exits.length !== selected.length) return null;
     const exits = row.exits.map((item: unknown, index: number) => {
       const exit = item as Record<string, unknown>; const expected = selected[index]!;
       if (!exit || typeof exit !== 'object' || Array.isArray(exit) || Object.keys(exit).length !== 3
         || exit.pid !== expected.pid || exit.birthTicks !== expected.birthTicks
         || typeof exit.exitTicks !== 'string' || !/^[1-9]\d{16,18}$/u.test(exit.exitTicks)
-        || BigInt(exit.exitTicks) <= BigInt(expected.birthTicks)) throw new Error();
+        || BigInt(exit.exitTicks) <= BigInt(expected.birthTicks)) throw new Error('invalid exit frame');
       return Object.freeze({ pid: expected.pid, birthTicks: expected.birthTicks, exitTicks: exit.exitTicks });
     });
-    const result = Object.freeze({ kind: 'selected-original-processes-gone' as const, identitySha256, exits: Object.freeze(exits) });
-    if (performance.now() > until) throw new Error();
-    verified.add(result);
-    return result;
-  } catch { return Object.freeze({ kind: 'unavailable' }); }
+    return Object.freeze({ kind: 'selected-original-processes-gone', identitySha256,
+      exits: Object.freeze(exits) });
+  };
+  const processFrame = (lineBytes: Buffer) => {
+    if (protocolBad || cancelled || !captured && (helperExitObserved
+      || child?.exitCode !== null && child?.exitCode !== undefined)) throw new Error('observer is no longer live');
+    if (terminal || lineBytes.length === 0 || lineBytes.length > 8_192 || frameCount >= 2)
+      throw new Error('invalid frame bounds');
+    const line = lineBytes.toString('utf8');
+    if (!Buffer.from(line, 'utf8').equals(lineBytes)) throw new Error('invalid UTF-8');
+    const row = uniqueJson(line) as Record<string, unknown>;
+    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('invalid frame');
+    frameCount++;
+    if (!captured) {
+      if (row.kind === 'unavailable' && Object.keys(row).length === 1) { terminal = Object.freeze({ kind: 'unavailable' }); return; }
+      if (Object.keys(row).length !== 4 || row.kind !== 'captured' || row.challenge !== challenge
+        || row.identitySha256 !== identitySha256 || row.processCount !== selected.length) throw new Error('invalid capture frame');
+      captured = true;
+      ticketState = { current: true, until };
+      ticket = Object.freeze({ kind: 'captured' as const, identitySha256, processCount: selected.length });
+      currentTickets.set(ticket, ticketState);
+      const session: WindowsProcessCaptureSession = Object.freeze({ ticket, completion, cancelObservation: () => {
+        if (ticketState) ticketState.current = false;
+        cancelled = true;
+        finishCompletion(Object.freeze({ kind: 'unavailable' }));
+        stopOwnedObserver();
+      } });
+      finishCapture(session);
+      // The helper waits for this exact ACK before starting the observation budget.
+      // Deferring one turn ensures callers can receive the session first.
+      setImmediate(() => {
+        if (cancelled || protocolBad || helperExitObserved || performance.now() > until
+          || !child || child.killed || child.exitCode !== null || child.signalCode !== null || !stdin.writable) return;
+        try { stdin.end(`${challenge}\n`); } catch { fail(); }
+      });
+      return;
+    }
+    if (terminal) throw new Error('duplicate terminal frame');
+    if (Object.keys(row).length === 3 && row.kind === 'unavailable'
+      && row.challenge === challenge && row.identitySha256 === identitySha256) {
+      terminal = Object.freeze({ kind: 'unavailable' });
+      if (ticketState) ticketState.current = false;
+      return;
+    }
+    terminal = validateTerminal(row);
+    if (!terminal) throw new Error('invalid terminal frame');
+    if (ticketState) ticketState.current = false;
+  };
+  try {
+    child = spawn(path.win32.join(systemDirectory, 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...deploymentStartupEnvironment(process.env), PSModulePath: path.win32.join(systemDirectory, 'Modules'),
+        VKODEX_EXIT_WITNESS_SCOPE: Buffer.from(scope).toString('base64') }
+    });
+  } catch { finishCapture(null); finishCompletion(Object.freeze({ kind: 'unavailable' })); return capturedSession; }
+  const stdin = child.stdin!; const stdout = child.stdout!; const stderr = child.stderr!;
+  timer = setTimeout(fail, totalRemaining);
+  stdout.on('data', (chunk: Buffer) => {
+    if (protocolBad || cancelled || !captured && (helperExitObserved || child.exitCode !== null)) return;
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > 16_384 || performance.now() > until) { fail(); return; }
+    pending = Buffer.concat([pending, chunk]);
+    let newline: number;
+    try {
+      while ((newline = pending.indexOf(10)) >= 0) {
+        const frame = pending.subarray(0, newline);
+        pending = pending.subarray(newline + 1);
+        processFrame(frame);
+      }
+    } catch { fail(); }
+  });
+  stderr.on('data', (chunk: Buffer) => { stderrBytes += chunk.length; if (stderrBytes > 0) fail(); });
+  stdin.on('error', fail);
+  stdout.on('error', fail);
+  stderr.on('error', fail);
+  child.on('error', fail);
+  stdout.on('end', () => { if (!terminal) fail(); });
+  child.on('exit', () => { helperExitObserved = true; if (ticketState) ticketState.current = false; });
+  child.on('close', (code, signal) => {
+    if (timer) clearTimeout(timer);
+    try {
+      if (pending.length) {
+        throw new Error('unterminated frame');
+      }
+      if (performance.now() > until || protocolBad || stderrBytes !== 0 || signal !== null || code !== 0) throw new Error();
+      if (!captured && terminal?.kind === 'unavailable' && frameCount === 1) {
+        finishCapture(null); finishCompletion(Object.freeze({ kind: 'unavailable' })); return;
+      }
+      if (frameCount !== 2 || !terminal || cancelled) throw new Error();
+      if (terminal.kind === 'selected-original-processes-gone') verified.add(terminal);
+      finishCompletion(terminal);
+      if (!captureSettled) finishCapture(null);
+    } catch { fail(); }
+  });
+  return capturedSession;
+}
+
+/** Backwards-compatible final-result API built on the capture-ready session. */
+export async function observeSelectedWindowsProcessExits(processes: readonly SelectedProcessIdentity[], deadlineMs = 1_000):
+  Promise<SelectedProcessExitObservation> {
+  const session = await captureSelectedWindowsProcesses(processes, deadlineMs);
+  return session ? session.completion : Object.freeze({ kind: 'unavailable' });
 }

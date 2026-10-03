@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { readFile, realpath } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
 import { readWindowsProcessIdentity, readWindowsProcessIdentityAsync } from '../src/desktop/windows-process-identity.js';
-import { observeSelectedWindowsProcessExits, isVerifiedSelectedProcessExit, ProcessAcquisitionBudget, type SelectedProcessIdentity } from '../src/desktop/windows-process-exit-witness.js';
+import { observeSelectedWindowsProcessExits, captureSelectedWindowsProcesses, isCurrentWindowsProcessCaptureTicket,
+  isVerifiedSelectedProcessExit, ProcessAcquisitionBudget, type SelectedProcessIdentity } from '../src/desktop/windows-process-exit-witness.js';
 
 test('process observer refuses invalid IDs before attempting a query', () => {
   for (const id of [0, -1, NaN, 1.5, Infinity, 2_147_483_648])
@@ -100,5 +104,143 @@ test('real process witness refuses wrong generation or image and does not turn a
       const result = await observeSelectedWindowsProcessExits([wrong], 0);
       assert.deepEqual(result, { kind: 'unavailable' });
       assert.equal(isVerifiedSelectedProcessExit(result), false);
+    }
+  });
+
+test('capture-ready ticket is live before terminal, binds exactly to selected exits, and is not JSON authority',
+  { skip: process.platform !== 'win32', timeout: 45_000 }, async () => {
+    const children = [10_000, 11_000].map(ms => spawn(process.execPath,
+      ['-e', 'setTimeout(() => process.exit(0), Number(process.argv[1]))', String(ms)], { windowsHide: true, stdio: 'ignore' }));
+    const exits = children.map(child => new Promise<void>((resolve, reject) => {
+      child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error('Fixture failed')));
+    }));
+    try {
+      const identities = await Promise.all(children.map(child => witnessIdentity(child.pid!)));
+      const session = await captureSelectedWindowsProcesses(identities, 20_000);
+      assert.ok(session, 'the observer must expose the retained-handle capture before the children exit');
+      assert.equal(isCurrentWindowsProcessCaptureTicket(session.ticket), true);
+      assert.deepEqual(JSON.parse(JSON.stringify(session.ticket)), {
+        kind: 'captured', identitySha256: session.ticket.identitySha256, processCount: identities.length
+      });
+      assert.equal(isCurrentWindowsProcessCaptureTicket(JSON.parse(JSON.stringify(session.ticket))), false,
+        'serialized capture metadata cannot be replayed as a current ticket');
+      const result = await session.completion;
+      assert.equal(result.kind, 'selected-original-processes-gone');
+      assert.equal(result.identitySha256, session.ticket.identitySha256,
+        'the terminal evidence must be bound to the exact captured ticket');
+      assert.equal(isVerifiedSelectedProcessExit(result), true);
+      assert.equal(isCurrentWindowsProcessCaptureTicket(session.ticket), false,
+        'terminal completion revokes the sequencing ticket');
+      if (result.kind === 'selected-original-processes-gone') {
+        assert.deepEqual(result.exits.map(exit => exit.pid), identities.map(identity => identity.pid));
+        assert.deepEqual(result.exits.map(exit => exit.birthTicks), identities.map(identity => identity.birthTicks));
+      }
+    } finally { await Promise.all(exits); }
+  });
+
+test('capture cancellation revokes the ticket and cannot later produce positive completion',
+  { skip: process.platform !== 'win32', timeout: 20_000 }, async () => {
+    const child = spawn(process.execPath,
+      ['-e', 'setTimeout(() => process.exit(0), 3_000)'], { windowsHide: true, stdio: 'ignore' });
+    const exited = new Promise<void>((resolve, reject) => {
+      child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error('Fixture failed')));
+    });
+    try {
+      const session = await captureSelectedWindowsProcesses([await witnessIdentity(child.pid!)], 5_000);
+      assert.ok(session);
+      assert.equal(isCurrentWindowsProcessCaptureTicket(session.ticket), true);
+      session.cancelObservation();
+      assert.equal(isCurrentWindowsProcessCaptureTicket(session.ticket), false);
+      assert.deepEqual(await session.completion, { kind: 'unavailable' });
+      assert.equal(isVerifiedSelectedProcessExit(await session.completion), false);
+    } finally { await exited; }
+  });
+
+test('capture protocol unit faults never mint a ticket from late frames or stream errors',
+  { skip: process.platform !== 'win32', timeout: 15_000 }, async () => {
+    const identity = await witnessIdentity(process.pid);
+    const originalSpawn = childProcess.spawn;
+    let mode: 'late-exit' | 'terminal-before-capture' | 'terminal-after-exit' | 'stdin-EPIPE' = 'late-exit';
+    let lastFakeExit: Promise<void> = Promise.resolve();
+    childProcess.spawn = ((_: string, __: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+      const envScope = options.env?.VKODEX_EXIT_WITNESS_SCOPE;
+      assert.equal(typeof envScope, 'string');
+      const scope = JSON.parse(Buffer.from(envScope!, 'base64').toString('utf8')) as { challenge: string; processes: unknown[] };
+      const identitySha256 = createHash('sha256').update(Buffer.from(envScope!, 'base64')).digest('hex');
+      const child = new EventEmitter() as EventEmitter & {
+        stdin: PassThrough; stdout: PassThrough; stderr: PassThrough;
+        killed: boolean; exitCode: number | null; signalCode: NodeJS.Signals | null; pid: number;
+        kill: ChildProcess['kill'];
+      };
+      lastFakeExit = new Promise(resolve => child.once('exit', () => resolve()));
+      const stdin = new PassThrough(); const stdout = new PassThrough(); const stderr = new PassThrough();
+      Object.assign(child, { stdin, stdout, stderr, killed: false, exitCode: null, signalCode: null, pid: 991_001 });
+      child.kill = (() => {
+        if (child.exitCode !== null || child.signalCode !== null) return false;
+        child.exitCode = 1; child.signalCode = 'SIGTERM'; child.killed = true;
+        setImmediate(() => { stdout.end(); stderr.end(); child.emit('exit', 1, 'SIGTERM'); child.emit('close', 1, 'SIGTERM'); });
+        return true;
+      }) as ChildProcess['kill'];
+      const captured = JSON.stringify({ kind: 'captured', challenge: scope.challenge,
+        identitySha256, processCount: scope.processes.length }) + '\n';
+      if (mode === 'late-exit') {
+        child.exitCode = 0; child.emit('exit', 0, null);
+        setImmediate(() => { stdout.write(captured); stdout.end(); stderr.end(); child.emit('close', 0, null); });
+      } else if (mode === 'terminal-before-capture') {
+        stdin.end = (() => stdin) as typeof stdin.end;
+        setImmediate(() => {
+          stdout.write(JSON.stringify({ kind: 'unavailable' }) + '\n' + captured);
+          stdout.end(); stderr.end(); child.exitCode = 0; child.emit('exit', 0, null); child.emit('close', 0, null);
+        });
+      } else if (mode === 'terminal-after-exit') {
+        const end = stdin.end.bind(stdin);
+        stdin.end = ((...args: Parameters<typeof stdin.end>) => {
+          const result = end(...args);
+          child.exitCode = 0; child.emit('exit', 0, null);
+          const terminal = JSON.stringify({ kind: 'selected-original-processes-gone', challenge: scope.challenge,
+            identitySha256, exits: [{ pid: identity.pid, birthTicks: identity.birthTicks,
+              exitTicks: String(BigInt(identity.birthTicks) + 1n) }] }) + '\n';
+          setImmediate(() => { stdout.write(terminal); stdout.end(); stderr.end(); child.emit('close', 0, null); });
+          return result;
+        }) as typeof stdin.end;
+        setImmediate(() => stdout.write(captured));
+      } else {
+        const end = stdin.end.bind(stdin);
+        stdin.end = ((...args: Parameters<typeof stdin.end>) => {
+          queueMicrotask(() => stdin.emit('error', Object.assign(new Error('mock EPIPE'), { code: 'EPIPE' })));
+          return end(...args);
+        }) as typeof stdin.end;
+        setImmediate(() => stdout.write(captured));
+      }
+      return child as unknown as ChildProcess;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    try {
+      const late = await captureSelectedWindowsProcesses([identity], 1_000);
+      assert.equal(late, null, 'a buffered captured frame after process exit must not mint a ticket');
+
+      mode = 'terminal-before-capture';
+      const outOfOrder = await captureSelectedWindowsProcesses([identity], 1_000);
+      assert.equal(outOfOrder, null, 'a capture frame after a terminal refusal must not mint a ticket');
+
+      mode = 'terminal-after-exit';
+      const terminalAfterExit = await captureSelectedWindowsProcesses([identity], 1_000);
+      assert.ok(terminalAfterExit);
+      assert.equal(isCurrentWindowsProcessCaptureTicket(terminalAfterExit.ticket), true,
+        'capture must be visible before the mock helper receives the acknowledgement');
+      await lastFakeExit;
+      assert.equal(isCurrentWindowsProcessCaptureTicket(terminalAfterExit.ticket), false,
+        'helper exit revokes the current ticket even while terminal output remains buffered');
+      assert.equal((await terminalAfterExit.completion).kind, 'selected-original-processes-gone',
+        'a valid terminal frame may drain after helper exit once capture had already been established');
+
+      mode = 'stdin-EPIPE';
+      const brokenPipe = await captureSelectedWindowsProcesses([identity], 1_000);
+      assert.ok(brokenPipe, 'the captured frame itself may arrive before the acknowledgement pipe fails');
+      assert.deepEqual(await brokenPipe.completion, { kind: 'unavailable' });
+      assert.equal(isCurrentWindowsProcessCaptureTicket(brokenPipe.ticket), false);
+    } finally {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
     }
   });

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { statSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
@@ -246,12 +247,22 @@ function managedBinding(row: ManagedOwnerBindingRow): ManagedOwnerBinding {
 
 export class BridgeStore {
   private readonly db: Database;
+  /** Physical-name scope for explicit maintenance coordination, never authority
+   * to open/replay a task or to move this database to another process. */
+  readonly databasePath: string | null;
+  readonly databaseFileIdentity: Readonly<{ dev: string; ino: string }> | null;
   private stageLegacyUnaccounted = false;
   private static readonly MAX_STAGE_FILES_PER_OPERATION = 256;
   private static readonly MAX_STAGE_FILES_GLOBAL = 2_048;
 
   constructor(filename = ":memory:") {
     this.db = new DatabaseConstructor(filename);
+    this.databasePath = filename === ":memory:" ? null : path.resolve(filename);
+    try {
+      const identity = this.databasePath ? statSync(this.databasePath, { bigint: true }) : null;
+      this.databaseFileIdentity = identity?.isFile() && identity.nlink === 1n
+        ? Object.freeze({ dev: String(identity.dev), ino: String(identity.ino) }) : null;
+    } catch { this.databaseFileIdentity = null; }
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");

@@ -6,6 +6,7 @@ import type { BridgeChat, BridgeHealthSnapshot, HealthCheckResult, HealthState, 
 import { BridgeStore, type ConnectionDiagnostic } from "./store.js";
 import type { QueuedInputHistoryCursor } from "../core/codex-tasks.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
+import type { PredecessorExitObservationSummary } from "../desktop/predecessor-exit-observation.js";
 
 /** Only scanner metadata is surfaced; native cursors and exception text stay private. */
 export interface QueueHistoryProgress {
@@ -21,6 +22,7 @@ export interface QueueHistoryProgress {
 }
 
 export interface RuntimeHealthState {
+  readonly predecessorExitObservation?: PredecessorExitObservationSummary;
   readonly startupAdmission?: Readonly<{ readonly kind: "predecessor-maintenance"; readonly fenceId: string;
     readonly snapshotSha256: string }>;
   readonly startedAt: number;
@@ -174,6 +176,18 @@ export class BridgeHealthMonitor {
     const runtime = this.runtime();
     if (runtime.startupAdmission) checks.push({ name: "startup_predecessor", state: "degraded",
       detail: "Проверка прежнего исполнителя не завершена. VK-ввод сохранён, но отправка, восстановление очереди и профильные RPC отключены. Автоматического снятия ограничения нет." });
+    if (runtime.startupAdmission && runtime.predecessorExitObservation) {
+      const observation = runtime.predecessorExitObservation;
+      const selectedGone = ["original-exit-observed", "selected-exit-scoped"].includes(observation.state);
+      checks.push({ name: "predecessor_exit_observation", state: "degraded",
+        detail: selectedGone
+          ? "Зафиксирован выход выбранных исходных процессов. Это не подтверждает отсутствие других исполнителей, отключение перезапуска или готовность Desktop. VK-ввод остаётся отложенным; старые запросы не повторяются."
+          : observation.state === "captured"
+            ? "Точные исходные процессы захвачены только для наблюдения. Разрешение на остановку и освобождение чатов из этого не следуют."
+            : observation.state === "scope-changed"
+              ? "Область привязок изменилась после наблюдения. Старое свидетельство не разрешает захват или повтор запроса."
+              : "Выход прежних процессов ещё не подтверждён. Наблюдение не запускает повтор, RPC или автоматическую остановку." });
+    }
     const clockReversed = checkedAt < runtime.lastTickAt ||
       runtime.updateStartedAt !== null && checkedAt < runtime.updateStartedAt;
     const tickAge = Math.max(0, checkedAt - runtime.lastTickAt);
