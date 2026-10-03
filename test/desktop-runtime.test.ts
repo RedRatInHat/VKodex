@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { execFile } from "node:child_process";
@@ -15,6 +15,8 @@ import { compatibleRuntime, launchArguments, windowsRuntimePath } from "../src/d
 import { boundedArtifactBytes, deploymentDataDirectory, deploymentValidationArguments, validateDeploymentArtifact } from "../src/desktop/deployment-artifact.js";
 import { BOOTSTRAP_FILES, deploymentBindingArguments, planDeploymentAction, validateDeploymentBinding } from "../src/desktop/deployment-binding.js";
 import { deploymentStartupEnvironment, executeDeployment } from "../src/desktop/deployment-execution.js";
+import { loadPredecessorMaintenance, validatePredecessorMaintenance } from "../src/desktop/predecessor-maintenance.js";
+import { BridgeStore } from "../src/bridge/store.js";
 
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
@@ -51,6 +53,51 @@ test("launcher does not accept substitute scripts or arbitrary Node options", ()
 // linked/aliased input. The cleanup boundary must use the same physical parent.
 const artifactTemporaryParent = await realpath(tmpdir());
 const artifactFixtures = await mkdtemp(path.join(artifactTemporaryParent, "vkodex-artifact-tests-"));
+test("required predecessor snapshot covers idle, running and detached bindings and stays pinned across boots", async () => {
+  const directory = path.join(artifactFixtures, `predecessor-${randomUUID()}`);
+  await mkdir(directory);
+  const store = new BridgeStore();
+  try {
+    for (const [threadId, status] of [["fixture-ms", "idle"], ["fixture-android", "running"], ["fixture-detached", "idle"]]) {
+      const binding = store.ensureBinding({ hostId: "local", threadId: threadId!, sourceId: "work", title: "Fixture", workspace: directory, updatedAt: 1 });
+      store.setValue(`task-details:${binding.id}`, { status });
+      if (threadId !== "fixture-detached") store.setChat(binding.id, 10001 + store.bindings().length, 1);
+    }
+    const snapshot = { version: 1, fenceId: "fixture-pending-predecessor", createdAt: 1, dataDirectory: directory,
+      recoveryPolicy: "reconcile-only", legacySourceIds: ["work"],
+      bindings: store.bindings().map(binding => ({ bindingId: binding.id, hostId: binding.hostId, threadId: binding.threadId,
+        sourceId: binding.sourceId ?? "", generation: store.streamGeneration(binding.id) })),
+      processes: [{ role: "bridge", pid: 1234, birthTicks: "12345", imagePath: process.execPath },
+        { role: "legacy-backend", pid: 1235, birthTicks: "12346", imagePath: process.execPath, sourceId: "work" }] };
+    const bytes = JSON.stringify(snapshot);
+    const pin = createHash("sha256").update(bytes).digest("hex");
+    assert.equal(await loadPredecessorMaintenance(store, directory, ["work"]), undefined, "ordinary clean startup is unchanged");
+    await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"], pin), /snapshot refused/u);
+    await writeFile(path.join(directory, "predecessor-maintenance.json"), bytes);
+    await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"]), /snapshot refused/u);
+    for (const invalid of [
+      { ...snapshot, version: 2 }, { ...snapshot, recoveryPolicy: "resume-interrupted" },
+      { ...snapshot, extra: true }, { ...snapshot, legacySourceIds: ["other"] },
+      { ...snapshot, bindings: snapshot.bindings.slice(0, 2) },
+      { ...snapshot, bindings: snapshot.bindings.map(binding => ({ ...binding, generation: binding.generation + 1 })) },
+      { ...snapshot, processes: snapshot.processes.slice(0, 1) },
+      { ...snapshot, processes: [...snapshot.processes, snapshot.processes[0]] },
+      { ...snapshot, processes: [...snapshot.processes, { role: ["restart-loop"], pid: 1236,
+        birthTicks: "12347", imagePath: process.execPath }] },
+      { ...snapshot, processes: [...snapshot.processes, { role: "unknown", pid: 1236,
+        birthTicks: "12347", imagePath: process.execPath }] },
+    ]) assert.throws(() => validatePredecessorMaintenance(invalid, store, directory, ["work"], pin), /snapshot refused/u);
+    const admission = await loadPredecessorMaintenance(store, directory, ["work"], pin);
+    assert.deepEqual(admission, { kind: "predecessor-maintenance", fenceId: snapshot.fenceId, snapshotSha256: pin });
+    assert.deepEqual(await loadPredecessorMaintenance(store, directory, ["work"]), admission,
+      "removing the environment pin cannot remove the durable fence");
+    await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"], "b".repeat(64)), /snapshot refused/u);
+    store.setValue(`stream-generation:${snapshot.bindings[0]!.bindingId}`, 99);
+    await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"]), /snapshot refused/u);
+    assert.deepEqual(store.getValue("startup-predecessor-fence"), admission, "failed validation never clears the gate");
+  } finally { store.close(); }
+});
+
 after(async () => {
   if (process.platform !== "win32") return; // No permanent deletion when a Recycle Bin is unavailable.
   await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",

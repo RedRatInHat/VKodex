@@ -821,6 +821,10 @@ If Codex acknowledged the insertion but VKodex has not observed the resulting tu
 
 Health separates retained request acknowledgements from holding a legacy subscription. An old ACK alone does not prevent safe release, but an unknown current mutation, active turn, goal, descendant or incomplete backend response blocks it. Observation and history reconciliation continue separately. After a restart, a saved release fact does not authorize reacquiring the writer: a new legacy dispatch is refused until the current owner is qualified. The shared App Server process is never stopped to clean up one chat.
 
+Controlled legacy migration has an explicit `predecessor-maintenance` mode. A trusted local operator prepares the complete `BOT_DATA_DIR/predecessor-maintenance.json` snapshot and supplies an independent SHA-256 through `VKODEX_PREDECESSOR_SNAPSHOT_SHA256`. Version 1 with `reconcile-only` records exact process PID/birth/image identities, every legacy source and all its bindings, including idle and detached tasks. An incomplete snapshot, changed binding or wrong pin refuses startup. This snapshot neither authorizes process interruption nor proves native writer release.
+
+In this mode all authorized VK input is durably deferred: no command dispatch, batch/queue replay, transfer, file work or cold profile RPC. Only proven read-only streams, local rollout observation and delivery of observed events run. Health explicitly reports pending predecessor verification. The SQLite fence persists: removing the environment variable or snapshot does not enable the writer. There is no automatic unlock or process-exit receipt consumer yet; this is not a normal restart mode. Physical cutover and the subsequent execution route require separate qualification.
+
 ### Codex questions in VK: `/questions`
 
 An open Codex question appears in the task conversation with option buttons and **“Свой ответ”** (custom answer). You can also use VK's **Reply** on the question card and type your answer. Multiple questions are collected in order and submitted together. `/questions` checks current questions and refreshes buttons, which expire after 30 minutes.

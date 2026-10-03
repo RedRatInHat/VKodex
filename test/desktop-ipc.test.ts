@@ -32,6 +32,8 @@ import { DesktopTaskStateTransport, TaskStateConnections, type TaskStateTranspor
 import { BridgeStore } from "../src/bridge/store.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { captureRestartIntent, readRestartIntent } from "../src/desktop/restart-intent.js";
+import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
+import { RoutedCodexTasks } from "../src/core/codex-task-router.js";
 import type { Binding, BridgeChat, MessageHandle, TaskTransferRecord, View } from "../src/bridge/contracts.js";
 
 const ref = { hostId: "local", threadId: "fixture-task" };
@@ -237,7 +239,8 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
     snapshot: import("../src/desktop/restart-intent.js").RestartTaskSnapshot) =>
     Promise<"unclaimed" | "active" | "settled" | "unknown">,
   passiveStates?: TaskStateTransport,
-  prepareRuntime?: (store: BridgeStore, binding: Binding, desktop: ConnectedDesktopTasks) => void) {
+  prepareRuntime?: (store: BridgeStore, binding: Binding, desktop: ConnectedDesktopTasks) => void,
+  startupAdmission?: { readonly kind: "predecessor-maintenance"; readonly fenceId: string; readonly snapshotSha256: string }) {
   const access = { ownerId: 101, groupId: 202 }; const peerId = 2_000_000_017;
   const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 };
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
@@ -260,6 +263,7 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   let now = 100_000;
   const adapters = {
     ...runtimeAdapters(streamTransport ?? new DesktopTaskStateTransport(client)), ...(history ? { history } : {}),
+    ...(startupAdmission ? { startupAdmission } : {}),
     ...(passiveStates ? { passiveStates } : {}),
     ...(inspectExternalOwner ? { inspectExternalOwner } : {}),
     ...(inspectManagedRestartTurn ? { inspectManagedRestartTurn } : {}),
@@ -270,6 +274,54 @@ function runtimeSetup(t: TestContext, healthCheckOverride?: (force: boolean) => 
   const follows = () => server.received.filter(message => message.method === "thread-stream-following-changed").map(message => (message.params as IpcObject).following);
   return { access, peerId, server, store, binding, desktop, chat, sent, edits, runtime, follows, advance: (ms = 30_001) => { now += ms; } };
 }
+
+test("Publishing predecessor maintenance preserves MS idle ACK and Android running ACKs before ingress", async t => {
+  for (const shape of [{ name: "MS idle with old queue ACK", status: "idle", ackCount: 1 },
+    { name: "Android running with two old ACKs", status: "running", ackCount: 2 }] as const) {
+    await t.test(shape.name, async t => {
+      let recoverCalls = 0, creatorCallbacks = 0, writerStarts = 0;
+      const writer: TaskStateTransport = {
+        subscribe(task) { return { task, start: async () => { writerStarts++; }, verifyOwner: async () => {}, close() {} }; },
+        close() {},
+      };
+      const admission = { kind: "predecessor-maintenance" as const, fenceId: "fixture-fence", snapshotSha256: "a".repeat(64) };
+      const s = runtimeSetup(t, undefined, writer, undefined, undefined, undefined, undefined, undefined, undefined,
+        (store, binding, desktop) => {
+          store.setValue(`task-details:${binding.id}`, { status: shape.status });
+          const originalRecover = store.recover.bind(store);
+          store.recover = () => { recoverCalls++; originalRecover(); };
+          Object.assign(desktop, { onCreationUpdate: () => { creatorCallbacks++; return () => {}; } });
+          for (let index = 0; index < shape.ackCount; index++) {
+            const id = `original-ack-${index}`;
+            store.recordOperation(id, binding, `original-inbox-${index}`, binding.id, 1);
+            store.finishOperation(id, "accepted");
+            store.rememberQueuedInput(binding.id, id, `original-queue-${index}`, 1);
+          }
+        }, admission);
+      const saved = { peerId: s.peerId, senderId: s.access.ownerId, eventId: "saved-prompt", text: "synthetic saved prompt" };
+      s.store.receiveInput(saved, 1);
+      s.store.saveInputBatch({ id: "saved-batch", peerId: s.peerId, parts: [saved], state: "collecting", startedAt: 1, updatedAt: 1 });
+      const before = s.store.queuedInputs(s.binding.id);
+      s.runtime.start();
+      await s.runtime.handle({ ...saved, eventId: "fresh-control", text: "/stop" });
+      await s.runtime.handle({ ...saved, eventId: "fresh-control", text: "/stop" });
+      await s.runtime.handle({ ...saved, peerId: s.access.ownerId, eventId: "manager-control", text: "/new" });
+      await s.runtime.tick();
+      assert.equal(recoverCalls, 0, "maintenance must not rewrite saved inbox recovery states");
+      assert.equal(creatorCallbacks, 0, "creator callbacks are not command ingress during maintenance");
+      assert.equal(writerStarts, 0);
+      assert.deepEqual(s.server.received, [], "no profile, queue or control RPC before predecessor proof");
+      assert.deepEqual(s.store.queuedInputs(s.binding.id), before);
+      assert.deepEqual(s.store.inputBatches().map(batch => batch.parts), [[saved]]);
+      for (const [peer, id] of [[s.peerId, "saved-prompt"], [s.peerId, "fresh-control"],
+        [s.access.ownerId, "manager-control"]] as const)
+        assert.equal(s.store.inputState(JSON.stringify([peer, id])), "received", "deferred is not rejected or consumed");
+      const health = (s.runtime as unknown as { runtimeHealth(): import("../src/bridge/health.js").RuntimeHealthState &
+        { startupAdmission?: typeof admission } }).runtimeHealth();
+      assert.deepEqual(health.startupAdmission, admission);
+    });
+  }
+});
 
 test("runtime schedules a fresh health check after clock rollback", async t => {
   let checks = 0;
@@ -282,6 +334,75 @@ test("runtime schedules a fresh health check after clock rollback", async t => {
   s.advance(-1);
   await s.runtime.tick(false);
   assert.equal(checks, 2);
+});
+
+test("predecessor maintenance health tolerates the actual fenced profile route without a cold probe", async t => {
+  let starts = 0, requests = 0;
+  const owner = new AppServerProfileOwner("", { start: async () => { starts++; },
+    request: async () => { requests++; return {}; }, onNotification: () => () => {}, onServerRequest: () => {}, close: async () => {} },
+    undefined, undefined, undefined, undefined, true);
+  t.after(() => owner.close());
+  const admission = { kind: "predecessor-maintenance" as const, fenceId: "fixture-fence", snapshotSha256: "a".repeat(64) };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (_store, _binding, desktop) => {
+      const routed = new RoutedCodexTasks(desktop, [owner]);
+      Object.assign(desktop, { legacyAcquisitionState: (task: typeof ref) => routed.legacyAcquisitionState(task) });
+    }, admission);
+  assert.doesNotThrow(() => (s.runtime as unknown as { runtimeHealth(): unknown }).runtimeHealth());
+  assert.equal(starts, 0);
+  assert.equal(requests, 0);
+});
+
+test("predecessor maintenance mirrors proven passive progress without settling original receipt debt", async t => {
+  let publish!: (snapshot: IpcObject, initial: boolean) => void;
+  let starts = 0;
+  const passive: TaskStateTransport = {
+    readOnly: true,
+    subscribe(task, onState) {
+      publish = onState;
+      return { task, readOnly: true, start: async () => { starts++; onState(state([], "inProgress"), true); },
+        verifyOwner: async () => {}, close() {} };
+    }, close() {},
+  };
+  const admission = { kind: "predecessor-maintenance" as const, fenceId: "fixture-fence", snapshotSha256: "a".repeat(64) };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, passive,
+    (store, binding) => {
+      store.recordOperation("old-ack", binding, "old-inbox", binding.id, 1);
+      store.finishOperation("old-ack", "accepted");
+      store.rememberQueuedInput(binding.id, "old-ack", "old-queue", 1);
+      store.rememberAcceptedTurn(binding.id, "fixture-turn", "old-ack");
+    }, admission);
+  let probes = 0;
+  Object.assign(s.desktop, { getGoal: async () => { probes++; return null; },
+    checkCompatibility: async () => { probes++; throw new Error("forbidden cold probe"); },
+    ownerAdapterStatus: async () => { probes++; return "ready"; } });
+  await s.runtime.tick();
+  assert.equal(starts, 1);
+  publish(state([{ type: "agentMessage", id: "passive-fresh", phase: "commentary", text: "Synthetic native progress" }]), false);
+  s.advance(3_000);
+  await s.runtime.tick();
+  publish(state([{ type: "userMessage", id: "native-old-ack", clientId: "old-ack", content: [{ type: "inputText", text: "synthetic" }] },
+    { type: "agentMessage", id: "passive-final", phase: "final_answer", text: "Synthetic native final" }], "completed"), false);
+  await s.runtime.tick();
+  const health = await (s.runtime as unknown as { checkHealth(force: boolean): Promise<import("../src/bridge/contracts.js").BridgeHealthSnapshot> })
+    .checkHealth(true);
+  assert.equal(probes, 0);
+  assert.ok(health.checks.some(check => check.name === "startup_predecessor" && check.state === "degraded"));
+  assert.deepEqual(s.server.received, []);
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+  assert.equal(s.store.acceptedTurns(s.binding.id).length, 1);
+  assert.equal(s.store.operationState("old-ack"), "accepted");
+  assert.ok(s.sent.some(item => item.view.text === "Synthetic native progress"),
+    "passive commentary is projected while ingress remains closed");
+  let unqualifiedStarts = 0;
+  const unqualified: TaskStateTransport = { readOnly: true,
+    subscribe(task) { return { task, start: async () => { unqualifiedStarts++; }, verifyOwner: async () => {}, close() {} }; },
+    close() {} };
+  const refused = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    unqualified, undefined, admission);
+  await refused.runtime.tick();
+  assert.equal(unqualifiedStarts, 0, "maintenance cannot start a stream lacking its own passive capability");
+  assert.deepEqual(refused.server.received, []);
 });
 
 test("runtime health samples local acquisition uncertainty for an idle disconnected binding", t => {

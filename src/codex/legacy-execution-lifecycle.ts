@@ -45,10 +45,11 @@ export class LegacyExecutionLifecycle {
   private readonly taskRevisions = new Map<string, number>();
   private readonly unsubscribe: () => void;
 
-  constructor(private readonly original: AppServerRpc, private readonly now: () => number = () => performance.now()) {
+  constructor(private readonly original: AppServerRpc, private readonly now: () => number = () => performance.now(),
+    private readonly predecessorFenced = false) {
     this.unsubscribe = original.onNotification(event => this.observe(event));
     this.rpc = {
-      start: () => original.start(),
+      start: async () => { this.assertPredecessorAdmission(); await original.start(); },
       currentInitializedSession: () => original.currentInitializedSession?.() ?? null,
       request: (method, params, options) => this.request(method, params, options),
       onNotification: listener => original.onNotification(listener),
@@ -64,6 +65,11 @@ export class LegacyExecutionLifecycle {
       } : null),
       close: () => original.close(),
     };
+  }
+
+  private assertPredecessorAdmission(): void {
+    if (this.predecessorFenced)
+      throw new ActionRejectedError("Прежний исполнитель ещё не проверен. Новый профильный процесс не запускается.");
   }
 
   private changeBusy(threadId: string, amount: number): void {
@@ -144,6 +150,9 @@ export class LegacyExecutionLifecycle {
       && this.original.currentInitializedSession?.()?.generation === generation;
   }
   private async request(method: string, params: ObjectValue = {}, options: AppServerRequestOptions = {}): Promise<ObjectValue> {
+    // Even read-only RPC can lazily create a backend. This fence is source-wide
+    // and immutable; it cannot be cleared by a task status or a new generation.
+    this.assertPredecessorAdmission();
     const threadId = id(params.threadId);
     const writer = options.mutating === true || method === "thread/resume";
     let acquisition: AcquisitionAttempt | null = null;
