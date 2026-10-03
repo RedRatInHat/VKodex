@@ -825,6 +825,8 @@ Controlled legacy migration has an explicit `predecessor-maintenance` mode. A tr
 
 In this mode all authorized VK input is durably deferred: no command dispatch, batch/queue replay, transfer, file work or cold profile RPC. Only proven read-only streams, local rollout observation and delivery of observed events run. Health explicitly reports pending predecessor verification. The SQLite fence persists: removing the environment variable or snapshot does not enable the writer. There is no automatic unlock or process-exit receipt consumer yet; this is not a normal restart mode. Physical cutover and the subsequent execution route require separate qualification.
 
+The Windows process-exit observer is a separate read-only utility, not an automatic health unlock. It opens query/synchronize handles for an explicitly selected live PID/birth/image/hash set, normalizes birth and exit times to .NET UTC ticks, and waits within bounded acquisition and observation budgets. Missing/inaccessible identity is unproved, not an affirmative exit. A positive current-session result proves only that selected set exited; it does not prove complete writer inventory, excluded restart authorities or native readiness. It neither signals those processes nor consumes saved prompts or receipts.
+
 ### Codex questions in VK: `/questions`
 
 An open Codex question appears in the task conversation with option buttons and **“Свой ответ”** (custom answer). You can also use VK's **Reply** on the question card and type your answer. Multiple questions are collected in order and submitted together. `/questions` checks current questions and refreshes buttons, which expire after 30 minutes.
