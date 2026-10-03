@@ -3,7 +3,7 @@ import test, { after } from "node:test";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
@@ -17,6 +17,9 @@ import { BOOTSTRAP_FILES, deploymentBindingArguments, planDeploymentAction, vali
 import { deploymentStartupEnvironment, executeDeployment } from "../src/desktop/deployment-execution.js";
 import { loadPredecessorMaintenance, validatePredecessorMaintenance } from "../src/desktop/predecessor-maintenance.js";
 import { BridgeStore } from "../src/bridge/store.js";
+import { observeMaintenancePredecessorExits, predecessorExitObservationSummary, type PredecessorExitObservationRequest } from "../src/desktop/predecessor-exit-observation.js";
+import { readWindowsProcessIdentityAsync } from "../src/desktop/windows-process-identity.js";
+import { isCurrentWindowsProcessCaptureTicket, type SelectedProcessIdentity } from "../src/desktop/windows-process-exit-witness.js";
 
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
@@ -430,6 +433,192 @@ async function bindingFixture() {
   };
   return { ...artifact, bootstrapRoot, stableRuntimePath, bindingPath, binding, manifest, repinBinding: repin, bindingSha256: await repin() };
 }
+
+async function predecessorObservationFixture(selected: readonly SelectedProcessIdentity[], reorderedBindings = false) {
+  const fixture = await bindingFixture();
+  const directory = fixture.descriptor.dataDirectory;
+  await mkdir(directory, { recursive: true });
+  const store = new BridgeStore(path.join(directory, 'vkodex.sqlite'));
+  const shapes = [{ threadId: '01a07930-dbba-77c2-8910-17bd61638e6f', status: 'idle', count: 1 },
+    { threadId: '01a06325-d3d0-7052-b495-371fcb7a2887', status: 'running', count: 2 }];
+  for (const shape of shapes) {
+    const binding = store.ensureBinding({ hostId: 'local', sourceId: 'fixture-source', threadId: shape.threadId,
+      title: 'Synthetic Publishing shape', workspace: directory, updatedAt: 1 });
+    store.setValue(`task-details:${binding.id}`, { status: shape.status });
+    store.setValue(`execution-lifecycle:${binding.id}`, { state: 'blocked', generation: 17 });
+    for (let index = 0; index < shape.count; index++) {
+      const operationId = `${shape.threadId}-original-${index}`;
+      store.recordOperation(operationId, binding, `${operationId}-inbox`, binding.id, 1);
+      store.finishOperation(operationId, 'accepted');
+      store.rememberQueuedInput(binding.id, operationId, `${operationId}-queue`, 1);
+      store.rememberAcceptedTurn(binding.id, `${operationId}-turn`, operationId);
+    }
+  }
+  const savedInput = { peerId: 23456, senderId: 12345, eventId: 'original-unknown-input', text: 'Synthetic publishing input' };
+  store.receiveInput(savedInput, 1);
+  const originalInputId = JSON.stringify([savedInput.peerId, savedInput.eventId]);
+  assert.equal(store.claimInput(originalInputId), true);
+  store.markInputPreparing([originalInputId]);
+  store.markInputSending([originalInputId]);
+  store.finishInput(originalInputId, true);
+  store.saveInputBatch({ id: 'original-batch', peerId: savedInput.peerId, parts: [savedInput], state: 'collecting', startedAt: 1, updatedAt: 1 });
+  const snapshot = { version: 1, fenceId: 'fixture-selected-predecessor', createdAt: 1, dataDirectory: directory,
+    recoveryPolicy: 'reconcile-only', legacySourceIds: ['fixture-source'],
+    bindings: store.bindings().map(binding => reorderedBindings
+      ? { generation: store.streamGeneration(binding.id), threadId: binding.threadId, sourceId: binding.sourceId ?? '', hostId: binding.hostId, bindingId: binding.id }
+      : { bindingId: binding.id, hostId: binding.hostId, threadId: binding.threadId, sourceId: binding.sourceId ?? '', generation: store.streamGeneration(binding.id) }),
+    processes: selected.map((identity, index) => ({ role: index === 0 ? 'bridge' : 'legacy-backend', pid: identity.pid,
+      birthTicks: identity.birthTicks, imagePath: identity.imagePath, ...(index === 0 ? {} : { sourceId: 'fixture-source' }) })) };
+  const bytes = JSON.stringify(snapshot);
+  await writeFile(path.join(directory, 'predecessor-maintenance.json'), bytes);
+  const request: PredecessorExitObservationRequest = { dataDirectory: directory, legacySourceIds: ['fixture-source'],
+    snapshotSha256: digest(bytes), selected, launchBindingPath: fixture.bindingPath, launchBindingSha256: fixture.bindingSha256,
+    configurationSha256: digest(await readFile(path.join(fixture.configurationRoot, '.env'))), deadlineMs: 40_000 };
+  const admission = await loadPredecessorMaintenance(store, directory, request.legacySourceIds, request.snapshotSha256);
+  assert.ok(admission);
+  const debt = () => ({ gate: store.getValue('startup-predecessor-fence'), batches: store.inputBatches(),
+    input: store.inputState(JSON.stringify([savedInput.peerId, savedInput.eventId])),
+    bindings: store.bindings().map(binding => ({ id: binding.id, queue: store.queuedInputs(binding.id), turns: store.acceptedTurns(binding.id),
+      lifecycle: store.getValue(`execution-lifecycle:${binding.id}`), managed: store.managedOwner(binding) })) });
+  return { fixture, store, request, admission, debt };
+}
+
+test('predecessor coordination checks independent pins and complete inventory before a controller receives a ticket', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  const before = s.debt(); let controllerCalls = 0;
+  try {
+    for (const request of [{ ...s.request, selected: selected.slice(0, 1) }, { ...s.request, configurationSha256: '0'.repeat(64) },
+      { ...s.request, launchBindingSha256: '0'.repeat(64) }, { ...s.request, snapshotSha256: '0'.repeat(64) },
+      { ...s.request, dataDirectory: s.fixture.configurationRoot }]) {
+      await assert.rejects(observeMaintenancePredecessorExits(s.store, request, () => { controllerCalls++; }));
+    }
+    assert.equal(controllerCalls, 0);
+    assert.equal(s.store.getValue('predecessor-exit-observation-lease'), null);
+    assert.deepEqual(s.debt(), before);
+  } finally { s.store.close(); }
+});
+
+test('predecessor coordination never rebases pinned original generations during asynchronous deployment validation', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  const before = s.debt(); let controllers = 0; let changed = false;
+  const original = fsPromises.lstat;
+  fsPromises.lstat = (async (file: Parameters<typeof original>[0], ...args: unknown[]) => {
+    if (String(file) === s.request.launchBindingPath && !changed) {
+      changed = true;
+      s.store.setValue(`stream-generation:${s.store.bindings()[0]!.id}`, 99);
+    }
+    return (original as (...values: unknown[]) => Promise<unknown>)(file, ...args);
+  }) as typeof original;
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(observeMaintenancePredecessorExits(s.store, s.request, () => { controllers++; }), /observation refused/);
+    assert.equal(changed, true, 'the generation changes after snapshot validation, before initial operation CAS');
+    assert.equal(controllers, 0);
+    assert.equal(s.store.getValue('predecessor-exit-observation-lease'), null);
+    assert.deepEqual(s.debt(), before);
+  } finally { fsPromises.lstat = original; syncBuiltinESMExports(); s.store.close(); }
+});
+
+test('predecessor observation requires an already installed maintenance gate and never installs it as a side effect', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  try {
+    s.store.setValue('startup-predecessor-fence', null);
+    await assert.rejects(observeMaintenancePredecessorExits(s.store, { ...s.request, selected: selected.slice(0, 1) }));
+    assert.equal(s.store.getValue('startup-predecessor-fence'), null);
+    assert.equal(s.store.getValue('predecessor-exit-observation-lease'), null);
+  } finally { s.store.close(); }
+});
+
+test('stored selected-exit states without complete physical evidence never produce a confirmed health diagnostic', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  try {
+    const scope = { storeIdentity: { path: s.store.databasePath, ...s.store.databaseFileIdentity! }, maintenance: s.admission,
+      sources: s.request.legacySourceIds, bindings: s.store.bindings().map(binding => ({ bindingId: binding.id, hostId: binding.hostId,
+        threadId: binding.threadId, sourceId: binding.sourceId ?? '', generation: s.store.streamGeneration(binding.id) }))
+        .sort((a, b) => a.bindingId.localeCompare(b.bindingId)), selected, deployment: {} };
+    const operationId = 'historical-json-is-not-a-capture';
+    const validPhysical = { identitySha256: 'a'.repeat(64), exits: selected.map(value => ({ pid: value.pid,
+      birthTicks: value.birthTicks, exitTicks: String(BigInt(value.birthTicks) + 1n) })) };
+    for (const defect of [{ physical: undefined }, { physical: { identitySha256: 'a'.repeat(64), exits: [] } },
+      { physical: { identitySha256: 'a'.repeat(64), exits: selected.map(value => ({ pid: value.pid, birthTicks: value.birthTicks, exitTicks: value.birthTicks })) } },
+      { physical: { ...validPhysical, identitySha256: ['a'.repeat(64)] } },
+      { selected: selected.map(value => ({ ...value, birthTicks: Number(value.birthTicks) })),
+        physical: { ...validPhysical, exits: validPhysical.exits.map(value => ({ ...value, birthTicks: Number(value.birthTicks) })) } },
+      { selected: [selected[0], selected[0]], physical: { ...validPhysical, exits: [validPhysical.exits[0], validPhysical.exits[0]] } }]) {
+      const observedScope = { ...scope, selected: defect.selected ?? selected };
+      const scopeSha256 = digest(JSON.stringify(observedScope));
+      s.store.setValue('predecessor-exit-observation-last', { operationId, scopeSha256 });
+      s.store.setValue(`predecessor-exit-observation:${operationId}`, { version: 1, operationId, scopeSha256, scope: observedScope,
+        state: 'selected-exit-scoped', startedAt: 1, observedAt: 2, controllerStarted: false, ...(defect.physical ? { physical: defect.physical } : {}) });
+      assert.deepEqual(predecessorExitObservationSummary(s.store, s.admission), { state: 'pending' });
+    }
+    assert.equal(isCurrentWindowsProcessCaptureTicket({ kind: 'captured', identitySha256: 'a'.repeat(64) }), false);
+  } finally { s.store.close(); }
+});
+
+test('real selected-exit coordination preserves both Publishing debts; changed generations prevent scoped promotion',
+  { skip: process.platform !== 'win32', timeout: 80_000 }, async () => {
+    // These are harmless private Node processes, not either original model task.
+    // All terminate themselves naturally; no signal, controller or Scheduler mutation.
+    const children = [30_000, 31_000].map(ms => spawn(process.execPath,
+      ['-e', 'setTimeout(() => process.exit(0), Number(process.argv[1]))', String(ms)], { windowsHide: true, stdio: 'ignore' }));
+    const exits = children.map(child => new Promise<void>((resolve, reject) => {
+      child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error('Fixture failed')));
+    }));
+    const stores: BridgeStore[] = [];
+    try {
+      const imagePath = await realpath(process.execPath);
+      const imageSha256 = digest(await readFile(imagePath));
+      const selected = await Promise.all(children.map(async child => {
+        const identity = await readWindowsProcessIdentityAsync(child.pid!);
+        assert.ok(identity);
+        return { ...identity, imagePath, imageSha256 };
+      }));
+      const cases = await Promise.all([predecessorObservationFixture(selected, true), predecessorObservationFixture(selected)]);
+      stores.push(...cases.map(s => s.store));
+      const before = cases.map(s => s.debt());
+      const calls = [0, 0];
+      const results = await Promise.all(cases.map((s, index) => observeMaintenancePredecessorExits(s.store, s.request, guard => {
+        calls[index] = (calls[index] ?? 0) + 1;
+        guard.assertCurrent();
+        assert.equal(isCurrentWindowsProcessCaptureTicket(guard.ticket), true);
+        assert.equal(isCurrentWindowsProcessCaptureTicket(JSON.parse(JSON.stringify(guard.ticket))), false);
+        const lease = s.store.getValue<{ operationId: string }>('predecessor-exit-observation-lease')!;
+        assert.equal(lease.operationId, guard.operationId);
+        assert.equal(s.store.getValue<{ state: string }>(`predecessor-exit-observation:${guard.operationId}`)!.state, 'captured');
+        if (index === 1) s.store.setValue(`stream-generation:${s.store.bindings()[0]!.id}`, 1);
+      })));
+      assert.deepEqual(calls, [1, 1]);
+      assert.deepEqual(results.map(result => result.state), ['selected-exit-scoped', 'original-exit-observed']);
+      for (const [index, s] of cases.entries()) {
+        assert.deepEqual(s.debt(), before[index], 'physical evidence never settles ACKs, unknown inputs, batches or owner lifecycle');
+        assert.equal(predecessorExitObservationSummary(s.store, s.admission).state, index === 0 ? 'selected-exit-scoped' : 'scope-changed');
+        const row = s.store.getValue<{ physical: { exits: unknown[] } }>(`predecessor-exit-observation:${results[index]!.operationId}`)!;
+        assert.equal(row.physical.exits.length, 2, 'original physical evidence survives the rejected promotion');
+        const fact = s.store.getValue<{ state: string; physical: unknown }>(`predecessor-exit-original-fact:${results[index]!.operationId}`)!;
+        assert.equal(fact.state, 'original-exit-observed');
+        assert.deepEqual(fact.physical, row.physical, 'immutable original evidence is retained independently of promotion');
+        assert.equal(s.store.getValue('predecessor-exit-observation-lease'), null);
+        s.store.close();
+        const reopened = new BridgeStore(path.join(s.request.dataDirectory, 'vkodex.sqlite'));
+        stores.push(reopened);
+        assert.equal(predecessorExitObservationSummary(reopened, s.admission).state, index === 0 ? 'selected-exit-scoped' : 'scope-changed');
+        assert.deepEqual(reopened.getValue('startup-predecessor-fence'), s.admission, 'reopening never lifts the profile fence or restores a capture ticket');
+      }
+      assert.deepEqual(calls, [1, 1], 'reading/reopening a diagnostic cannot invoke a controller');
+    } finally {
+      for (const store of stores) { try { store.close(); } catch { /* already closed in restart check */ } }
+      await Promise.all(exits);
+    }
+  });
 
 test("versioned binding keeps stable runtime path and fixed bootstrap separate from artifact and original nested data", async () => {
   const fixture = await bindingFixture();
