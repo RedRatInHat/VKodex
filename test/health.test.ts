@@ -335,6 +335,34 @@ test("health distinguishes a live task stream from a missing native owner adapte
   assert.equal(recovered.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "ok");
 });
 
+test("idle disconnected legacy acquisition uncertainty remains visible without an owner probe", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const task = (await new HealthDesktop().listTasks())[0]!;
+  const binding = store.ensureBinding(task);
+  store.setChat(binding.id, 2_000_000_001, 1); store.setAttached(binding.id, true);
+  let probes = 0;
+  const desktop = Object.assign(new HealthDesktop(), {
+    ownerAdapterStatus: async () => { probes++; return "ready" as const; },
+  });
+  const now = 100_000;
+  const monitor = new BridgeHealthMonitor(access, desktop, new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+    bindings: [{ id: binding.id, title: binding.title, source: ".codex-work", status: "idle", connected: false,
+      lastConfirmedAt: null, failure: null, legacyAcquisition: "unknown" as const,
+      route: { kind: "native-observer" as const, routeGeneration: 2 } }],
+  }), undefined, () => now, undefined, () => true);
+  const report = await monitor.check(true);
+  const check = report.checks.find(item => item.name === `codex_legacy_acquisition:${binding.id}`);
+  assert.equal(probes, 0, "diagnostic uses local state without starting an owner probe");
+  assert.equal(check?.state, "degraded");
+  assert.match(check?.detail ?? "", /исход.*подключен|результат.*подключен|неизвест/u);
+  assert.match(check?.detail ?? "", /не доказательство физического native writer/u);
+  assert.equal(report.checks.some(item => item.name === `codex_native_access:${binding.id}`), false,
+    "a read-only observer stays an observer while the old legacy ticket is diagnosed");
+  assert.equal(report.state, "degraded");
+});
+
 test("publishing task execution lifecycle warns independently of task status and queued ACK age", async t => {
   const s = setupWithBindings(t, () => bindings);
   const specs = [

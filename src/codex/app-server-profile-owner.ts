@@ -62,23 +62,33 @@ export class AppServerProfileOwner {
   }
   async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing" | "unknown"> {
     this.assertOwner(task);
+    if (this.legacyAcquisitionState(task)) return "unknown";
     if (this.lifecycle.isDraining(task)) return "unknown"; // Avoid activity that can extend the native unload grace period.
     const session = this.rpc.currentInitializedSession?.();
     if (!session) return "unknown";
     try {
       const result = await this.rpc.request("thread/read", { threadId: task.threadId, includeTurns: false },
         { expectedGeneration: session.generation, timeoutMs: 5_000 });
+      if (this.legacyAcquisitionState(task) || this.lifecycle.isDraining(task)) return "unknown";
       const thread = result.thread;
       return thread && typeof thread === "object" && !Array.isArray(thread)
         && (thread as Record<string, unknown>).id === task.threadId ? "ready" : "unknown";
     } catch { return "unknown"; }
   }
-  drainIdleExecution(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult> {
+  drainIdleExecution(task: TaskRef, beforeRelease: () => void, assertScope?: () => void): Promise<ExecutionDrainResult> {
     this.assertOwner(task);
     // Detached/shared executors use their own contract; never drain them through legacy health.
     if (this.routingPolicy === "exclusive") return Promise.resolve("unavailable");
     return this.lifecycle.drain(task, beforeRelease, () => this.executor.executionSnapshot(task),
-      () => this.nativeStates.subscriptionSnapshot(task));
+      () => this.nativeStates.subscriptionSnapshot(task), assertScope);
+  }
+  pendingLegacyAcquisition(task: TaskRef): symbol | null {
+    this.assertOwner(task);
+    return this.routingPolicy === "exclusive" ? null : this.lifecycle.pendingLegacyAcquisition(task);
+  }
+  legacyAcquisitionState(task: TaskRef): "pending" | "unknown" | "abandoned" | null {
+    this.assertOwner(task);
+    return this.routingPolicy === "exclusive" ? null : this.lifecycle.legacyAcquisitionState(task);
   }
   restoreExecutionDrain(task: TaskRef): void {
     this.assertOwner(task);

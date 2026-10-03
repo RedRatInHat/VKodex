@@ -15,6 +15,7 @@ class Rpc implements AppServerRpc {
   waitUnsubscribe: Promise<void> | null = null; failUnsubscribe = false; unsubscribeStatus = "unsubscribed";
   threadStatus: "idle" | "active" | "notLoaded" | "systemError" = "idle";
   generation = 1; sessionAvailable = true;
+  failResume: Error | null = null;
   threadListResponse: JsonObject = { data: [], nextCursor: null };
   loadedListResponse: JsonObject = { data: ["task"], nextCursor: null };
   turnsListResponse: JsonObject = { data: [{ id: "accepted-turn", items: [
@@ -46,6 +47,7 @@ class Rpc implements AppServerRpc {
     if (method === "thread/resume") {
       this.resumeTimeouts.push(_options?.timeoutMs ?? 30_000);
       if (this.waitResume) await this.waitResume;
+      if (this.failResume) throw this.failResume;
       return { thread: { id: String(_params.threadId ?? "task"), name: "Task", cwd: "D:\\w", status: { type: "idle" } },
         cwd: "D:\\w", model: "gpt", reasoningEffort: "high", initialTurnsPage: { data: [], nextCursor: null } };
     }
@@ -94,6 +96,42 @@ type DrainableOwner = AppServerProfileOwner & {
   drainIdleExecution?: (task: { hostId: string; threadId: string; sourceId: string }, beforeRelease: () => void) => Promise<DrainStatus>;
 };
 const taskRef = { hostId: "local", threadId: "task", sourceId: "work" };
+test("owner adapter metadata cannot report ready across a legacy acquisition fence", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {});
+  rpc.failResume = new AppServerUncertainError();
+  await assert.rejects(stream.start(), AppServerUncertainError);
+  const before = rpc.calls.length;
+  const launches = rpc.starts;
+  assert.equal(owner.legacyAcquisitionState(taskRef), "unknown");
+  assert.equal(await owner.ownerAdapterStatus(taskRef), "unknown");
+  assert.equal(rpc.calls.length, before, "a known fence needs no metadata RPC or launch");
+  assert.equal(rpc.starts, launches, "diagnostic accessor never starts the backend");
+  rpc.requests.find(request => request.method === "thread/resume")?.options?.onLateResponseEnvelope?.(
+    { result: { thread: { id: taskRef.threadId, status: { type: "idle" } } } });
+  assert.equal(owner.legacyAcquisitionState(taskRef), "abandoned");
+  assert.equal(await owner.ownerAdapterStatus(taskRef), "unknown");
+  assert.equal(rpc.calls.length, before, "a late ACK is diagnostic evidence, not a new probe");
+  stream.close(); await owner.close();
+});
+
+test("owner adapter status rechecks a fence that appears while metadata is pending", async () => {
+  const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
+  let release!: () => void;
+  rpc.pauseMethod = "thread/read";
+  rpc.pauseGate = new Promise<void>(resolve => { release = resolve; });
+  let reading!: () => void;
+  const started = new Promise<void>(resolve => { reading = resolve; });
+  rpc.onPausedRequest = () => reading();
+  const status = owner.ownerAdapterStatus(taskRef);
+  await started;
+  rpc.failResume = new AppServerUncertainError();
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {});
+  await assert.rejects(stream.start(), AppServerUncertainError);
+  release();
+  assert.equal(await status, "unknown", "a stale metadata response cannot imply input readiness");
+  stream.close(); await owner.close();
+});
 function drainIdle(owner: AppServerProfileOwner, beforeRelease: () => void): Promise<DrainStatus> {
   const drain = (owner as DrainableOwner).drainIdleExecution;
   return drain ? drain.call(owner, taskRef, beforeRelease) : Promise.resolve("unavailable");

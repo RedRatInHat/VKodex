@@ -284,6 +284,20 @@ test("runtime schedules a fresh health check after clock rollback", async t => {
   assert.equal(checks, 2);
 });
 
+test("runtime health samples local acquisition uncertainty for an idle disconnected binding", t => {
+  let reads = 0;
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (_store, _binding, desktop) => {
+      Object.assign(desktop, { legacyAcquisitionState: () => { reads++; return "unknown" as const; } });
+    });
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+    effort: null, nextModel: null, nextEffort: null, context: null });
+  const snapshot = (s.runtime as unknown as { runtimeHealth(): import("../src/bridge/health.js").RuntimeHealthState }).runtimeHealth();
+  assert.equal(snapshot.bindings?.[0]?.legacyAcquisition, "unknown");
+  assert.equal(reads, 1);
+  assert.deepEqual(s.server.received, [], "health sampling does not launch or contact an owner");
+});
+
 test("runtime restores the owner fence before command callbacks and never treats persisted release as current proof", t => {
   let restored = 0, callbackInstalled = false;
   const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
@@ -452,6 +466,101 @@ test("health idle drain blocks an active Android writer and releases only after 
   assert.equal(writerCloses, 1);
   assert.deepEqual(s.store.queuedInputs(s.binding.id).map(item => item.operationId), operationIds);
   assert.equal(s.store.acceptedTurns(s.binding.id).length, 2);
+});
+
+test("maintenance wakes an exact orphan acquisition without a live stream and refuses a changed ticket", async t => {
+  const s = runtimeSetup(t);
+  let ticket = Symbol("original-acquisition");
+  let drains = 0; let callbacks = 0;
+  Object.assign(s.desktop, {
+    executionDrainSupported: () => true,
+    pendingLegacyAcquisition: () => ticket,
+    drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void) => {
+      drains++; beforeRelease(); callbacks++; return "waiting-unload" as const;
+    },
+  });
+  const generation = s.store.streamGeneration(s.binding.id);
+  const matches = () => s.store.streamGeneration(s.binding.id) === generation;
+  const maintain = (s.runtime as unknown as { maintainExecutionLifecycle(binding: Binding,
+    matches: () => boolean): Promise<void> }).maintainExecutionLifecycle.bind(s.runtime);
+  await maintain(s.binding, matches);
+  assert.equal(drains, 1);
+  assert.equal(callbacks, 1);
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "waiting-unload");
+
+  s.advance(60_001);
+  Object.assign(s.desktop, { drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void) => {
+    drains++; ticket = Symbol("replacement-acquisition"); beforeRelease();
+    return "waiting-unload" as const;
+  } });
+  await maintain(s.binding, matches);
+  assert.equal(drains, 2);
+  assert.equal(callbacks, 1, "a new ticket cannot inherit the old release callback");
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "unavailable");
+});
+
+test("orphan cleanup can run beside an unchanged read-only follower without closing it", async t => {
+  let followerCloses = 0;
+  const follower: TaskStateTransport = { readOnly: true,
+    subscribe(task, onState) { return { task, readOnly: true,
+      start: async () => { onState({ ...state([], "completed"), id: task.threadId }, true); },
+      verifyOwner: async () => {}, close: () => { followerCloses++; } }; }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, follower);
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref, intent: "observe"): Promise<void> })
+    .connectBinding(s.binding, ref, "observe");
+  const ticket = Symbol("original-legacy-acquisition");
+  let drains = 0;
+  Object.assign(s.desktop, { executionDrainSupported: () => true, pendingLegacyAcquisition: () => ticket,
+    drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void, assertScope?: () => void) => {
+      drains++; beforeRelease(); assertScope?.(); return "waiting-unload" as const;
+    } });
+  const generation = s.store.streamGeneration(s.binding.id);
+  await (s.runtime as unknown as { maintainExecutionLifecycle(binding: Binding,
+    matches: () => boolean): Promise<void> }).maintainExecutionLifecycle(s.binding,
+    () => s.store.streamGeneration(s.binding.id) === generation);
+  assert.equal(drains, 1);
+  assert.equal(followerCloses, 0);
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "waiting-unload");
+  s.advance(60_001);
+  Object.assign(s.desktop, { drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void,
+    assertScope?: () => void) => {
+    drains++; beforeRelease();
+    (s.runtime as unknown as { connectionAttempts: Map<string, symbol> }).connectionAttempts
+      .set(s.binding.id, Symbol("replacement-follower"));
+    assertScope?.();
+    return "waiting-unload" as const;
+  } });
+  await (s.runtime as unknown as { maintainExecutionLifecycle(binding: Binding,
+    matches: () => boolean): Promise<void> }).maintainExecutionLifecycle(s.binding,
+    () => s.store.streamGeneration(s.binding.id) === generation);
+  assert.equal(drains, 2);
+  assert.equal(followerCloses, 0);
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "unavailable");
+});
+
+test("normal writer retirement permits its original unsubscribe wire guard", async t => {
+  let closes = 0;
+  const writer: TaskStateTransport = {
+    subscribe(task, onState) { return { task,
+      start: async () => { onState({ ...state([], "inProgress"), id: task.threadId }, true); },
+      verifyOwner: async () => {}, close: () => { closes++; } }; }, close() {},
+  };
+  const s = runtimeSetup(t, undefined, writer);
+  await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+    .connectBinding(s.binding, ref);
+  let wireGuards = 0;
+  Object.assign(s.desktop, { executionDrainSupported: () => true,
+    drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void, assertScope?: () => void) => {
+      beforeRelease(); assertScope?.(); wireGuards++; return "waiting-unload" as const;
+    } });
+  const generation = s.store.streamGeneration(s.binding.id);
+  await (s.runtime as unknown as { maintainExecutionLifecycle(binding: Binding,
+    matches: () => boolean): Promise<void> }).maintainExecutionLifecycle(s.binding,
+    () => s.store.streamGeneration(s.binding.id) === generation);
+  assert.equal(closes, 1);
+  assert.equal(wireGuards, 1);
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "waiting-unload");
 });
 
 test("an old queued ACK does not let demanded outlive input preparation and suppress the next owner drain", async t => {
