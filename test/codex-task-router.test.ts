@@ -7,6 +7,21 @@ import { RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, t
 const primary = { hostId: "local", threadId: "primary" };
 const work = { hostId: "local", threadId: "work", sourceId: "work" };
 
+test("legacy routed transfer project preserves explicit null without a native hook", async () => {
+  const s = fixture();
+  const base: CodexTasks = { ...s.base, listTasks: async () => [{ ...primary,
+    title: "Legacy", workspace: "/workspace", updatedAt: 1, projectId: null }] };
+  assert.equal(await new RoutedCodexTasks(base, []).transferProjectId(primary), null);
+});
+
+test("routed transfer project never falls back after an unavailable native read", async () => {
+  const s = fixture();
+  const base: CodexTasks = { ...s.base, listTasks: async () => [{ ...primary,
+    title: "Legacy", workspace: "/workspace", updatedAt: 1, projectId: null }],
+    transferProjectId: async () => { throw new DesktopUnavailableError("native read unavailable"); } };
+  await assert.rejects(new RoutedCodexTasks(base, []).transferProjectId(primary), DesktopUnavailableError);
+});
+
 function fixture() {
   const calls: string[] = [];
   const base = {

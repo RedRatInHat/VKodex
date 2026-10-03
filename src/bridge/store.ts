@@ -255,17 +255,31 @@ export class BridgeStore {
   private static readonly MAX_STAGE_FILES_PER_OPERATION = 256;
   private static readonly MAX_STAGE_FILES_GLOBAL = 2_048;
 
-  constructor(filename = ":memory:") {
-    this.db = new DatabaseConstructor(filename);
+  constructor(filename = ":memory:", options: { readonly existingTransferSchemaSha256?: string } = {}) {
+    const pinnedSchema = options.existingTransferSchemaSha256;
+    if (pinnedSchema !== undefined && (!path.isAbsolute(filename) || !/^[a-f0-9]{64}$/u.test(pinnedSchema))) {
+      throw new Error("Invalid existing transfer database pin");
+    }
+    this.db = new DatabaseConstructor(filename, { ...(pinnedSchema ? { fileMustExist: true } : {}) });
     this.databasePath = filename === ":memory:" ? null : path.resolve(filename);
     try {
       const identity = this.databasePath ? statSync(this.databasePath, { bigint: true }) : null;
       this.databaseFileIdentity = identity?.isFile() && identity.nlink === 1n
         ? Object.freeze({ dev: String(identity.dev), ino: String(identity.ino) }) : null;
     } catch { this.databaseFileIdentity = null; }
-    this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
+    // A one-operation helper shares an older live store. It must not initialize
+    // a new DB, upgrade its schema, backfill unrelated file ledgers or recover
+    // the runtime. The caller pins the exact existing schema after read-only
+    // account/home/file validation. All ordinary runtime opens still migrate.
+    if (pinnedSchema) {
+      const schema = this.db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name").all();
+      const actual = createHash("sha256").update(JSON.stringify(schema)).digest("hex");
+      if (actual !== pinnedSchema) { this.db.close(); throw new Error("Existing transfer database schema changed"); }
+      return;
+    }
+    this.db.pragma("journal_mode = WAL");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS bridge_bindings (${bindingColumns});
       CREATE TABLE IF NOT EXISTS bridge_inbox (

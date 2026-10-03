@@ -317,6 +317,9 @@ export interface CodexTasks {
   listTasks(): Promise<readonly DesktopTask[]>;
   listSources?(): readonly DesktopSource[];
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]>;
+  /** Explicit persisted assignment, not a catalog's workspace-based display
+   * inference. Unknown metadata must reject, never become null. */
+  transferProjectId?(task: TaskRef): Promise<string | null>;
   createProject?(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject>;
   catalogWarnings?(): readonly string[];
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;

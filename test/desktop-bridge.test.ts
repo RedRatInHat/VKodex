@@ -1722,6 +1722,93 @@ function transferFixture(s: ReturnType<typeof setup>) {
     targetSourceId: "work", targetProjectId: null, phase: "forking" as const };
 }
 
+for (const displayProject of [undefined, "inferred-from-another-profile"] as const) {
+  test(`transfer uses confirmed native project instead of display project ${displayProject}`, async t => {
+    const s = setup(t); s.attach();
+    const displayedTask = { ...task };
+    delete displayedTask.projectId;
+    if (displayProject !== undefined) displayedTask.projectId = displayProject;
+    s.desktop.tasks = [displayedTask];
+    s.desktop.capabilities.transferTask = true;
+    s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+    s.desktop.sourceProjects = { "": [], work: [] };
+    let reads = 0;
+    Object.assign(s.desktop, { transferProjectId: async () => { reads++; return null; } });
+    await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+    await clickPanel(s, ".codex-work"); await clickPanel(s, "Без проекта"); await clickPanel(s, "Перенести");
+    assert.equal(reads, 2);
+    assert.equal(s.desktop.transfers.length, 1);
+  });
+}
+
+test("transfer never treats unreadable native project as no project", async t => {
+  const s = setup(t); s.attach(); s.desktop.tasks = [{ ...task, projectId: null }];
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  Object.assign(s.desktop, { transferProjectId: async () => { throw new DesktopUnavailableError("native project unavailable"); } });
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.ok(s.chat.sent.some(message => message.view.text.includes("native project unavailable")));
+});
+
+test("scoped transfer atomically claims only its requested operation before RPC", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const other = s.store.ensureBinding({ ...task, threadId: "unrelated-task", sourceId: "unrelated" });
+  s.store.setChat(other.id, peerId + 1, 18);
+  s.store.beginTransfer({ ...record, id: "unrelated-transfer", bindingId: other.id,
+    source: { ...task, threadId: other.threadId, sourceId: "unrelated" }, targetSourceId: "elsewhere", version: 2, revision: 0 });
+  assert.ok(s.store.claimTransfer(s.store.transfer(other.id)!, "unrelated-owner", process.pid, () => true));
+  const unrelated = s.store.transfer(other.id);
+  let competitorCalls = 0;
+  const competingDesktop = Object.create(s.desktop) as Desktop;
+  competingDesktop.transferCheckpoint = async () => { competitorCalls++; throw new Error("must not run"); };
+  const competitor = new TaskTransfers(s.store, competingDesktop, s.now);
+  const checkpoint = s.desktop.transferCheckpoint.bind(s.desktop);
+  s.desktop.transferCheckpoint = async () => {
+    const saved = s.store.transfer(record.bindingId)!;
+    assert.equal(saved.lease?.pid, process.pid);
+    assert.equal(s.store.transferBlocksInput(record.bindingId), true);
+    competitor.tick(); await competitor.idle();
+    // Both live claims remain pinned while the competitor scans.
+    assert.equal(s.store.transfer(record.bindingId)?.lease?.owner, saved.lease?.owner);
+    return checkpoint();
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await transfers.startScoped(record);
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.transfer(record.bindingId)?.lease, null);
+  assert.equal(competitorCalls, 0);
+  assert.deepEqual(s.store.transfer(other.id), unrelated);
+  assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("scoped transfer refuses a live source lease without leaving a new fence", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const other = s.store.ensureBinding({ ...task, threadId: "leased-task" });
+  s.store.setChat(other.id, peerId + 1, 18);
+  s.store.beginTransfer({ ...record, id: "live-transfer", bindingId: other.id,
+    source: { ...task, threadId: other.threadId }, version: 2, revision: 0 });
+  const saved = s.store.transfer(other.id)!;
+  assert.ok(s.store.claimTransfer(saved, "other-owner", process.pid, () => true));
+  const before = s.store.streamGeneration(record.bindingId);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await assert.rejects(transfers.startScoped(record), /операци|process|lease/iu);
+  assert.equal(s.store.transfer(record.bindingId), null);
+  assert.equal(s.store.streamGeneration(record.bindingId), before);
+  assert.equal(s.desktop.transfers.length, 0);
+});
+
+test("scoped transfer never steals or replays an existing operation", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.beginTransfer({ ...record, version: 2, revision: 0 });
+  const before = s.store.transfer(record.bindingId);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await assert.rejects(transfers.startScoped(record), /операци|already/iu);
+  assert.deepEqual(s.store.transfer(record.bindingId), before);
+  assert.equal(s.desktop.transfers.length, 0);
+});
+
 test("transfer switches the VK observation epoch after copied history", async t => {
   const s = setup(t); const record = transferFixture(s);
   s.store.setValue(`projection:${record.bindingId}`, { since: 1, lastObservedAt: 2,
@@ -2447,7 +2534,17 @@ test("transfer checkpoints and leases survive reopening SQLite; only a dead owne
   first.beginTransfer(record);
   first.claimTransfer(record, "old-owner", 123, () => true);
   first.close();
-  const reopened = new BridgeStore(file); t.after(() => reopened.close());
+  const existing = new DatabaseConstructor(file);
+  existing.exec("DROP TABLE bridge_managed_queue_receipts; DROP TABLE bridge_managed_operation_authorities");
+  const schemaSql = "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name";
+  const oldSchema = existing.prepare(schemaSql).all();
+  const pin = createHash("sha256").update(JSON.stringify(oldSchema)).digest("hex");
+  existing.close();
+  assert.throws(() => new BridgeStore(file, { existingTransferSchemaSha256: "0".repeat(64) }), /schema changed/u);
+  const reopened = new BridgeStore(file, { existingTransferSchemaSha256: pin }); t.after(() => reopened.close());
+  const verify = new DatabaseConstructor(file, { readonly: true });
+  assert.deepEqual(verify.prepare(schemaSql).all(), oldSchema);
+  verify.close();
   const restored = reopened.transfer(binding.id)!;
   assert.equal(restored.checkpoint?.lastTurnId, "persisted-boundary");
   assert.equal(restored.forkSubmitted, true);

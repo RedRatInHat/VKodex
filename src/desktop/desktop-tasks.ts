@@ -535,8 +535,15 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.metadata.assignProject(task, rawProjectId);
     const current = (await this.listTasks()).find(candidate => sameTask(candidate, task));
     if (!current) throw new UncertainActionError();
-    if (current.projectId !== expectedProjectId
-      || (this.metadata.read && (await this.metadata.read(task)).projectId !== rawProjectId)) {
+    // The catalog can infer a display project from the workspace even when
+    // the acknowledged native assignment is null. Prefer the exact native
+    // read for null; explicit assignments still require the expected catalog
+    // project too. Unknown native reads never use display inference as proof.
+    const confirmed = this.metadata.read
+      ? (await this.metadata.read(task)).projectId === rawProjectId
+        && (rawProjectId === null || current.projectId === expectedProjectId)
+      : current.projectId === expectedProjectId;
+    if (!confirmed) {
       throw new ProjectAssignmentUnconfirmedError();
     }
   }
@@ -547,6 +554,17 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     const source = (await this.listTasks()).find(task => sameTask(task, request.task));
     if (!source?.rolloutPath) throw new ActionRejectedError("Codex не сообщил путь истории задачи. Обнови список и повтори перенос.");
     return this.live.transfer.fork({ ...request, task: { ...request.task, rolloutPath: source.rolloutPath } });
+  }
+
+  async transferProjectId(task: TaskRef): Promise<string | null> {
+    if (!this.metadata?.read) throw new DesktopUnavailableError("Нативный проект исходной задачи недоступен.");
+    const assignment = await this.metadata.read(task);
+    if (assignment.projectId === null) return null;
+    const scopedId = task.sourceId ? JSON.stringify([task.sourceId, assignment.projectId]) : assignment.projectId;
+    const project = (await this.listProjects(task.sourceId ?? ""))
+      .find(project => project.id === scopedId || project.legacyIds?.includes(scopedId));
+    if (!project) throw new ActionRejectedError("Нативный проект исходной задачи не найден в её каталоге. Перенос не начат.");
+    return project.id;
   }
 
   async submit(request: SubmitTaskRequest): Promise<void> {
