@@ -103,6 +103,19 @@ test('one monotonic acquisition budget bounds a hung preflight and cannot launch
   assert.throws(() => new ProcessAcquisitionBudget(15_001), /Invalid process acquisition budget/);
 });
 
+test('acquisition timeout permanently revokes the budget even before the monotonic deadline', async context => {
+  // The timer and performance.now() can reach their boundaries in different
+  // orders. Advance only the timer to reproduce that ordering deterministically.
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const budget = new ProcessAcquisitionBudget(15_000);
+  const timedOut = assert.rejects(budget.read(() => new Promise<never>(() => {})), /acquisition budget expired/);
+  context.mock.timers.tick(15_000);
+  await timedOut;
+  await assert.rejects(budget.read(async () => 'must not acquire after timeout'), /acquisition budget expired/);
+  assert.throws(() => budget.assertCurrent(), /acquisition budget expired/);
+  assert.equal(budget.remaining(), 0);
+});
+
 async function witnessIdentity(pid: number): Promise<SelectedProcessIdentity> {
   const imagePath = await realpath(process.execPath);
   const imageSha256 = createHash('sha256').update(await readFile(imagePath)).digest('hex');

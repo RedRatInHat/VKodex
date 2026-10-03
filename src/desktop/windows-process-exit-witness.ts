@@ -51,20 +51,30 @@ export function isCurrentWindowsProcessCaptureTicket(value: unknown): value is W
  */
 export class ProcessAcquisitionBudget {
   private readonly until: number;
+  private expired = false;
   constructor(milliseconds: number) {
     if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || milliseconds > 15_000)
       throw new TypeError('Invalid process acquisition budget');
     this.until = performance.now() + milliseconds;
   }
-  remaining(): number { return Math.max(0, this.until - performance.now()); }
+  remaining(): number {
+    if (this.expired) return 0;
+    const remaining = this.until - performance.now();
+    if (remaining <= 0) { this.expired = true; return 0; }
+    return remaining;
+  }
   assertCurrent(): void { if (this.remaining() <= 0) throw new Error('Process acquisition budget expired'); }
   async read<T>(operation: () => Promise<T>): Promise<T> {
     this.assertCurrent();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const value = await Promise.race([Promise.resolve().then(() => { this.assertCurrent(); return operation(); }),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Process acquisition budget expired')),
-          Math.ceil(this.remaining())); })]);
+        new Promise<never>((_, reject) => { timer = setTimeout(() => {
+          // Once timeout has been observed, no later read may reacquire the
+          // budget, even if the timer ran just before performance.now()'s limit.
+          this.expired = true;
+          reject(new Error('Process acquisition budget expired'));
+        }, Math.ceil(this.remaining())); })]);
       this.assertCurrent();
       return value;
     } finally { if (timer) clearTimeout(timer); }
