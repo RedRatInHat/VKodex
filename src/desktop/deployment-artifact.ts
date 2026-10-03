@@ -36,6 +36,7 @@ export interface DeploymentLaunchPlan {
   readonly manifestSha256: string;
   readonly sourceCommit: string;
   readonly sourceTree: string;
+  readonly runtimeSha256: string;
 }
 
 function refuse(category: string): never {
@@ -156,9 +157,10 @@ function inventoryPath(relative: string): void {
   if (segments.some(segment => /^(?:\.env(?:\.|$)|auth\.json$)|\.sqlite(?:-|$)/iu.test(segment))) refuse("configuration or data in artifact");
 }
 
-interface InventoryFile { readonly size: number; readonly sha256: string }
+export interface InventoryFile { readonly size: number; readonly sha256: string }
 
-async function verifyInventory(root: string, inventory: ReadonlyMap<string, InventoryFile>): Promise<() => Promise<void>> {
+async function verifyInventory(root: string, inventory: ReadonlyMap<string, InventoryFile>, manifestName = MANIFEST,
+  strictDirectories = false): Promise<() => Promise<void>> {
   const found = new Set<string>();
   const observed = new Map<string, BigIntStats>();
   let nodes = 0;
@@ -176,9 +178,12 @@ async function verifyInventory(root: string, inventory: ReadonlyMap<string, Inve
       const fileBefore = await lstat(file, { bigint: true });
       observed.set(file, fileBefore);
       if (fileBefore.isSymbolicLink() || !samePath(await realpath(file), file)) refuse("linked artifact file");
-      if (fileBefore.isDirectory()) { await walk(file); continue; }
+      if (fileBefore.isDirectory()) {
+        if (strictDirectories && ![...inventory.keys()].some(entry => entry.startsWith(`${relative}/`))) refuse("unlisted inventory directory");
+        await walk(file); continue;
+      }
       if (!fileBefore.isFile() || fileBefore.nlink !== 1n) refuse("artifact file is not private and regular");
-      if (relative === MANIFEST) continue;
+      if (relative === manifestName) continue;
       const expected = inventory.get(relative);
       if (!expected || fileBefore.size !== BigInt(expected.size)) refuse("unlisted or changed artifact file");
       const hash = createHash("sha256");
@@ -198,6 +203,25 @@ async function verifyInventory(root: string, inventory: ReadonlyMap<string, Inve
       if (after.isSymbolicLink() || !stable(before, after) || before.nlink !== after.nlink ||
           before.mode !== after.mode || !samePath(await realpath(file), file)) refuse("artifact changed during validation");
     }
+  };
+}
+
+/** Internal, read-only building blocks shared by the trusted binding planner.
+ * Exporting these does not authorize executing any of the observed bytes.
+ */
+export const deploymentValidationIO = Object.freeze({ object, sha, absolute, contained, canonical, metadataFile, verifyInventory });
+
+export async function verifyDeploymentRuntime(file: string, expectedSha256: string): Promise<() => Promise<void>> {
+  await canonical(file, "file");
+  const before = await lstat(file, { bigint: true });
+  if (before.nlink !== 1n || before.size > 2n * 1024n ** 3n) refuse("runtime file limit or link");
+  const hash = createHash("sha256");
+  for await (const chunk of boundedArtifactBytes(createReadStream(file), Number(before.size))) hash.update(chunk);
+  if (hash.digest("hex") !== sha(expectedSha256) || !stable(before, await lstat(file, { bigint: true }))) refuse("runtime hash mismatch or concurrent change");
+  return async () => {
+    await canonical(file, "file");
+    const after = await lstat(file, { bigint: true });
+    if (after.nlink !== 1n || after.mode !== before.mode || !stable(before, after)) refuse("runtime changed during validation");
   };
 }
 
@@ -298,7 +322,8 @@ export async function validateDeploymentArtifact(descriptorPath: string, expecte
     return Object.freeze({ executable: path.join(artifactRoot, runtimeRelative), entryPoint, cwd: configurationRoot, environmentFile,
       dataDirectory, nativeCodexPath, arguments: Object.freeze([`--env-file=${environmentFile}`, entryPoint]),
       environmentOverrides: Object.freeze({ BOT_DATA_DIR: dataDirectory, NODE_OPTIONS: "", NODE_PATH: "" }),
-      descriptorSha256: expectedSha256, manifestSha256, sourceCommit: manifest.sourceCommit, sourceTree: manifest.sourceTree });
+      descriptorSha256: expectedSha256, manifestSha256, sourceCommit: manifest.sourceCommit, sourceTree: manifest.sourceTree,
+      runtimeSha256: inventory.get(runtimeRelative)!.sha256 });
   } catch (error) {
     if (error instanceof RuntimeSetupError) throw error;
     refuse("required artifact metadata unavailable");
