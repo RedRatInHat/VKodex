@@ -22,6 +22,7 @@ export interface QueueHistoryProgress {
 }
 
 export interface RuntimeHealthState {
+  readonly predecessorMaintenanceRestoration?: Readonly<{ state: "unchanged" | "binding-scope-changed" | "unavailable" }>;
   readonly predecessorExitObservation?: PredecessorExitObservationSummary;
   readonly startupAdmission?: Readonly<{ readonly kind: "predecessor-maintenance"; readonly fenceId: string;
     readonly snapshotSha256: string }>;
@@ -176,6 +177,13 @@ export class BridgeHealthMonitor {
     const runtime = this.runtime();
     if (runtime.startupAdmission) checks.push({ name: "startup_predecessor", state: "degraded",
       detail: "Проверка прежнего исполнителя не завершена. VK-ввод сохранён, но отправка, восстановление очереди и профильные RPC отключены. Автоматического снятия ограничения нет." });
+    if (runtime.startupAdmission && runtime.predecessorMaintenanceRestoration) checks.push({
+      name: "predecessor_quarantine_restoration", state: "degraded",
+      detail: runtime.predecessorMaintenanceRestoration.state === "binding-scope-changed"
+        ? "Карантин того же физического хранилища восстановлен после изменения привязок. Это не обновляет разрешение на остановку, не освобождает Desktop и не повторяет запросы."
+        : runtime.predecessorMaintenanceRestoration.state === "unchanged"
+          ? "Карантин восстановлен с прежней областью привязок. Автоматического снятия ограничения или повтора запросов нет."
+          : "Подтверждение восстановления карантина недоступно. Это не считается освобождением прежнего исполнителя." });
     if (runtime.startupAdmission && runtime.predecessorExitObservation) {
       const observation = runtime.predecessorExitObservation;
       const selectedGone = ["original-exit-observed", "selected-exit-scoped"].includes(observation.state);
