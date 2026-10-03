@@ -15,15 +15,18 @@ import { observeSelectedWindowsProcessExits, captureSelectedWindowsProcesses, is
 
 test('concrete predecessor cutover requires an explicit pinned operator action and never accepts a stored closure', async () => {
   const controller = await import('../src/desktop/predecessor-cutover-controller.js');
+  const requestPath = path.resolve('private-fixture', 'action.json');
   assert.throws(() => controller.predecessorCutoverArguments([]));
-  assert.throws(() => controller.predecessorCutoverArguments(['--request', 'C:\\private\\action.json', '--sha256', 'a'.repeat(64)]));
-  assert.deepEqual(controller.predecessorCutoverArguments(['--request', 'C:\\private\\action.json', '--sha256', 'a'.repeat(64),
+  assert.throws(() => controller.predecessorCutoverArguments(['--request', requestPath, '--sha256', 'a'.repeat(64)]));
+  assert.throws(() => controller.predecessorCutoverArguments(['--request', 'private-fixture/action.json', '--sha256', 'a'.repeat(64),
+    '--operator-approved-stop', 'stop-selected-legacy-runtime-no-replay']));
+  assert.deepEqual(controller.predecessorCutoverArguments(['--request', requestPath, '--sha256', 'a'.repeat(64),
     '--operator-approved-stop', 'stop-selected-legacy-runtime-no-replay']), {
-    requestPath: 'C:\\private\\action.json', requestSha256: 'a'.repeat(64),
+    requestPath, requestSha256: 'a'.repeat(64),
     operatorApproval: 'stop-selected-legacy-runtime-no-replay',
   });
   assert.equal(controller.isVerifiedKnownPredecessorStop({ kind: 'known-predecessor-stopped', exits: [] }), false);
-  await assert.rejects(controller.stopPinnedPredecessor({ requestPath: 'C:\\private\\action.json', requestSha256: 'a'.repeat(64),
+  await assert.rejects(controller.stopPinnedPredecessor({ requestPath, requestSha256: 'a'.repeat(64),
     operatorApproval: 'not-approved' }), /Predecessor cutover refused/);
 });
 

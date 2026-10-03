@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -133,7 +133,9 @@ test("read-only restart snapshot succeeds while the bridge holds a writer lock",
 });
 
 test("committed predecessor snapshot uses SQLite backup to include WAL-only final rows", { skip: process.platform !== "win32" }, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-predecessor-snapshot-"));
+  // GitHub's Windows TEMP may use RUNNER~1. Positive fixtures must resolve that
+  // alias; production deliberately rejects aliased source-database paths.
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vkodex-predecessor-snapshot-")));
   const databasePath = path.join(root, "vkodex.sqlite");
   const naivePath = path.join(root, "main-only-copy.sqlite");
   const operationId = "fixture-operation-0001";
@@ -223,7 +225,7 @@ test("committed predecessor snapshot uses SQLite backup to include WAL-only fina
       const recycle = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
         "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $parent=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_PARENT).TrimEnd('\\')+'\\'; if(-not $target.StartsWith($parent,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($target) -notlike 'vkodex-predecessor-snapshot-*'){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)"], {
         encoding: "utf8", timeout: 10_000, windowsHide: true,
-        env: { ...process.env, VKODEX_TEST_RECYCLE_PARENT: os.tmpdir(), VKODEX_TEST_RECYCLE_TARGET: root },
+        env: { ...process.env, VKODEX_TEST_RECYCLE_PARENT: path.dirname(root), VKODEX_TEST_RECYCLE_TARGET: root },
       });
       assert.equal(recycle.status, 0, "fixture cleanup must move the private root to Recycle Bin");
     }
