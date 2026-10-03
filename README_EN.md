@@ -582,9 +582,19 @@ This exclusion is for VKodex, not every `node.exe` process and not Codex itself.
 
 ## 9. Updates and backups
 
+### Validate a separate artifact without launching it
+
+`node dist/src/desktop/deployment-artifact-check.js --descriptor "<absolute descriptor.json path>" --sha256 "<lowercase descriptor SHA-256>"` checks files only; it is not an installation command. Use trusted Node.js and a trusted validator build, never the runtime or code of the unverified artifact. Success prints `validated_not_launched` and hashes, without configuration contents or local paths.
+
+Keep the descriptor outside Git and the artifact. Version 1 accepts exactly `version`, `artifactRoot`, `configurationRoot`, `dataDirectory`, and `manifestSha256`. Roots are absolute; the artifact must be separate from configuration and data. `configurationRoot/.env` is checked as a regular file, without reading its contents. `dataDirectory` is the independently selected effective `BOT_DATA_DIR`; resolve relative configuration values against the original configuration root, not the artifact.
+
+`artifactRoot/artifact-manifest.json` requires exactly `version`, `sourceCommit`, `sourceTree`, `node` (`version`, `platform`, `arch`, `modules`), `sdkVersion`, and `files`. `files` lists every file except the manifest itself: relative forward-slash path → `{ "size": byte_count, "sha256": hash }`. Validation covers complete inventory/hashes, fixed runtime/bridge/scripts/icon/package/lock files, pinned SDK/CLI, and the SDK ESM export. Links, junctions, unsupported paths, application-directory dependency shadows, and added/changed files refuse. Only `dist`, `scripts`, `node_modules`, `runtime`, `docs/logo.ico`, `package.json`, and `package-lock.json` are allowed; exclude secrets, `.env`, and data.
+
+This validates inventory and declared metadata, not runtime executability, build provenance from the stated commit, or Desktop readiness. The internal plan retains the original cwd, absolute `BOT_DATA_DIR`, and explicitly empty `NODE_OPTIONS`/`NODE_PATH`. The validator does not execute the plan, copy a runtime, create directories, open a database, or modify Scheduled Tasks. C#/PowerShell/bridge integration is not implemented yet; existing launch/install commands do not consume the descriptor. A future launcher must revalidate it. `service:install -NoStart` is not safe validation: the existing installer still stops the previous service.
+
 ### Updating the source
 
-1. Stop VKodex normally. You do not need to stop an active Codex task to update the bridge.
+1. Stop VKodex normally during an agreed maintenance window. Stopping the bridge may interrupt turns in its owned backends; a snapshot and `reconcile-only` do not guarantee preservation. Desktop and VS Code do not separately need to be stopped.
 2. Back up the configuration and data.
 3. Check `git status`. Preserve or reconcile your own changes before updating; do not force-reset them.
 4. Run these commands in the repository:
