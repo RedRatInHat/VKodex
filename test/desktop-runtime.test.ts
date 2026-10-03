@@ -3,7 +3,7 @@ import test, { after } from "node:test";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,17 +40,21 @@ test("launcher does not accept substitute scripts or arbitrary Node options", ()
   assert.throws(() => launchArguments("probe", ["one", "two"]));
 });
 
-const artifactFixtures = await mkdtemp(path.join(tmpdir(), "vkodex-artifact-tests-"));
+// Windows runners can expose TEMP through an 8.3 alias (RUNNER~1). Positive
+// fixture descriptors need physical canonical paths; the product still refuses
+// linked/aliased input. The cleanup boundary must use the same physical parent.
+const artifactTemporaryParent = await realpath(tmpdir());
+const artifactFixtures = await mkdtemp(path.join(artifactTemporaryParent, "vkodex-artifact-tests-"));
 after(async () => {
   if (process.platform !== "win32") return; // No permanent deletion when a Recycle Bin is unavailable.
   await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-    "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $root=[IO.Path]::GetFullPath($env:TEMP).TrimEnd('\\')+'\\'; if(-not $target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($target) -notlike 'vkodex-artifact-tests-*'){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)"],
-  { windowsHide: true, env: { ...process.env, VKODEX_TEST_RECYCLE_TARGET: artifactFixtures } });
+    "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $root=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_PARENT).TrimEnd('\\')+'\\'; if(-not $target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($target) -notlike 'vkodex-artifact-tests-*'){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)"],
+  { windowsHide: true, env: { ...process.env, VKODEX_TEST_RECYCLE_TARGET: artifactFixtures, VKODEX_TEST_RECYCLE_PARENT: artifactTemporaryParent } });
 });
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 
-async function artifactFixture() {
-  const root = await mkdtemp(path.join(artifactFixtures, "launch with spaces "));
+async function artifactFixture(temporaryRoot = artifactFixtures) {
+  const root = await mkdtemp(path.join(await realpath(temporaryRoot), "launch with spaces "));
   const artifactRoot = path.join(root, "versioned artifact");
   const configurationRoot = path.join(root, "original checkout");
   await mkdir(configurationRoot);
@@ -330,4 +334,16 @@ test("SDK metadata that otherwise qualifies still rejects duplicate keys and mal
     fixture.manifest.files[relative] = { size: bytes.length, sha256: digest(bytes) };
     await assert.rejects(validateDeploymentArtifact(fixture.descriptorPath, await fixture.repin()), defect);
   }
+});
+
+test("positive fixtures canonicalize aliased temporary roots while production still refuses aliases", async () => {
+  const target = path.join(artifactFixtures, "physical temporary target");
+  const alias = path.join(artifactFixtures, "temporary root alias");
+  await mkdir(target);
+  await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
+  const fixture = await artifactFixture(alias);
+  const plan = await validateDeploymentArtifact(fixture.descriptorPath, fixture.expectedSha256);
+  assert.equal(plan.cwd.startsWith(target + path.sep), true);
+  const aliasedDescriptor = fixture.descriptorPath.replace(target, alias);
+  await assert.rejects(validateDeploymentArtifact(aliasedDescriptor, fixture.expectedSha256), /linked or aliased/u);
 });
