@@ -10,6 +10,23 @@ import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, ProjectAssignmentUnconfirmedError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks, submissionMode } from "../src/desktop/desktop-tasks.js";
+
+test("transfer project assignment uses the native source namespace, not display inference", async () => {
+  const sourceTask = { hostId: "local", threadId: "scoped-project-task", sourceId: "work" };
+  let nativeId: string | null = null;
+  const expected = JSON.stringify(["work", "native-project"]);
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [],
+    listProjects: async sourceId => {
+      assert.equal(sourceId, "work");
+      return [{ id: expected, title: "Project", workspace: "/workspace" }];
+    } }, undefined, { rename: async () => {}, archive: async () => {}, markdown: async () => "",
+      assignProject: async () => {}, read: async () => ({ title: "Task", projectId: nativeId }) });
+  assert.equal(await adapter.transferProjectId(sourceTask), null);
+  nativeId = "native-project";
+  assert.equal(await adapter.transferProjectId(sourceTask), expected);
+  nativeId = "unavailable-project";
+  await assert.rejects(adapter.transferProjectId(sourceTask), /не найден/iu);
+});
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";

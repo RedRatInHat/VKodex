@@ -1,5 +1,5 @@
 import type { CodexQuestions } from "./codex-questions.js";
-import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, sameTask, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -72,6 +72,15 @@ export class RoutedCodexTasks implements CodexTasks {
   listTasks(): Promise<readonly DesktopTask[]> { return this.base.listTasks(); }
   listSources(): readonly DesktopSource[] { return this.base.listSources?.() ?? []; }
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]> { return this.base.listProjects(sourceId); }
+  async transferProjectId(task: TaskRef): Promise<string | null> {
+    this.refuseExclusive(task);
+    if (this.base.transferProjectId) return this.base.transferProjectId(task);
+    // Preserve the pre-existing contract of adapters without this optional
+    // hook. A failing native hook is never replaced by display inference.
+    const current = (await this.base.listTasks()).find(candidate => sameTask(candidate, task));
+    if (!current || current.projectId === undefined) throw new ActionRejectedError("Нативный проект исходной задачи не подтверждён.");
+    return current.projectId;
+  }
   catalogWarnings(): readonly string[] { return this.base.catalogWarnings?.() ?? []; }
   createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject> {
     if (!this.base.createProject) throw new ActionRejectedError("Создание проекта недоступно в этом подключении.");

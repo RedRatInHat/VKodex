@@ -57,6 +57,38 @@ export class TaskTransfers {
     this.tick();
   }
 
+  /** Operator helper: fence and claim one NEW operation in the same committed
+   * transaction, before any RPC or background worker can observe it. Never
+   * scans the transfer queue or takes over another live process's lease. */
+  async startScoped(record: TaskTransferRecord): Promise<void> {
+    if (this.stopped || record.phase !== "forking" || record.target || record.checkpoint || record.forkSubmitted) {
+      throw new ActionRejectedError("Новая операция переноса не подтверждена.");
+    }
+    const claimed = this.store.atomic(() => {
+      const existing = this.store.transfer(record.bindingId);
+      if (existing?.id === record.id || existing && !["complete", "cancelled"].includes(existing.phase)) {
+        throw new ActionRejectedError("Операция переноса уже существует. Повторное создание запрещено.");
+      }
+      this.store.beginTransfer({ ...record, version: 2, step: "snapshot", revision: 0,
+        updatedAt: this.now(), attempt: 0 });
+      const saved = this.store.transfer(record.bindingId)!;
+      const leased = this.store.claimTransfer(saved, this.owner, process.pid, processAlive, this.now());
+      if (!leased) throw new ActionRejectedError("Операция занята другим процессом VKodex; новый перенос не начат.");
+      return leased;
+    });
+    const sources = [...new Set([claimed.source.sourceId ?? "", claimed.targetSourceId])];
+    sources.forEach(source => this.busySources.add(source));
+    const work = (async () => {
+      try { this.publish(claimed); await this.run(claimed); }
+      finally {
+        try { this.store.releaseTransfer(claimed.bindingId, claimed.id, this.owner, this.now()); }
+        finally { this.running.delete(claimed.id); sources.forEach(source => this.busySources.delete(source)); }
+      }
+    })();
+    this.running.set(claimed.id, work);
+    await work;
+  }
+
   resume(bindingId: string): void {
     const current = this.store.transfer(bindingId);
     if (!current || ["complete", "cancelled"].includes(current.phase)) throw new ActionRejectedError("Незавершённого переноса нет.");

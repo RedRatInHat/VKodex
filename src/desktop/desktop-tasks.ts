@@ -549,6 +549,17 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.live.transfer.fork({ ...request, task: { ...request.task, rolloutPath: source.rolloutPath } });
   }
 
+  async transferProjectId(task: TaskRef): Promise<string | null> {
+    if (!this.metadata?.read) throw new DesktopUnavailableError("Нативный проект исходной задачи недоступен.");
+    const assignment = await this.metadata.read(task);
+    if (assignment.projectId === null) return null;
+    const scopedId = task.sourceId ? JSON.stringify([task.sourceId, assignment.projectId]) : assignment.projectId;
+    const project = (await this.listProjects(task.sourceId ?? ""))
+      .find(project => project.id === scopedId || project.legacyIds?.includes(scopedId));
+    if (!project) throw new ActionRejectedError("Нативный проект исходной задачи не найден в её каталоге. Перенос не начат.");
+    return project.id;
+  }
+
   async submit(request: SubmitTaskRequest): Promise<void> {
     await this.submitWithReceipt(request);
   }
