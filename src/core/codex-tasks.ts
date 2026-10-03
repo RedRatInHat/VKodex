@@ -342,7 +342,11 @@ export interface CodexTasks {
   archiveRetryReady?(task: TaskRef): Promise<boolean>;
   ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing" | "unknown">;
   /** Exact original execution owner only; callback is synchronous and fenced. */
-  drainIdleExecution?(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult>;
+  drainIdleExecution?(task: TaskRef, beforeRelease: () => void, assertScope?: () => void): Promise<ExecutionDrainResult>;
+  /** Opaque original-owner receipt for a confirmed acquisition whose stream retired. Never starts a backend. */
+  pendingLegacyAcquisition?(task: TaskRef): symbol | null;
+  /** Local diagnostic only; no owner launch, metadata RPC, or physical writer claim. */
+  legacyAcquisitionState?(task: TaskRef): "pending" | "unknown" | "abandoned" | null;
   executionDrainSupported?(task: TaskRef): boolean;
   /** Restore an admission fence only, never infer current ownership/unload. */
   restoreExecutionDrain?(task: TaskRef): void;

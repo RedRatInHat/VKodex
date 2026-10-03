@@ -40,6 +40,8 @@ export interface RuntimeHealthState {
     readonly source: string;
     readonly status: string;
     readonly connected: boolean;
+    /** Local acquisition ticket evidence, never a physical writer or input-readiness claim. */
+    readonly legacyAcquisition?: "pending" | "unknown" | "abandoned" | null;
     /** Whether VKodex currently holds the Codex task stream lease. */
     readonly streamMode?: "attached" | "detached" | "unknown";
     readonly lastEventAt?: number | null;
@@ -287,6 +289,16 @@ export class BridgeHealthMonitor {
         : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
+      if (binding.legacyAcquisition) {
+        const detail = binding.legacyAcquisition === "pending"
+          ? "Подключение к задаче выполняется; результат пока ожидается."
+          : binding.legacyAcquisition === "unknown"
+            ? "Исход подключения к задаче неизвестен после ошибки или тайм-аута; повторный запуск заблокирован до доказательства."
+            : "Поздний ответ подтвердил прежнее подключение после потери потока; освобождение прежнего исполнения ещё не доказано.";
+        checks.push({ name: `codex_legacy_acquisition:${binding.id}`,
+          state: binding.legacyAcquisition === "pending" ? "ok" : "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: ${detail} Это локальная запись, не доказательство физического native writer или готовности ввода.` });
+      }
       const diagnostic = binding.lastConnectionDiagnostic;
       const lifecycle = binding.executionLifecycle;
       if (lifecycle) {

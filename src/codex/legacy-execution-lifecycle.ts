@@ -11,8 +11,10 @@ const MAX_TASK_REVISIONS = 4096;
 const UNLOAD_READBACK_INTERVAL_MS = 31 * 60_000;
 interface Drain { generation: number; state: ExecutionDrainResult | "checking"; unloaded: boolean;
   release: Promise<ObjectValue> | null; restored?: true; assertRelease?: () => void;
-  nextRefreshAt?: number; refresh?: Promise<ExecutionDrainResult> }
+  nextRefreshAt?: number; refresh?: Promise<ExecutionDrainResult>; family?: readonly string[] }
 interface WorkReceipt { readonly turnId?: string; readonly clientId?: string }
+interface AcquisitionAttempt { readonly token: symbol; readonly generation: number;
+  state: "pending" | "unknown" | "abandoned" }
 
 // Pinned native notifications with an explicit threadId and no family-topology
 // effect. Unknown/unscoped notifications retain a profile-wide proof fence.
@@ -37,6 +39,7 @@ export class LegacyExecutionLifecycle {
   private readonly busy = new Map<string, number>();
   private readonly unknown = new Set<string>();
   private readonly receipts = new Map<string, WorkReceipt[]>();
+  private readonly acquisitions = new Map<string, Set<AcquisitionAttempt>>();
   private revision = 0;
   private unscopedRevision = 0;
   private readonly taskRevisions = new Map<string, number>();
@@ -86,9 +89,44 @@ export class LegacyExecutionLifecycle {
       || family.some(threadId => (this.taskRevisions.get(threadId) ?? 0) > revision);
   }
   assertAdmission(task: TaskRef): void {
+    this.assertAdmissionExcept(task);
+  }
+  private assertAdmissionExcept(task: TaskRef, allowed?: AcquisitionAttempt): void {
     const drain = this.drains.get(task.threadId);
     if (drain?.state === "released" && this.current(drain.generation)) throw new TaskOwnedByClientError();
     if (drain) throw new ActionRejectedError("Освобождение прежнего исполнителя ещё не подтверждено; новый запуск не отправлен.");
+    if ([...(this.acquisitions.get(task.threadId) ?? [])].some(attempt => attempt !== allowed
+      && (allowed !== undefined || attempt.state !== "pending")))
+      throw new ActionRejectedError("Исход подключения к задаче ещё не подтверждён; новый запуск не отправлен.");
+  }
+  private forgetAcquisition(threadId: string, attempt: AcquisitionAttempt): void {
+    const attempts = this.acquisitions.get(threadId);
+    if (attempts?.delete(attempt)) this.changedAcquisition(threadId);
+    if (!attempts?.size) this.acquisitions.delete(threadId);
+  }
+  private changedAcquisition(threadId: string): void {
+    this.changed(threadId);
+  }
+  private hasOtherAcquisition(threadId: string, allowed?: AcquisitionAttempt): boolean {
+    return [...(this.acquisitions.get(threadId) ?? [])].some(attempt => attempt !== allowed);
+  }
+  private validResume(result: ObjectValue, threadId: string): boolean {
+    const thread = object(result.thread) ? result.thread : null;
+    return thread?.id === threadId && object(thread.status)
+      && typeof thread.status.type === "string"
+      && ["idle", "active", "systemError"].includes(thread.status.type);
+  }
+  pendingLegacyAcquisition(task: TaskRef): symbol | null {
+    const attempts = [...(this.acquisitions.get(task.threadId) ?? [])];
+    const attempt = attempts.length === 1 ? attempts[0] : null;
+    return attempt?.state === "abandoned" && this.current(attempt.generation) ? attempt.token : null;
+  }
+  legacyAcquisitionState(task: TaskRef): "pending" | "unknown" | "abandoned" | null {
+    const attempts = this.acquisitions.get(task.threadId);
+    if (!attempts?.size) return null;
+    if ([...attempts].some(attempt => attempt.state === "abandoned")) return "abandoned";
+    if ([...attempts].some(attempt => attempt.state === "unknown")) return "unknown";
+    return "pending";
   }
   isDraining(task: TaskRef): boolean { return this.drains.has(task.threadId); }
   restore(task: TaskRef): void {
@@ -108,22 +146,62 @@ export class LegacyExecutionLifecycle {
   private async request(method: string, params: ObjectValue = {}, options: AppServerRequestOptions = {}): Promise<ObjectValue> {
     const threadId = id(params.threadId);
     const writer = options.mutating === true || method === "thread/resume";
+    let acquisition: AcquisitionAttempt | null = null;
+    if (threadId && method === "thread/resume") {
+      const task = { hostId: "local", threadId };
+      this.assertAdmission(task);
+      if (this.acquisitions.has(threadId)) throw new ActionRejectedError("Подключение к задаче уже выполняется.");
+      const initial = this.original.currentInitializedSession?.();
+      if (options.expectedGeneration !== undefined
+        && (!initial || initial.generation !== options.expectedGeneration)) throw new AppServerUnavailableError();
+      // A foreground resume may initialize its owner. Health never calls this path.
+      if (!initial) await this.original.start();
+      this.assertAdmission(task);
+      if (this.acquisitions.has(threadId)) throw new ActionRejectedError("Подключение к задаче уже выполняется.");
+      const session = this.original.currentInitializedSession?.();
+      if (!session || options.expectedGeneration !== undefined && options.expectedGeneration !== session.generation)
+        throw new AppServerUnavailableError();
+      acquisition = { token: Symbol(threadId), generation: session.generation, state: "pending" };
+      const attempts = this.acquisitions.get(threadId) ?? new Set<AcquisitionAttempt>();
+      attempts.add(acquisition); this.acquisitions.set(threadId, attempts); this.changedAcquisition(threadId);
+    }
     const drain = threadId ? this.drains.get(threadId) : undefined;
     const controlledRelease = method === "thread/unsubscribe" && drain?.state === "checking";
     let dispatched = false;
     let definitiveRejection = false;
     if (threadId && writer) this.changeBusy(threadId, 1);
-    let generation = options.expectedGeneration ?? this.original.currentInitializedSession?.()?.generation;
+    let generation = acquisition?.generation ?? options.expectedGeneration ?? this.original.currentInitializedSession?.()?.generation;
     const guarded = { ...options,
       ...(method === "thread/resume" ? { mutating: true } : {}),
+      ...(acquisition ? { expectedGeneration: acquisition.generation } : {}),
       ...(drain ? { expectedGeneration: drain.generation } : {}),
       onResponseEnvelope: (envelope: import("./app-server-connection.js").AppServerResponseEnvelope) => {
         const error = "error" in envelope ? envelope.error : null;
         definitiveRejection = object(error) && Number.isSafeInteger(error.code) && typeof error.message === "string";
         options.onResponseEnvelope?.(envelope);
       },
+      ...(acquisition ? { onLateResponseEnvelope: (envelope: import("./app-server-connection.js").AppServerResponseEnvelope) => {
+        if (threadId && acquisition && this.acquisitions.get(threadId)?.has(acquisition)
+          && this.current(acquisition.generation)) {
+          if ("result" in envelope && this.validResume(envelope.result, threadId)) {
+            acquisition.state = "abandoned"; this.changedAcquisition(threadId);
+          }
+          else if ("error" in envelope && object(envelope.error)
+            && Number.isSafeInteger(envelope.error.code)
+            && typeof envelope.error.message === "string") this.forgetAcquisition(threadId, acquisition);
+        }
+        options.onLateResponseEnvelope?.(envelope);
+      } } : {}),
       assertBeforeWrite: () => {
         options.assertBeforeWrite?.();
+        if (threadId && acquisition) {
+          this.assertAdmissionExcept({ hostId: "local", threadId }, acquisition);
+          if (!this.current(acquisition.generation) || !this.acquisitions.get(threadId)?.has(acquisition))
+            throw new AppServerUnavailableError();
+        }
+        if (threadId && writer && method !== "turn/interrupt" && !acquisition
+          && this.hasOtherAcquisition(threadId))
+          throw new ActionRejectedError("Исход подключения к задаче ещё не подтверждён; команда не отправлена.");
         if (threadId && writer && this.drains.has(threadId) && method !== "turn/interrupt")
           this.assertAdmission({ hostId: "local", threadId });
         if (controlledRelease && (!this.current(drain.generation) || drain.unloaded))
@@ -134,8 +212,11 @@ export class LegacyExecutionLifecycle {
       },
     };
     const work = this.original.request(method, params, guarded).then(result => {
-      if (threadId && method === "thread/resume" && generation !== undefined && this.current(generation))
-        this.acquired.set(threadId, generation);
+      if (threadId && acquisition) {
+        if (!this.validResume(result, threadId) || !this.current(acquisition.generation)) throw new AppServerUnavailableError();
+        this.acquired.set(threadId, acquisition.generation);
+        this.forgetAcquisition(threadId, acquisition);
+      }
       if (threadId && writer && method === "turn/start") {
         const turnId = object(result.turn) ? id(result.turn.id) : null;
         if (turnId) this.remember(threadId, { turnId }); else this.unknown.add(threadId);
@@ -156,7 +237,11 @@ export class LegacyExecutionLifecycle {
     }).catch(error => {
       // A final wire guard proves refusal. A written timeout, malformed ACK or
       // disconnect does not; retain uncertainty until explicit outcome proof.
-      if (threadId && writer && dispatched && !(error instanceof AppServerRejectedError && definitiveRejection)) this.unknown.add(threadId);
+      if (threadId && acquisition) {
+        if (!dispatched || error instanceof AppServerRejectedError && definitiveRejection)
+          this.forgetAcquisition(threadId, acquisition);
+        else if (acquisition.state === "pending") { acquisition.state = "unknown"; this.changedAcquisition(threadId); }
+      } else if (threadId && writer && dispatched && !(error instanceof AppServerRejectedError && definitiveRejection)) this.unknown.add(threadId);
       throw error;
     }).finally(() => { if (threadId && writer) this.changeBusy(threadId, -1); });
     if (controlledRelease) drain.release = work;
@@ -224,7 +309,8 @@ export class LegacyExecutionLifecycle {
       && !local().blocked && !local().releasePending
       && !this.busy.has(task.threadId) && !this.unknown.has(task.threadId)
       && !this.busy.has("__unscoped_server_request__") && !this.unknown.has("__unscoped_server_request__")
-      && !this.changedSince([task.threadId], revision, unscopedRevision);
+      && !(drain.family ?? [task.threadId]).some(threadId => this.hasOtherAcquisition(threadId))
+      && !this.changedSince(drain.family ?? [task.threadId], revision, unscopedRevision);
     if (!safe()) return !this.current(generation) || this.drains.get(task.threadId) !== drain
       ? "unavailable" : drain.state === "released" ? "released" : "waiting-unload";
     drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;
@@ -243,7 +329,8 @@ export class LegacyExecutionLifecycle {
   }
   async drain(task: TaskRef, beforeRelease: () => void,
     local: () => { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending?: boolean },
-    subscription: () => { readonly count: number; readonly revision: number }): Promise<ExecutionDrainResult> {
+    subscription: () => { readonly count: number; readonly revision: number },
+    assertScope: () => void = () => {}): Promise<ExecutionDrainResult> {
     const existing = this.drains.get(task.threadId);
     if (existing) {
       if (!this.current(existing.generation)) return "unavailable";
@@ -255,10 +342,14 @@ export class LegacyExecutionLifecycle {
       try { return await refresh; } finally { if (existing.refresh === refresh) delete existing.refresh; }
     }
     const session = this.original.currentInitializedSession?.();
-    if (!session || this.acquired.get(task.threadId) !== session.generation) return "unavailable";
+    const attempts = [...(this.acquisitions.get(task.threadId) ?? [])];
+    const orphan = attempts.length === 1 && attempts[0]?.state === "abandoned" ? attempts[0] : null;
+    if (attempts.length && !orphan) return "blocked";
+    if (!session || !orphan && this.acquired.get(task.threadId) !== session.generation) return "unavailable";
+    if (orphan && orphan.generation !== session.generation) return "unavailable";
     const generation = session.generation;
     const scoped = subscription();
-    if (scoped.count !== 1 || local().blocked || local().releasePending || this.busy.has(task.threadId) || this.unknown.has(task.threadId)
+    if (scoped.count !== (orphan ? 0 : 1) || local().blocked || local().releasePending || this.busy.has(task.threadId) || this.unknown.has(task.threadId)
       || this.busy.has("__unscoped_server_request__") || this.unknown.has("__unscoped_server_request__")) return "blocked";
     const drain: Drain = { generation, state: "checking", unloaded: false, release: null };
     this.drains.set(task.threadId, drain);
@@ -269,7 +360,8 @@ export class LegacyExecutionLifecycle {
     try {
       const family = [task.threadId, ...await this.family(task.threadId, generation, deadline)];
       for (const threadId of family) {
-        if (this.busy.has(threadId) || this.unknown.has(threadId)) return "blocked";
+        if (this.busy.has(threadId) || this.unknown.has(threadId)
+          || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined)) return "blocked";
         const response = await this.read("thread/read", { threadId, includeTurns: false }, generation, deadline);
         const thread = object(response.thread) && response.thread.id === threadId ? response.thread : null;
         if (!thread || !object(thread.status)) throw new AppServerUnavailableError();
@@ -285,19 +377,31 @@ export class LegacyExecutionLifecycle {
       }
       const confirmed = await this.family(task.threadId, generation, deadline);
       if (JSON.stringify(confirmed) !== JSON.stringify(family.slice(1))) return "blocked";
+      assertScope();
       if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision) || local().blocked
-        || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId))
-        || subscription().count !== 1 || subscription().revision !== scoped.revision) return "blocked";
+        || local().releasePending
+        || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId)
+          || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined))
+        || subscription().count !== (orphan ? 0 : 1) || subscription().revision !== scoped.revision
+        || orphan && this.pendingLegacyAcquisition(task) !== orphan.token) return "blocked";
       drain.assertRelease = () => {
-        if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision) || local().blocked || subscription().count !== 0
+        assertScope();
+        if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision)
+          || local().blocked || orphan && local().releasePending || subscription().count !== 0
           || this.busy.has("__unscoped_server_request__") || this.unknown.has("__unscoped_server_request__")
-          || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId)))
+          || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId)
+            || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined))
+          || orphan && (this.pendingLegacyAcquisition(task) !== orphan.token || subscription().revision !== scoped.revision))
           throw new AppServerUnavailableError();
       };
+      drain.family = family;
       closing = true;
       beforeRelease(); // No await: exact binding/stream validation and close are atomic with admission revocation.
+      if (orphan) void this.rpc.request("thread/unsubscribe", { threadId: task.threadId },
+        { expectedGeneration: generation, timeoutMs: 30_000 }).catch(() => {});
       if (!drain.release || subscription().count !== 0) { drain.state = "unavailable"; return "unavailable"; }
       const release = await drain.release;
+      if (orphan) this.forgetAcquisition(task.threadId, orphan);
       drain.state = !this.current(generation) ? "unavailable" : drain.unloaded ? "released" : "waiting-unload";
       if (drain.state === "waiting-unload" && release.status === "unsubscribed")
         drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;

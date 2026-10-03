@@ -243,6 +243,7 @@ export class BridgeRuntime {
         : null;
       return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
         status: details?.status ?? "unavailable", connected: isConnected(binding),
+        legacyAcquisition: this.desktop.legacyAcquisitionState?.(binding) ?? null,
         lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
         streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null,
         lastConnectionDiagnostic: recentConnectionHistory.findLast(event => event.outcome === "failed" || event.outcome === "blocked")
@@ -851,35 +852,65 @@ export class BridgeRuntime {
 
   private async maintainExecutionLifecycle(binding: Binding, matches: () => boolean): Promise<void> {
     const pendingUnload = ["checking", "waiting-unload", "unavailable"].includes(this.executionLifecycle(binding)?.state ?? "");
+    const orphanFollower = this.connections.has(binding.id) && this.connections.isReadOnly(binding.id)
+      && this.matchesConnection(binding);
+    const orphanTicket = !this.connections.has(binding.id) || orphanFollower
+      ? this.desktop.pendingLegacyAcquisition?.(binding) ?? null : null;
     if (!this.desktop.drainIdleExecution || this.desktop.executionDrainSupported?.(binding) === false
-      || !pendingUnload && (this.connections.isReadOnly(binding.id) || !this.matchesConnection(binding))
+      || !pendingUnload && !orphanTicket && (this.connections.isReadOnly(binding.id) || !this.matchesConnection(binding))
       || this.connecting.has(binding.id)
       || this.pendingReacquire.has(binding.id)) return;
     const routeGeneration = this.connections.diagnostic(binding.id)?.routeGeneration ?? 0;
-    if (!pendingUnload && routeGeneration === 0) return;
+    const connectionAttempt = this.connectionAttempts.get(binding.id);
+    if (!pendingUnload && !orphanTicket && routeGeneration === 0) return;
     const last = this.drainAttempts.get(binding.id);
     if (last?.routeGeneration === routeGeneration && !intervalElapsed(this.now(), last.since, 60_000)) return;
     this.drainAttempts.set(binding.id, { since: this.now(), routeGeneration });
     const generation = this.store.streamGeneration(binding.id);
+    let retiredWriter = false;
     const writeFact = (state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable"): void => {
       this.store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state, at: this.now(), generation });
+    };
+    const assertScope = (): void => {
+      if (orphanTicket) {
+        if (!matches() || this.connecting.has(binding.id)
+          || this.pendingReacquire.has(binding.id)
+          || (orphanFollower
+            ? !this.matchesConnection(binding) || !this.connections.isReadOnly(binding.id)
+              || this.connections.diagnostic(binding.id)?.routeGeneration !== routeGeneration
+              || this.connectionAttempts.get(binding.id) !== connectionAttempt
+            : this.connections.has(binding.id))
+          || this.desktop.pendingLegacyAcquisition?.(binding) !== orphanTicket)
+          throw new ActionRejectedError("Исходное подключение изменилось во время освобождения.");
+      } else if (!matches() || this.connecting.has(binding.id) || this.pendingReacquire.has(binding.id)
+        || this.connectionAttempts.get(binding.id) !== connectionAttempt
+        || (retiredWriter ? this.connections.has(binding.id)
+          : !this.matchesConnection(binding) || this.connections.isReadOnly(binding.id)
+            || this.connections.diagnostic(binding.id)?.routeGeneration !== routeGeneration))
+        throw new ActionRejectedError("Подключение изменилось во время проверки освобождения.");
     };
     writeFact("checking");
     try {
       const result = await this.desktop.drainIdleExecution(binding, () => {
         // The owner revoked new admissions before probing. Recheck the exact
         // local stream synchronously; never close a newer binding/connection.
-        if (!matches() || !this.matchesConnection(binding) || this.connections.isReadOnly(binding.id) || this.connecting.has(binding.id)
-          || this.pendingReacquire.has(binding.id)
-          || this.connections.diagnostic(binding.id)?.routeGeneration !== routeGeneration)
-          throw new ActionRejectedError("Подключение изменилось во время проверки освобождения.");
+        assertScope();
+        if (orphanTicket) {
+          if (orphanFollower) return; // The separate read-only observer keeps its own live lease.
+          this.enableRolloutFallback(binding, this.now());
+          this.releasedIdle.add(binding.id);
+          this.setStreamMode(binding.id, "detached");
+          this.recordLease(binding.id, "detached");
+          return;
+        }
         this.enableRolloutFallback(binding, this.now());
         this.releasedIdle.add(binding.id);
         this.setStreamMode(binding.id, "detached");
         // No receipt or accepted turn is consumed by subscription cleanup.
         this.connections.close(binding.id);
+        retiredWriter = true;
         this.recordLease(binding.id, "detached");
-      });
+      }, assertScope);
       if (matches()) {
         writeFact(result);
         if (result === "released") {

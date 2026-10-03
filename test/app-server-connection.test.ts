@@ -4,8 +4,12 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { AppServerConnection, AppServerFrontendResponseError, AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError } from "../src/codex/app-server-connection.js";
-import type { AppServerServerRequest, AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
+import type { AppServerRpc, AppServerServerRequest, AppServerServerRequestContext } from "../src/codex/app-server-connection.js";
 import { AppServerRequestInbox } from "../src/codex/app-server-request-inbox.js";
+import { LegacyExecutionLifecycle } from "../src/codex/legacy-execution-lifecycle.js";
+import { AppServerTaskStateTransport } from "../src/codex/app-server-task-state.js";
+import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
+import { ActionRejectedError } from "../src/core/codex-tasks.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -46,6 +50,289 @@ class AppServerChild extends EventEmitter {
   kill(): boolean { this.disconnect(); return true; }
   asChild(): ChildProcessWithoutNullStreams { return this as unknown as ChildProcessWithoutNullStreams; }
 }
+
+test("late exact resume ACK permits orphan cleanup after the original stream timed out", async () => {
+  const child = new AppServerChild();
+  let runtimeStatus: "active" | "idle" = "active";
+  child.respond = message => {
+    if (message.method === "initialize") return { id: message.id, result: { serverInfo: { name: "fixture" } } };
+    if (message.method === "thread/resume") return null;
+    if (message.method === "thread/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/read") return { id: message.id, result: { thread: { id: "own", status: { type: runtimeStatus } } } };
+    if (message.method === "thread/goal/get") return { id: message.id, result: { goal: null } };
+    if (message.method === "thread/queue/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/unsubscribe") return { id: message.id, result: { status: "unsubscribed" } };
+    return null;
+  };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  let releases = 0;
+  const transport = new AppServerTaskStateTransport(lifecycle.rpc, () => [], () => { releases++; }, () => {},
+    ref => lifecycle.rpc.request("thread/resume", { threadId: ref.threadId, excludeTurns: true,
+      initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "full" } }, { timeoutMs: 15 }));
+  const stream = transport.subscribe(task, () => assert.fail("timed-out stream must not project a late ACK"), () => {});
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await assert.rejects(stream.start(), AppServerUncertainError);
+    stream.close();
+    assert.equal(releases, 1);
+    assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }, { timeoutMs: 15 }), ActionRejectedError);
+    const resumeId = child.messages.find(message => message.method === "thread/resume")?.id;
+    child.send({ id: resumeId, result: { thread: { id: "own", status: { type: "idle" } },
+      initialTurnsPage: { data: [], nextCursor: null }, cwd: "D:\\fixture", model: "gpt", reasoningEffort: "high" } });
+    child.send({ id: resumeId, result: { thread: { id: "own", status: { type: "idle" } } } });
+    assert.equal(await lifecycle.drain(task, () => {}, () => ({ activeTurnId: null, blocked: false }),
+      () => transport.subscriptionSnapshot(task)), "blocked");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }, { timeoutMs: 15 }), ActionRejectedError);
+    runtimeStatus = "idle";
+    const status = await lifecycle.drain(task, () => {}, () => ({ activeTurnId: null, blocked: false }),
+      () => transport.subscriptionSnapshot(task));
+    assert.equal(status, "waiting-unload");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 1);
+    assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+    child.send({ method: "thread/closed", params: { threadId: "own" } });
+    assert.equal(await lifecycle.drain(task, () => {}, () => ({ activeTurnId: null, blocked: false }),
+      () => transport.subscriptionSnapshot(task)), "released");
+  } finally { clearInterval(keepAlive); stream.close(); transport.close(); lifecycle.close(); await connection.close(); }
+});
+
+test("profile owner retires its timed-out stream and drains only its late acquired writer", async () => {
+  const child = new AppServerChild();
+  child.respond = message => {
+    if (message.method === "initialize") return { id: message.id, result: {} };
+    if (message.method === "thread/resume") return null;
+    if (message.method === "thread/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/read") return { id: message.id, result: { thread: { id: "own", status: { type: "idle" } } } };
+    if (message.method === "thread/goal/get") return { id: message.id, result: { goal: null } };
+    if (message.method === "thread/queue/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/unsubscribe") return { id: message.id, result: { status: "unsubscribed" } };
+    return null;
+  };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const rpc: AppServerRpc = {
+    start: () => connection.start(), currentInitializedSession: () => connection.currentInitializedSession(),
+    request: (method, params, options) => connection.request(method, params,
+      method === "thread/resume" ? { ...options, timeoutMs: 15 } : options),
+    onNotification: listener => connection.onNotification(listener),
+    onDisconnect: listener => connection.onDisconnect(listener),
+    onServerRequest: handler => connection.onServerRequest(handler), close: () => connection.close(),
+  };
+  const owner = new AppServerProfileOwner("work", rpc);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  const stream = owner.states.subscribe(task, () => assert.fail("retired stream cannot project late ACK"), () => {});
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await assert.rejects(stream.start());
+    stream.close();
+    assert.equal(owner.pendingLegacyAcquisition(task), null);
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+    const resumeId = child.messages.find(message => message.method === "thread/resume")?.id;
+    child.send({ id: resumeId, result: { thread: { id: "own", status: { type: "idle" } },
+      initialTurnsPage: { data: [], nextCursor: null } } });
+    assert.equal(typeof owner.pendingLegacyAcquisition(task), "symbol");
+    assert.equal(await owner.drainIdleExecution(task, () => {}), "waiting-unload");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 1);
+    assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+    child.send({ method: "thread/closed", params: { threadId: "own" } });
+    assert.equal(await owner.drainIdleExecution(task, () => assert.fail("no second release")), "released");
+  } finally { clearInterval(keepAlive); stream.close(); await owner.close(); }
+});
+
+test("normal profile owner drain still writes one unsubscribe after its stream closes", async () => {
+  const child = new AppServerChild();
+  child.respond = message => {
+    if (message.method === "initialize") return { id: message.id, result: {} };
+    if (message.method === "thread/resume") return { id: message.id, result: { thread: {
+      id: "own", status: { type: "idle" } }, initialTurnsPage: { data: [], nextCursor: null } } };
+    if (message.method === "thread/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/read") return { id: message.id, result: { thread: { id: "own", status: { type: "idle" } } } };
+    if (message.method === "thread/goal/get") return { id: message.id, result: { goal: null } };
+    if (message.method === "thread/queue/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/unsubscribe") return { id: message.id, result: { status: "unsubscribed" } };
+    return null;
+  };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const owner = new AppServerProfileOwner("work", connection);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  const stream = owner.states.subscribe(task, () => {}, () => {});
+  try {
+    await stream.start();
+    assert.equal(await owner.drainIdleExecution(task, () => stream.close()), "waiting-unload");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 1);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("a child acquisition ticket blocks the parent family proof before and after its late ACK", async () => {
+  const child = new AppServerChild();
+  child.respond = message => {
+    if (message.method === "initialize") return { id: message.id, result: {} };
+    if (message.method === "thread/resume") return (message.params as JsonObject).threadId === "root"
+      ? { id: message.id, result: { thread: { id: "root", status: { type: "idle" } } } } : null;
+    if (message.method === "thread/list") return { id: message.id, result: { data: [{ id: "child" }], nextCursor: null } };
+    if (message.method === "thread/read") return { id: message.id, result: { thread: {
+      id: (message.params as JsonObject).threadId, status: { type: "idle" } } } };
+    if (message.method === "thread/goal/get") return { id: message.id, result: { goal: null } };
+    if (message.method === "thread/queue/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    return null;
+  };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  const root = { hostId: "local", threadId: "root", sourceId: "work" };
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await lifecycle.rpc.request("thread/resume", { threadId: "root" }, { timeoutMs: 20 });
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "child" }, { timeoutMs: 10 }),
+      AppServerUncertainError);
+    const drain = () => lifecycle.drain(root, () => assert.fail("child ticket cannot release parent"),
+      () => ({ activeTurnId: null, blocked: false }), () => ({ count: 1, revision: 1 }));
+    assert.equal(await drain(), "blocked");
+    const childId = child.messages.find(message => message.method === "thread/resume"
+      && (message.params as JsonObject).threadId === "child")?.id;
+    child.send({ id: childId, result: { thread: { id: "child", status: { type: "idle" } } } });
+    assert.equal(await drain(), "blocked");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+  } finally { clearInterval(keepAlive); lifecycle.close(); await connection.close(); }
+});
+
+test("late acquisition proof cannot clear a separate uncertain queued write", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await assert.rejects(lifecycle.rpc.request("thread/queue/add", { threadId: "own", clientUserMessageId: "operation" },
+      { mutating: true, timeoutMs: 10 }), AppServerUncertainError);
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }, { timeoutMs: 10 }),
+      AppServerUncertainError);
+    const resumeId = child.messages.find(message => message.method === "thread/resume")?.id;
+    child.send({ id: resumeId, result: { thread: { id: "own", status: { type: "idle" } } } });
+    assert.equal(typeof lifecycle.pendingLegacyAcquisition(task), "symbol");
+    assert.equal(await lifecycle.drain(task, () => assert.fail("queued uncertainty cannot be cleared by resume"),
+      () => ({ activeTurnId: null, blocked: false }), () => ({ count: 0, revision: 0 })), "blocked");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+  } finally { clearInterval(keepAlive); lifecycle.close(); await connection.close(); }
+});
+
+test("binding scope is rechecked at the unsubscribe wire after an asynchronous boundary", async () => {
+  const child = new AppServerChild();
+  child.respond = message => {
+    if (message.method === "initialize") return { id: message.id, result: {} };
+    if (message.method === "thread/resume") return { id: message.id, result: { thread: { id: "own", status: { type: "idle" } } } };
+    if (message.method === "thread/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/read") return { id: message.id, result: { thread: { id: "own", status: { type: "idle" } } } };
+    if (message.method === "thread/goal/get") return { id: message.id, result: { goal: null } };
+    if (message.method === "thread/queue/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "thread/unsubscribe") return { id: message.id, result: { status: "unsubscribed" } };
+    return null;
+  };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 1_000);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  try {
+    await lifecycle.rpc.request("thread/resume", { threadId: "own" });
+    let count = 1; let scopeCurrent = true;
+    const status = await lifecycle.drain(task, () => {
+      count = 0;
+      queueMicrotask(() => { scopeCurrent = false; });
+      void lifecycle.rpc.request("thread/unsubscribe", { threadId: "own" }).catch(() => {});
+    }, () => ({ activeTurnId: null, blocked: false }), () => ({ count, revision: count ? 1 : 2 }),
+    () => { if (!scopeCurrent) throw new ActionRejectedError("binding changed"); });
+    assert.equal(status, "unavailable");
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+  } finally { lifecycle.close(); await connection.close(); }
+});
+
+test("late resume receipts cannot promote wrong, malformed, rejected or disconnected acquisitions", async t => {
+  for (const kind of ["wrong-thread", "malformed-status", "malformed-status-array", "rejected", "disconnected"] as const)
+    await t.test(kind, async () => {
+      const child = new AppServerChild();
+      child.respond = message => message.method === "initialize"
+        ? { id: message.id, result: { serverInfo: { name: "fixture" } } } : null;
+      let launches = 0;
+      const connection = new AppServerConnection(() => { launches++; return child.asChild(); }, undefined, 1_000);
+      const lifecycle = new LegacyExecutionLifecycle(connection);
+      const task = { hostId: "local", threadId: "own", sourceId: "work" };
+      const keepAlive = setInterval(() => {}, 1_000);
+      try {
+        await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }, { timeoutMs: 10 }),
+          AppServerUncertainError);
+        const resumeId = child.messages.find(message => message.method === "thread/resume")?.id;
+        if (kind === "disconnected") child.disconnect();
+        else if (kind === "rejected") child.send({ id: resumeId, error: { code: 409, message: "rejected" } });
+        else child.send({ id: resumeId, result: { thread: {
+          id: kind === "wrong-thread" ? "other" : "own",
+          status: kind === "wrong-thread" ? { type: "idle" }
+            : kind === "malformed-status-array" ? { type: ["idle"] } : {},
+        } } });
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(lifecycle.pendingLegacyAcquisition(task), null);
+        if (kind === "malformed-status-array") assert.equal(lifecycle.legacyAcquisitionState(task), "unknown");
+        assert.equal(await lifecycle.drain(task, () => assert.fail("invalid receipt cannot release"),
+          () => ({ activeTurnId: null, blocked: false }), () => ({ count: 0, revision: 0 })),
+        kind === "rejected" ? "unavailable" : "blocked");
+        assert.equal(launches, 1);
+        assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+        assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+      } finally { clearInterval(keepAlive); lifecycle.close(); await connection.close(); }
+    });
+});
+
+test("normal resume ACK with array status cannot clear its acquisition fence", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
+    : message.method === "thread/resume" ? { id: message.id, result: {
+      thread: { id: "own", status: { type: ["idle"] } } } } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  const task = { hostId: "local", threadId: "own", sourceId: "work" };
+  try {
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }), AppServerUnavailableError);
+    assert.equal(lifecycle.legacyAcquisitionState(task), "unknown");
+    await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" }), ActionRejectedError);
+    assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+    assert.equal(child.messages.filter(message => message.method === "thread/unsubscribe").length, 0);
+  } finally { lifecycle.close(); await connection.close(); }
+});
+
+test("cold pinned resume never launches an owner for any expected generation", async t => {
+  for (const expectedGeneration of [1, 0, 999]) await t.test(String(expectedGeneration), async () => {
+    const child = new AppServerChild(); let launches = 0;
+    const connection = new AppServerConnection(() => { launches++; return child.asChild(); }, undefined, 100);
+    const lifecycle = new LegacyExecutionLifecycle(connection);
+    try {
+      await assert.rejects(lifecycle.rpc.request("thread/resume", { threadId: "own" },
+        { expectedGeneration, timeoutMs: 10 }), AppServerUnavailableError);
+      assert.equal(launches, 0);
+      assert.deepEqual(child.messages, []);
+    } finally { lifecycle.close(); await connection.close(); }
+  });
+});
+
+test("a pending acquisition blocks another writer RPC at the actual wire", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} }
+    : message.method === "thread/resume" ? null : { id: message.id, result: {} };
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const lifecycle = new LegacyExecutionLifecycle(connection);
+  try {
+    const resume = lifecycle.rpc.request("thread/resume", { threadId: "own" }, { timeoutMs: 1_000 });
+    while (!child.messages.some(message => message.method === "thread/resume"))
+      await new Promise<void>(resolve => setImmediate(resolve));
+    await assert.rejects(lifecycle.rpc.request("turn/start", { threadId: "own" },
+      { mutating: true, timeoutMs: 10 }), ActionRejectedError);
+    assert.equal(child.messages.filter(message => message.method === "turn/start").length, 0);
+    const resumeId = child.messages.find(message => message.method === "thread/resume")?.id;
+    child.send({ id: resumeId, result: { thread: { id: "own", status: { type: "idle" } } } });
+    assert.equal(((await resume).thread as JsonObject).id, "own");
+    assert.equal(child.messages.filter(message => message.method === "thread/resume").length, 1);
+  } finally { lifecycle.close(); await connection.close(); }
+});
 
 test("request inbox keeps worker questions across frontend detach and fences typed replies", async () => {
   const child = new AppServerChild();

@@ -12,7 +12,9 @@ export interface CodexTaskOwner {
   /** Health evidence only; never used to select or authorize a command route. */
   isReady?(task: TaskRef): boolean;
   ownerAdapterStatus?(task: TaskRef): Promise<"ready" | "missing" | "unknown">;
-  drainIdleExecution?(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult>;
+  drainIdleExecution?(task: TaskRef, beforeRelease: () => void, assertScope?: () => void): Promise<ExecutionDrainResult>;
+  pendingLegacyAcquisition?(task: TaskRef): symbol | null;
+  legacyAcquisitionState?(task: TaskRef): "pending" | "unknown" | "abandoned" | null;
   restoreExecutionDrain?(task: TaskRef): void;
   owns(task: TaskRef): boolean;
   /** Original immutable operation route, independent of fresh command ownership. */
@@ -239,9 +241,16 @@ export class RoutedCodexTasks implements CodexTasks {
     if (owner) return owner.ownerAdapterStatus?.(task) ?? "unknown";
     return this.base.ownerAdapterStatus?.(task) ?? "missing";
   }
-  async drainIdleExecution(task: TaskRef, beforeRelease: () => void): Promise<ExecutionDrainResult> {
+  async drainIdleExecution(task: TaskRef, beforeRelease: () => void, assertScope?: () => void): Promise<ExecutionDrainResult> {
     // A metadata reader or another client cannot attest the original writer.
-    return this.owner(task)?.drainIdleExecution?.(task, beforeRelease) ?? "unavailable";
+    return this.owner(task)?.drainIdleExecution?.(task, beforeRelease, assertScope) ?? "unavailable";
+  }
+  pendingLegacyAcquisition(task: TaskRef): symbol | null {
+    return this.owner(task)?.pendingLegacyAcquisition?.(task) ?? null;
+  }
+  legacyAcquisitionState(task: TaskRef): "pending" | "unknown" | "abandoned" | null {
+    const owner = this.owner(task);
+    return owner?.routingPolicy === "exclusive" ? null : owner?.legacyAcquisitionState?.(task) ?? null;
   }
   executionDrainSupported(task: TaskRef): boolean {
     const owner = this.owner(task);
