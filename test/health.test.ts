@@ -50,6 +50,23 @@ class HealthDesktop implements DesktopTasks {
   async checkCompatibility() { this.compatibilityChecks++; return this.compatibilityState; }
 }
 
+test('restored predecessor quarantine with binding drift remains degraded without native lifecycle probes', async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const desktop = new HealthDesktop(); const chat = new HealthChat();
+  const monitor = new BridgeHealthMonitor(access, desktop, chat, store, () => ({
+    startedAt: 40_000, lastTickAt: 100_000, updateStartedAt: null, stopped: false,
+    activeBindings: 0, connectedBindings: 0, requiredBindings: 0, connectedRequiredBindings: 0,
+    startupAdmission: { kind: 'predecessor-maintenance', fenceId: 'fixture-existing-quarantine', snapshotSha256: 'a'.repeat(64) },
+    predecessorMaintenanceRestoration: { state: 'binding-scope-changed' },
+  }), undefined, () => 100_000, undefined, () => true);
+  const report = await monitor.check(true);
+  assert.equal(report.state, 'degraded');
+  assert.equal(report.checks.find(row => row.name === 'predecessor_quarantine_restoration')?.state, 'degraded');
+  assert.match(report.checks.find(row => row.name === 'predecessor_quarantine_restoration')!.detail, /не освобождает Desktop/);
+  assert.equal(desktop.compatibilityChecks, 0);
+  assert.equal(desktop.goalReads, 0, 'health cannot heal this gate by acquiring an owner or replaying input');
+});
+
 function setup(t: { after(fn: () => void): void }, stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED,
   stageLedgerAudit?: { lastAttemptAt: number; eligibleCount: number; ineligibleCount: number; failed: boolean }) {
   const store = new BridgeStore(); t.after(() => store.close());

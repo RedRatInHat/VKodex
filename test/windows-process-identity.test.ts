@@ -6,9 +6,52 @@ import { EventEmitter } from 'node:events';
 import { readFile, realpath } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
+import { promisify } from 'node:util';
+import path from 'node:path';
+import { deploymentStartupEnvironment } from '../src/desktop/deployment-execution.js';
 import { readWindowsProcessIdentity, readWindowsProcessIdentityAsync } from '../src/desktop/windows-process-identity.js';
 import { observeSelectedWindowsProcessExits, captureSelectedWindowsProcesses, isCurrentWindowsProcessCaptureTicket,
   isVerifiedSelectedProcessExit, ProcessAcquisitionBudget, type SelectedProcessIdentity } from '../src/desktop/windows-process-exit-witness.js';
+
+test('concrete predecessor cutover requires an explicit pinned operator action and never accepts a stored closure', async () => {
+  const controller = await import('../src/desktop/predecessor-cutover-controller.js');
+  assert.throws(() => controller.predecessorCutoverArguments([]));
+  assert.throws(() => controller.predecessorCutoverArguments(['--request', 'C:\\private\\action.json', '--sha256', 'a'.repeat(64)]));
+  assert.deepEqual(controller.predecessorCutoverArguments(['--request', 'C:\\private\\action.json', '--sha256', 'a'.repeat(64),
+    '--operator-approved-stop', 'stop-selected-legacy-runtime-no-replay']), {
+    requestPath: 'C:\\private\\action.json', requestSha256: 'a'.repeat(64),
+    operatorApproval: 'stop-selected-legacy-runtime-no-replay',
+  });
+  assert.equal(controller.isVerifiedKnownPredecessorStop({ kind: 'known-predecessor-stopped', exits: [] }), false);
+  await assert.rejects(controller.stopPinnedPredecessor({ requestPath: 'C:\\private\\action.json', requestSha256: 'a'.repeat(64),
+    operatorApproval: 'not-approved' }), /Predecessor cutover refused/);
+});
+
+test('Windows Task definition pin accepts implicit Enabled default and permits no behavior change except Enabled',
+  { skip: process.platform !== 'win32', timeout: 20_000 }, async () => {
+    const { predecessorCutoverWindowsScript } = await import('../src/desktop/predecessor-cutover-windows.js');
+    const begin = predecessorCutoverWindowsScript.indexOf('  function Definition-Hash(');
+    const end = predecessorCutoverWindowsScript.indexOf('  $scheduler=', begin);
+    assert.ok(begin > 0 && end > begin);
+    const fixture = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings><Actions><Exec><Command>fixture-original.exe</Command></Exec></Actions></Task>';
+    const docs = { missing: fixture, enabled: fixture.replace('</Settings>', '<Enabled>true</Enabled></Settings>'),
+      disabled: fixture.replace('</Settings>', '<Enabled>false</Enabled></Settings>'),
+      changed: fixture.replace('fixture-original.exe', 'fixture-different.exe'),
+      dtd: '<!DOCTYPE Task [<!ENTITY external SYSTEM "file:///never-read-fixture">]>' + fixture };
+    const systemDirectory = path.win32.join(process.env.SystemRoot!, 'System32', 'WindowsPowerShell', 'v1.0');
+    const script = `$ErrorActionPreference='Stop'\n${predecessorCutoverWindowsScript.slice(begin, end)}\n` +
+      "$docs=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:VKODEX_TASK_XML_FIXTURE))|ConvertFrom-Json\n" +
+      "$dtdRefused=$false;try{$null=Definition-Hash @{Xml=$docs.dtd}}catch{$dtdRefused=$true}\n" +
+      "[Console]::Out.WriteLine((@{missing=(Definition-Hash @{Xml=$docs.missing});enabled=(Definition-Hash @{Xml=$docs.enabled});disabled=(Definition-Hash @{Xml=$docs.disabled});changed=(Definition-Hash @{Xml=$docs.changed});dtdRefused=$dtdRefused}|ConvertTo-Json -Compress))";
+    const result = await promisify(childProcess.execFile)(path.win32.join(systemDirectory, 'powershell.exe'),
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 15_000, maxBuffer: 4096,
+        env: { ...deploymentStartupEnvironment(process.env), PSModulePath: path.win32.join(systemDirectory, 'Modules'),
+          VKODEX_TASK_XML_FIXTURE: Buffer.from(JSON.stringify(docs)).toString('base64') } });
+    assert.equal(result.stderr.trim(), '');
+    const row = JSON.parse(result.stdout.trim());
+    assert.equal(row.missing, row.enabled); assert.equal(row.missing, row.disabled);
+    assert.notEqual(row.missing, row.changed); assert.equal(row.dtdRefused, true);
+  });
 
 test('process observer refuses invalid IDs before attempting a query', () => {
   for (const id of [0, -1, NaN, 1.5, Infinity, 2_147_483_648])
@@ -242,5 +285,56 @@ test('capture protocol unit faults never mint a ticket from late frames or strea
     } finally {
       childProcess.spawn = originalSpawn;
       syncBuiltinESMExports();
+    }
+  });
+
+test('real retained Windows handle refuses an expired action and leaves its original process alive',
+  { skip: process.platform !== 'win32', timeout: 45_000 }, async () => {
+    const { predecessorCutoverWindowsScript } = await import('../src/desktop/predecessor-cutover-windows.js');
+    const classStart = predecessorCutoverWindowsScript.indexOf("  Add-Type -TypeDefinition @'\n");
+    const classEnd = predecessorCutoverWindowsScript.indexOf("\n'@", classStart);
+    assert.ok(classStart >= 0 && classEnd > classStart, 'the reviewed cutover script must contain its concrete C# handle class');
+    const csharp = predecessorCutoverWindowsScript.slice(classStart + "  Add-Type -TypeDefinition @'\n".length, classEnd);
+    assert.match(csharp, /public sealed class VKodexCutoverHandle/);
+    assert.match(csharp, /if\(remaining<=0\) throw new InvalidOperationException\("action-expired"\)/);
+
+    const child = spawn(process.execPath,
+      ['-e', 'setTimeout(() => process.exit(0), 14_000)'], { windowsHide: true, stdio: 'ignore' });
+    const exited = new Promise<number>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', code => code === 0 ? resolve(code) : reject(new Error('Fixture failed')));
+    });
+    try {
+      const identity = await witnessIdentity(child.pid!);
+      const powershellDirectory = path.win32.join(process.env.SystemRoot!, 'System32', 'WindowsPowerShell', 'v1.0');
+      const powershell = path.win32.join(powershellDirectory, 'powershell.exe');
+      const helper = `$ErrorActionPreference='Stop'\nAdd-Type -TypeDefinition @'\n${csharp}\n'@\n` +
+        '$handle=$null; try { ' +
+        '$handle=New-Object VKodexCutoverHandle ([int]$env:VKODEX_FIXTURE_PID),$env:VKODEX_FIXTURE_BIRTH,' +
+        '$env:VKODEX_FIXTURE_IMAGE,$env:VKODEX_FIXTURE_IMAGE_SHA256,$true; ' +
+        '$beforeAlive=$null -eq $handle.ExitTicks(); $expired=$false; ' +
+        'try { $null=$handle.Stop(([VKodexCutoverHandle]::Now())-1) } catch { $exception=$_.Exception; while($null -ne $exception.InnerException) { $exception=$exception.InnerException }; $expired=$exception.Message -ceq "action-expired" }; ' +
+        '$afterAlive=$null -eq $handle.ExitTicks(); ' +
+        '$row=@{expired=$expired;beforeAlive=$beforeAlive;afterAlive=$afterAlive}; ' +
+        '[Console]::Out.WriteLine(($row|ConvertTo-Json -Compress)); [Console]::Out.Flush() ' +
+        '} finally { if($null -ne $handle) { $handle.Dispose() } }';
+      const result = await promisify(childProcess.execFile)(powershell,
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', helper], {
+          windowsHide: true, timeout: 40_000, maxBuffer: 4096,
+          env: {
+            ...deploymentStartupEnvironment(process.env),
+            PSModulePath: path.win32.join(powershellDirectory, 'Modules'),
+            VKODEX_FIXTURE_PID: String(identity.pid),
+            VKODEX_FIXTURE_BIRTH: identity.birthTicks,
+            VKODEX_FIXTURE_IMAGE: identity.imagePath,
+            VKODEX_FIXTURE_IMAGE_SHA256: identity.imageSha256,
+          },
+        });
+      assert.equal(result.stderr.trim(), '', 'the private helper should not emit diagnostic or process data');
+      assert.ok(result.stdout.length <= 4096);
+      const row = JSON.parse(result.stdout.trim()) as { expired: boolean; beforeAlive: boolean; afterAlive: boolean };
+      assert.deepEqual(row, { expired: true, beforeAlive: true, afterAlive: true });
+    } finally {
+      assert.equal(await exited, 0, 'the sole owned process must finish naturally; no signal or fallback termination is used');
     }
   });

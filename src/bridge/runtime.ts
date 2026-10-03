@@ -11,6 +11,7 @@ import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
 import { BridgeHealthMonitor, type QueueHistoryProgress, type RuntimeHealthState } from "./health.js";
 import { predecessorExitObservationSummary } from "../desktop/predecessor-exit-observation.js";
+import { predecessorMaintenanceRestorationSummary } from "../desktop/predecessor-maintenance.js";
 import type { BridgeHealthSnapshot } from "./contracts.js";
 import { MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
@@ -280,7 +281,8 @@ export class BridgeRuntime {
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped, stagedFilePilot: this.stagedFilePilot,
       ...(this.startupAdmission ? { startupAdmission: this.startupAdmission,
-        predecessorExitObservation: predecessorExitObservationSummary(this.store, this.startupAdmission) } : {}),
+        predecessorExitObservation: predecessorExitObservationSummary(this.store, this.startupAdmission),
+        predecessorMaintenanceRestoration: predecessorMaintenanceRestorationSummary(this.store, this.startupAdmission) } : {}),
       maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
       ...(this.files ? { stageMaintenance: { startedAt: this.stageMaintenanceStartedAt, lastAttemptAt: this.stageMaintenanceLastAttemptAt,
         failed: this.stageMaintenanceFailed }, stageLedgerAudit: this.stageLedgerAudit } : {}),

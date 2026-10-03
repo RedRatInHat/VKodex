@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fsPromises } from "node:fs";
+import { promises as fsPromises, readFileSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { execFile, spawn } from "node:child_process";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { link, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,11 +16,12 @@ import { compatibleRuntime, launchArguments, windowsRuntimePath } from "../src/d
 import { boundedArtifactBytes, deploymentDataDirectory, deploymentValidationArguments, validateDeploymentArtifact } from "../src/desktop/deployment-artifact.js";
 import { BOOTSTRAP_FILES, deploymentBindingArguments, planDeploymentAction, validateDeploymentBinding } from "../src/desktop/deployment-binding.js";
 import { deploymentStartupEnvironment, executeDeployment } from "../src/desktop/deployment-execution.js";
-import { loadPredecessorMaintenance, validatePredecessorMaintenance } from "../src/desktop/predecessor-maintenance.js";
+import { loadPredecessorMaintenance, predecessorMaintenanceRestorationSummary, validatePredecessorMaintenance } from "../src/desktop/predecessor-maintenance.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { observeMaintenancePredecessorExits, predecessorExitObservationSummary, type PredecessorExitObservationRequest } from "../src/desktop/predecessor-exit-observation.js";
 import { readWindowsProcessIdentityAsync } from "../src/desktop/windows-process-identity.js";
 import { isCurrentWindowsProcessCaptureTicket, type SelectedProcessIdentity } from "../src/desktop/windows-process-exit-witness.js";
+import { stopPinnedPredecessor, isVerifiedKnownPredecessorStop } from "../src/desktop/predecessor-cutover-controller.js";
 
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
@@ -98,6 +100,29 @@ test("required predecessor snapshot covers idle, running and detached bindings a
     store.setValue(`stream-generation:${snapshot.bindings[0]!.bindingId}`, 99);
     await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"]), /snapshot refused/u);
     assert.deepEqual(store.getValue("startup-predecessor-fence"), admission, "failed validation never clears the gate");
+  } finally { store.close(); }
+});
+
+test("first predecessor installation refuses passive binding drift without a physical store pin", async () => {
+  const directory = path.join(artifactFixtures, `predecessor-first-pin-${randomUUID()}`);
+  await mkdir(directory);
+  const store = new BridgeStore(path.join(directory, "vkodex.sqlite"));
+  try {
+    const binding = store.ensureBinding({ hostId: "local", threadId: "fixture-first-pin", sourceId: "work",
+      title: "Fixture", workspace: directory, updatedAt: 1 });
+    store.setChat(binding.id, 12001, 1);
+    const snapshot = { version: 1, fenceId: "fixture-first-install", createdAt: 1, dataDirectory: directory,
+      recoveryPolicy: "reconcile-only", legacySourceIds: ["work"],
+      bindings: store.bindings().map(row => ({ bindingId: row.id, hostId: row.hostId, threadId: row.threadId,
+        sourceId: row.sourceId ?? "", generation: store.streamGeneration(row.id) })),
+      processes: [{ role: "bridge", pid: 1234, birthTicks: "12345", imagePath: process.execPath },
+        { role: "legacy-backend", pid: 1235, birthTicks: "12346", imagePath: process.execPath, sourceId: "work" }] };
+    const bytes = JSON.stringify(snapshot);
+    await writeFile(path.join(directory, "predecessor-maintenance.json"), bytes);
+    store.stopStreaming(binding.id);
+    await assert.rejects(loadPredecessorMaintenance(store, directory, ["work"], digest(bytes)), /snapshot refused/u);
+    assert.equal(store.getValue("startup-predecessor-fence"), null);
+    assert.equal(store.getValue("startup-predecessor-store-scope"), null);
   } finally { store.close(); }
 });
 
@@ -434,7 +459,7 @@ async function bindingFixture() {
   return { ...artifact, bootstrapRoot, stableRuntimePath, bindingPath, binding, manifest, repinBinding: repin, bindingSha256: await repin() };
 }
 
-async function predecessorObservationFixture(selected: readonly SelectedProcessIdentity[], reorderedBindings = false) {
+async function predecessorObservationFixture(selected: readonly SelectedProcessIdentity[], reorderedBindings = false, sourceId = 'fixture-source') {
   const fixture = await bindingFixture();
   const directory = fixture.descriptor.dataDirectory;
   await mkdir(directory, { recursive: true });
@@ -442,7 +467,7 @@ async function predecessorObservationFixture(selected: readonly SelectedProcessI
   const shapes = [{ threadId: '01a07930-dbba-77c2-8910-17bd61638e6f', status: 'idle', count: 1 },
     { threadId: '01a06325-d3d0-7052-b495-371fcb7a2887', status: 'running', count: 2 }];
   for (const shape of shapes) {
-    const binding = store.ensureBinding({ hostId: 'local', sourceId: 'fixture-source', threadId: shape.threadId,
+    const binding = store.ensureBinding({ hostId: 'local', sourceId, threadId: shape.threadId,
       title: 'Synthetic Publishing shape', workspace: directory, updatedAt: 1 });
     store.setValue(`task-details:${binding.id}`, { status: shape.status });
     store.setValue(`execution-lifecycle:${binding.id}`, { state: 'blocked', generation: 17 });
@@ -463,15 +488,15 @@ async function predecessorObservationFixture(selected: readonly SelectedProcessI
   store.finishInput(originalInputId, true);
   store.saveInputBatch({ id: 'original-batch', peerId: savedInput.peerId, parts: [savedInput], state: 'collecting', startedAt: 1, updatedAt: 1 });
   const snapshot = { version: 1, fenceId: 'fixture-selected-predecessor', createdAt: 1, dataDirectory: directory,
-    recoveryPolicy: 'reconcile-only', legacySourceIds: ['fixture-source'],
+    recoveryPolicy: 'reconcile-only', legacySourceIds: [sourceId],
     bindings: store.bindings().map(binding => reorderedBindings
       ? { generation: store.streamGeneration(binding.id), threadId: binding.threadId, sourceId: binding.sourceId ?? '', hostId: binding.hostId, bindingId: binding.id }
       : { bindingId: binding.id, hostId: binding.hostId, threadId: binding.threadId, sourceId: binding.sourceId ?? '', generation: store.streamGeneration(binding.id) }),
     processes: selected.map((identity, index) => ({ role: index === 0 ? 'bridge' : 'legacy-backend', pid: identity.pid,
-      birthTicks: identity.birthTicks, imagePath: identity.imagePath, ...(index === 0 ? {} : { sourceId: 'fixture-source' }) })) };
+      birthTicks: identity.birthTicks, imagePath: identity.imagePath, ...(index === 0 ? {} : { sourceId }) })) };
   const bytes = JSON.stringify(snapshot);
   await writeFile(path.join(directory, 'predecessor-maintenance.json'), bytes);
-  const request: PredecessorExitObservationRequest = { dataDirectory: directory, legacySourceIds: ['fixture-source'],
+  const request: PredecessorExitObservationRequest = { dataDirectory: directory, legacySourceIds: [sourceId],
     snapshotSha256: digest(bytes), selected, launchBindingPath: fixture.bindingPath, launchBindingSha256: fixture.bindingSha256,
     configurationSha256: digest(await readFile(path.join(fixture.configurationRoot, '.env'))), deadlineMs: 40_000 };
   const admission = await loadPredecessorMaintenance(store, directory, request.legacySourceIds, request.snapshotSha256);
@@ -482,6 +507,185 @@ async function predecessorObservationFixture(selected: readonly SelectedProcessI
       lifecycle: store.getValue(`execution-lifecycle:${binding.id}`), managed: store.managedOwner(binding) })) });
   return { fixture, store, request, admission, debt };
 }
+
+test('concrete cutover protocol unit boundary durably grants before actions, preserves both Publishing debts, and never replays an unknown step',
+  { skip: process.platform !== 'win32', timeout: 30_000 }, async () => {
+    // Mocked Windows boundary only. The SQLite snapshots/debts here are real;
+    // no Task COM setter, OS signal, original chat or native backend is invoked.
+    const imagePath = await realpath(process.execPath); const imageSha256 = digest(await readFile(imagePath));
+    const identities = Array.from({ length: 5 }, (_, index) => ({ pid: 991110 + index,
+      birthTicks: String(639100000000000000n + BigInt(index)), imagePath, imageSha256 }));
+    const originalSpawn = childProcess.spawn;
+    let mode: 'complete' | 'legacy-default-source' | 'lost-first-ack' | 'changed-config' | 'caller-pin-mutated' | 'malformed-snapshot' = 'complete';
+    let spawns = 0; let journal = ''; let configurationFile = '';
+    childProcess.spawn = ((_: string, __: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+      spawns++;
+      const bytes = Buffer.from(options.env!.VKODEX_CUTOVER_SCOPE!, 'base64');
+      const scope = JSON.parse(bytes.toString()) as { challenge: string; mode: string; processes: {
+        pid: number; birthTicks: string; role: string }[] };
+      assert.equal(scope.mode, 'stop');
+      const scopeSha256 = digest(bytes);
+      const child = new EventEmitter() as ReturnType<typeof spawn>;
+      const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+      Object.assign(child, { stdin, stdout, stderr, exitCode: null, signalCode: null, killed: false, pid: 991999 });
+      const end = (code: number) => {
+        if (child.exitCode !== null) return;
+        stdout.end(); stderr.end(); Object.assign(child, { exitCode: code });
+        child.emit('exit', code, null); child.emit('close', code, null);
+      };
+      child.kill = (() => { end(87); return true; }) as typeof child.kill;
+      const send = (row: Record<string, unknown>) => stdout.write(JSON.stringify({ ...row, challenge: scope.challenge, scopeSha256 }) + '\n');
+      const roles = ['supervisor', 'watchdog', 'wrapper', 'bridge', 'backend'];
+      const ordered = roles.flatMap(role => scope.processes.filter(p => p.role === role));
+      let sequence = 0;
+      stdin.on('data', (chunk: Buffer) => {
+        const action = sequence === 0 ? 'disable-task' : sequence <= ordered.length ? `stop-${ordered[sequence - 1]!.pid}` : 'final-check';
+        assert.equal(chunk.toString(), `${scope.challenge}:${sequence}:${action}\n`);
+        const grant = JSON.parse(readFileSync(path.join(journal, `${String(sequence).padStart(3, '0')}-grant.json`), 'utf8'));
+        assert.equal(grant.action, action); assert.equal(grant.outcome, 'unknown-until-ack', 'grant is fsynced before the helper receives it');
+        if (mode === 'lost-first-ack') { setImmediate(() => end(87)); return; }
+        if (action === 'final-check') {
+          assert.equal(JSON.parse(readFileSync(path.join(journal, 'committed-snapshot.json'), 'utf8')).kind, 'committed-predecessor-snapshot');
+          send({ kind: 'verified', sequence }); setImmediate(() => end(0)); return;
+        }
+        const p = ordered[sequence - 1];
+        send({ kind: 'step', sequence, action, ...(p ? { pid: p.pid, birthTicks: p.birthTicks, exitTicks: String(BigInt(p.birthTicks) + 1000n) } : {}) });
+        sequence++;
+        if (sequence === ordered.length + 1) send({ kind: 'stopped', sequence });
+      });
+      setImmediate(() => {
+        if (mode === 'changed-config') writeFileSync(configurationFile, 'fixture-mutated-after-capture=1');
+        send({ kind: 'ready', processCount: scope.processes.length });
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    try {
+      for (const requestedMode of ['malformed-snapshot', 'complete', 'legacy-default-source', 'caller-pin-mutated', 'changed-config', 'lost-first-ack'] as const) {
+        mode = requestedMode;
+        const s = await predecessorObservationFixture(identities, false, mode === 'legacy-default-source' ? '' : 'fixture-source');
+        try {
+          const before = s.debt();
+          const root = path.dirname(s.fixture.descriptorPath); const privateJournalDirectory = path.join(root, 'private cutover journal');
+          configurationFile = path.join(s.fixture.configurationRoot, '.env');
+          await mkdir(privateJournalDirectory);
+          const actionProcesses = [{ ...identities[0]!, role: 'bridge', parentPid: identities[3]!.pid },
+            { ...identities[1]!, role: 'backend', parentPid: identities[0]!.pid },
+            { ...identities[2]!, role: 'wrapper', parentPid: 4567 },
+            { ...identities[3]!, role: 'supervisor', parentPid: identities[2]!.pid },
+            { ...identities[4]!, role: 'watchdog', parentPid: identities[3]!.pid }];
+          const operationId = randomUUID(); journal = path.join(privateJournalDirectory, operationId);
+          const snapshotFile = path.join(s.request.dataDirectory, 'predecessor-maintenance.json');
+          const snapshot = JSON.parse(await readFile(snapshotFile, 'utf8'));
+          snapshot.processes = actionProcesses.map(p => ({ role: p.role === 'bridge' ? 'bridge' : p.role === 'backend' ? 'legacy-backend' : 'restart-loop',
+            pid: p.pid, birthTicks: p.birthTicks, imagePath: p.imagePath, ...(p.role === 'backend' ? { sourceId: s.request.legacySourceIds[0] } : {}) }));
+          if (mode === 'malformed-snapshot') snapshot.bindings = null;
+          const snapshotText = JSON.stringify(snapshot); await writeFile(snapshotFile, snapshotText);
+          const request = { version: 1, operationId, dataDirectory: s.request.dataDirectory,
+            legacyRoot: s.fixture.configurationRoot, privateJournalDirectory, expectedFileIdentity: s.store.databaseFileIdentity,
+            legacySourceIds: s.request.legacySourceIds, snapshotSha256: digest(snapshotText),
+            launchBindingPath: s.request.launchBindingPath, launchBindingSha256: s.request.launchBindingSha256,
+            configurationSha256: s.request.configurationSha256, deadlineMs: 10_000,
+            task: { path: '\\Synthetic-VKodex-Controller', definitionSha256: 'b'.repeat(64),
+              instances: [{ instanceGuid: '{00000000-0000-0000-0000-000000000001}', enginePid: identities[2]!.pid }] }, processes: actionProcesses };
+          const requestPath = path.join(root, 'cutover request.json'); const requestText = JSON.stringify(request); await writeFile(requestPath, requestText);
+          const invocation = { requestPath, requestSha256: digest(requestText), operatorApproval: 'stop-selected-legacy-runtime-no-replay' };
+          if (mode === 'malformed-snapshot') {
+            const count = spawns; await assert.rejects(stopPinnedPredecessor(invocation));
+            assert.equal(spawns, count, 'a pinned but malformed historical snapshot is refused before capture or irreversible actions');
+            assert.deepEqual(s.debt(), before); continue;
+          }
+          const pendingStop = stopPinnedPredecessor(invocation);
+          if (mode === 'caller-pin-mutated') invocation.requestSha256 = '0'.repeat(64);
+          const result = await pendingStop;
+          assert.deepEqual(s.debt(), before, 'neither the idle MS nor running Android ACK/unknown/batch debt is settled');
+          if (mode === 'complete' || mode === 'legacy-default-source' || mode === 'caller-pin-mutated') {
+            assert.equal(result.kind, 'known-predecessor-stopped'); assert.equal(isVerifiedKnownPredecessorStop(result), true);
+            assert.equal(isVerifiedKnownPredecessorStop(JSON.parse(JSON.stringify(result))), false);
+            if (result.kind === 'known-predecessor-stopped') {
+              assert.equal(result.exits.length, 5); assert.equal(result.finalSnapshot.bindingVector.length, 2);
+              assert.deepEqual(result.finalSnapshot.bindingVector.map(binding => binding.sourceId),
+                [s.request.legacySourceIds[0], s.request.legacySourceIds[0]]);
+              assert.equal(result.finalSnapshot.backupSha256, digest(await readFile(result.finalSnapshot.backupPath)));
+            }
+          } else {
+            assert.deepEqual(result, { kind: 'unknown', operationId });
+            assert.equal(isVerifiedKnownPredecessorStop(result), false);
+            const count = spawns;
+            await assert.rejects(stopPinnedPredecessor(invocation));
+            assert.equal(spawns, count, 'a durable unknown grant never recreates a controller or replays the step');
+            assert.deepEqual((await readdir(journal)).sort(), mode === 'lost-first-ack'
+              ? ['000-grant.json', 'action-scope.json'] : ['action-scope.json'], 'changed pins suppress even the first mutating grant');
+          }
+        } finally { s.store.close(); }
+      }
+    } finally { childProcess.spawn = originalSpawn; syncBuiltinESMExports(); }
+  });
+
+test('persisted predecessor quarantine restores degraded after passive generation drift while action checks stay strict', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  const databasePath = path.join(s.request.dataDirectory, 'vkodex.sqlite');
+  const debt = (store: BridgeStore) => ({ gate: store.getValue('startup-predecessor-fence'), batches: store.inputBatches(),
+    input: store.inputState(JSON.stringify([23456, 'original-unknown-input'])),
+    bindings: store.bindings().map(binding => ({ id: binding.id, queue: store.queuedInputs(binding.id), turns: store.acceptedTurns(binding.id),
+      lifecycle: store.getValue(`execution-lifecycle:${binding.id}`), managed: store.managedOwner(binding) })) });
+  const before = debt(s.store);
+  s.store.close();
+  let reopened: BridgeStore | undefined;
+  try {
+    reopened = new BridgeStore(databasePath);
+    const bindingId = reopened.bindings()[0]!.id;
+    reopened.stopStreaming(bindingId); // ordinary passive stream closure advances this binding generation
+    const afterPassiveDrift = debt(reopened);
+    assert.deepEqual(afterPassiveDrift, before, 'passive generation drift must not settle or rewrite predecessor debt');
+
+    const restored = await loadPredecessorMaintenance(reopened, s.request.dataDirectory, s.request.legacySourceIds);
+    assert.deepEqual(restored, s.admission,
+      'an exact persisted physical store pin restores the source-wide no-execution quarantine after passive binding drift');
+    assert.deepEqual(predecessorMaintenanceRestorationSummary(reopened, restored!), { state: "binding-scope-changed" });
+
+    const bytes = await readFile(path.join(s.request.dataDirectory, 'predecessor-maintenance.json'));
+    const snapshot = JSON.parse(bytes.toString('utf8')) as unknown;
+    assert.throws(() => validatePredecessorMaintenance(snapshot, reopened!, s.request.dataDirectory,
+      s.request.legacySourceIds, s.request.snapshotSha256), /snapshot refused/u,
+    'the original action authority remains pinned to its pre-drift binding vector');
+    let controllerCalls = 0;
+    await assert.rejects(observeMaintenancePredecessorExits(reopened, s.request, () => { controllerCalls++; }));
+    assert.equal(controllerCalls, 0, 'restoration is not a controller ticket or action authorization');
+    await assert.rejects(loadPredecessorMaintenance(reopened, s.request.dataDirectory, ["wrong-source"]), /snapshot refused/u);
+    assert.deepEqual(debt(reopened), before, 'restoration and rejected action qualification preserve debts');
+
+    const wrongStore = new BridgeStore(path.join(s.request.dataDirectory, "other.sqlite"));
+    try {
+      wrongStore.setValue("startup-predecessor-fence", reopened.getValue("startup-predecessor-fence"));
+      wrongStore.setValue("startup-predecessor-store-scope", reopened.getValue("startup-predecessor-store-scope"));
+      await assert.rejects(loadPredecessorMaintenance(wrongStore, s.request.dataDirectory, s.request.legacySourceIds), /snapshot refused/u);
+      assert.deepEqual(wrongStore.getValue("startup-predecessor-fence"), s.admission,
+        'a copied fence cannot restore quarantine from another physical store');
+    } finally { wrongStore.close(); }
+
+    reopened.setValue("startup-predecessor-store-scope", null);
+    assert.deepEqual(predecessorMaintenanceRestorationSummary(reopened, restored!), { state: "unavailable" });
+    await assert.rejects(loadPredecessorMaintenance(reopened, s.request.dataDirectory, s.request.legacySourceIds), /snapshot refused/u);
+    assert.deepEqual(reopened.getValue("startup-predecessor-fence"), s.admission,
+      "missing physical scope pin cannot clear or broaden the existing quarantine");
+  } finally {
+    reopened?.close();
+  }
+});
+
+test('corrupted predecessor restoration diagnostic is unavailable rather than normalized to unchanged', async () => {
+  const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
+    { pid: 1235, birthTicks: '639100000000000001', imagePath: process.execPath, imageSha256: 'a'.repeat(64) }];
+  const s = await predecessorObservationFixture(selected);
+  try {
+    const prior = s.store.getValue<Record<string, unknown>>('startup-predecessor-restoration-diagnostic');
+    s.store.setValue('startup-predecessor-restoration-diagnostic', { ...prior, state: ['bindingScopeChanged'] });
+    assert.deepEqual(predecessorMaintenanceRestorationSummary(s.store, s.admission), { state: 'unavailable' });
+  } finally { s.store.close(); }
+});
 
 test('predecessor coordination checks independent pins and complete inventory before a controller receives a ticket', async () => {
   const selected = [{ pid: 1234, birthTicks: '639100000000000000', imagePath: process.execPath, imageSha256: 'a'.repeat(64) },
