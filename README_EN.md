@@ -592,6 +592,16 @@ Keep the descriptor outside Git and the artifact. Version 1 accepts exactly `ver
 
 This validates inventory and declared metadata, not runtime executability, build provenance from the stated commit, or Desktop readiness. The internal plan retains the original cwd, absolute `BOT_DATA_DIR`, and explicitly empty `NODE_OPTIONS`/`NODE_PATH`. The validator does not execute the plan, copy a runtime, create directories, open a database, or modify Scheduled Tasks. C#/PowerShell/bridge integration is not implemented yet; existing launch/install commands do not consume the descriptor. A future launcher must revalidate it. `service:install -NoStart` is not safe validation: the existing installer still stops the previous service.
 
+### Pinned launch planning without installation
+
+The trusted build also contains the `deployment-binding` library and a separate internal `deployment-plan-private` CLI. They only validate files and return data; C#/PowerShell, the installer, and the live service do not consume this path yet. A plan does not release a chat writer or establish Desktop recovery.
+
+Launch-binding v1 accepts exactly `version`, `descriptorPath`, `descriptorSha256`, `bootstrapRoot`, `bootstrapManifestSha256`, `stableRuntimePath`, and `stableRuntimeSha256`. The internal CLI accepts only `--launch-binding <absolute file> --launch-binding-sha256 <independent SHA-256>`. The bootstrap manifest has `version`, `protocol: "deployment-plan-v1"`, and `files`, with a fixed complete inventory of validator modules, ESM metadata, launcher, and supervisor/watchdog. These files are checked as data, never executed. Configuration may contain the data directory; bootstrap and artifact code must be outside both. Keep bindings/manifests and configuration outside Git.
+
+The plan selects the independently pinned `stableRuntimePath`, retaining the existing runtime path for future routing rules. Its digest must match both its independent pin and the verified artifact runtime inventory. A mismatch refuses without copying, repair, or a fallback runtime. Checks repeat after reading the artifact. The immutable result says `validated_not_launched`; `planDeploymentAction` only returns proposed arguments, without installation.
+
+The internal CLI prints one bounded JSON record containing necessary local paths, not a public log. It does not read `.env` contents. Its running Node and code must already be trusted: validating the bundle after startup cannot authenticate that startup or undo previously executed `NODE_OPTIONS`. A future parent must verify code/runtime and clear the startup environment before invoking the CLI, then revalidate immediately before acting. This slice does not qualify executable ABI, network access, process exclusivity, or safe live cutover.
+
 ### Updating the source
 
 1. Stop VKodex normally during an agreed maintenance window. Stopping the bridge may interrupt turns in its owned backends; a snapshot and `reconcile-only` do not guarantee preservation. Desktop and VS Code do not separately need to be stopped.

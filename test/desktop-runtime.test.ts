@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createHash } from "node:crypto";
+import { promises as fsPromises } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { compatibleRuntime, launchArguments, windowsRuntimePath } from "../src/desktop/runtime.js";
 import { boundedArtifactBytes, deploymentDataDirectory, deploymentValidationArguments, validateDeploymentArtifact } from "../src/desktop/deployment-artifact.js";
+import { BOOTSTRAP_FILES, deploymentBindingArguments, planDeploymentAction, validateDeploymentBinding } from "../src/desktop/deployment-binding.js";
 
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
@@ -346,4 +349,195 @@ test("positive fixtures canonicalize aliased temporary roots while production st
   assert.equal(plan.cwd.startsWith(target + path.sep), true);
   const aliasedDescriptor = fixture.descriptorPath.replace(target, alias);
   await assert.rejects(validateDeploymentArtifact(aliasedDescriptor, fixture.expectedSha256), /linked or aliased/u);
+});
+
+async function bindingFixture() {
+  const artifact = await artifactFixture();
+  const root = path.dirname(artifact.descriptorPath);
+  const bootstrapRoot = path.join(root, "trusted bootstrap");
+  const stableRuntimePath = path.join(root, "stable runtime", process.platform === "win32" ? "VKodex.exe" : "node");
+  await mkdir(path.dirname(stableRuntimePath));
+  await writeFile(stableRuntimePath, await readFile(path.join(artifact.artifactRoot, artifact.runtimeRelative)));
+  const files: Record<string, { size: number; sha256: string }> = {};
+  for (const relative of BOOTSTRAP_FILES) {
+    const bytes = relative === "package.json" ? JSON.stringify({ type: "module" }) : `not-executable-bootstrap-fixture:${relative}`;
+    const file = path.join(bootstrapRoot, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, bytes);
+    files[relative] = { size: Buffer.byteLength(bytes), sha256: digest(bytes) };
+  }
+  const manifest = { version: 1, protocol: "deployment-plan-v1", files };
+  const binding = { version: 1, descriptorPath: artifact.descriptorPath, descriptorSha256: artifact.expectedSha256,
+    bootstrapRoot, bootstrapManifestSha256: "", stableRuntimePath, stableRuntimeSha256: digest(await readFile(stableRuntimePath)) };
+  const bindingPath = path.join(root, "launch binding.json");
+  const repin = async () => {
+    const text = JSON.stringify(manifest);
+    await writeFile(path.join(bootstrapRoot, "bootstrap-manifest.json"), text);
+    binding.bootstrapManifestSha256 = digest(text);
+    const bindingText = JSON.stringify(binding);
+    await writeFile(bindingPath, bindingText);
+    return digest(bindingText);
+  };
+  return { ...artifact, bootstrapRoot, stableRuntimePath, bindingPath, binding, manifest, repinBinding: repin, bindingSha256: await repin() };
+}
+
+test("versioned binding keeps stable runtime path and fixed bootstrap separate from artifact and original nested data", async () => {
+  const fixture = await bindingFixture();
+  const plan = await validateDeploymentBinding(fixture.bindingPath, fixture.bindingSha256);
+  assert.equal(plan.executable, fixture.stableRuntimePath);
+  assert.notEqual(plan.executable, path.join(fixture.artifactRoot, fixture.runtimeRelative));
+  assert.equal(plan.runtimeSha256, fixture.binding.stableRuntimeSha256);
+  assert.equal(plan.bindingSha256, fixture.bindingSha256);
+  assert.equal(plan.bootstrapManifestSha256, fixture.binding.bootstrapManifestSha256);
+  assert.equal(plan.descriptorSha256, fixture.expectedSha256);
+  assert.equal(plan.cwd, fixture.configurationRoot);
+  assert.equal(plan.dataDirectory, fixture.descriptor.dataDirectory);
+  assert.equal(plan.launcherPath, path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"));
+  assert.equal(plan.supervisorPath, path.join(fixture.bootstrapRoot, "scripts/run-windows-supervisor.ps1"));
+  assert.equal(plan.watchdogPath, path.join(fixture.bootstrapRoot, "scripts/watch-windows-bridge.ps1"));
+  assert.equal(plan.protocol, "deployment-plan-v1");
+  assert.equal(plan.status, "validated_not_launched");
+  assert.deepEqual(plan.arguments, [`--env-file=${plan.environmentFile}`, plan.entryPoint]);
+  assert.deepEqual(plan.environmentOverrides, { BOT_DATA_DIR: plan.dataDirectory, NODE_OPTIONS: "", NODE_PATH: "" });
+  assert.equal(Object.isFrozen(plan), true);
+  assert.equal(Object.isFrozen(plan.arguments), true);
+  assert.equal(Object.isFrozen(plan.environmentOverrides), true);
+  assert.doesNotMatch(JSON.stringify(plan), /SECRET_FIXTURE|do-not-print/u);
+  assert.deepEqual(await readdir(fixture.configurationRoot), [".env"]);
+});
+
+test("offline action planning emits fixed pinned arguments without launching or installing the fixture", async () => {
+  const fixture = await bindingFixture();
+  const action = await planDeploymentAction(fixture.bindingPath, fixture.bindingSha256);
+  assert.deepEqual(action, { status: "proposed_action_not_installed", executable: path.join(fixture.bootstrapRoot, "launcher/VKodexSupervisor.exe"),
+    cwd: fixture.configurationRoot, arguments: ["--launch-binding", fixture.bindingPath, "--launch-binding-sha256", fixture.bindingSha256] });
+  assert.equal(Object.isFrozen(action), true);
+  assert.equal(Object.isFrozen(action.arguments), true);
+  assert.deepEqual(await readdir(fixture.configurationRoot), [".env"]);
+});
+
+test("binding CLI argument contract accepts exactly the independent binding pin", () => {
+  const file = path.join(artifactFixtures, "binding with spaces.json");
+  assert.deepEqual(deploymentBindingArguments(["--launch-binding", file, "--launch-binding-sha256", "a".repeat(64)]),
+    { bindingPath: file, expectedSha256: "a".repeat(64) });
+  for (const args of [[], [file, "a".repeat(64)], ["--launch-binding", file, "--launch-binding-sha256", "bad"],
+    ["--launch-binding", file, "--launch-binding-sha256", "a".repeat(64), "--inspect"]]) {
+    assert.throws(() => deploymentBindingArguments(args));
+  }
+});
+
+test("binding pins reject changed binding, bootstrap or stable runtime without repair or fallback", async () => {
+  const fixture = await bindingFixture();
+  await assert.rejects(validateDeploymentBinding(fixture.bindingPath, "0".repeat(64)));
+  await writeFile(path.join(fixture.bootstrapRoot, "scripts/run-windows-supervisor.ps1"), "substitute-script");
+  await assert.rejects(validateDeploymentBinding(fixture.bindingPath, fixture.bindingSha256));
+  const runtime = await bindingFixture();
+  await writeFile(runtime.stableRuntimePath, "different-runtime");
+  await assert.rejects(validateDeploymentBinding(runtime.bindingPath, runtime.bindingSha256));
+  assert.equal(await readFile(runtime.stableRuntimePath, "utf8"), "different-runtime");
+});
+
+test("individually pinned stable runtime must also match the validated artifact inventory", async () => {
+  const fixture = await bindingFixture();
+  await writeFile(fixture.stableRuntimePath, "independently-pinned-but-different");
+  fixture.binding.stableRuntimeSha256 = digest("independently-pinned-but-different");
+  await assert.rejects(validateDeploymentBinding(fixture.bindingPath, await fixture.repinBinding()));
+});
+
+test("bootstrap requires fixed complete inventory and ESM package metadata, no extras or dependency shadows", async () => {
+  for (const defect of ["missing", "extra", "unlisted", "package-type", "protocol", "case-shadow", "empty-directory"]) {
+    const fixture = await bindingFixture();
+    if (defect === "missing") delete fixture.manifest.files["launcher/VKodexSupervisor.exe"];
+    else if (defect === "protocol") fixture.manifest.protocol = "other-protocol";
+    else if (defect === "empty-directory") await mkdir(path.join(fixture.bootstrapRoot, "unlisted directory"));
+    else {
+      const relative = defect === "package-type" ? "package.json" : defect === "case-shadow" ? "dist/Node_Modules/shadow.js" : "extra.js";
+      const bytes = defect === "package-type" ? JSON.stringify({ type: "commonjs" }) : "must-not-execute";
+      await mkdir(path.dirname(path.join(fixture.bootstrapRoot, relative)), { recursive: true });
+      await writeFile(path.join(fixture.bootstrapRoot, relative), bytes);
+      if (defect !== "unlisted") fixture.manifest.files[relative] = { size: Buffer.byteLength(bytes), sha256: digest(bytes) };
+    }
+    await assert.rejects(validateDeploymentBinding(fixture.bindingPath, await fixture.repinBinding()), defect);
+  }
+});
+
+test("binding rejects duplicate/unknown JSON fields and malformed UTF-8 despite matching hash", async () => {
+  const fixture = await bindingFixture();
+  const text = JSON.stringify(fixture.binding);
+  for (const bytes of [Buffer.from(`{"version":0,${text.slice(1)}`), Buffer.from(`${text.slice(0, -1)},"nodeOptions":"--inspect"}`),
+    Buffer.concat([Buffer.from('{"ignored":"'), Buffer.from([0xff]), Buffer.from('"}')])]) {
+    await writeFile(fixture.bindingPath, bytes);
+    await assert.rejects(validateDeploymentBinding(fixture.bindingPath, digest(bytes)));
+  }
+});
+
+test("bootstrap and runtime aliases are refused rather than inferred from environment", async () => {
+  const fixture = await bindingFixture();
+  const alias = path.join(path.dirname(fixture.bindingPath), "bootstrap alias");
+  await symlink(fixture.bootstrapRoot, alias, process.platform === "win32" ? "junction" : "dir");
+  fixture.binding.bootstrapRoot = alias;
+  await assert.rejects(validateDeploymentBinding(fixture.bindingPath, await fixture.repinBinding()));
+  const runtime = await bindingFixture();
+  const linked = path.join(path.dirname(runtime.stableRuntimePath), "linked runtime");
+  await link(runtime.stableRuntimePath, linked);
+  runtime.binding.stableRuntimePath = linked;
+  await assert.rejects(validateDeploymentBinding(runtime.bindingPath, await runtime.repinBinding()));
+});
+
+test("binding final fences catch runtime, binding and bootstrap replacement during awaited artifact reads", async (context) => {
+  for (const target of ["runtime", "binding", "bootstrap"]) {
+    const fixture = await bindingFixture();
+    const originalLstat = fsPromises.lstat;
+    let changed = false;
+    // Test-only interception of the builtin, not a production validation bypass
+    // or sleep-based race. Restore ESM exports before any later test executes.
+    context.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof originalLstat>) => {
+      if (!changed && String(args[0]) === path.join(fixture.artifactRoot, "dist/src/desktop-main.js")) {
+        changed = true;
+        const file = target === "runtime" ? fixture.stableRuntimePath : target === "binding" ? fixture.bindingPath :
+          path.join(fixture.bootstrapRoot, "scripts/run-windows-supervisor.ps1");
+        await writeFile(file, "changed-during-artifact-observation");
+      }
+      return Reflect.apply(originalLstat, fsPromises, args);
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(validateDeploymentBinding(fixture.bindingPath, fixture.bindingSha256), target);
+      assert.equal(changed, true);
+    } finally {
+      context.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test("private plan CLI emits one bounded record while public CLI remains identity-only", async () => {
+  const fixture = await bindingFixture();
+  const privateEntry = fileURLToPath(new URL("../src/desktop/deployment-plan-private.ts", import.meta.url));
+  const args = ["--import", "tsx", privateEntry, "--launch-binding", fixture.bindingPath, "--launch-binding-sha256", fixture.bindingSha256];
+  const privateResult = await promisify(execFile)(process.execPath, args, { windowsHide: true, maxBuffer: 32 * 1024 });
+  const lines = privateResult.stdout.trim().split(/\r?\n/u);
+  assert.equal(lines.length, 1);
+  assert.equal(privateResult.stderr, "");
+  assert.equal(Buffer.byteLength(privateResult.stdout) <= 16 * 1024, true);
+  const plan = JSON.parse(lines[0]!) as Record<string, unknown>;
+  assert.equal(plan.status, "validated_not_launched");
+  assert.equal(plan.executable, fixture.stableRuntimePath);
+  assert.equal(plan.bindingSha256, fixture.bindingSha256);
+  assert.doesNotMatch(privateResult.stdout, /SECRET_FIXTURE|do-not-print/u);
+  for (const extra of [[], ["--inspect"], ["--plan-only"]]) {
+    const wrong = extra.length ? [...args, ...extra] : args.slice(0, -2);
+    await assert.rejects(promisify(execFile)(process.execPath, wrong, { windowsHide: true, maxBuffer: 32 * 1024 }), (error: unknown) => {
+      const failure = error as { stdout: string; stderr: string };
+      assert.equal(failure.stdout, "");
+      assert.doesNotMatch(failure.stderr, /SECRET_FIXTURE|do-not-print|launch with spaces/u);
+      return true;
+    });
+  }
+  const publicEntry = fileURLToPath(new URL("../src/desktop/deployment-artifact-check.ts", import.meta.url));
+  const publicResult = await promisify(execFile)(process.execPath, ["--import", "tsx", publicEntry, "--descriptor", fixture.descriptorPath,
+    "--sha256", fixture.expectedSha256], { windowsHide: true, maxBuffer: 32 * 1024 });
+  assert.deepEqual(Object.keys(JSON.parse(publicResult.stdout) as Record<string, unknown>).sort(),
+    ["status", "descriptorSha256", "manifestSha256", "sourceCommit", "sourceTree"].sort());
+  await assert.rejects(promisify(execFile)(process.execPath, ["--import", "tsx", publicEntry, ...args.slice(3)], { windowsHide: true }));
 });
