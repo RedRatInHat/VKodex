@@ -18,6 +18,7 @@ export interface VersionedDeploymentPlan extends DeploymentLaunchPlan {
   readonly bootstrapManifestSha256: string;
   readonly runtimeSha256: string;
   readonly launcherPath: string;
+  readonly launcherSha256: string;
   readonly supervisorPath: string;
   readonly watchdogPath: string;
 }
@@ -93,6 +94,7 @@ export async function validateDeploymentBinding(bindingPath: string, expectedSha
     return Object.freeze({ ...artifact, executable: stableRuntimePath, version: 1, status: "validated_not_launched", protocol: "deployment-plan-v1", bindingPath,
       bindingSha256: expectedSha256, bootstrapManifestSha256, runtimeSha256,
       launcherPath: path.join(bootstrapRoot, "launcher/VKodexSupervisor.exe"),
+      launcherSha256: inventory.get("launcher/VKodexSupervisor.exe")!.sha256,
       supervisorPath: path.join(bootstrapRoot, "scripts/run-windows-supervisor.ps1"),
       watchdogPath: path.join(bootstrapRoot, "scripts/watch-windows-bridge.ps1") });
   } catch (error) {
@@ -104,5 +106,5 @@ export async function validateDeploymentBinding(bindingPath: string, expectedSha
 export async function planDeploymentAction(bindingPath: string, expectedSha256: string) {
   const plan = await validateDeploymentBinding(bindingPath, expectedSha256);
   return Object.freeze({ status: "proposed_action_not_installed", executable: plan.launcherPath, cwd: plan.cwd,
-    arguments: Object.freeze(["--launch-binding", plan.bindingPath, "--launch-binding-sha256", plan.bindingSha256]) });
+    arguments: Object.freeze(["--launch-binding", plan.bindingPath, "--launch-binding-sha256", plan.bindingSha256, "--operation", "supervise"]) });
 }
