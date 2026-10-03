@@ -101,7 +101,7 @@ async function canonical(file: string, kind: "file" | "directory" | "future-dire
   }
 }
 
-function uniqueJson(text: string): unknown {
+export function uniqueJson(text: string): unknown {
   let value: unknown;
   try { value = JSON.parse(text); } catch { refuse("invalid JSON metadata"); }
   // JSON.parse accepts duplicate keys. Scan the already grammar-validated text

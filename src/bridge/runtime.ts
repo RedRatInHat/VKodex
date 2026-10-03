@@ -20,6 +20,9 @@ import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 import { MutableQueuedInputTurnError, QueueHistoryReadError } from "../desktop/input-reconciliation.js";
 
 export interface BridgeRuntimeAdapters {
+  /** Trusted startup gate, installed before any command callback. No unlock API. */
+  readonly startupAdmission?: Readonly<{ readonly kind: "predecessor-maintenance"; readonly fenceId: string;
+    readonly snapshotSha256: string }>;
   readonly states: TaskStateTransport;
   /** Background observation only; no execution resume or writer acquisition. */
   readonly passiveStates?: TaskStateTransport;
@@ -131,6 +134,7 @@ export class BridgeRuntime {
   private readonly passiveStates: TaskStateTransport | undefined;
   private readonly inspectExternalOwner: BridgeRuntimeAdapters["inspectExternalOwner"];
   private readonly inspectManagedRestartTurn: BridgeRuntimeAdapters["inspectManagedRestartTurn"];
+  private readonly startupAdmission: BridgeRuntimeAdapters["startupAdmission"];
 
   constructor(private readonly access: OwnerAccess, private readonly desktop: CodexTasks, chat: BridgeChat, private readonly store: BridgeStore,
     adapters: BridgeRuntimeAdapters, private readonly now: () => number = Date.now, fileRoot?: string,
@@ -138,9 +142,10 @@ export class BridgeRuntime {
     private readonly healthCheckOverride?: (force: boolean) => Promise<BridgeHealthSnapshot>, projectlessRoot?: string,
     inboundFileLimits?: InboundFileLimits, private readonly stagedFilePilot: StagedFilePilot = STAGED_FILE_PILOT_DISABLED) {
     store.assertOwner(access.ownerId, access.groupId);
+    this.startupAdmission = adapters.startupAdmission && Object.freeze({ ...adapters.startupAdmission });
     // Controls (model/goal/rename/stop/archive) bypass prompt preparation.
     // Restore the exact owner's fence before installing ANY command callback.
-    for (const binding of store.bindings()) {
+    if (!this.startupAdmission) for (const binding of store.bindings()) {
       const lifecycle = this.executionLifecycle(binding);
       if (!lifecycle || lifecycle.state === "blocked" || !desktop.restoreExecutionDrain
         || desktop.executionDrainSupported?.(binding) === false) continue;
@@ -155,8 +160,17 @@ export class BridgeRuntime {
     });
     this.observeTaskState = adapters.observe;
     this.historyRecovery = adapters.history;
-    this.passiveStates = adapters.passiveStates ?? (adapters.states.readOnly === true ? adapters.states : undefined);
-    if (this.passiveStates && this.passiveStates.readOnly !== true) throw new Error("Background observation transport is not read-only");
+    const passive = adapters.passiveStates ?? (adapters.states.readOnly === true ? adapters.states : undefined);
+    if (passive && passive.readOnly !== true) throw new Error("Background observation transport is not read-only");
+    this.passiveStates = passive && this.startupAdmission ? {
+      readOnly: true,
+      subscribe: (task, onState, onError) => {
+        const stream = passive.subscribe(task, onState, onError);
+        if (stream.readOnly !== true) { stream.close(); throw new DesktopUnavailableError("Пассивный поток не подтверждён как read-only."); }
+        return stream;
+      },
+      close: () => passive.close(),
+    } : passive;
     this.inspectExternalOwner = adapters.inspectExternalOwner;
     this.inspectManagedRestartTurn = adapters.inspectManagedRestartTurn;
     for (const binding of store.bindings()) this.observedTasks.set(binding.id, binding);
@@ -168,7 +182,7 @@ export class BridgeRuntime {
       binding => this.releaseForExternalClient(binding), undefined, binding => this.prepareTaskInput(binding));
     this.mirror = new TaskMirror(store, 3_500, now);
     this.activity = new TaskActivity(store, now);
-    this.unsubscribeCreation = desktop.onCreationUpdate?.(update => this.acceptCreation(update)) ?? null;
+    if (!this.startupAdmission) this.unsubscribeCreation = desktop.onCreationUpdate?.(update => this.acceptCreation(update)) ?? null;
   }
 
   private acceptCreation(update: TaskCreationUpdate): void {
@@ -201,6 +215,16 @@ export class BridgeRuntime {
 
   start(): void {
     if (this.timer || this.stopped) throw new Error("Bridge runtime can only be started once");
+    if (this.startupAdmission) {
+      // No inbox rewrite, batch timers, replay, transfer, receipt or file
+      // maintenance while physical predecessor ownership remains unresolved.
+      this.timer = setInterval(() => {
+        this.lastTickAt = this.now();
+        void this.tick(false).catch(() => {});
+      }, 1_000);
+      void this.tick(false).then(() => this.checkHealth(true), () => this.checkHealth(true)).catch(() => {});
+      return;
+    }
     for (const binding of this.store.bindings()) if (binding.attached && binding.paused) this.store.setPaused(binding.id, false);
     this.store.recover();
     this.manager.recoverInputs();
@@ -243,7 +267,7 @@ export class BridgeRuntime {
         : null;
       return { id: binding.id, title: binding.title, source: binding.sourceLabel || binding.sourceId || ".codex",
         status: details?.status ?? "unavailable", connected: isConnected(binding),
-        legacyAcquisition: this.desktop.legacyAcquisitionState?.(binding) ?? null,
+        legacyAcquisition: this.startupAdmission ? null : this.desktop.legacyAcquisitionState?.(binding) ?? null,
         lastConfirmedAt: this.connections.lastVerifiedAt(binding.id), failure: details?.failure ?? null,
         streamMode, lastEventAt: lease?.lastEventAt ?? null, leaseSince: lease?.leaseSince ?? null,
         lastConnectionDiagnostic: recentConnectionHistory.findLast(event => event.outcome === "failed" || event.outcome === "blocked")
@@ -254,6 +278,7 @@ export class BridgeRuntime {
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
       && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
     return { startedAt: this.startedAt, lastTickAt: this.lastTickAt, updateStartedAt: this.updateStartedAt, stopped: this.stopped, stagedFilePilot: this.stagedFilePilot,
+      ...(this.startupAdmission ? { startupAdmission: this.startupAdmission } : {}),
       maintenance: [...this.maintenance.values()].map(({ phase, bindingId, startedAt }) => ({ phase, ...(bindingId ? { bindingId } : {}), startedAt })),
       ...(this.files ? { stageMaintenance: { startedAt: this.stageMaintenanceStartedAt, lastAttemptAt: this.stageMaintenanceLastAttemptAt,
         failed: this.stageMaintenanceFailed }, stageLedgerAudit: this.stageLedgerAudit } : {}),
@@ -473,6 +498,15 @@ export class BridgeRuntime {
 
   async handle(input: BridgeInput): Promise<void> {
     if (this.stopped) return;
+    if (this.startupAdmission) {
+      // Match TaskManager's authorization but never claim/finish an input.
+      // A duplicate retains the original durable payload and event identity.
+      if (input.peerId === this.access.ownerId && input.senderId !== this.access.ownerId
+        || input.peerId !== this.access.ownerId && [this.access.groupId, -this.access.groupId].includes(input.senderId)
+        || input.action && input.senderId !== this.access.ownerId) return;
+      this.store.receiveInput(input, this.now());
+      return;
+    }
     await this.manager.handle(input);
     this.closeInactiveSubscriptions();
     if (!this.stopped) await this.delivery.flush();
@@ -545,6 +579,7 @@ export class BridgeRuntime {
   /** V1 retains the explicitly requested continuation behavior. V2 only
    * reconciles exact managed turns, never authorizing profile acquisition or input. */
   recoverRestartIntent(dataDir: string): Promise<void> {
+    if (this.startupAdmission) return Promise.resolve();
     if (this.restartRecovery) return this.restartRecovery;
     const work = this.recoverRestartIntentOnce(dataDir);
     this.restartRecovery = work;
@@ -764,6 +799,11 @@ export class BridgeRuntime {
             this.store.setValue(`task-details:${binding.id}`, { ...withoutFailure, status: "approval" });
           }
         }
+        if (this.startupAdmission) {
+          if (event.type === "status") this.activity.observe(binding.id,
+            event.status === "running" ? "running" : "idle", event.status === "running" ? event.turnId : null);
+          continue;
+        }
         if (event.type === "final") {
           this.store.settleAcceptedTurn(binding.id, event.turnId);
           this.files?.observe(binding.id, "idle", event.turnId);
@@ -928,6 +968,7 @@ export class BridgeRuntime {
     if (!this.stopped && intervalElapsed(now, this.lastHealthAt, this.healthIntervalMs))
       void this.checkHealth().catch(() => {});
     if (this.stopped) return Promise.resolve();
+    if (this.startupAdmission) return this.maintenanceObservation(waitForConnections, bindingId);
     try { this.reconcileManagedQueueReceipt(); } catch { /* Preserve original debt on unavailable journal. */ }
     this.updateStartedAt = this.now();
     try { this.update(); }
@@ -942,6 +983,34 @@ export class BridgeRuntime {
       await Promise.allSettled(bindingId ? connection ? [connection] : [] : this.connecting.values());
       void this.delivery.flush().catch(() => {});
     }) : Promise.resolve();
+  }
+
+  /** Only proven passive streams/local rollout projections may run here.
+   * Never call general update: it schedules creator/transfer/receipt work. */
+  private maintenanceObservation(wait: boolean, bindingId?: string): Promise<void> {
+    this.mirror.tick();
+    this.activity.tick();
+    this.closeInactiveSubscriptions();
+    const bindings = this.store.bindings();
+    for (const binding of bindings) {
+      if (!binding.attached || binding.peerId === null) continue;
+      this.prepareBindingObservation(binding);
+      if (this.matchesConnection(binding)) { this.connections.maintain(binding.id); continue; }
+      if (this.passiveStates && this.connecting.size < 6 && this.connections.canAttempt(binding.id))
+        void this.connectBinding(binding, binding, "observe").catch(() => {});
+      else {
+        const checkpoint = this.store.getValue<TaskObservationCheckpoint>(`projection:${binding.id}`);
+        this.enableRolloutFallback(binding, checkpoint?.lastObservedAt ?? checkpoint?.since ?? this.now());
+      }
+    }
+    this.scheduleRolloutFallbacks(bindings);
+    void this.delivery.flush().catch(() => {});
+    if (!wait) return Promise.resolve();
+    return Promise.allSettled([...this.maintenance.values()].filter(job => !bindingId || job.bindingId === bindingId)
+      .map(job => job.work)).then(async () => {
+        await Promise.allSettled(bindingId ? [this.connecting.get(bindingId)].filter(value => value !== undefined)
+          : this.connecting.values());
+      });
   }
 
   /** Audit abandoned writer reservations away from the delivery tick. Automatic
@@ -1168,6 +1237,20 @@ export class BridgeRuntime {
           const current = this.store.getBinding(binding.id);
           if (!currentGeneration() || !this.connections.matches(binding.id, task) || !current?.attached || !sameTask(current, task)) return;
           this.store.atomic(() => {
+            if (this.startupAdmission) {
+              const previous = this.store.getValue<TaskObservationCheckpoint>(checkpointKey);
+              const observation = this.observeTaskState(state, previous, this.now(), {
+                rebaseline: initial && previous === null,
+                finalRecorded: eventId => this.store.hasEvent(binding.id, eventId),
+              });
+              this.mirror.acceptObservation(binding.id, observation.events, observation.inputTurnIds,
+                observation.activeTurnId ? [observation.activeTurnId] : []);
+              this.store.setValue(checkpointKey, observation.checkpoint);
+              this.store.setValue(`task-details:${binding.id}`, observation.details);
+              this.activity.observe(binding.id, observation.details.status, observation.activeTurnId);
+              this.recordLease(binding.id, "attached", observation.activeTurnId);
+              return; // Projection is not an old operation/queue settlement receipt.
+            }
             this.store.setValue(`route-failure:${binding.id}`, null);
             this.disableRolloutFallback(current);
             this.store.markDesktopHandoff(binding.id, task, "live", this.now());
@@ -1240,7 +1323,7 @@ export class BridgeRuntime {
           }
         }, failure => { if (currentGeneration()) this.subscriptionFailed(binding.id, failure); }, undefined, transport);
         if (this.stopped || !currentGeneration() || !this.connections.matches(binding.id, task)) return;
-        this.store.markDesktopHandoff(binding.id, task, "live", this.now());
+        if (!this.startupAdmission) this.store.markDesktopHandoff(binding.id, task, "live", this.now());
       } catch (error) {
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !currentGeneration() || !current?.attached || !sameTask(current, task)) return;

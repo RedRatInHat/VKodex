@@ -26,6 +26,7 @@ import { inspectManagedRestartTurn } from "./bridge/managed-owner-observed-task-
 import { createDesktopRouting } from "./desktop/desktop-routing.js";
 import { sameTask } from "./core/codex-tasks.js";
 import type { AppServerStreamDiagnostic } from "./codex/app-server-task-state.js";
+import { loadPredecessorMaintenance } from "./desktop/predecessor-maintenance.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -53,6 +54,11 @@ const desktop = new ConnectedDesktopTasks(catalog, undefined, metadata,
   new ProfileAccountUsage(config.codexHomes, task => catalog.sourceHome(task), undefined, () => catalog.listSources()), new ProfileDesktopGoals(task => catalog.sourceHome(task)),
   { launcher, creator, transfer });
 const sourceIds = catalog.listSources();
+// Validate and persist the startup gate BEFORE owners, command callbacks,
+// gateway ingress, batch restoration or restart recovery become available.
+const startupAdmission = await loadPredecessorMaintenance(store, config.dataDir,
+  config.codexSources.flatMap((source, index) => source.owner === "app-server" ? [sourceIds[index]!.id] : []),
+  process.env.VKODEX_PREDECESSOR_SNAPSHOT_SHA256);
 const recordAppServerDiagnostic = (task: import("./core/codex-tasks.js").TaskRef, event: AppServerStreamDiagnostic): void => {
   // The transport has a task, not a VK binding. Record only for exact attached matches.
   const binding = store.bindings().find(candidate => candidate.attached && sameTask(candidate, task));
@@ -68,7 +74,7 @@ const appServerOwners = config.codexSources.flatMap((source, index) => {
     return { rawProjectId: resolved.rawProjectId, ...(resolved.sourceId ? { sourceId: resolved.sourceId } : {}) };
   };
   if (source.owner === "app-server")
-    return [createAppServerProfileOwner(sourceIds[index]!.id, source.home, resolveProject, recordAppServerDiagnostic)];
+    return [createAppServerProfileOwner(sourceIds[index]!.id, source.home, resolveProject, recordAppServerDiagnostic, !!startupAdmission)];
   if (source.owner === "detached-app-server") {
     if (!detachedProfileBase) throw new Error("Independent profile owner requires Windows user-local storage");
     return [createDetachedAppServerProfileOwner(sourceIds[index]!.id, source.home,
@@ -91,6 +97,7 @@ const observe = (state: import("./core/task-state.js").TaskState,
     ? observeAppServerTaskState(state, previous, now, options) : observeTaskState(state, previous, now, options);
 const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
   { states, ...(passiveStates ? { passiveStates } : {}), observe, history: new RolloutTaskHistoryRecovery(),
+    ...(startupAdmission ? { startupAdmission } : {}),
     inspectExternalOwner: task => inspectThroughOwner(catalog.sourceHome(task), task.threadId),
     inspectManagedRestartTurn: (task, snapshot) => managedResolver.owns(task)
       ? inspectManagedRestartTurn(managedResolver, task, snapshot)

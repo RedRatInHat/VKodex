@@ -21,6 +21,8 @@ export interface QueueHistoryProgress {
 }
 
 export interface RuntimeHealthState {
+  readonly startupAdmission?: Readonly<{ readonly kind: "predecessor-maintenance"; readonly fenceId: string;
+    readonly snapshotSha256: string }>;
   readonly startedAt: number;
   readonly lastTickAt: number;
   readonly updateStartedAt: number | null;
@@ -170,6 +172,8 @@ export class BridgeHealthMonitor {
 
     setPhase("runtime-and-store");
     const runtime = this.runtime();
+    if (runtime.startupAdmission) checks.push({ name: "startup_predecessor", state: "degraded",
+      detail: "Проверка прежнего исполнителя не завершена. VK-ввод сохранён, но отправка, восстановление очереди и профильные RPC отключены. Автоматического снятия ограничения нет." });
     const clockReversed = checkedAt < runtime.lastTickAt ||
       runtime.updateStartedAt !== null && checkedAt < runtime.updateStartedAt;
     const tickAge = Math.max(0, checkedAt - runtime.lastTickAt);
@@ -286,7 +290,9 @@ export class BridgeHealthMonitor {
     checks.push({ name: "vk_inbound_journal",
       state: recoveryError || replayAge > 10 * 60_000 ? "failed" : replayable.count ? "degraded" : "ok",
       detail: recoveryError ? "Журнал входящих VK-запросов не удалось восстановить. Автоматическая отправка остановлена для повреждённых записей."
-        : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. Мост повторяет только запросы без начатой отправки.`
+        : replayable.count ? `Сохранённых запросов до отправки: ${replayable.count}; старейший ожидает ${Math.round(replayAge / 1_000)} с. `
+          + (runtime.startupAdmission ? "Отправка отложена проверкой прежнего исполнителя; автоматический повтор отключён."
+            : "Мост повторяет только запросы без начатой отправки.")
           : "Необработанных входящих VK-запросов нет." });
     for (const binding of runtime.bindings ?? []) {
       if (binding.legacyAcquisition) {
@@ -458,16 +464,20 @@ export class BridgeHealthMonitor {
     }
 
     setPhase("external-checks");
-    const active = new Set(["vk", "catalog", "goals", "compatibility", "owner-adapters"]);
+    const active = new Set(runtime.startupAdmission ? ["vk"] : ["vk", "catalog", "goals", "compatibility", "owner-adapters"]);
     setPending([...active]);
     const checked = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
       try { return await run(); }
       finally { active.delete(name); setPending([...active]); }
     };
     const [vkResult, catalogResult, goalsResult, compatibilityResult, ownerAdapters] = await Promise.all([
-      checked("vk", () => this.checkVk()), checked("catalog", () => this.checkCatalog()),
-      checked("goals", () => this.checkGoals()), checked("compatibility", () => this.checkCompatibility(force, checkedAt)),
-      checked("owner-adapters", () => this.checkOwnerAdapters(runtime)),
+      checked("vk", () => this.checkVk()), runtime.startupAdmission ? Promise.resolve([]) : checked("catalog", () => this.checkCatalog()),
+      runtime.startupAdmission ? Promise.resolve({ name: "goals", state: "degraded" as const,
+        detail: "Native goal RPC отложен проверкой прежнего исполнителя." }) : checked("goals", () => this.checkGoals()),
+      runtime.startupAdmission ? Promise.resolve({ name: "codex_live_api", state: "degraded" as const,
+        detail: "Native readiness не проверяется профильным RPC в режиме predecessor maintenance." })
+        : checked("compatibility", () => this.checkCompatibility(force, checkedAt)),
+      runtime.startupAdmission ? Promise.resolve([]) : checked("owner-adapters", () => this.checkOwnerAdapters(runtime)),
     ]);
     checks.push(...vkResult, ...catalogResult, goalsResult, compatibilityResult, ...ownerAdapters);
 

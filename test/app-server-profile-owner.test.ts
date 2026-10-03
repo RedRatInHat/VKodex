@@ -6,6 +6,7 @@ import { AppServerProfileOwner, AppServerOwnerStateRouter } from "../src/codex/a
 import { ActionRejectedError, TaskOwnedByClientError } from "../src/core/codex-tasks.js";
 import { RoutedCodexTasks } from "../src/core/codex-task-router.js";
 import type { CodexTasks } from "../src/core/codex-tasks.js";
+import { LegacyExecutionLifecycle } from "../src/codex/legacy-execution-lifecycle.js";
 
 type JsonObject = Record<string, unknown>;
 class Rpc implements AppServerRpc {
@@ -96,6 +97,31 @@ type DrainableOwner = AppServerProfileOwner & {
   drainIdleExecution?: (task: { hostId: string; threadId: string; sourceId: string }, beforeRelease: () => void) => Promise<DrainStatus>;
 };
 const taskRef = { hostId: "local", threadId: "task", sourceId: "work" };
+test("predecessor source quarantine refuses cold reads and unlisted tasks without starting a backend", async () => {
+  const rpc = new Rpc();
+  const owner = Reflect.construct(AppServerProfileOwner,
+    ["work", rpc, undefined, undefined, undefined, undefined, true]) as AppServerProfileOwner;
+  const unlisted = { ...taskRef, threadId: "not-in-snapshot" };
+  try {
+    assert.equal(await owner.ownerAdapterStatus(taskRef), "unknown");
+    assert.throws(() => owner.states.subscribe(unlisted, () => {}, () => {}), ActionRejectedError);
+    await assert.rejects(owner.ensureOpen(unlisted), ActionRejectedError);
+    await assert.rejects(owner.inspectTask(taskRef), ActionRejectedError);
+    await assert.rejects(async () => owner.getGoal(taskRef), ActionRejectedError);
+    await assert.rejects(owner.findAcceptedInput(taskRef, "old-operation"), ActionRejectedError);
+    await assert.rejects(owner.interrupt(taskRef), ActionRejectedError);
+    assert.deepEqual(rpc.calls, []);
+    assert.equal(rpc.starts, 0);
+  } finally { await owner.close(); }
+  const coldRpc = new Rpc(); const lifecycle = new LegacyExecutionLifecycle(coldRpc, undefined, true);
+  try {
+    await assert.rejects(lifecycle.rpc.start(), ActionRejectedError);
+    await assert.rejects(lifecycle.rpc.request("thread/read", { threadId: taskRef.threadId }), ActionRejectedError);
+    assert.equal(coldRpc.starts, 0);
+    assert.deepEqual(coldRpc.calls, []);
+  } finally { lifecycle.close(); }
+});
+
 test("owner adapter metadata cannot report ready across a legacy acquisition fence", async () => {
   const rpc = new Rpc(); const owner = new AppServerProfileOwner("work", rpc);
   const stream = owner.states.subscribe(taskRef, () => {}, () => {});

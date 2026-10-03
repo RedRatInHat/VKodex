@@ -26,9 +26,10 @@ export class AppServerProfileOwner {
     private readonly resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
     private readonly detachedThreadIds?: ReadonlySet<string>,
     onDiagnostic: (task: TaskRef, event: AppServerStreamDiagnostic) => void = () => {},
-    now?: () => number) {
+    now?: () => number, private readonly predecessorFenced = false) {
+    if (predecessorFenced && detachedThreadIds) throw new ActionRejectedError("Нельзя изменить контракт независимого владельца через legacy fence.");
     if (detachedThreadIds) this.routingPolicy = "exclusive";
-    this.lifecycle = new LegacyExecutionLifecycle(rpc, now);
+    this.lifecycle = new LegacyExecutionLifecycle(rpc, now, predecessorFenced);
     this.rpc = this.lifecycle.rpc;
     this.executor = new AppServerTaskExecutor(this.rpc);
     this.nativeStates = new AppServerTaskStateTransport(this.rpc,
@@ -54,6 +55,8 @@ export class AppServerProfileOwner {
 
   private assertOwner(task: TaskRef): void {
     if (!this.owns(task)) throw new ActionRejectedError("Задача относится к другому аккаунту Codex.");
+    if (this.predecessorFenced)
+      throw new ActionRejectedError("Прежний исполнитель ещё не проверен. Профильный маршрут остаётся отключённым.");
   }
   private async command<T>(task: TaskRef, work: () => Promise<T>, currentWorkControl = false): Promise<T> {
     this.assertOwner(task);
@@ -61,6 +64,7 @@ export class AppServerProfileOwner {
     try { return await work(); } finally { finish(); }
   }
   async ownerAdapterStatus(task: TaskRef): Promise<"ready" | "missing" | "unknown"> {
+    if (this.predecessorFenced) return "unknown";
     this.assertOwner(task);
     if (this.legacyAcquisitionState(task)) return "unknown";
     if (this.lifecycle.isDraining(task)) return "unknown"; // Avoid activity that can extend the native unload grace period.
@@ -176,12 +180,12 @@ export class AppServerProfileOwner {
 
 export function createAppServerProfileOwner(sourceId: string, codexHome: string,
   resolveProject?: (projectId: string) => Promise<{ readonly rawProjectId: string; readonly sourceId?: string }>,
-  onDiagnostic?: (task: TaskRef, event: AppServerStreamDiagnostic) => void): AppServerProfileOwner {
+  onDiagnostic?: (task: TaskRef, event: AppServerStreamDiagnostic) => void, predecessorFenced = false): AppServerProfileOwner {
   const rpc = new AppServerConnection(() => spawn(nativeCodexPath(), ["app-server", "--stdio"], {
     windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     env: { ...buildCodexEnvironment(process.env), CODEX_HOME: codexHome },
   }));
-  return new AppServerProfileOwner(sourceId, rpc, resolveProject, undefined, onDiagnostic);
+  return new AppServerProfileOwner(sourceId, rpc, resolveProject, undefined, onDiagnostic, undefined, predecessorFenced);
 }
 
 /** Opt-in only: the bridge obtains a client capability from the independent
