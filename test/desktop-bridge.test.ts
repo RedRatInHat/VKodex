@@ -509,6 +509,48 @@ test("manager menu separates the project overview from task browsing", async t =
   assert.match(s.chat.sent.at(-1)!.view.text, /Existing desktop task/u);
 });
 
+test("manager menu remains deliverable with a large health report and keeps navigation", async t => {
+  const s = setup(t); s.attach();
+  s.store.setValue("health:latest", { state: "failed", checkedAt: Date.now(), pid: 1, uptimeSeconds: 10,
+    checks: Array.from({ length: 30 }, (_, i) => ({ name: `long-check-${i}`, state: "failed", detail: "Диагностика 🚀 ".repeat(60) })) });
+  await s.handle("/menu");
+  const view = panelView(s, access.ownerId);
+  assert.ok(view.text.length <= 4000, `manager panel exceeds VK budget: ${view.text.length}`);
+  assert.match(view.text, /сокращена/u);
+  assert.ok(view.buttons!.some(button => button.label === "Задачи Codex"));
+  await clickPanel(s, "Задачи Codex", access.ownerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /В каком проекте/u);
+});
+
+test("VK transport bounds persisted interactive panels for both send and edit without truncating ordinary messages", async t => {
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const vk = new VK({ token: "fixture-token" });
+  t.mock.method(vk.api, "callWithRequest", async ({ method, params }: { method: string; params: Record<string, unknown> }) => {
+    assert.ok(["messages.send", "messages.edit"].includes(method));
+    calls.push({ method, params });
+    return method === "messages.send" ? [{ peer_id: access.ownerId, conversation_message_id: 8, message_id: 99 }] : 1;
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 0);
+  const header = "VKodex · менеджер\n";
+  const view = { text: header + "🚀".repeat(3500), buttons: [MENU_BUTTON], silent: true };
+  const params = vkSendParams(access.ownerId, view, 77);
+  assert.ok(params.message.length <= 4000, `legacy panel exceeds VK budget: ${params.message.length}`);
+  assert.ok(!/[\uD800-\uDBFF]$/u.test(params.message.split("\n")[1]!));
+  const handle = await gateway.send(access.ownerId, view, 77);
+  await gateway.edit(handle, view);
+  assert.equal(calls[0]!.params.message, params.message);
+  assert.equal(calls[1]!.params.message, params.message);
+  assert.equal(calls[0]!.params.random_id, 77);
+  assert.equal(calls[0]!.params.keyboard, vkKeyboard(view));
+  const ordinary = { text: "unmodified ".repeat(700) };
+  assert.equal(vkSendParams(access.ownerId, ordinary, 78).message, ordinary.text);
+  const exact = { text: header + "x".repeat(4000 - header.length), buttons: [MENU_BUTTON] };
+  assert.equal(vkSendParams(access.ownerId, exact, 79).message, exact.text);
+  assert.equal(vkSendParams(access.ownerId, { ...ordinary, buttons: [MENU_BUTTON] }, 80).message, ordinary.text,
+    "write-confirmation cards must never be silently shortened");
+  assert.equal(view.text.length, 7000 + header.length);
+});
+
 test("manager health button runs a fresh check and renders its component report", async t => {
   const s = setup(t, true);
   await s.handle("/menu");

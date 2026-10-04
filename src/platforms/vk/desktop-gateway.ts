@@ -1,5 +1,6 @@
 import { APIError, VK, MessageContext, UpdateSource, DocumentAttachment, type MessageEventContext } from "vk-io";
 import { BridgeStore } from "../../bridge/store.js";
+import { boundedInteractiveView } from "../../bridge/interactive-view.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
 import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
@@ -23,6 +24,8 @@ export function vkKeyboard(view: View): string {
 }
 
 export function vkSendParams(peerId: number, view: View, randomId: number) {
+  // Persisted panels from older versions can exceed the ceiling too.
+  view = boundedInteractiveView(view);
   return {
     peer_ids: [peerId], random_id: randomId, message: view.text,
     ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}),
@@ -356,6 +359,7 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async edit(handle: MessageHandle, view: View): Promise<void> {
+    view = boundedInteractiveView(view);
     await this.write(() => this.vk.api.messages.edit({ peer_id: handle.peerId, cmid: handle.conversationMessageId, message: view.text, ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}), ...(view.attachments?.length ? { attachment: view.attachments.join(",") } : {}), dont_parse_links: 1, disable_mentions: 1 }));
   }
 
