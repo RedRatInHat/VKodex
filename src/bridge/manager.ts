@@ -970,9 +970,14 @@ export class TaskManager {
       // request before start/steer is dispatched. Treating it as uncertain
       // strands a prompt that Codex could not possibly have accepted and also
       // hides the actual routing failure behind the generic uncertainty check.
-      if (reported instanceof TaskNotOpenError) this.store.setValue(`route-failure:${binding.id}`, {
-        at: Date.now(), kind: "no-active-owner",
-      });
+      if (reported instanceof TaskNotOpenError) {
+        const current = this.store.getBinding(binding.id);
+        if (current?.attached && current.peerId === input.peerId && sameTask(current, binding)
+          && current.rolloutPath === binding.rolloutPath && this.store.streamGeneration(binding.id) === generation)
+          this.store.setValue(`route-failure:${binding.id}`, {
+            at: Date.now(), kind: "no-active-owner", streamGeneration: generation,
+          });
+      }
       const state = reported instanceof ActionRejectedError || reported instanceof TaskNotOpenError ? "rejected" : "uncertain";
       this.store.settlePromptDispatch(operationId, state);
       this.files?.finish(binding.id, operationId, state);

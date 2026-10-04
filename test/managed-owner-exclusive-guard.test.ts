@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { BridgeStore } from '../src/bridge/store.js';
 import { BridgeRuntime } from '../src/bridge/runtime.js';
+import { withDiagnosticSink, type DiagnosticRecord } from '../src/bridge/diagnostics.js';
 import { observeAppServerTaskState } from '../src/codex/app-server-task-state.js';
 import { ManagedOwnerExclusiveRouteGuard } from '../src/bridge/managed-owner-exclusive-guard.js';
 import { ManagedClaimBoundVkIngress } from '../src/bridge/managed-claim-bound-vk-ingress.js';
@@ -11,12 +12,296 @@ import type { ManagedOwnerIngressResolver } from '../src/bridge/managed-owner-ro
 import { createDesktopRouting } from '../src/desktop/desktop-routing.js';
 import type { ManagedOwnerRouteObserver } from '../src/bridge/managed-owner-observed-task-state-transport.js';
 import { RoutedCodexTasks } from '../src/core/codex-task-router.js';
-import { ActionRejectedError, type CodexTasks, type TaskRef } from '../src/core/codex-tasks.js';
+import { ActionRejectedError, TaskNotOpenError, TaskOwnedByClientError, type CodexTasks, type TaskRef } from '../src/core/codex-tasks.js';
 import { ObserverOnlyTaskStateTransport, RoutedTaskStateTransport, TaskStateConnections, type TaskStateTransport } from '../src/core/task-state.js';
 import type { BridgeChat, View } from '../src/bridge/contracts.js';
 
 const task = (sourceId = 'source-a'): TaskRef =>
   ({ hostId: 'local', threadId: 'managed-thread', sourceId });
+
+test('health opens a missing native observation once after owner-busy command refusal, without replay', async () => {
+  const store = new BridgeStore();
+  const peerId = 2_000_000_017;
+  const nativeTask = { hostId: 'local', threadId: 'native-thread', sourceId: '', sourceLabel: '.codex',
+    title: 'Native fixture', workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(nativeTask);
+  store.setChat(binding.id, peerId, 17);
+  let now = Date.now(), nativeOnline = false, launches = 0, writes = 0, profileStarts = 0;
+  const snapshot = { kind: 'app-server', threadId: nativeTask.threadId, title: nativeTask.title,
+    cwd: nativeTask.workspace, model: 'fixture-model', effort: 'low', runtimeStatus: 'active',
+    context: null, questions: [], turns: [] };
+  const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => ({
+    task: requested, readOnly: true,
+    async start() { if (!nativeOnline) throw new TaskNotOpenError(); onState(snapshot, true); },
+    async verifyOwner() {}, diagnostic: () => ({ kind: 'native-observer' as const }), close() {},
+  }), close() {} };
+  const profile: TaskStateTransport = { subscribe: requested => ({ task: requested,
+    async start() { profileStarts++; throw new TaskOwnedByClientError(); },
+    async verifyOwner() {}, close() {},
+  }), close() {} };
+  const states = new RoutedTaskStateTransport(native, [{ owns: () => true, states: profile }]);
+  const desktop = { listTasks: async () => [nativeTask],
+    submitWithReceipt: async () => { writes++; throw new Error('refused command must not reach a writer'); },
+    openNativeObservation: async (requested: TaskRef, assertCurrent: () => void) => {
+      assert.equal(requested.threadId, nativeTask.threadId);
+      assertCurrent(); launches++; nativeOnline = true; return 'opened' as const;
+    },
+  } as unknown as CodexTasks;
+  const chat = { members: async () => [101, -202],
+    send: async () => ({ peerId, conversationMessageId: 1 }), edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const history = { enable() {}, disable() {}, poll: async () => null };
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+    { states, passiveStates: native, observe: observeAppServerTaskState, history }, () => now,
+    undefined, undefined, 1,
+    async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+  try {
+    const diagnostics: DiagnosticRecord[] = [];
+    // Production's profile-owner callback records this exact failed resume
+    // before routed native discovery reports that no client holds the task.
+    store.recordConnectionDiagnostic(binding.id, { at: now, phase: 'resume', outcome: 'failed',
+      reason: 'owner-busy', routeGeneration: 1 }, nativeTask);
+    const input = { eventId: 'native-owner-refusal', peerId, senderId: 101, text: 'do not replay' };
+    await runtime.handle(input);
+    assert.equal(store.inputState(JSON.stringify([peerId, input.eventId])), 'done');
+    assert.equal(store.byPeer(peerId)?.id, binding.id, 'the original local binding survives refusal');
+    assert.equal(writes, 0);
+    assert.ok(profileStarts >= 1);
+    assert.ok(store.connectionDiagnostics(binding.id, nativeTask).some(event =>
+      event.phase === 'resume' && event.reason === 'owner-busy'));
+    assert.equal(store.getValue<{ kind: string }>(`route-failure:${binding.id}`)?.kind, 'no-active-owner');
+    // An old attached lease is not proof of a current native owner.
+    store.setValue(`task-lease:${binding.id}`, { state: 'attached', leaseSince: 1, lastEventAt: 1 });
+    now += 60_000;
+    await withDiagnosticSink(record => { diagnostics.push(record); }, () => runtime.tick(true, binding.id));
+    for (let i = 0; i < 8; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(launches, 1, 'health requests only the configured native observation opening');
+    assert.equal(writes, 0, 'health never submits the rejected command');
+    assert.equal(store.inputState(JSON.stringify([peerId, input.eventId])), 'done');
+    await withDiagnosticSink(record => { diagnostics.push(record); }, () => runtime.tick(true, binding.id));
+    assert.equal(launches, 1, 'a repeated health tick cannot cycle the foreground window');
+    assert.equal(store.getValue<{ lastObservedAt: number }>(`projection:${binding.id}`)?.lastObservedAt,
+      now, 'readiness requires a real passive snapshot after opening');
+    const health = (runtime as unknown as { runtimeHealth(): { bindings: readonly {
+      nativeObservationRecovery?: { state: string } }[] } }).runtimeHealth();
+    assert.equal(health.bindings[0]?.nativeObservationRecovery?.state, 'ready');
+    assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'recovered');
+    assert.ok(diagnostics.some(record => record.event === 'connection.lifecycle'
+      && record.stage === 'native-observation-recovery' && record.outcome === 'start'));
+    assert.ok(diagnostics.some(record => record.event === 'connection.lifecycle'
+      && record.stage === 'native-observation-recovery' && record.reason === 'passive-snapshot'
+      && record.ready === true));
+    assert.equal(JSON.stringify(diagnostics).includes(input.text), false, 'diagnostics cannot disclose VK input text');
+    nativeOnline = false;
+    (runtime as unknown as { closeSubscription(id: string): void }).closeSubscription(binding.id);
+    assert.equal((runtime as unknown as { runtimeHealth(): { bindings: readonly {
+      nativeObservationRecovery?: { state: string } }[] } }).runtimeHealth()
+      .bindings[0]?.nativeObservationRecovery?.state, 'recovered',
+    'a verified historical recovery survives normal idle stream release without claiming a current connection');
+    now += 61_000;
+    store.recordConnectionDiagnostic(binding.id, { at: now - 2, phase: 'resume', outcome: 'failed',
+      reason: 'owner-busy', routeGeneration: 3 }, nativeTask);
+    store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
+      reason: 'task-not-open', routeGeneration: 3 }, nativeTask);
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    await runtime.tick(true, binding.id);
+    assert.equal(launches, 2, 'only a new outage after verified recovery can open the client again');
+    assert.equal(writes, 0);
+  } finally { await runtime.stop(); store.close(); }
+});
+
+test('native health recovery rejects stale, foreign, quarantined and superseded evidence', async () => {
+  for (const blocked of ['legacy', 'generation', 'secondary', 'detached', 'creator', 'quarantine',
+    'exclusive', 'transfer', 'foreground', 'connecting', 'confirmed'] as const) {
+    const store = new BridgeStore();
+    const peerId = 2_000_000_019;
+    const candidate = { hostId: 'local', threadId: `native-${blocked}`, sourceId: blocked === 'secondary' ? 'other' : '',
+      title: 'Native fixture', workspace: 'C:\\Fixture', rolloutPath: `C:\\Fixture\\${blocked}.jsonl`, updatedAt: 1 };
+    const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 19);
+    const now = Date.now(); let launches = 0;
+    store.recordConnectionDiagnostic(binding.id, { at: now - 2, phase: 'resume', outcome: 'failed',
+      reason: 'owner-busy', routeGeneration: 1 }, candidate);
+    store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
+      reason: 'task-not-open', routeGeneration: 1 }, candidate);
+    if (blocked === 'confirmed') store.recordConnectionDiagnostic(binding.id, {
+      at: now, phase: 'resume', outcome: 'confirmed', routeGeneration: 2 }, candidate);
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner',
+      ...(blocked === 'legacy' ? {} : { streamGeneration: 0 }) });
+    if (blocked === 'generation') store.setValue(`stream-generation:${binding.id}`, 1);
+    if (blocked === 'detached') store.setAttached(binding.id, false);
+    if (blocked === 'exclusive') store.claimManagedOwner(binding.id, {
+      ownerEpoch: randomUUID(), canonicalHome: candidate.workspace, familyRoot: candidate.threadId });
+    if (blocked === 'transfer') store.transfer = () => ({ version: 2, phase: 'preparing' }) as never;
+    const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
+      readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+      verifyOwner: async () => {}, close() {} }), close() {} };
+    const desktop = { listTasks: async () => [candidate], isCreationActive: () => blocked === 'creator',
+      openNativeObservation: async () => { launches++; return 'opened' as const; } } as unknown as CodexTasks;
+    const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+      edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+    const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+      { states: native, passiveStates: native, observe: observeAppServerTaskState,
+        history: { enable() {}, disable() {}, poll: async () => null },
+        ...(blocked === 'quarantine' ? { startupAdmission: { kind: 'predecessor-maintenance' as const,
+          fenceId: 'fixture', snapshotSha256: 'fixture' } } : {}) }, () => now,
+      undefined, undefined, 10_000_000,
+      async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+    try {
+      if (blocked === 'foreground') (runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire.add(binding.id);
+      if (blocked === 'connecting') (runtime as unknown as { connecting: Map<string, Promise<void>> })
+        .connecting.set(binding.id, Promise.resolve());
+      await runtime.tick(true, binding.id);
+      assert.equal(launches, 0, `${blocked} must never launch a native client`);
+    } finally { await runtime.stop(); store.close(); }
+  }
+});
+
+test('native health recovery consumes an outage before probe and does not relaunch for later busy retries', async () => {
+  const store = new BridgeStore(); const peerId = 2_000_000_020;
+  const candidate = { hostId: 'local', threadId: 'native-outage', sourceId: '', title: 'Native fixture',
+    workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 20);
+  let now = Date.now(), probes = 0, launches = 0;
+  let releaseProbe!: () => void;
+  const probePending = new Promise<void>(resolve => { releaseProbe = resolve; });
+  const evidence = (at: number, generation: number) => {
+    store.recordConnectionDiagnostic(binding.id, { at, phase: 'resume', outcome: 'failed',
+      reason: 'owner-busy', routeGeneration: generation }, candidate);
+    store.recordConnectionDiagnostic(binding.id, { at: at + 1, phase: 'resume', outcome: 'failed',
+      reason: 'task-not-open', routeGeneration: generation }, candidate);
+    store.setValue(`route-failure:${binding.id}`, { at: at + 2, kind: 'no-active-owner', streamGeneration: 0 });
+  };
+  evidence(now - 2, 1);
+  const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
+    readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+    verifyOwner: async () => {}, close() {} }), close() {} };
+  const desktop = { listTasks: async () => [candidate],
+    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
+      probes++; await probePending; assertCurrent(); launches++; return 'opened' as const;
+    } } as unknown as CodexTasks;
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+    edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+    { states: native, passiveStates: native, observe: observeAppServerTaskState,
+      history: { enable() {}, disable() {}, poll: async () => null } }, () => now,
+    undefined, undefined, 10_000_000,
+    async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+  try {
+    await runtime.tick(false, binding.id);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await runtime.tick(false, binding.id);
+    assert.equal(probes, 1, 'a pending native discovery remains single-flight');
+    assert.equal(launches, 0, 'a pending discovery has not opened the client');
+    releaseProbe();
+    await runtime.tick(true, binding.id);
+    assert.equal(launches, 1);
+    now += 61_000; evidence(now - 2, 2);
+    await runtime.tick(true, binding.id);
+    assert.equal(launches, 1, 'a new command refusal in the same unverified outage cannot refocus');
+    assert.equal(probes, 1, 'a durable attempt is consumed before native discovery');
+    assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'opened');
+  } finally { await runtime.stop(); store.close(); }
+});
+
+test('a passive snapshot cannot mark native recovery ready after an exclusive claim appears', async () => {
+  const store = new BridgeStore(); const peerId = 2_000_000_021; const now = Date.now();
+  const candidate = { hostId: 'local', threadId: 'native-claim-race', sourceId: '', title: 'Native fixture',
+    workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 21);
+  store.recordConnectionDiagnostic(binding.id, { at: now - 2, phase: 'resume', outcome: 'failed',
+    reason: 'owner-busy', routeGeneration: 1 }, candidate);
+  store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
+    reason: 'task-not-open', routeGeneration: 1 }, candidate);
+  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+  let snapshots = 0;
+  const snapshot = { kind: 'app-server', threadId: candidate.threadId, title: candidate.title,
+    cwd: candidate.workspace, model: 'fixture-model', effort: 'low', runtimeStatus: 'active',
+    context: null, questions: [], turns: [] };
+  const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => ({ task: requested,
+    readOnly: true, start: async () => { snapshots++; onState(snapshot, true); },
+    verifyOwner: async () => {}, diagnostic: () => ({ kind: 'native-observer' as const }), close() {} }), close() {} };
+  const desktop = { listTasks: async () => [candidate],
+    openNativeObservation: async () => {
+      store.claimManagedOwner(binding.id, { ownerEpoch: randomUUID(), canonicalHome: candidate.workspace,
+        familyRoot: candidate.threadId });
+      return 'opened' as const;
+    } } as unknown as CodexTasks;
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+    edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+    { states: native, passiveStates: native, observe: observeAppServerTaskState,
+      history: { enable() {}, disable() {}, poll: async () => null } }, () => now,
+    undefined, undefined, 10_000_000,
+    async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+  try {
+    await runtime.tick(true, binding.id);
+    await runtime.tick(true, binding.id);
+    assert.equal(snapshots, 1, 'the fixture offered a passive frame after the claim appeared');
+    assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'opened');
+    assert.notEqual((runtime as unknown as { runtimeHealth(): { bindings: readonly {
+      nativeObservationRecovery?: { state: string } }[] } }).runtimeHealth()
+      .bindings[0]?.nativeObservationRecovery?.state, 'ready');
+  } finally { await runtime.stop(); store.close(); }
+});
+
+test('native opening rechecks task, transfer and foreground fences after asynchronous discovery', async () => {
+  for (const changed of ['generation', 'transfer', 'foreground', 'detached', 'stopped', 'postlaunch'] as const) {
+    const store = new BridgeStore(); const peerId = 2_000_000_022; let now = Date.now();
+    const candidate = { hostId: 'local', threadId: `native-race-${changed}`, sourceId: '',
+      title: 'Native fixture', workspace: 'C:\\Fixture', updatedAt: 1 };
+    const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 22);
+    store.recordConnectionDiagnostic(binding.id, { at: now - 2, phase: 'resume', outcome: 'failed',
+      reason: 'owner-busy', routeGeneration: 1 }, candidate);
+    store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
+      reason: 'task-not-open', routeGeneration: 1 }, candidate);
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    let launches = 0, scopeChecks = 0; let runtime!: BridgeRuntime;
+    const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
+      readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+      verifyOwner: async () => {}, close() {} }), close() {} };
+    const desktop = { listTasks: async () => [candidate],
+      openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
+        scopeChecks++; await Promise.resolve();
+        if (changed === 'postlaunch') {
+          assertCurrent(); launches++;
+          (runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire.add(binding.id);
+          assertCurrent();
+        }
+        if (changed === 'generation') store.setValue(`stream-generation:${binding.id}`, 1);
+        if (changed === 'transfer') store.transfer = () => ({ version: 2, phase: 'preparing' }) as never;
+        if (changed === 'foreground') (runtime as unknown as { pendingReacquire: Set<string> })
+          .pendingReacquire.add(binding.id);
+        if (changed === 'detached') store.setAttached(binding.id, false);
+        if (changed === 'stopped') (runtime as unknown as { stopped: boolean }).stopped = true;
+        assertCurrent(); launches++; return 'opened' as const;
+      } } as unknown as CodexTasks;
+    const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+      edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+    runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+      { states: native, passiveStates: native, observe: observeAppServerTaskState,
+        history: { enable() {}, disable() {}, poll: async () => null } }, () => now,
+      undefined, undefined, 10_000_000,
+      async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+    try {
+      await runtime.tick(true, binding.id);
+      assert.equal(scopeChecks, 1, `${changed} must be discovered only once`);
+      assert.equal(launches, changed === 'postlaunch' ? 1 : 0,
+        `${changed} invalidates the launch fence after an await`);
+      if (changed === 'postlaunch') {
+        (runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire.delete(binding.id);
+        assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'unknown');
+        now += 61_000;
+        store.recordConnectionDiagnostic(binding.id, { at: now - 2, phase: 'resume', outcome: 'failed',
+          reason: 'owner-busy', routeGeneration: 2 }, candidate);
+        store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
+          reason: 'task-not-open', routeGeneration: 2 }, candidate);
+        store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+        await runtime.tick(true, binding.id);
+        assert.equal(launches, 1, 'a possibly completed launch cannot repeat in the same outage');
+        assert.equal(scopeChecks, 1);
+      }
+    } finally { await runtime.stop(); store.close(); }
+  }
+});
 
 test('claimed facade classifies unavailable pre-submit admission as rejection without reserving authority', async () => {
   for (const error of [new ManagedWorkerControlRefusedError(), new ManagedWorkerControlUnknownError(), new Error('read unavailable'), null]) {
