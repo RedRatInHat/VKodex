@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, realpath, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { prepareDiagnosticDirectory } from "../src/desktop/diagnostic-private-directory.js";
 
 test("diagnostic directory preparation accepts only a private dedicated leaf", async () => {
-  const parent = await mkdtemp(path.join(os.tmpdir(), "vkodex-private-diagnostic-"));
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-private-diagnostic-"));
   const directory = path.join(parent, "diagnostics");
+  const lexicalAlias = `${parent}${path.sep}..${path.sep}${path.basename(parent)}${path.sep}diagnostics`;
+  assert.equal(await prepareDiagnosticDirectory(lexicalAlias), false);
+  await assert.rejects(lstat(directory), { code: "ENOENT" });
   assert.equal(await prepareDiagnosticDirectory(directory), true);
   assert.equal(await prepareDiagnosticDirectory(directory), true);
   const info = await lstat(directory);
@@ -20,7 +23,8 @@ test("diagnostic directory preparation accepts only a private dedicated leaf", a
 });
 
 test("diagnostic directory preparation refuses existing public or linked leaves", async () => {
-  const parent = await mkdtemp(path.join(os.tmpdir(), "vkodex-public-diagnostic-"));
+  const tempRoot = await realpath(os.tmpdir());
+  const parent = await mkdtemp(path.join(tempRoot, "vkodex-public-diagnostic-"));
   const directory = path.join(parent, "diagnostics");
   await mkdir(directory, { mode: 0o755 });
   if (process.platform !== "win32") await chmod(directory, 0o755);
@@ -29,7 +33,7 @@ test("diagnostic directory preparation refuses existing public or linked leaves"
   assert.equal(info.isDirectory(), true);
   if (process.platform !== "win32") assert.notEqual(info.mode & 0o077, 0);
 
-  const linkedParent = await mkdtemp(path.join(os.tmpdir(), "vkodex-linked-diagnostic-"));
+  const linkedParent = await mkdtemp(path.join(tempRoot, "vkodex-linked-diagnostic-"));
   const target = path.join(linkedParent, "target");
   await mkdir(target);
   const link = path.join(linkedParent, "diagnostics");
@@ -40,7 +44,7 @@ test("diagnostic directory preparation refuses existing public or linked leaves"
 });
 
 test("existing Windows ACL without file inheritance is refused without repair", { skip: process.platform !== "win32" }, async () => {
-  const parent = await mkdtemp(path.join(os.tmpdir(), "vkodex-acl-inheritance-diagnostic-"));
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-acl-inheritance-diagnostic-"));
   const directory = path.join(parent, "diagnostics");
   assert.equal(await prepareDiagnosticDirectory(directory), true);
   const executable = path.win32.join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
