@@ -1,7 +1,9 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { closeAppServer } from "./app-server-process.js";
+import { captureDiagnostic, diagnosticError } from "../bridge/diagnostics.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -134,11 +136,13 @@ interface PendingRequest {
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
   readonly onResponseEnvelope: ((envelope: AppServerResponseEnvelope) => void) | undefined;
+  readonly trace: (stage: string, outcome: string, error?: unknown) => void;
 }
 
 interface LateResponseReceipt {
   readonly generation: number;
   readonly callback: (envelope: AppServerResponseEnvelope) => void;
+  readonly trace: PendingRequest["trace"];
 }
 
 interface PendingServerRequest {
@@ -165,6 +169,7 @@ function accountModelRejection(error: JsonObject): boolean {
 
 /** One restartable JSONL App Server connection owned by a single Codex profile. */
 export class AppServerConnection implements AppServerRpc {
+  private readonly connectionId = randomUUID();
   private child: AppServerWireEndpoint | null = null;
   private generation = 0;
   private initialized: AppServerInitializedSession | null = null;
@@ -177,6 +182,7 @@ export class AppServerConnection implements AppServerRpc {
   private readonly pending = new Map<number, PendingRequest>();
   private readonly lateResponseReceipts = new Map<number, LateResponseReceipt>();
   private guardedInbound: Array<{ child: AppServerWireEndpoint; generation: number; chunk: string }> | null = null;
+  private deferredRpcDiagnostics: Array<() => void> | null = null;
   private readonly pendingServerRequests = new Map<string | number, PendingServerRequest>();
   private readonly notificationListeners = new Set<(notification: AppServerEnvelope) => void>();
   private readonly disconnectListeners = new Set<(error: Error) => void>();
@@ -234,10 +240,18 @@ export class AppServerConnection implements AppServerRpc {
   }
 
   async request(method: string, params: JsonObject = {}, options: AppServerRequestOptions = {}): Promise<JsonObject> {
-    if (!method || /[\x00-\x20]/u.test(method)) throw new AppServerRejectedError();
-    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))
+    const emit = captureDiagnostic();
+    const prewrite = (stage: string): void => this.emitRpcDiagnostic(() => emit("rpc.stage", {
+      connectionId: this.connectionId, backendGeneration: this.generation,
+      method, mutating: options.mutating === true, stage, outcome: "failure", elapsedMs: 0,
+    }));
+    if (!method || /[\x00-\x20]/u.test(method)) { prewrite("guard-refused"); throw new AppServerRejectedError(); }
+    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration)) {
+      prewrite("guard-refused");
       throw new AppServerUnavailableError();
-    await this.start();
+    }
+    try { await this.start(); }
+    catch (error) { prewrite("disconnect"); throw error; }
     return this.sendRequest(method, params, options);
   }
 
@@ -265,20 +279,35 @@ export class AppServerConnection implements AppServerRpc {
   }
 
   private sendRequest(method: string, params: JsonObject, options: AppServerRequestOptions): Promise<JsonObject> {
-    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))
-      return Promise.reject(new AppServerUnavailableError());
-    const child = this.child;
-    if (!child) return Promise.reject(new AppServerUnavailableError());
+    const emit = captureDiagnostic();
+    const startedAt = performance.now();
     const generation = this.generation;
+    let id = -1;
+    const trace = (stage: string, outcome: string, error?: unknown): void => this.emitRpcDiagnostic(() => emit("rpc.stage", {
+      connectionId: this.connectionId, backendGeneration: generation, ...(id < 0 ? {} : { requestId: id }),
+      method, mutating: options.mutating === true, stage, outcome,
+      elapsedMs: performance.now() - startedAt, ...(error === undefined ? {} : diagnosticError(error)),
+    }));
+    trace("start", "start");
+    if (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration)) {
+      trace("guard-refused", "failure");
+      return Promise.reject(new AppServerUnavailableError());
+    }
+    const child = this.child;
+    if (!child) { trace("disconnect", "failure"); return Promise.reject(new AppServerUnavailableError()); }
+    trace("before-write", "start");
     try { options.assertBeforeWrite?.(); }
     catch (error) {
       try { options.onBeforeWriteRefused?.(); } catch { /* preserve the original guard refusal */ }
+      trace("guard-refused", "failure", error);
       return Promise.reject(error);
     }
     if (this.child !== child || this.generation !== generation ||
-      (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration)))
+      (options.expectedGeneration !== undefined && !this.isSessionCurrent(options.expectedGeneration))) {
+      trace("guard-refused", "failure");
       return Promise.reject(new AppServerUnavailableError());
-    const id = this.nextId++;
+    }
+    id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
@@ -286,11 +315,12 @@ export class AppServerConnection implements AppServerRpc {
         this.pending.delete(id);
         if (pending.mutating && options.expectedGeneration === generation &&
           this.isSessionCurrent(generation) && typeof options.onLateResponseEnvelope === "function") {
-          this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope });
+          this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope, trace: pending.trace });
           if (this.lateResponseReceipts.size > MAX_LATE_RESPONSE_RECEIPTS)
             this.lateResponseReceipts.delete(this.lateResponseReceipts.keys().next().value!);
         }
         const error = pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError("Codex App Server не ответил вовремя.", "timeout");
+        pending.trace("timeout", pending.mutating ? "unknown" : "failure", error);
         pending.reject(error);
         // A timeout describes this operation, not the health of the writer.
         // A mutation may already be running: keep its notifications and other
@@ -301,11 +331,13 @@ export class AppServerConnection implements AppServerRpc {
       this.pending.set(id, { mutating: options.mutating === true, generation, resolve, reject, timer,
         rejectionMethod: ["initialize", "turn/start", "turn/steer", "thread/queue/add", "thread/settings/update"].includes(method)
           ? method as NonNullable<AppServerRejectedError["requestMethod"]> : null,
-        onResponseEnvelope: options.onResponseEnvelope });
+        onResponseEnvelope: options.onResponseEnvelope, trace });
       if (options.withWriteGuard !== undefined) {
         let enteredWrite = false, wireFailed = false, callbackInvoked = false, invalid = false, active = true;
         const heldInbound: NonNullable<AppServerConnection['guardedInbound']> = [];
         this.guardedInbound = heldInbound;
+        const deferred: Array<() => void> = [];
+        this.deferredRpcDiagnostics = deferred;
         try {
           const guard = options.withWriteGuard;
           if (typeof guard !== 'function' || Object.prototype.toString.call(guard) === '[object AsyncFunction]')
@@ -342,7 +374,7 @@ export class AppServerConnection implements AppServerRpc {
             reject(options.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());
             if (!wireFailed && options.mutating && options.expectedGeneration === generation &&
                 this.isSessionCurrent(generation) && options.onLateResponseEnvelope) {
-              this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope });
+              this.lateResponseReceipts.set(id, { generation, callback: options.onLateResponseEnvelope, trace });
               if (this.lateResponseReceipts.size > MAX_LATE_RESPONSE_RECEIPTS)
                 this.lateResponseReceipts.delete(this.lateResponseReceipts.keys().next().value!);
             }
@@ -350,17 +382,30 @@ export class AppServerConnection implements AppServerRpc {
           }
         } finally {
           active = false; this.guardedInbound = null;
+          this.deferredRpcDiagnostics = null;
         }
+        for (const publish of deferred) publish();
+        if (enteredWrite) trace("write-attempt", "start");
+        if (this.pending.has(id)) trace("write-returned", "success");
+        else trace(enteredWrite ? "write-returned" : "guard-refused",
+          enteredWrite && options.mutating ? "unknown" : "failure");
         for (const incoming of heldInbound) this.receive(incoming.child, incoming.generation, incoming.chunk);
         return;
       }
-      try { this.write(child, { id, method, params }); }
-      catch {
+      trace("write-attempt", "start");
+      try { this.write(child, { id, method, params }); trace("write-returned", "success"); }
+      catch (error) {
         clearTimeout(timer); this.pending.delete(id);
+        trace("write-returned", options.mutating ? "unknown" : "failure", error);
         reject(options.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());
         this.failConnection(child, this.generation, new AppServerUnavailableError(), id);
       }
     });
+  }
+
+  private emitRpcDiagnostic(publish: () => void): void {
+    if (this.deferredRpcDiagnostics) this.deferredRpcDiagnostics.push(publish);
+    else publish();
   }
 
   private write(child: AppServerWireEndpoint, value: JsonObject): void {
@@ -427,23 +472,25 @@ export class AppServerConnection implements AppServerRpc {
       this.lateResponseReceipts.delete(id);
       if (!this.isSessionCurrent(late.generation)) return;
       const hasResult = Object.hasOwn(value, "result"), hasError = Object.hasOwn(value, "error");
-      if (hasResult === hasError) return;
+      if (hasResult === hasError) { late.trace("invalid-response", "unknown"); return; }
       let envelope: AppServerResponseEnvelope;
       if (hasResult) {
-        if (!isObject(value.result)) return;
+        if (!isObject(value.result)) { late.trace("invalid-response", "unknown"); return; }
         envelope = { result: value.result };
       } else {
         if (!isObject(value.error) ||
           !(Number.isSafeInteger(value.error.code) || typeof value.error.code === "string") ||
-          typeof value.error.message !== "string") return;
+          typeof value.error.message !== "string") { late.trace("invalid-response", "unknown"); return; }
         envelope = { error: value.error };
       }
       try { late.callback(structuredClone(envelope)); }
       catch { /* A late observer cannot abort the shared worker. */ }
+      late.trace("late-response", hasResult ? "success" : "failure");
       return;
     }
     this.pending.delete(id); clearTimeout(pending.timer);
     if (Object.hasOwn(value, "result") && Object.hasOwn(value, "error")) {
+      pending.trace("invalid-response", pending.mutating ? "unknown" : "failure");
       pending.reject(pending.mutating ? new AppServerUncertainError() :
         new AppServerUnavailableError("Codex App Server вернул неоднозначный ответ."));
       return;
@@ -459,10 +506,16 @@ export class AppServerConnection implements AppServerRpc {
       const code = typeof error.code === "number" || typeof error.code === "string" ? error.code : null;
       const reason = typeof error.message === "string" && /already has an active writer/iu.test(error.message)
         ? "active-writer" as const : accountModelRejection(error) ? "model-not-supported-for-account" as const : null;
-      pending.reject(new AppServerRejectedError(code, reason, pending.generation, pending.rejectionMethod)); return;
+      const rejection = new AppServerRejectedError(code, reason, pending.generation, pending.rejectionMethod);
+      pending.trace("response", "failure", rejection);
+      pending.reject(rejection); return;
     }
-    if (!isObject(value.result)) { pending.reject(new AppServerUnavailableError("Codex App Server вернул некорректный ответ.")); return; }
+    if (!isObject(value.result)) {
+      pending.trace("invalid-response", pending.mutating ? "unknown" : "failure");
+      pending.reject(new AppServerUnavailableError("Codex App Server вернул некорректный ответ.")); return;
+    }
     deliver({ result: value.result });
+    pending.trace("response", "success");
     pending.resolve(value.result);
   }
 
@@ -544,6 +597,7 @@ export class AppServerConnection implements AppServerRpc {
     for (const [id, pending] of this.pending) {
       if (id === skipId) continue;
       this.pending.delete(id); clearTimeout(pending.timer);
+      pending.trace("disconnect", pending.mutating ? "unknown" : "failure", fallback);
       pending.reject(pending.mutating ? new AppServerUncertainError() : fallback);
     }
     for (const listener of this.disconnectListeners) {
@@ -559,6 +613,7 @@ export class AppServerConnection implements AppServerRpc {
     this.clearServerRequests();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.trace("disconnect", pending.mutating ? "unknown" : "failure");
       pending.reject(pending.mutating ? new AppServerUncertainError() : new AppServerUnavailableError());
     }
     this.pending.clear();

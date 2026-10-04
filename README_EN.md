@@ -8,6 +8,34 @@
 
 # VKodex
 
+### Connection and input diagnostics
+
+The Desktop bridge creates a separate private JSONL journal under `BOT_DATA_DIR/diagnostics`.
+`vkodex.diagnostic.v1` records UTC time, run/PID/sequence, input attempt, VK event, binding/thread,
+stream/route/backend generations, operation and stage. `entrySha256` fingerprints the entry point at
+startup; it does not prove the identity of the entire bundle. Input queueing, observer preparation,
+owner discovery refusal, routing, RPC write/reply and history reconciliation can be correlated.
+Joined connections reference the existing `connectionAttemptId`; merged fragments use `input.associated`.
+RPC bodies/results, message/file content, tokens and exception messages/stacks are excluded. Unusual IDs
+are hashed; failures contain only allowlisted class/reason and numeric code.
+
+After building: `npm run diagnostics:read -- --thread THREAD_UUID --event message:123 --limit 200`.
+Optional filters: `--directory ABSOLUTE_PATH`, `--attempt`, `--operation`, `--connection`, `--peer`, `--after`, `--before`.
+Find the attempt using the event, then query `--attempt` without the event filter for its full chain.
+For `connection.join`, separately query its `connectionAttemptId` using `--connection`; background events may lack the input's attempt ID.
+The reader bounds and re-sanitizes its input; it never connects to Codex or SQLite. Journal/adapter start
+does not prove wire dispatch; `write-returned` is not a turn receipt. `accepted` requires native turn/queue
+evidence or history reconciliation. `adapter-returned` lacks that proof; `unknown` never permits a retry.
+Diagnostics grant no command authority and do not replace health checks. Existing processes require a
+qualified update/restart before emitting newly implemented events.
+
+The async queue is bounded to 256 KiB/512 events, records to 4 KiB, disk to 16 process-owned 1 MiB segments.
+Old segments are never overwritten; 16 allocations can exhaust capacity before the 16 MiB byte limit.
+Startup and changed loss counters appear in the ordinary log, at most once per minute; sequence gaps also
+indicate an incomplete trace. Full/broken logging does not block commands. Preserve needed segments outside
+Git and move unwanted ones to the Recycle Bin, then use the safe bridge restart procedure. Internal logs
+must not be committed or copied to a user-facing VK outbox.
+
 
 **VKodex is an open-source VK bot for remotely controlling OpenAI Codex through VK messages and conversations.**
 

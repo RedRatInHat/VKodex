@@ -51,6 +51,7 @@ import { ManagedNativeQueueRefusal } from "../src/desktop/managed-native-stock-q
 import { projectSnapshot, summarizeTurnState } from "../src/desktop/projector.js";
 import { RevisionedState } from "../src/desktop/state.js";
 import { TaskSubscription } from "../src/desktop/subscription.js";
+import { diagnosticScope, withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { RolloutTailer } from "../src/desktop/rollout-tailer.js";
 import { RolloutTaskHistoryRecovery, type TaskHistoryRecovery } from "../src/desktop/history-recovery.js";
 import { comparablePath } from "../src/desktop/paths.js";
@@ -2943,6 +2944,20 @@ test("runtime reports the actual connection failure without leaking malformed IP
   await assert.rejects(subscription.start(100), error => error instanceof DesktopUnavailableError && /прочитать/u.test(error.message) && !error.message.includes("private-data"));
 });
 
+test("diagnostic runtime preserves the swallowed discovery failure and emits zero prompt dispatch", async t => {
+  const s = runtimeSetup(t); s.server.rejectDiscovery = true;
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.runtime.handle({
+    peerId: s.peerId, senderId: s.access.ownerId, eventId: "message:99001", text: "never send this fixture" }));
+  const cause = records.find(record => record.event === "connection.result" && record.outcome === "failure");
+  assert.equal(cause?.errorType, "TaskNotOpenError");
+  assert.ok(cause?.connectionAttemptId);
+  assert.ok(cause?.attemptId);
+  assert.equal(records.find(record => record.event === "input.result")?.outcome, "not-dispatched");
+  assert.equal(records.some(record => record.event === "input.adapter"), false);
+  assert.equal(JSON.stringify(records).includes("never send this fixture"), false);
+});
+
 test("diagnostic IPC client rejects a snapshot above its smaller inbound limit before allocation", async t => {
   assert.throws(() => new FrameDecoder(0), RangeError);
   assert.throws(() => new DesktopIpcClient(() => new Server(), 50, null, 256 * 1024 * 1024 + 1), RangeError);
@@ -2996,10 +3011,48 @@ test("subscription uses honest client registration and filters other tasks and o
   let updates = 0;
   const subscription = new TaskSubscription(client, ref, () => { updates++; }, () => {});
   server.onFollow = () => { server.snapshot(11, "other-owner"); server.snapshot(11, "owner", "other-task"); server.snapshot(); };
-  await subscription.start(100); assert.equal(updates, 1);
+  await withDiagnosticSink(() => { throw new Error("Diagnostic sink unavailable"); }, () => subscription.start(100));
+  assert.equal(updates, 1);
   assert.deepEqual(server.received[0]!.params, { clientType: "vkodex" });
   subscription.close();
   assert.ok(server.received.some(message => message.method === "thread-stream-following-changed" && isObject(message.params) && message.params.following === false));
+});
+
+test("subscription diagnostics retain the owner discovery refusal before translating it", async t => {
+  const server = new Server(); server.rejectDiscovery = true;
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const records: DiagnosticRecord[] = [];
+  const subscription = new TaskSubscription(client, { ...ref, threadId: "private-task-identifier" },
+    () => assert.fail("Missing owner delivered state"), () => {});
+  await withDiagnosticSink(record => { records.push(record); }, async () => {
+    await assert.rejects(subscription.start(100), TaskNotOpenError);
+  });
+  assert.ok(records.some(record => record.event === "subscription.stage" && record.stage === "discover-owner"
+    && record.outcome === "failure" && record.reason === "no-client-found"));
+  assert.equal(records.some(record => record.stage === "snapshot"), false);
+  assert.equal(server.received.filter(message => message.method === "thread-owner-discovery").length, 1);
+  assert.equal(server.received.some(message => String(message.method).startsWith("thread-follower-")), false);
+  assert.doesNotMatch(JSON.stringify(records), /private-task-identifier|handledByClientId|params/u);
+});
+
+test("subscription diagnostics keep their initiating scope for later wire callbacks", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const records: DiagnosticRecord[] = [], unrelated: DiagnosticRecord[] = [];
+  let failures = 0;
+  const subscription = new TaskSubscription(client, ref, () => {}, () => { failures++; });
+  const attemptId = "123e4567-e89b-42d3-a456-426614174000";
+  await withDiagnosticSink(record => { records.push(record); }, () => diagnosticScope({ attemptId }, () => subscription.start(100)));
+  assert.ok(records.some(record => record.stage === "ready" && record.outcome === "success"));
+  await withDiagnosticSink(record => { unrelated.push(record); }, () => diagnosticScope({
+    attemptId: "123e4567-e89b-42d3-a456-426614174001",
+  }, async () => {
+    server.snapshot(999);
+    await new Promise(resolve => setImmediate(resolve));
+  }));
+  assert.equal(failures, 1);
+  assert.equal(unrelated.length, 0);
+  assert.ok(records.some(record => record.stage === "protocol-mismatch" && record.attemptId === attemptId));
+  assert.ok(records.every(record => record.attemptId === attemptId));
 });
 
 test("runtime rediscovers a replaced owner on a surviving IPC broker and recovers only its final", async t => {
@@ -3343,7 +3396,13 @@ test("a source-bound subscription rejects a different rollout before exposing an
   const server = new Server(); server.dataState = { ...state(), rolloutPath: "C:/profiles/primary/sessions/task.jsonl" };
   const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
   const subscription = new TaskSubscription(client, { ...ref, sourceId: "work", rolloutPath: "C:/profiles/work/sessions/task.jsonl" }, () => assert.fail("Wrong-source events leaked"), () => {});
-  await assert.rejects(subscription.start(100), /другой копии/u);
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, async () => {
+    await assert.rejects(subscription.start(100), /другой копии/u);
+  });
+  assert.ok(records.some(record => record.stage === "source-validation" && record.outcome === "failure"
+    && record.reason === "source-mismatch"));
+  assert.doesNotMatch(JSON.stringify(records), /profiles|task\.jsonl|turnHistory|entitiesByKey/u);
   assert.equal(server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))), false);
 });
 

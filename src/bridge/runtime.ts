@@ -1,4 +1,6 @@
 import { TaskStateConnections, type TaskStateConnectionFailure, type TaskStateTransport } from "../core/task-state.js";
+import { randomUUID } from "node:crypto";
+import { captureDiagnostic, diagnosticEvent, diagnosticScope, diagnosticError } from "./diagnostics.js";
 import type { TaskHistoryRecovery } from "../core/task-history.js";
 import type { TaskObservationCheckpoint, TaskStateObserver } from "../core/task-observation.js";
 import type { Binding, BridgeChat, BridgeInput, OwnerAccess } from "./contracts.js";
@@ -94,6 +96,7 @@ export class BridgeRuntime {
   private readonly connecting = new Map<string, Promise<void>>();
   private readonly connectionGenerations = new Map<string, number>();
   private readonly connectionAttempts = new Map<string, symbol>();
+  private readonly diagnosticConnectionIds = new Map<string, string>();
   private readonly drainAttempts = new Map<string, { readonly since: number; readonly routeGeneration: number }>();
   private readonly releasedExecutionScopes = new Map<string, string>();
   private executionLifecycle(binding: Binding): { state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
@@ -157,6 +160,12 @@ export class BridgeRuntime {
     }
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.connections = new TaskStateConnections(adapters.states, now, (bindingId, event, task) => {
+      diagnosticScope({ attemptId: undefined, operationId: undefined, eventId: undefined, peerId: undefined }, () =>
+        diagnosticEvent("connection.lifecycle", { bindingId, threadId: task?.threadId, sourceId: task?.sourceId,
+        connectionAttemptId: this.diagnosticConnectionIds.get(bindingId), stage: event.phase,
+        outcome: event.outcome === "attempt" ? "start" : event.outcome === "confirmed" ? "success" : "failure",
+        routeGeneration: event.routeGeneration, ...(event.elapsedMs !== undefined ? { elapsedMs: event.elapsedMs } : {}),
+        ...(event.reason ? { reason: event.reason } : {}) }));
       try { store.recordConnectionDiagnostic(bindingId, { at: now(), ...event }, task); }
       catch { /* Diagnostic persistence must not interrupt task observation. */ }
     });
@@ -548,7 +557,10 @@ export class BridgeRuntime {
       // An active creator already owns the first turn and its event stream.
       // Never acquire a competing stream for that task.
       if (!creator) {
-        await this.connecting.get(binding.id);
+        const pending = this.connecting.get(binding.id);
+        if (pending) diagnosticEvent("connection.join", { bindingId: binding.id, threadId: binding.threadId,
+          connectionAttemptId: this.diagnosticConnectionIds.get(binding.id), intent: "command", reason: "already-connecting" });
+        await pending;
         if (!matches()) throw new ActionRejectedError("Привязка задачи изменилась во время подключения. Сообщение не отправлено; проверь /menu и повтори запрос.");
         if (!this.matchesConnection(binding)) {
           if (this.connections.has(binding.id)) this.closeSubscription(binding.id);
@@ -562,6 +574,7 @@ export class BridgeRuntime {
         // existing writer. Command adapters verify ownership before writes.
         this.connections.maintain(binding.id);
         if (!this.connections.connected(binding.id, Infinity)) {
+          diagnosticEvent("input.prepare", { stage: "ready", outcome: "failure", reason: "connection-not-ready", ready: false });
           this.store.setValue(`route-failure:${binding.id}`, { at: this.now(), kind: "no-active-owner" });
           throw new TaskNotOpenError();
         }
@@ -709,6 +722,7 @@ export class BridgeRuntime {
   }
   private closeSubscription(bindingId: string): void {
     this.connections.close(bindingId);
+    this.diagnosticConnectionIds.delete(bindingId);
     this.manager.panels.disconnected(bindingId);
     this.activity.disconnected(bindingId);
     this.files?.observe(bindingId, "unavailable");
@@ -1220,22 +1234,42 @@ export class BridgeRuntime {
 
   private connectBinding(binding: Binding, task: TaskRef, intent: "command" | "observe" = "command"): Promise<void> {
     const pending = this.connecting.get(binding.id);
-    if (pending) return pending;
+    if (pending) {
+      diagnosticEvent("connection.join", { bindingId: binding.id, threadId: task.threadId,
+        connectionAttemptId: this.diagnosticConnectionIds.get(binding.id), intent, reason: "already-connecting" });
+      return pending;
+    }
     const current = this.store.getBinding(binding.id);
-    if (this.stopped || !current?.attached || !sameTask(current, task)) return Promise.resolve();
+    if (this.stopped || !current?.attached || !sameTask(current, task)) {
+      diagnosticEvent("connection.skip", { bindingId: binding.id, threadId: task.threadId, intent,
+        reason: this.stopped ? "runtime-stopped" : !current?.attached ? "not-attached" : "stale" });
+      return Promise.resolve();
+    }
     const lifecycle = this.executionLifecycle(current);
     if (intent === "command" && lifecycle && ["checking", "waiting-unload", "released", "unavailable"].includes(lifecycle.state))
       intent = "observe"; // Persisted drain intent never authorizes legacy writer reacquisition after restart.
-    if (this.matchesConnection(binding)) return Promise.resolve();
+    if (this.matchesConnection(binding)) {
+      diagnosticEvent("connection.skip", { bindingId: binding.id, threadId: task.threadId, intent, reason: "matching",
+        connectionAttemptId: this.diagnosticConnectionIds.get(binding.id) });
+      return Promise.resolve();
+    }
     const transport = intent === "observe" ? this.passiveStates : undefined;
-    if (intent === "observe" && !transport) { this.enableRolloutFallback(current); return Promise.resolve(); }
+    if (intent === "observe" && !transport) {
+      diagnosticEvent("connection.skip", { bindingId: binding.id, threadId: task.threadId, intent, reason: "no-passive-route" });
+      this.enableRolloutFallback(current); return Promise.resolve();
+    }
     const generation = this.store.streamGeneration(binding.id);
     this.connectionGenerations.set(binding.id, generation);
     this.connectionAttempts.set(binding.id, Symbol("task-connection"));
+    const connectionAttemptId = randomUUID();
+    this.diagnosticConnectionIds.set(binding.id, connectionAttemptId);
     const currentGeneration = (): boolean => this.store.streamGeneration(binding.id) === generation;
     const checkpointKey = `projection:${binding.id}`;
-    const start = (async () => {
+    const start = diagnosticScope({ connectionAttemptId, bindingId: binding.id, threadId: task.threadId,
+      sourceId: task.sourceId ?? "", streamGeneration: generation }, async () => {
+      const trace = captureDiagnostic();
       const connectStartedAt = this.now();
+      trace("connection.start", { intent });
       try {
         await this.connections.connect(binding.id, task, (state, initial) => {
           const current = this.store.getBinding(binding.id);
@@ -1325,10 +1359,19 @@ export class BridgeRuntime {
             && !this.demanded.has(binding.id) && !this.hasPendingTaskWork(binding.id)) {
             this.releaseIdleSubscription(binding);
           }
-        }, failure => { if (currentGeneration()) this.subscriptionFailed(binding.id, failure); }, undefined, transport);
-        if (this.stopped || !currentGeneration() || !this.connections.matches(binding.id, task)) return;
+        }, failure => {
+          trace("connection.result", { outcome: "failure", stage: "notification", ...diagnosticError(failure.error) });
+          if (currentGeneration()) this.subscriptionFailed(binding.id, failure);
+        }, undefined, transport);
+        if (this.stopped || !currentGeneration() || !this.connections.matches(binding.id, task)) {
+          trace("connection.result", { outcome: "failure", reason: "stale", elapsedMs: this.now() - connectStartedAt });
+          return;
+        }
+        trace("connection.result", { outcome: "success", stage: "ready", elapsedMs: this.now() - connectStartedAt });
         if (!this.startupAdmission) this.store.markDesktopHandoff(binding.id, task, "live", this.now());
       } catch (error) {
+        trace("connection.result", { outcome: "failure", stage: "subscribe", elapsedMs: this.now() - connectStartedAt,
+          ...diagnosticError(error) });
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !currentGeneration() || !current?.attached || !sameTask(current, task)) return;
         if (this.connections.matches(binding.id, task)) this.closeSubscription(binding.id);
@@ -1345,7 +1388,7 @@ export class BridgeRuntime {
           text: `Не удалось подключиться к задаче «${binding.title.slice(0, 200)}». ${reason} Подключение будет повторено; новая задача вместо неё не создаётся.`,
         });
       }
-    })();
+    });
     this.connecting.set(binding.id, start);
     const settled = () => {
       if (this.connecting.get(binding.id) === start) this.connecting.delete(binding.id);
