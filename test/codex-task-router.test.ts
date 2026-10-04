@@ -3,7 +3,7 @@ import test from "node:test";
 import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
 import { ActionRejectedError, DesktopUnavailableError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
-import { RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
+import { PassiveTaskStateTransport, RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
 const work = { hostId: "local", threadId: "work", sourceId: "work" };
@@ -55,6 +55,46 @@ function fixture() {
   };
   return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
 }
+
+test("native observation recovery never consults a profile owner and rechecks exclusive claims before launch", async () => {
+  const s = fixture();
+  let exclusive = false, opens = 0;
+  const owner: CodexTaskOwner = { ...s.owner, routingPolicy: "exclusive", owns: () => exclusive };
+  const base: CodexTasks = { ...s.base, openNativeObservation: async (_task, assertCurrent) => {
+    await Promise.resolve();
+    assertCurrent();
+    opens++;
+    return "opened";
+  } };
+  const routed = new RoutedCodexTasks(base, [owner]);
+  assert.equal(await routed.openNativeObservation(primary, () => {}), "opened");
+  assert.deepEqual(s.calls, []);
+  exclusive = true;
+  await assert.rejects(routed.openNativeObservation(primary, () => {}), ActionRejectedError);
+  exclusive = false;
+  const pending = routed.openNativeObservation(primary, () => {});
+  exclusive = true;
+  await assert.rejects(pending, ActionRejectedError);
+  assert.equal(opens, 1);
+});
+
+test("an exclusive passive observer cannot advertise the shared native observation recovery route", async () => {
+  const native: TaskStateTransport = { readOnly: true,
+    subscribe: task => ({ task, readOnly: true, start: async () => {}, verifyOwner: async () => {}, close: () => {},
+      diagnostic: () => ({ kind: "native-observer" }) }), close: () => {},
+  };
+  let exclusive = true;
+  const transport = new PassiveTaskStateTransport(native, [{ routingPolicy: "exclusive", owns: () => exclusive, states: native }]);
+  const protectedStream = transport.subscribe(primary, () => {}, () => {});
+  await protectedStream.start();
+  assert.equal(protectedStream.diagnostic?.().kind, "unknown");
+  protectedStream.close();
+  exclusive = false;
+  const nativeStream = transport.subscribe(primary, () => {}, () => {});
+  await nativeStream.start();
+  assert.equal(nativeStream.diagnostic?.().kind, "native-observer");
+  nativeStream.close();
+});
 
 test("diagnostic routing records selected and connected fallback without additional dispatch", async () => {
   const f = fixture(); const records: DiagnosticRecord[] = [];

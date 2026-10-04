@@ -93,6 +93,24 @@ function setupWithBindings(t: { after(fn: () => void): void }, bindings: () => R
   return { store, chat, desktop, monitor };
 }
 
+test("native observation recovery health separates opening from verified and historical snapshots", async t => {
+  let state: "opened" | "ready" | "recovered" | "unavailable" = "opened";
+  const s = setupWithBindings(t, () => [{ id: "native-recovery", title: "Native fixture", source: ".codex",
+    status: "idle", connected: state === "ready", lastConfirmedAt: state === "ready" ? 100_000 : null,
+    failure: null, nativeObservationRecovery: { state, at: 90_000 } }]);
+  const check = async () => (await s.monitor.check(true)).checks.find(item =>
+    item.name === "codex_native_observation_recovery:native-recovery")!;
+  assert.equal((await check()).state, "degraded", "opening a window is not a passive owner snapshot");
+  state = "ready";
+  assert.equal((await check()).state, "ok");
+  state = "recovered";
+  const historical = await check();
+  assert.equal(historical.state, "ok", "normal idle stream release retains verified historical recovery");
+  assert.match(historical.detail, /свежесть текущего соединения проверяется отдельно/u);
+  state = "unavailable";
+  assert.equal((await check()).state, "degraded", "a later route failure is not currently ready");
+});
+
 test("health monitor verifies the complete healthy bridge and persists its snapshot", async t => {
   const s = setup(t);
   const report = await s.monitor.check(true);

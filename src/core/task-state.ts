@@ -193,7 +193,20 @@ export class PassiveTaskStateTransport implements TaskStateTransport {
       const current = this.exclusive(requested);
       return selected ? current.length !== 1 || current[0] !== selected : current.length !== 0;
     });
-    return fenced.subscribe(task, onState, onError);
+    const stream = fenced.subscribe(task, onState, onError);
+    if (!selected) return stream;
+    // An exclusive owner's passive stream may delegate to native IPC. It is
+    // still not evidence of an unrestricted shared native observation route.
+    return {
+      task: stream.task, readOnly: true,
+      start: timeoutMs => stream.start(timeoutMs),
+      verifyOwner: timeoutMs => stream.verifyOwner(timeoutMs),
+      close: () => stream.close(),
+      diagnostic: () => {
+        const route = stream.diagnostic?.() ?? { kind: "unknown" as const };
+        return route.kind === "native-observer" ? { ...route, kind: "unknown" as const } : route;
+      },
+    };
   }
   close(): void {
     const sources = new Set([this.native, ...this.owners.filter(owner => owner.routingPolicy === "exclusive"

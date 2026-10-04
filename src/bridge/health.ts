@@ -56,6 +56,10 @@ export interface RuntimeHealthState {
     readonly lastConnectionDiagnostic?: ConnectionDiagnostic | null;
     /** Local route evidence, never a claim of physical native writer ownership. */
     readonly route?: TaskStateRouteDiagnostic;
+    /** Opening the client is only an attempt; passive snapshot proves readiness. */
+    readonly nativeObservationRecovery?: Readonly<{ readonly state:
+      "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" |
+      "ready" | "unavailable" | "recovered"; readonly at: number }>;
     /** Per-binding execution writer lifecycle evidence from the runtime. */
     readonly executionLifecycle?: Readonly<{
       readonly state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
@@ -379,6 +383,16 @@ export class BridgeHealthMonitor {
           detail: `«${binding.title.slice(0, 120)}»: маршрут ${selection}; класс отказа: ${failure}; локальное поколение попытки ${route.routeGeneration ?? "неизвестно"}. Причина очищена от деталей транспорта; это не доказательство физического writer.` });
       }
       const routeFailure = this.store.getValue<{ at: number; kind: "no-active-owner" }>(`route-failure:${binding.id}`);
+      if (binding.nativeObservationRecovery) {
+        const recovery = binding.nativeObservationRecovery;
+        checks.push({ name: `codex_native_observation_recovery:${binding.id}`,
+          state: recovery.state === "ready" || recovery.state === "recovered" ? "ok" : "degraded",
+          detail: recovery.state === "ready"
+            ? "Наблюдение native восстановлено подтверждённым пассивным снимком; отклонённый VK-запрос не повторялся."
+            : recovery.state === "recovered"
+              ? "Наблюдение native ранее восстановлено пассивным снимком; свежесть текущего соединения проверяется отдельно. Отклонённый VK-запрос не повторялся."
+            : `Восстановление native-наблюдения: ${recovery.state}; открытие клиента и локальная аренда не доказывают готовность. Отклонённый VK-запрос не повторялся.` });
+      }
       if (routeFailure?.kind === "no-active-owner") {
         const at = Number.isSafeInteger(routeFailure.at) && Math.abs(routeFailure.at) <= 8.64e15
           ? new Date(routeFailure.at).toISOString() : "неизвестно";

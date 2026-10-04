@@ -5364,6 +5364,82 @@ test("read-only task operations never invoke the configured launcher", async () 
   assert.equal(opens, 0);
 });
 
+test("native observation recovery opens only after an exact missing-owner discovery, without following or writing", async () => {
+  for (const scenario of ["missing", "found", "malformed", "rejected", "disconnect"] as const) {
+    const server = new Server();
+    server.rejectDiscovery = scenario === "missing" || scenario === "rejected";
+    if (scenario === "rejected") server.discoveryError = "private backend error";
+    if (scenario === "malformed") server.ownerId = "";
+    if (scenario === "disconnect") server.onDiscovery = () => server.destroy();
+    const task = { ...ref, title: "Existing", workspace: "/fixture", updatedAt: 1 };
+    let opens = 0, guards = 0;
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
+      () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
+      { launcher: { canOpenNativeObservation: () => true, open: async () => { opens++; } } });
+    const result = await adapter.openNativeObservation(task, () => { guards++; });
+    assert.equal(result, scenario === "missing" ? "opened" : scenario === "found" ? "owner-present" : "unknown", scenario);
+    assert.equal(opens, scenario === "missing" ? 1 : 0, scenario);
+    assert.ok(guards >= 3);
+    assert.deepEqual(server.received.filter(message => message.type === "request").map(message => message.method),
+      ["initialize", "thread-owner-discovery"]);
+    assert.equal(server.received.some(message => message.method === "thread-stream-following-changed"), false);
+  }
+});
+
+test("native observation recovery cancels after scope change and refuses unqualified launchers before IPC", async () => {
+  const task = { ...ref, title: "Existing", workspace: "/fixture", updatedAt: 1 };
+  let clients = 0, opens = 0;
+  const make = (qualified: boolean, listed = [task]) => new ConnectedDesktopTasks(
+    { listTasks: async () => listed, listProjects: async () => [] },
+    () => {
+      clients++;
+      const server = new Server(); server.rejectDiscovery = true;
+      server.onDiscovery = () => { invalid = true; };
+      return new DesktopIpcClient(() => server, 100);
+    }, undefined, undefined, undefined, { launcher: {
+      canOpenNativeObservation: () => qualified, open: async () => { opens++; },
+    } });
+  let invalid = false;
+  const assertCurrent = () => { if (invalid) throw new ActionRejectedError("Scope changed"); };
+  assert.equal(await make(false).openNativeObservation(task, assertCurrent), "unsupported");
+  assert.equal(await make(true, []).openNativeObservation(task, assertCurrent), "unsupported");
+  assert.equal(clients, 0);
+  await assert.rejects(make(true).openNativeObservation(task, assertCurrent), ActionRejectedError);
+  assert.equal(opens, 0);
+});
+
+test("native observation recovery rejects a changed catalog home and a missing-client handshake error", async () => {
+  const task = { ...ref, title: "Existing", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: path.resolve("fixture-primary/sessions/task.jsonl") };
+  let opens = 0, clients = 0;
+  class MissingHandshakeClient extends DesktopIpcClient {
+    override async connect(): Promise<void> { throw new DesktopRequestRejectedError("no-client-found"); }
+  }
+  let listed = { ...task, rolloutPath: path.resolve("fixture-secondary/sessions/task.jsonl") };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [listed], listProjects: async () => [] },
+    () => { clients++; return new MissingHandshakeClient(); }, undefined, undefined, undefined,
+    { launcher: { canOpenNativeObservation: () => true, open: async () => { opens++; } } });
+  assert.equal(await adapter.openNativeObservation(task, () => {}), "unsupported");
+  assert.equal(clients, 0);
+  listed = task;
+  assert.equal(await adapter.openNativeObservation(task, () => {}), "unknown");
+  assert.equal(clients, 1);
+  assert.equal(opens, 0);
+});
+
+test("native observation recovery rechecks the catalog after the missing-owner probe", async () => {
+  const task = { ...ref, title: "Existing", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: path.resolve("fixture-primary/sessions/task.jsonl") };
+  let listed = task, opens = 0;
+  const server = new Server(); server.rejectDiscovery = true;
+  server.onDiscovery = () => { listed = { ...task, rolloutPath: path.resolve("fixture-other/sessions/task.jsonl") }; };
+  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [listed], listProjects: async () => [] },
+    () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
+    { launcher: { canOpenNativeObservation: () => true, open: async () => { opens++; } } });
+  assert.equal(await adapter.openNativeObservation(task, () => {}), "unsupported");
+  assert.equal(opens, 0);
+});
+
 test("an idle or unloaded task starts the next turn through its owner with inherited settings", async () => {
   for (const [status, runtimeStatus] of [["completed", "idle"], ["interrupted", "idle"], ["failed", "idle"], ["completed", "notLoaded"]] as const) {
     const server = new Server(); server.dataState = { ...state([], status), resumeState: "resumed", threadRuntimeStatus: { type: runtimeStatus } };
