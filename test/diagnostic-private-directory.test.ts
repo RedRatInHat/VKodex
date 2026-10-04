@@ -54,9 +54,12 @@ test("existing Windows ACL without file inheritance is refused without repair", 
     const result = spawnSync(executable,
       ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
         input: directory, encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 4_096,
+        env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
       });
     assert.equal(result.error, undefined);
-    assert.equal(result.status, 0, "ACL fixture setup failed");
+    const detail = result.stderr.replaceAll(directory, "<diagnostics>").replaceAll(parent, "<fixture>")
+      .replaceAll(os.homedir(), "<home>").slice(0, 600);
+    assert.equal(result.status, 0, `ACL fixture setup failed: ${detail}`);
     assert.equal(result.stderr, "");
     return result.stdout;
   };
