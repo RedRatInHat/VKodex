@@ -2,8 +2,12 @@ import { DesktopRequestRejectedError, DesktopUnavailableError, TaskConnectionLos
 import { DesktopIpcClient, isObject, type IpcObject } from "./ipc-client.js";
 import { RevisionedState } from "./state.js";
 import { sameRolloutSource } from "./paths.js";
+import { captureDiagnostic, diagnosticError, type DiagnosticFields } from "../bridge/diagnostics.js";
 
 class SourceRefreshRequired extends Error {}
+type SubscriptionStage = "connect" | "discover-owner" | "snapshot" | "source-validation"
+  | "protocol-mismatch" | "revision-recovery" | "ready" | "disconnect";
+type SubscriptionDiagnostic = (stage: SubscriptionStage, outcome: "start" | "success" | "failure", fields?: DiagnosticFields) => void;
 
 export class TaskSubscription {
   private readonly state = new RevisionedState();
@@ -20,6 +24,7 @@ export class TaskSubscription {
   private sourceTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
   private cancelStart: ((error: Error) => void) | null = null;
+  private report: SubscriptionDiagnostic = () => {};
 
   constructor(
     private readonly client: DesktopIpcClient,
@@ -34,16 +39,23 @@ export class TaskSubscription {
   get failure(): Error | null { return this.lastFailure; }
 
   private async discoverOwner(timeoutMs: number): Promise<string> {
+    const report = this.report;
+    report("discover-owner", "start");
     let reply: IpcObject;
     try {
       reply = await this.client.request("thread-owner-discovery", 1, {
         hostId: this.task.hostId, conversationId: this.task.threadId,
       }, { timeoutMs });
     } catch (error) {
+      report("discover-owner", "failure", diagnosticError(error));
       if (error instanceof DesktopRequestRejectedError && error.reason === "no-client-found") throw new TaskNotOpenError();
       throw error;
     }
-    if (typeof reply.handledByClientId !== "string") throw new TaskNotOpenError();
+    if (typeof reply.handledByClientId !== "string") {
+      report("discover-owner", "failure", { reason: "invalid-response" });
+      throw new TaskNotOpenError();
+    }
+    report("discover-owner", "success");
     return reply.handledByClientId;
   }
 
@@ -60,6 +72,13 @@ export class TaskSubscription {
 
   async start(timeoutMs = 5_000): Promise<void> {
     if (!this.closed) throw new Error("Subscription is already active");
+    // Wire callbacks can run in another request's async context. Retain this
+    // start's diagnostic scope without changing the subscription authority.
+    const emit = captureDiagnostic();
+    const report: SubscriptionDiagnostic = (stage, outcome, fields = {}) => emit("subscription.stage",
+      { threadId: this.task.threadId, stage, outcome, ...fields });
+    this.report = report;
+    let stage: SubscriptionStage = "connect";
     this.closed = false;
     this.recovering = false;
     this.lastFailure = null;
@@ -71,18 +90,26 @@ export class TaskSubscription {
       if (this.closed || this.generation !== generation) throw new DesktopUnavailableError("Подписка на задачу отменена.");
     };
     try {
+      report("connect", "start");
       await this.client.connect();
       checkActive();
+      report("connect", "success");
+      stage = "discover-owner";
       const owner = await this.discoverOwner(timeoutMs);
       checkActive();
       this.ownerId = owner;
+      stage = "snapshot";
+      report("snapshot", "start");
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
+          report(this.sourceProblem ? "source-validation" : "snapshot", "failure",
+            { reason: this.sourceProblem === "mismatch" ? "source-mismatch" : this.sourceProblem ? "source-missing" : "timeout" });
           this.close(this.sourceProblem ? this.sourceError() : new DesktopUnavailableError("Не получено состояние задачи."));
         }, timeoutMs);
         let ready = false;
         this.cancelStart = error => { clearTimeout(timer); reject(error); };
         this.disconnect = this.client.onDisconnect(error => {
+          report("disconnect", "failure", diagnosticError(error));
           clearTimeout(timer);
           const failure = new TaskConnectionLostError(error.message);
           this.close(failure);
@@ -93,6 +120,7 @@ export class TaskSubscription {
           const params = message.params;
           if (!isObject(params) || params.hostId !== this.task.hostId || params.conversationId !== this.task.threadId) return;
           if (message.version !== 11) {
+            report("protocol-mismatch", "failure", { reason: "protocol-mismatch" });
             clearTimeout(timer);
             const error = new DesktopUnavailableError("Версия событий десктопа не поддерживается.");
             this.close(error);
@@ -105,20 +133,34 @@ export class TaskSubscription {
           if ((this.recovering || this.sourceRefreshRequested) && isObject(params.change) && params.change.type === "patches") return;
           try {
             const initial = this.state.current === null;
+            const recovering = this.recovering;
             const state = this.state.accept(params.change, candidate => {
               if (candidate.id !== this.task.threadId || candidate.hostId !== this.task.hostId) throw new Error("Unexpected task state");
-              this.validateSource(candidate);
+              const validating = initial || this.sourceRefreshRequested;
+              try {
+                this.validateSource(candidate);
+                if (validating) report("source-validation", "success");
+              } catch (error) {
+                report("source-validation", "failure", { ...diagnosticError(error),
+                  reason: this.sourceProblem === "mismatch" ? "source-mismatch" : "source-missing" });
+                throw error;
+              }
             });
             this.recovering = false;
             if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
             this.onState(state, initial);
-            if (!ready) { ready = true; clearTimeout(timer); this.cancelStart = null; resolve(); }
+            if (recovering) report("revision-recovery", "success");
+            if (!ready) {
+              ready = true; clearTimeout(timer); this.cancelStart = null;
+              report("snapshot", "success"); report("ready", "success"); resolve();
+            }
           } catch (error) {
             if (error instanceof SourceRefreshRequired) {
               if (ready && !this.sourceTimer) {
                 this.sourceTimer = setTimeout(() => {
                   this.sourceTimer = null;
                   const failure = this.sourceError();
+                  report("source-validation", "failure", { reason: this.sourceProblem === "mismatch" ? "source-mismatch" : "source-missing" });
                   this.close(failure); this.onError(failure);
                 }, timeoutMs);
               }
@@ -131,18 +173,21 @@ export class TaskSubscription {
               return;
             }
             if (this.recovering) {
-              const error = new DesktopUnavailableError("Не удалось восстановить состояние задачи.");
+              report("revision-recovery", "failure", diagnosticError(error));
+              const failure = new DesktopUnavailableError("Не удалось восстановить состояние задачи.");
               clearTimeout(timer);
-              this.close(error);
-              if (ready) this.onError(error); else reject(error);
+              this.close(failure);
+              if (ready) this.onError(failure); else reject(failure);
               return;
             }
             this.recovering = true;
+            report("revision-recovery", "start", diagnosticError(error));
             this.state.reset();
             if (ready && !this.recoveryTimer) {
               this.recoveryTimer = setTimeout(() => {
                 this.recoveryTimer = null;
                 const failure = new TaskConnectionLostError("Codex не прислал новый снимок состояния задачи после разрыва последовательности событий.");
+                report("revision-recovery", "failure", { reason: "timeout" });
                 this.close(failure); this.onError(failure);
               }, timeoutMs);
             }
@@ -153,6 +198,7 @@ export class TaskSubscription {
         this.follow(true);
       });
     } catch (error) {
+      report(stage, "failure", diagnosticError(error));
       if (this.generation === generation) this.close();
       throw error;
     }

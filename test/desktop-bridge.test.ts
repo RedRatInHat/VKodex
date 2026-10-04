@@ -30,12 +30,59 @@ import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendP
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { taskInput as desktopTaskInput } from "../src/core/task-input.js";
 import { pendingCodexQuestions, type CodexQuestions } from "../src/desktop/questions.js";
+import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 
 // Deliberately fictional fixture IDs; production identity is supplied only through local configuration.
 const access = { ownerId: 101, groupId: 202 };
 const task: DesktopTask = { hostId: "local", threadId: "task-a", title: "Existing desktop task", workspace: "/project", projectId: "project-a", updatedAt: 10 };
 const peerId = 2_000_000_017;
 const STAGED_FILE_PILOT_FOR_TEST = Object.freeze({ mode: "single-chat" as const, peerId });
+
+test("diagnostic trace explains preparation refusal without claiming prompt dispatch", async t => {
+  const s = setup(t); s.attach();
+  const records: DiagnosticRecord[] = [];
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate,
+    undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => { throw new TaskNotOpenError(); });
+  await withDiagnosticSink(record => { records.push(record); }, () => manager.handle(s.input("secret prompt", peerId)));
+  assert.equal(s.desktop.submissions.length, 0);
+  const refusal = records.find(record => record.event === "input.prepare" && record.outcome === "failure");
+  assert.equal(refusal?.errorType, "TaskNotOpenError");
+  assert.ok(refusal?.attemptId);
+  assert.equal(records.some(record => record.event === "input.journal" || record.event === "input.adapter"), false);
+  assert.equal(records.find(record => record.event === "input.result")?.outcome, "not-dispatched");
+  assert.equal(JSON.stringify(records).includes("secret prompt"), false);
+});
+
+test("diagnostic trace correlates adapter receipt and remains safe when sink fails", async t => {
+  const s = setup(t); s.attach();
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle(s.input("privacy canary", peerId)));
+  const accepted = records.find(record => record.event === "input.result" && record.outcome === "accepted");
+  assert.ok(accepted?.operationId);
+  assert.equal(accepted?.attemptId, records.find(record => record.event === "input.started")?.attemptId);
+  assert.equal(JSON.stringify(records).includes("privacy canary"), false);
+  await withDiagnosticSink(() => { throw new Error("sink refused"); }, () => s.manager.handle(s.input("next", peerId)));
+  assert.equal(s.desktop.submissions.length, 2);
+});
+
+test("diagnostic trace does not call a receipt with no native turn proof accepted", async t => {
+  const s = setup(t); s.attach(); s.desktop.submitReceipt = { mode: "start", turnId: null };
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle(s.input("x", peerId)));
+  assert.equal(records.find(record => record.event === "input.result")?.outcome, "adapter-returned");
+});
+
+test("diagnostic non-prompt mutation failure cannot assert it was never dispatched", async t => {
+  const s = setup(t); s.attach();
+  s.desktop.renameTask = async () => { throw new UncertainActionError(); };
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle({ ...s.input("", peerId),
+    conversationTitle: "[VKodex] changed title" }));
+  const failure = records.find(record => record.event === "input.result");
+  assert.equal(failure?.outcome, "unknown");
+  assert.equal(failure?.dispatched, undefined);
+});
 
 class Chat implements BridgeChat {
   participants = [access.ownerId, -access.groupId];

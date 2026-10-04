@@ -10,6 +10,8 @@ import { LegacyExecutionLifecycle } from "../src/codex/legacy-execution-lifecycl
 import { AppServerTaskStateTransport } from "../src/codex/app-server-task-state.js";
 import { AppServerProfileOwner } from "../src/codex/app-server-profile-owner.js";
 import { ActionRejectedError } from "../src/core/codex-tasks.js";
+import { diagnosticScope, withDiagnosticSink } from "../src/bridge/diagnostics.js";
+import type { DiagnosticRecord } from "../src/bridge/diagnostics.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -1851,5 +1853,104 @@ test('duplicate callback or post-write guard failure is uncertain, writes once a
     assert.equal(receipts, 2);
     assert.equal(child.messages.filter(message => message.method === 'turn/start').length, 2);
     assert.equal(connection.isSessionCurrent(session.generation), true);
+  } finally { await connection.close(); }
+});
+
+test("RPC diagnostics retain initiating scope across rejection, timeout and late receipt without payloads", async () => {
+  const child = new AppServerChild();
+  child.respond = message => message.method === "initialize" ? { id: message.id, result: {} } : null;
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const keepAlive = setInterval(() => {}, 1_000);
+  const records: DiagnosticRecord[] = [];
+  const sink = (record: DiagnosticRecord) => { records.push(record); };
+  try {
+    const session = await connection.initializedSession();
+    const rejectedAttempt = "00000000-0000-4000-8000-000000000001";
+    const rejected = withDiagnosticSink(sink, () => diagnosticScope({ attemptId: rejectedAttempt }, () =>
+      connection.request("turn/start", { secret: "RPC-PARAM-SECRET" }, {
+        mutating: true, expectedGeneration: session.generation,
+      })));
+    await new Promise(resolve => setImmediate(resolve));
+    const rejectedId = child.messages.find(message => message.method === "turn/start")?.id as number;
+    child.send({ id: rejectedId, error: { code: 409, message: "RPC-ERROR-SECRET" } });
+    await assert.rejects(rejected, AppServerRejectedError);
+    const rejectedStages = records.filter(record => record.attemptId === rejectedAttempt);
+    assert.deepEqual(rejectedStages.map(record => record.stage),
+      ["start", "before-write", "write-attempt", "write-returned", "response"]);
+    assert.ok(rejectedStages.every(record => record.connectionId === rejectedStages[0]?.connectionId &&
+      record.backendGeneration === session.generation && record.method === "turn/start" && record.mutating === true));
+    assert.ok(rejectedStages.slice(2).every(record => record.requestId === rejectedId));
+    assert.equal(rejectedStages.at(-1)?.outcome, "failure");
+
+    const timedOutAttempt = "00000000-0000-4000-8000-000000000002";
+    let receipts = 0;
+    const timedOut = withDiagnosticSink(sink, () => diagnosticScope({ attemptId: timedOutAttempt }, () =>
+      connection.request("turn/start", { secret: "RPC-TIMEOUT-SECRET" }, {
+        mutating: true, expectedGeneration: session.generation, timeoutMs: 10,
+        onLateResponseEnvelope: () => { receipts++; },
+      })));
+    await new Promise(resolve => setImmediate(resolve));
+    const timedOutId = child.messages.filter(message => message.method === "turn/start").at(-1)?.id as number;
+    await assert.rejects(timedOut, AppServerUncertainError);
+    child.send({ id: timedOutId, result: { secret: "RPC-RESULT-SECRET" } });
+    assert.equal(receipts, 1);
+    const timedOutStages = records.filter(record => record.attemptId === timedOutAttempt);
+    assert.ok(timedOutStages.slice(2).every(record => record.requestId === timedOutId));
+    assert.deepEqual(timedOutStages.map(record => record.stage),
+      ["start", "before-write", "write-attempt", "write-returned", "timeout", "late-response"]);
+    assert.ok(timedOutStages.every(record => record.attemptId === timedOutAttempt));
+    assert.equal(timedOutStages.find(record => record.stage === "timeout")?.outcome, "unknown");
+    assert.equal(timedOutStages.find(record => record.stage === "late-response")?.outcome, "success");
+    assert.doesNotMatch(JSON.stringify(records), /RPC-(?:PARAM|ERROR|TIMEOUT|RESULT)-SECRET/u);
+  } finally { clearInterval(keepAlive); await connection.close(); }
+});
+
+test("RPC diagnostics report actual-write refusal only after the guard exits", async () => {
+  const child = new AppServerChild();
+  const connection = new AppServerConnection(() => child.asChild(), undefined, 100);
+  const records: DiagnosticRecord[] = [];
+  let insideGuard = false;
+  let diagnosticInsideGuard = false;
+  try {
+    const session = await connection.initializedSession();
+    const denied = new Error("RPC-GUARD-SECRET");
+    await assert.rejects(withDiagnosticSink(record => {
+      if (insideGuard) diagnosticInsideGuard = true;
+      records.push(record);
+    }, () => diagnosticScope({ attemptId: "00000000-0000-4000-8000-000000000003" }, () =>
+      connection.request("turn/start", { secret: "RPC-PARAM-SECRET" }, {
+        mutating: true, expectedGeneration: session.generation,
+        withWriteGuard: () => { insideGuard = true; try { throw denied; } finally { insideGuard = false; } },
+      }))), error => error === denied);
+    assert.equal(diagnosticInsideGuard, false);
+    assert.equal(child.messages.some(message => message.method === "turn/start"), false);
+    assert.deepEqual(records.map(record => record.stage), ["start", "before-write", "guard-refused"]);
+    assert.equal(records.at(-1)?.requestId, 2);
+    assert.equal(records.at(-1)?.outcome, "failure");
+    assert.doesNotMatch(JSON.stringify(records), /RPC-(?:GUARD|PARAM)-SECRET/u);
+    records.length = 0;
+    await withDiagnosticSink(record => {
+      if (insideGuard) diagnosticInsideGuard = true;
+      records.push(record);
+    }, () => connection.request("turn/start", {}, {
+      mutating: true, expectedGeneration: session.generation,
+      withWriteGuard: write => { insideGuard = true; try { write(); } finally { insideGuard = false; } },
+    }));
+    assert.equal(diagnosticInsideGuard, false);
+    assert.deepEqual(records.map(record => record.stage),
+      ["start", "before-write", "write-attempt", "write-returned", "response"]);
+    records.length = 0;
+    await assert.rejects(withDiagnosticSink(record => {
+      if (insideGuard) diagnosticInsideGuard = true;
+      records.push(record);
+    }, () => connection.request("turn/start", {}, {
+      mutating: true, expectedGeneration: session.generation,
+      withWriteGuard: write => {
+        insideGuard = true;
+        try { write(); child.disconnect(); } finally { insideGuard = false; }
+      },
+    })), AppServerUncertainError);
+    assert.equal(diagnosticInsideGuard, false);
+    assert.ok(records.some(record => record.stage === "disconnect" && record.outcome === "unknown"));
   } finally { await connection.close(); }
 });

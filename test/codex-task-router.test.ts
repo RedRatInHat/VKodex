@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
 import { ActionRejectedError, DesktopUnavailableError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
 import { RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
@@ -54,6 +55,29 @@ function fixture() {
   };
   return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
 }
+
+test("diagnostic routing records selected and connected fallback without additional dispatch", async () => {
+  const f = fixture(); const records: DiagnosticRecord[] = [];
+  f.owner.submitWithReceipt = async () => { throw new TaskOwnedByClientError(); };
+  await withDiagnosticSink(record => { records.push(record); }, () =>
+    f.routed.submitWithReceipt({ task: work, operationId: "route-fixture", text: "private prompt" }));
+  assert.deepEqual(f.calls, ["base:connectedSubmit"]);
+  assert.equal(records.find(record => record.event === "route.selected")?.route, "profile-owner");
+  assert.equal(records.find(record => record.event === "route.fallback")?.reason, "owner-conflict");
+  assert.equal(JSON.stringify(records).includes("private prompt"), false);
+});
+
+test("diagnostic exclusive owner refusal never records or executes a fallback", async () => {
+  const f = fixture(); const records: DiagnosticRecord[] = [];
+  const owner = { ...f.owner, routingPolicy: "exclusive" as const,
+    submitWithReceipt: async () => { throw new TaskOwnedByClientError(); } };
+  await withDiagnosticSink(record => { records.push(record); }, () => assert.rejects(
+    new RoutedCodexTasks(f.base, [owner]).submitWithReceipt({ task: work, operationId: "exclusive-fixture", text: "x" }),
+    TaskOwnedByClientError));
+  assert.deepEqual(f.calls, []);
+  assert.equal(records.find(record => record.event === "route.selected")?.route, "exclusive-owner");
+  assert.equal(records.some(record => record.event === "route.fallback"), false);
+});
 
 test("command router uses exactly the configured source owner", async () => {
   const f = fixture();

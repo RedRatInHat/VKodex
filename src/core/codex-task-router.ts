@@ -1,4 +1,5 @@
 import type { CodexQuestions } from "./codex-questions.js";
+import { diagnosticEvent } from "../bridge/diagnostics.js";
 import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, sameTask, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
@@ -90,11 +91,14 @@ export class RoutedCodexTasks implements CodexTasks {
   async submit(request: SubmitTaskRequest): Promise<void> { await this.submitWithReceipt(request); }
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
     const owner = this.owner(request.task);
+    diagnosticEvent("route.selected", { operationId: request.operationId, threadId: request.task.threadId,
+      sourceId: request.task.sourceId ?? "", route: !owner ? "base" : owner.routingPolicy === "exclusive" ? "exclusive-owner" : "profile-owner" });
     if (!owner) return this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
     try { return await owner.submitWithReceipt(request); }
     catch (error) {
       if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error;
       if (!this.base.submitConnectedWithReceipt) throw new ActionRejectedError("Задача открыта в Codex, но её активное подключение недоступно. Повтори после восстановления клиента.");
+      diagnosticEvent("route.fallback", { operationId: request.operationId, route: "connected-desktop", reason: "owner-conflict" });
       return this.base.submitConnectedWithReceipt(request);
     }
   }
@@ -153,11 +157,14 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async queue(request: SubmitTaskRequest): Promise<string> {
     const owner = this.owner(request.task);
+    diagnosticEvent("route.selected", { operationId: request.operationId, threadId: request.task.threadId,
+      sourceId: request.task.sourceId ?? "", stage: "queue", route: !owner ? "base" : owner.routingPolicy === "exclusive" ? "exclusive-owner" : "profile-owner" });
     if (owner) {
       try { return await owner.queue(request); }
       catch (error) {
         if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error;
         if (!this.base.queue) throw new ActionRejectedError("Штатная очередь активного клиента недоступна.");
+        diagnosticEvent("route.fallback", { operationId: request.operationId, stage: "queue", route: "connected-desktop", reason: "owner-conflict" });
         return this.base.queue(request);
       }
     }
