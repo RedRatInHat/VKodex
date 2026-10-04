@@ -7,6 +7,7 @@ import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { formatHealthSummary } from "./health.js";
+import { boundedInteractiveView } from "./interactive-view.js";
 import { TaskTransfers, transferStatus, type TransferredGoalUsage } from "./transfers.js";
 
 interface PanelState {
@@ -1088,7 +1089,7 @@ export class TaskPanels {
   private show(peerId: number, state: PanelState, view: View): void {
     if (state.view === "home") state.expiresAt = Date.now() + 30 * 60_000;
     this.store.setValue(`panel:${peerId}`, state);
-    this.store.enqueue(state.messageKey, peerId, { ...view, silent: true }, state.bindingId, "panel");
+    this.store.enqueue(state.messageKey, peerId, boundedInteractiveView({ ...view, silent: true }), state.bindingId, "panel");
   }
   private renderTask(binding: Binding, state: PanelState): void {
     if (binding.peerId === null) return;
