@@ -3643,6 +3643,20 @@ test("VK collects photos and documents, removes duplicate previews and rejects u
   await assert.rejects(collectVkFiles({ attachments: [{ type: "video" }] }), /документы/u);
 });
 
+test("attachment refusals identify the actual route instead of assuming a task chat exists", async t => {
+  const s = setup(t);
+  const attachment = { key: "doc", kind: "file" as const, fileName: "notes.txt", url: "https://sun1.userapi.com/file" };
+  await s.manager.handle({ ...s.input(""), attachments: [attachment] });
+  s.attach();
+  await s.manager.handle({ ...s.input("/files", peerId), attachments: [attachment] });
+  await s.manager.handle({ ...s.input("Read this", peerId), attachments: [attachment] });
+  await s.worker.flush();
+  assert.match(s.chat.sent[0]!.view.text, /Менеджер VKodex не принимает вложения/u);
+  assert.match(s.chat.sent[1]!.view.text, /Команду или кнопку нельзя отправить вместе с вложением/u);
+  assert.match(s.chat.sent[2]!.view.text, /Передача вложений сейчас не настроена/u);
+  assert.equal(s.desktop.submissions.length, 0);
+});
+
 test("VK Long Poll photo and reply-document payloads reach the linked task through SDK getters", async t => {
   const s = setup(t); s.attach(); const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-file-test-"));
   const files = new TaskFiles(root, s.store, s.chat, s.gate);
