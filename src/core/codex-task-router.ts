@@ -1,5 +1,6 @@
 import type { CodexQuestions } from "./codex-questions.js";
-import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { diagnosticEvent } from "../bridge/diagnostics.js";
+import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, sameTask, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -72,6 +73,15 @@ export class RoutedCodexTasks implements CodexTasks {
   listTasks(): Promise<readonly DesktopTask[]> { return this.base.listTasks(); }
   listSources(): readonly DesktopSource[] { return this.base.listSources?.() ?? []; }
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]> { return this.base.listProjects(sourceId); }
+  async transferProjectId(task: TaskRef): Promise<string | null> {
+    this.refuseExclusive(task);
+    if (this.base.transferProjectId) return this.base.transferProjectId(task);
+    // Preserve the pre-existing contract of adapters without this optional
+    // hook. A failing native hook is never replaced by display inference.
+    const current = (await this.base.listTasks()).find(candidate => sameTask(candidate, task));
+    if (!current || current.projectId === undefined) throw new ActionRejectedError("Нативный проект исходной задачи не подтверждён.");
+    return current.projectId;
+  }
   catalogWarnings(): readonly string[] { return this.base.catalogWarnings?.() ?? []; }
   createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject> {
     if (!this.base.createProject) throw new ActionRejectedError("Создание проекта недоступно в этом подключении.");
@@ -81,11 +91,14 @@ export class RoutedCodexTasks implements CodexTasks {
   async submit(request: SubmitTaskRequest): Promise<void> { await this.submitWithReceipt(request); }
   async submitWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
     const owner = this.owner(request.task);
+    diagnosticEvent("route.selected", { operationId: request.operationId, threadId: request.task.threadId,
+      sourceId: request.task.sourceId ?? "", route: !owner ? "base" : owner.routingPolicy === "exclusive" ? "exclusive-owner" : "profile-owner" });
     if (!owner) return this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
     try { return await owner.submitWithReceipt(request); }
     catch (error) {
       if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error;
       if (!this.base.submitConnectedWithReceipt) throw new ActionRejectedError("Задача открыта в Codex, но её активное подключение недоступно. Повтори после восстановления клиента.");
+      diagnosticEvent("route.fallback", { operationId: request.operationId, route: "connected-desktop", reason: "owner-conflict" });
       return this.base.submitConnectedWithReceipt(request);
     }
   }
@@ -144,11 +157,14 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async queue(request: SubmitTaskRequest): Promise<string> {
     const owner = this.owner(request.task);
+    diagnosticEvent("route.selected", { operationId: request.operationId, threadId: request.task.threadId,
+      sourceId: request.task.sourceId ?? "", stage: "queue", route: !owner ? "base" : owner.routingPolicy === "exclusive" ? "exclusive-owner" : "profile-owner" });
     if (owner) {
       try { return await owner.queue(request); }
       catch (error) {
         if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error;
         if (!this.base.queue) throw new ActionRejectedError("Штатная очередь активного клиента недоступна.");
+        diagnosticEvent("route.fallback", { operationId: request.operationId, stage: "queue", route: "connected-desktop", reason: "owner-conflict" });
         return this.base.queue(request);
       }
     }
@@ -353,6 +369,13 @@ export class RoutedCodexTasks implements CodexTasks {
     return this.base.continueGoal(task, operationId);
   }
   async revealTask(task: TaskRef): Promise<void> { this.refuseExclusive(task); return this.base.revealTask?.(task) ?? Promise.resolve(); }
+  async openNativeObservation(task: TaskRef, assertCurrent: () => void): Promise<import("./codex-tasks.js").NativeObservationOpenResult> {
+    const assertRoute = (): void => { assertCurrent(); this.refuseExclusive(task); };
+    assertRoute();
+    const result = await this.base.openNativeObservation?.(task, assertRoute) ?? "unsupported";
+    assertRoute();
+    return result;
+  }
   async ensureOpen(task: TaskRef): Promise<void> {
     const owner = this.owner(task);
     if (owner) {

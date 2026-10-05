@@ -25,13 +25,23 @@ function externalCommand(uri: string): { executable: string; args: string[] } {
 
 export class SourceTaskLauncher implements DesktopTaskLauncher {
   private readonly sources = new Map<string, CodexSourceConfig>();
+  private readonly primaryHome: string | undefined;
 
   constructor(
     sources: readonly CodexSourceConfig[],
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly launch: Spawn = (executable, args, options) => spawn(executable, [...args], options),
   ) {
+    this.primaryHome = sources[0] ? comparablePath(sources[0].home) : undefined;
     for (const source of sources) this.sources.set(comparablePath(source.home), source);
+  }
+
+  canOpenNativeObservation(task: TaskRef): boolean {
+    if (task.hostId !== "local" || !task.threadId || (task.sourceId ?? "") !== "") return false;
+    try {
+      const home = comparablePath(this.sourceHome(task));
+      return home === this.primaryHome && this.sources.get(home)?.launcher?.type === "desktop";
+    } catch { return false; }
   }
 
   async open(task: TaskRef): Promise<void> {

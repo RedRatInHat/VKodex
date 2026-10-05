@@ -288,7 +288,12 @@ export interface TaskCreationUpdate {
 
 export interface DesktopTaskLauncher {
   open(task: TaskRef): Promise<void>;
+  /** Narrow automatic recovery capability; a general launcher is not eligible. */
+  canOpenNativeObservation?(task: TaskRef): boolean;
 }
+
+/** An opened UI is not evidence of a verified subscription or accepted input. */
+export type NativeObservationOpenResult = "opened" | "owner-present" | "unknown" | "unsupported";
 
 export interface DesktopCompatibility {
   readonly state: "checking" | "ok" | "unverified" | "failed";
@@ -317,6 +322,9 @@ export interface CodexTasks {
   listTasks(): Promise<readonly DesktopTask[]>;
   listSources?(): readonly DesktopSource[];
   listProjects(sourceId?: string): Promise<readonly DesktopProject[]>;
+  /** Explicit persisted assignment, not a catalog's workspace-based display
+   * inference. Unknown metadata must reject, never become null. */
+  transferProjectId?(task: TaskRef): Promise<string | null>;
   createProject?(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string): Promise<DesktopProject>;
   catalogWarnings?(): readonly string[];
   createTask(request: CreateTaskRequest): Promise<DesktopTask>;
@@ -372,6 +380,11 @@ export interface CodexTasks {
   continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;
   /** Bring the configured Codex client to the foreground after an explicit user action. */
   revealTask?(task: TaskRef): Promise<void>;
+  /** Repair native owner discovery through the configured primary Desktop UI.
+   * Must probe the native broker first, launch only on exact no-client-found,
+   * and call assertCurrent after asynchronous boundaries and before launch.
+   * Never resume, submit, queue, change goals/settings, or acquire a writer. */
+  openNativeObservation?(task: TaskRef, assertCurrent: () => void): Promise<NativeObservationOpenResult>;
   /** One-time handoff used after a task or transfer is first linked to VK. */
   ensureOpen?(task: TaskRef): Promise<void>;
   isCreationActive?(task: TaskRef): boolean;

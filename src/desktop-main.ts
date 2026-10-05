@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { inspect } from "node:util";
 import { loadDesktopBridgeConfig, type DesktopBridgeConfig } from "./bridge/config.js";
@@ -12,6 +13,9 @@ import { AppServerTaskTransfer } from "./desktop/app-server-transfer.js";
 import { SourceTaskLauncher } from "./desktop/launcher.js";
 import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
 import { createDesktopLogger } from "./desktop/logging.js";
+import { createDiagnosticLog, type DiagnosticLog } from "./desktop/diagnostic-log.js";
+import { prepareDiagnosticDirectory } from "./desktop/diagnostic-private-directory.js";
+import { installDiagnosticSink } from "./bridge/diagnostics.js";
 import { writeRuntimeProcessState } from "./desktop/process-state.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
 import { DesktopTaskStateTransport } from "./desktop/state-transport.js";
@@ -27,6 +31,7 @@ import { createDesktopRouting } from "./desktop/desktop-routing.js";
 import { sameTask } from "./core/codex-tasks.js";
 import type { AppServerStreamDiagnostic } from "./codex/app-server-task-state.js";
 import { loadPredecessorMaintenance } from "./desktop/predecessor-maintenance.js";
+import { loadDotNativeRoute } from "./dot-native/runtime.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -41,6 +46,31 @@ catch (error) {
   logger.fatal({ error: formatFatalDetail(error) }, "VKodex desktop bridge configuration is invalid");
   process.exit(1);
 }
+// This separate channel never serializes request bodies or exceptions. Only a
+// new dedicated leaf can receive a private ACL; existing Codex/data ACLs are untouched.
+const diagnosticDirectory = path.join(config.dataDir, "diagnostics");
+let disabledDiagnosticDrops = 0;
+const diagnosticLog: DiagnosticLog = await prepareDiagnosticDirectory(diagnosticDirectory)
+  ? await createDiagnosticLog(diagnosticDirectory)
+  : { write: () => { disabledDiagnosticDrops++; }, flush: async () => {},
+    status: () => ({ state: "disabled", written: 0, dropped: disabledDiagnosticDrops, failed: 0 }) };
+let entrySha256: string | undefined;
+try { entrySha256 = createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex"); }
+catch { /* Missing build evidence cannot turn diagnostics into a startup dependency. */ }
+installDiagnosticSink(diagnosticLog.write, entrySha256 ? { entrySha256 } : undefined);
+try { logger.info({ diagnostics: diagnosticLog.status() }, "Private lifecycle diagnostics initialized"); }
+catch { /* Even the ordinary status channel is observational. */ }
+let lastDiagnosticLoss = "";
+const diagnosticStatusTimer = setInterval(() => {
+  const status = diagnosticLog.status();
+  const loss = JSON.stringify([status.state, status.dropped, status.failed]);
+  if (loss !== lastDiagnosticLoss && (status.state !== "ready" || status.dropped || status.failed)) {
+    lastDiagnosticLoss = loss;
+    try { logger.warn({ diagnostics: status }, "Lifecycle diagnostics are incomplete; missing events are not absence of work"); }
+    catch { /* Do not stop healthy task transport because a status log failed. */ }
+  }
+}, 60_000);
+diagnosticStatusTimer.unref();
 const store = new BridgeStore(path.join(config.dataDir, "vkodex.sqlite"));
 store.assertPrimaryHome(config.codexHome);
 const gateway = new DesktopVkGateway(config, undefined, undefined, logger);
@@ -104,17 +134,28 @@ const runtime = new BridgeRuntime(config.access, tasks, gateway, store,
       : Promise.resolve("unclaimed" as const) }, undefined,
   path.join(config.dataDir, "files"), path.join(config.dataDir, "health.json"), config.healthIntervalMs, undefined, config.projectlessRoot, config.inboundFileLimits,
   config.stagedFilePilot);
+const dotRoute = await loadDotNativeRoute(config.dataDir, config.access, gateway,
+  peerId => store.byPeer(peerId) !== null && store.byPeer(peerId) !== undefined,
+  state => logger.info({ state }, "Native dot route status"),
+  (peerId, after) => gateway.readDotInputs(peerId, after));
 const startedAt = Date.now();
 let exitReason = "process_exit";
 let stopping = false;
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
+  clearInterval(diagnosticStatusTimer);
   logger.info({ reason: exitReason }, "VKodex desktop bridge is stopping");
   await gateway.stop().catch(() => {});
+  await dotRoute?.close().catch(() => {});
   await runtime.stop().catch(() => {});
   await Promise.allSettled(appServerOwners.map(owner => owner.close()));
   try { store.close(); } catch { /* Process is already stopping. */ }
+  let diagnosticFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([diagnosticLog.flush(), new Promise<void>(resolve => {
+    diagnosticFlushTimer = setTimeout(resolve, 250);
+  })]).catch(() => {});
+  if (diagnosticFlushTimer) clearTimeout(diagnosticFlushTimer);
 };
 writeRuntimeProcessState(config.dataDir, { status: "running", pid: process.pid, at: startedAt, startedAt });
 process.once("exit", code => {
@@ -135,9 +176,13 @@ process.once("uncaughtException", error => fatalShutdown("uncaught_exception", e
 process.once("unhandledRejection", reason => fatalShutdown("unhandled_rejection", reason));
 try {
   logger.info("VKodex desktop bridge is starting");
-  await gateway.start(input => runtime.handle(input));
+  await gateway.start(async input => {
+    if (dotRoute && await dotRoute.relay.handle(input)) return;
+    await runtime.handle(input);
+  });
   gateway.startReconciliation(store);
   runtime.start();
+  dotRoute?.relay.start();
   // A controlled bridge restart leaves a one-shot intent next to the private
   // database. Recover it only after VK and the task streams are live; the
   // durable inbox event ID makes a second startup idempotent.

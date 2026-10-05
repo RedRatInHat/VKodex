@@ -6,7 +6,8 @@ import { taskDetails } from "./details.js";
 import { activeTurnsFromState, summarizeTurnState, turnsFromState } from "./projector.js";
 import { asyncQuestionReply, pendingCodexQuestions, type CodexQuestions } from "./questions.js";
 import { taskInput, type PreparedTaskInput } from "../core/task-input.js";
-import { comparablePath } from "./paths.js";
+import { comparablePath, sameRolloutSource } from "./paths.js";
+import { diagnosticEvent } from "../bridge/diagnostics.js";
 
 class TransientSubmissionStateError extends ActionRejectedError {}
 
@@ -415,6 +416,48 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.live.launcher.open(resolved);
   }
 
+  async openNativeObservation(task: TaskRef, assertCurrent: () => void): Promise<import("./contracts.js").NativeObservationOpenResult> {
+    const launcher = this.live?.launcher;
+    if (task.hostId !== "local" || (task.sourceId ?? "") !== ""
+      || !launcher?.canOpenNativeObservation?.(task) || this.live?.creator?.isActive(task)) return "unsupported";
+    assertCurrent();
+    const resolved = (await this.listTasks()).find(candidate => sameTask(candidate, task));
+    assertCurrent();
+    if (!resolved || task.rolloutPath && (!resolved.rolloutPath || !sameRolloutSource(task.rolloutPath, resolved.rolloutPath))
+      || !launcher.canOpenNativeObservation?.(resolved) || this.live?.creator?.isActive(resolved)) return "unsupported";
+    // Discovery is a read-only native broker request. In particular, do not use
+    // connect/ensureOpen: TaskNotOpenError also represents malformed replies.
+    const client = this.createClient();
+    let missing = false;
+    let discovering = false;
+    try {
+      await client.connect();
+      assertCurrent();
+      discovering = true;
+      diagnosticEvent("connection.lifecycle", { stage: "discover-owner", outcome: "start", intent: "observe", mutating: false, ready: false });
+      const reply = await client.request("thread-owner-discovery", 1, {
+        hostId: resolved.hostId, conversationId: resolved.threadId,
+      }, { timeoutMs: 5_000 });
+      assertCurrent();
+      return typeof reply.handledByClientId === "string" && reply.handledByClientId.length > 0
+        ? "owner-present" : "unknown";
+    } catch (error) {
+      assertCurrent();
+      missing = discovering && error instanceof DesktopRequestRejectedError && error.reason === "no-client-found";
+      if (!missing) return "unknown";
+    } finally { client.close(); }
+    assertCurrent();
+    const latest = (await this.listTasks()).find(candidate => sameTask(candidate, task));
+    assertCurrent();
+    if (!missing || !latest || task.rolloutPath && (!latest.rolloutPath || !sameRolloutSource(task.rolloutPath, latest.rolloutPath))
+      || !launcher.canOpenNativeObservation?.(latest) || this.live?.creator?.isActive(latest)) return "unsupported";
+    diagnosticEvent("connection.lifecycle", { stage: "native-observation-recovery", outcome: "start",
+      reason: "no-client-found", intent: "observe", mutating: false, ready: false });
+    await launcher.open(latest);
+    assertCurrent();
+    return "opened";
+  }
+
   private async interruptState(task: TaskRef, expectedTurnId: string | undefined): Promise<"running" | "stopped" | "unknown"> {
     try {
       return await this.follow(task, async subscription => {
@@ -535,8 +578,15 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.metadata.assignProject(task, rawProjectId);
     const current = (await this.listTasks()).find(candidate => sameTask(candidate, task));
     if (!current) throw new UncertainActionError();
-    if (current.projectId !== expectedProjectId
-      || (this.metadata.read && (await this.metadata.read(task)).projectId !== rawProjectId)) {
+    // The catalog can infer a display project from the workspace even when
+    // the acknowledged native assignment is null. Prefer the exact native
+    // read for null; explicit assignments still require the expected catalog
+    // project too. Unknown native reads never use display inference as proof.
+    const confirmed = this.metadata.read
+      ? (await this.metadata.read(task)).projectId === rawProjectId
+        && (rawProjectId === null || current.projectId === expectedProjectId)
+      : current.projectId === expectedProjectId;
+    if (!confirmed) {
       throw new ProjectAssignmentUnconfirmedError();
     }
   }
@@ -547,6 +597,17 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     const source = (await this.listTasks()).find(task => sameTask(task, request.task));
     if (!source?.rolloutPath) throw new ActionRejectedError("Codex не сообщил путь истории задачи. Обнови список и повтори перенос.");
     return this.live.transfer.fork({ ...request, task: { ...request.task, rolloutPath: source.rolloutPath } });
+  }
+
+  async transferProjectId(task: TaskRef): Promise<string | null> {
+    if (!this.metadata?.read) throw new DesktopUnavailableError("Нативный проект исходной задачи недоступен.");
+    const assignment = await this.metadata.read(task);
+    if (assignment.projectId === null) return null;
+    const scopedId = task.sourceId ? JSON.stringify([task.sourceId, assignment.projectId]) : assignment.projectId;
+    const project = (await this.listProjects(task.sourceId ?? ""))
+      .find(project => project.id === scopedId || project.legacyIds?.includes(scopedId));
+    if (!project) throw new ActionRejectedError("Нативный проект исходной задачи не найден в её каталоге. Перенос не начат.");
+    return project.id;
   }
 
   async submit(request: SubmitTaskRequest): Promise<void> {

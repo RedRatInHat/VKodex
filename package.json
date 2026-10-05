@@ -22,13 +22,14 @@
     "vk:token:setup": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/setup-vk-document-token.ps1",
     "vk:token:import": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/import-vk-document-token.ps1",
     "health:check": "node --env-file=.env --import tsx src/desktop/health-check.ts",
+    "diagnostics:read": "node dist/src/diagnostics-main.js",
     "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-task.ps1",
     "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-windows-task.ps1",
     "service:controlled-restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/controlled-restart.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
-    "test": "node --import tsx --test --test-concurrency=4 test/*.test.ts",
-    "integration:test": "node --import tsx --test --test-concurrency=1 test/integration/production-pinned-first-thread.test.ts",
+    "test": "node --import ./scripts/test-offline-guard.mjs --import tsx --test --test-concurrency=4 test/*.test.ts",
+    "integration:test": "node --import ./scripts/test-offline-guard.mjs --import tsx --test --test-concurrency=1 test/integration/production-pinned-first-thread.test.ts",
     "check": "npm run typecheck && npm test && npm run integration:test"
   },
   "dependencies": {

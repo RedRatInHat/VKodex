@@ -7,6 +7,7 @@ import { taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { formatHealthSummary } from "./health.js";
+import { boundedInteractiveView } from "./interactive-view.js";
 import { TaskTransfers, transferStatus, type TransferredGoalUsage } from "./transfers.js";
 
 interface PanelState {
@@ -445,13 +446,16 @@ export class TaskPanels {
         const source = (this.desktop.listSources?.() ?? []).find(item => item.id === action.sourceId);
         if (!source || source.id === (binding.sourceId ?? "")) throw new ActionRejectedError("Целевой каталог недоступен или совпадает с текущим.");
         const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
-        if (!current || current.projectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
-        if (current.projectId === null) {
+        if (!current) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+        const sourceProjectId = this.desktop.transferProjectId
+          ? await this.desktop.transferProjectId(current) : current.projectId;
+        if (sourceProjectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+        if (sourceProjectId === null) {
           await this.renderTransferProjects(binding, source.id, source.label, 0);
           break;
         }
         const sourceProject = (await this.desktop.listProjects(binding.sourceId ?? ""))
-          .find(project => project.id === current.projectId || project.legacyIds?.includes(current.projectId!));
+          .find(project => project.id === sourceProjectId || project.legacyIds?.includes(sourceProjectId));
         if (!sourceProject) throw new ActionRejectedError("Проект исходной задачи не найден в её каталоге. Перенос не начат.");
         const matches = (await this.desktop.listProjects(source.id)).filter(project => sameProject(sourceProject, project));
         if (matches.length > 1) throw new ActionRejectedError("В каталоге назначения несколько одинаковых проектов. Перенос не начат.");
@@ -486,7 +490,9 @@ export class TaskPanels {
         }
         if (!state.sourceProjectId) {
           const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
-          if (!current || current.projectId !== null) {
+          const sourceProjectId = current && (this.desktop.transferProjectId
+            ? await this.desktop.transferProjectId(current) : current.projectId);
+          if (!current || sourceProjectId !== null) {
             throw new ActionRejectedError("Проект исходной задачи изменился после подтверждения. Открой перенос заново.");
           }
         }
@@ -808,9 +814,12 @@ export class TaskPanels {
     if (!state.sourceProjectId || !state.sourceProjectTitle || !state.sourceProjectRoots || state.targetSourceId === undefined
       || !this.desktop.createProject) throw new ActionRejectedError("Сведения о проекте назначения недоступны. Перенос не начат.");
     const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
-    if (!current || current.projectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+    if (!current) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
+    const sourceProjectId = this.desktop.transferProjectId
+      ? await this.desktop.transferProjectId(current) : current.projectId;
+    if (sourceProjectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
     const source = (await this.desktop.listProjects(binding.sourceId ?? ""))
-      .find(project => project.id === current.projectId || project.legacyIds?.includes(current.projectId!));
+      .find(project => project.id === sourceProjectId || sourceProjectId !== null && project.legacyIds?.includes(sourceProjectId));
     if (!source || source.id !== state.sourceProjectId || source.title !== state.sourceProjectTitle
       || projectRoots(source).length !== state.sourceProjectRoots.length
       || projectRoots(source).some((root, index) => comparablePath(root) !== comparablePath(state.sourceProjectRoots![index]!))) {
@@ -1080,7 +1089,7 @@ export class TaskPanels {
   private show(peerId: number, state: PanelState, view: View): void {
     if (state.view === "home") state.expiresAt = Date.now() + 30 * 60_000;
     this.store.setValue(`panel:${peerId}`, state);
-    this.store.enqueue(state.messageKey, peerId, { ...view, silent: true }, state.bindingId, "panel");
+    this.store.enqueue(state.messageKey, peerId, boundedInteractiveView({ ...view, silent: true }), state.bindingId, "panel");
   }
   private renderTask(binding: Binding, state: PanelState): void {
     if (binding.peerId === null) return;

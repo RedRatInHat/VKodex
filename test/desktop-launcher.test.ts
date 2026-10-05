@@ -43,3 +43,21 @@ test("Desktop tasks use the registered protocol handler instead of starting the 
   assert.equal(call!.executable, process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open");
   assert.deepEqual(call!.args, ["codex://threads/11111111-1111-4111-8111-111111111111"]);
 });
+
+test("automatic observation opening requires the actual configured primary Desktop home", () => {
+  const primary = path.resolve("fixture-primary-home"), secondary = path.resolve("fixture-secondary-home");
+  const sources = [{ home: primary, launcher: { type: "desktop" as const } },
+    { home: secondary, launcher: { type: "desktop" as const } }];
+  let resolved = primary;
+  const launcher = new SourceTaskLauncher(sources, () => resolved, () => { throw new Error("Eligibility must not spawn"); });
+  const task = { hostId: "local", threadId: "fixture-thread" };
+  assert.equal(launcher.canOpenNativeObservation(task), true);
+  assert.equal(launcher.canOpenNativeObservation({ ...task, sourceId: "work" }), false);
+  assert.equal(launcher.canOpenNativeObservation({ ...task, hostId: "remote" }), false);
+  resolved = secondary;
+  assert.equal(launcher.canOpenNativeObservation(task), false);
+  for (const config of [{ type: "vscode" as const, executable: process.execPath, userDataDir: primary },
+    { type: "command" as const, executable: process.execPath, arguments: [] }]) {
+    assert.equal(new SourceTaskLauncher([{ home: primary, launcher: config }], () => primary).canOpenNativeObservation(task), false);
+  }
+});

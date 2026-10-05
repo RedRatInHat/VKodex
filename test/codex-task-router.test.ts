@@ -1,11 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
 import { ActionRejectedError, DesktopUnavailableError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
-import { RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
+import { PassiveTaskStateTransport, RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
 const work = { hostId: "local", threadId: "work", sourceId: "work" };
+
+test("legacy routed transfer project preserves explicit null without a native hook", async () => {
+  const s = fixture();
+  const base: CodexTasks = { ...s.base, listTasks: async () => [{ ...primary,
+    title: "Legacy", workspace: "/workspace", updatedAt: 1, projectId: null }] };
+  assert.equal(await new RoutedCodexTasks(base, []).transferProjectId(primary), null);
+});
+
+test("routed transfer project never falls back after an unavailable native read", async () => {
+  const s = fixture();
+  const base: CodexTasks = { ...s.base, listTasks: async () => [{ ...primary,
+    title: "Legacy", workspace: "/workspace", updatedAt: 1, projectId: null }],
+    transferProjectId: async () => { throw new DesktopUnavailableError("native read unavailable"); } };
+  await assert.rejects(new RoutedCodexTasks(base, []).transferProjectId(primary), DesktopUnavailableError);
+});
 
 function fixture() {
   const calls: string[] = [];
@@ -39,6 +55,69 @@ function fixture() {
   };
   return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
 }
+
+test("native observation recovery never consults a profile owner and rechecks exclusive claims before launch", async () => {
+  const s = fixture();
+  let exclusive = false, opens = 0;
+  const owner: CodexTaskOwner = { ...s.owner, routingPolicy: "exclusive", owns: () => exclusive };
+  const base: CodexTasks = { ...s.base, openNativeObservation: async (_task, assertCurrent) => {
+    await Promise.resolve();
+    assertCurrent();
+    opens++;
+    return "opened";
+  } };
+  const routed = new RoutedCodexTasks(base, [owner]);
+  assert.equal(await routed.openNativeObservation(primary, () => {}), "opened");
+  assert.deepEqual(s.calls, []);
+  exclusive = true;
+  await assert.rejects(routed.openNativeObservation(primary, () => {}), ActionRejectedError);
+  exclusive = false;
+  const pending = routed.openNativeObservation(primary, () => {});
+  exclusive = true;
+  await assert.rejects(pending, ActionRejectedError);
+  assert.equal(opens, 1);
+});
+
+test("an exclusive passive observer cannot advertise the shared native observation recovery route", async () => {
+  const native: TaskStateTransport = { readOnly: true,
+    subscribe: task => ({ task, readOnly: true, start: async () => {}, verifyOwner: async () => {}, close: () => {},
+      diagnostic: () => ({ kind: "native-observer" }) }), close: () => {},
+  };
+  let exclusive = true;
+  const transport = new PassiveTaskStateTransport(native, [{ routingPolicy: "exclusive", owns: () => exclusive, states: native }]);
+  const protectedStream = transport.subscribe(primary, () => {}, () => {});
+  await protectedStream.start();
+  assert.equal(protectedStream.diagnostic?.().kind, "unknown");
+  protectedStream.close();
+  exclusive = false;
+  const nativeStream = transport.subscribe(primary, () => {}, () => {});
+  await nativeStream.start();
+  assert.equal(nativeStream.diagnostic?.().kind, "native-observer");
+  nativeStream.close();
+});
+
+test("diagnostic routing records selected and connected fallback without additional dispatch", async () => {
+  const f = fixture(); const records: DiagnosticRecord[] = [];
+  f.owner.submitWithReceipt = async () => { throw new TaskOwnedByClientError(); };
+  await withDiagnosticSink(record => { records.push(record); }, () =>
+    f.routed.submitWithReceipt({ task: work, operationId: "route-fixture", text: "private prompt" }));
+  assert.deepEqual(f.calls, ["base:connectedSubmit"]);
+  assert.equal(records.find(record => record.event === "route.selected")?.route, "profile-owner");
+  assert.equal(records.find(record => record.event === "route.fallback")?.reason, "owner-conflict");
+  assert.equal(JSON.stringify(records).includes("private prompt"), false);
+});
+
+test("diagnostic exclusive owner refusal never records or executes a fallback", async () => {
+  const f = fixture(); const records: DiagnosticRecord[] = [];
+  const owner = { ...f.owner, routingPolicy: "exclusive" as const,
+    submitWithReceipt: async () => { throw new TaskOwnedByClientError(); } };
+  await withDiagnosticSink(record => { records.push(record); }, () => assert.rejects(
+    new RoutedCodexTasks(f.base, [owner]).submitWithReceipt({ task: work, operationId: "exclusive-fixture", text: "x" }),
+    TaskOwnedByClientError));
+  assert.deepEqual(f.calls, []);
+  assert.equal(records.find(record => record.event === "route.selected")?.route, "exclusive-owner");
+  assert.equal(records.some(record => record.event === "route.fallback"), false);
+});
 
 test("command router uses exactly the configured source owner", async () => {
   const f = fixture();

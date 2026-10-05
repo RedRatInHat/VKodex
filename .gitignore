@@ -7,6 +7,7 @@ node_modules/
 # Local configuration and credentials
 .env
 .env.*
+dot-native.json
 !/.env.example
 .npmrc
 *.pem

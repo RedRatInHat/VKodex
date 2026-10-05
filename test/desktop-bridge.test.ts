@@ -30,12 +30,59 @@ import { collectVkFiles, DesktopVkGateway, hasVkAttachments, vkKeyboard, vkSendP
 import { projectSnapshot } from "../src/desktop/projector.js";
 import { taskInput as desktopTaskInput } from "../src/core/task-input.js";
 import { pendingCodexQuestions, type CodexQuestions } from "../src/desktop/questions.js";
+import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 
 // Deliberately fictional fixture IDs; production identity is supplied only through local configuration.
 const access = { ownerId: 101, groupId: 202 };
 const task: DesktopTask = { hostId: "local", threadId: "task-a", title: "Existing desktop task", workspace: "/project", projectId: "project-a", updatedAt: 10 };
 const peerId = 2_000_000_017;
 const STAGED_FILE_PILOT_FOR_TEST = Object.freeze({ mode: "single-chat" as const, peerId });
+
+test("diagnostic trace explains preparation refusal without claiming prompt dispatch", async t => {
+  const s = setup(t); s.attach();
+  const records: DiagnosticRecord[] = [];
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate,
+    undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => { throw new TaskNotOpenError(); });
+  await withDiagnosticSink(record => { records.push(record); }, () => manager.handle(s.input("secret prompt", peerId)));
+  assert.equal(s.desktop.submissions.length, 0);
+  const refusal = records.find(record => record.event === "input.prepare" && record.outcome === "failure");
+  assert.equal(refusal?.errorType, "TaskNotOpenError");
+  assert.ok(refusal?.attemptId);
+  assert.equal(records.some(record => record.event === "input.journal" || record.event === "input.adapter"), false);
+  assert.equal(records.find(record => record.event === "input.result")?.outcome, "not-dispatched");
+  assert.equal(JSON.stringify(records).includes("secret prompt"), false);
+});
+
+test("diagnostic trace correlates adapter receipt and remains safe when sink fails", async t => {
+  const s = setup(t); s.attach();
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle(s.input("privacy canary", peerId)));
+  const accepted = records.find(record => record.event === "input.result" && record.outcome === "accepted");
+  assert.ok(accepted?.operationId);
+  assert.equal(accepted?.attemptId, records.find(record => record.event === "input.started")?.attemptId);
+  assert.equal(JSON.stringify(records).includes("privacy canary"), false);
+  await withDiagnosticSink(() => { throw new Error("sink refused"); }, () => s.manager.handle(s.input("next", peerId)));
+  assert.equal(s.desktop.submissions.length, 2);
+});
+
+test("diagnostic trace does not call a receipt with no native turn proof accepted", async t => {
+  const s = setup(t); s.attach(); s.desktop.submitReceipt = { mode: "start", turnId: null };
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle(s.input("x", peerId)));
+  assert.equal(records.find(record => record.event === "input.result")?.outcome, "adapter-returned");
+});
+
+test("diagnostic non-prompt mutation failure cannot assert it was never dispatched", async t => {
+  const s = setup(t); s.attach();
+  s.desktop.renameTask = async () => { throw new UncertainActionError(); };
+  const records: DiagnosticRecord[] = [];
+  await withDiagnosticSink(record => { records.push(record); }, () => s.manager.handle({ ...s.input("", peerId),
+    conversationTitle: "[VKodex] changed title" }));
+  const failure = records.find(record => record.event === "input.result");
+  assert.equal(failure?.outcome, "unknown");
+  assert.equal(failure?.dispatched, undefined);
+});
 
 class Chat implements BridgeChat {
   participants = [access.ownerId, -access.groupId];
@@ -460,6 +507,48 @@ test("manager menu separates the project overview from task browsing", async t =
   assert.doesNotMatch(s.chat.sent.at(-1)!.view.text, /Existing desktop task/u);
   await clickPanel(s, "1. Project", access.ownerId);
   assert.match(s.chat.sent.at(-1)!.view.text, /Existing desktop task/u);
+});
+
+test("manager menu remains deliverable with a large health report and keeps navigation", async t => {
+  const s = setup(t); s.attach();
+  s.store.setValue("health:latest", { state: "failed", checkedAt: Date.now(), pid: 1, uptimeSeconds: 10,
+    checks: Array.from({ length: 30 }, (_, i) => ({ name: `long-check-${i}`, state: "failed", detail: "Диагностика 🚀 ".repeat(60) })) });
+  await s.handle("/menu");
+  const view = panelView(s, access.ownerId);
+  assert.ok(view.text.length <= 4000, `manager panel exceeds VK budget: ${view.text.length}`);
+  assert.match(view.text, /сокращена/u);
+  assert.ok(view.buttons!.some(button => button.label === "Задачи Codex"));
+  await clickPanel(s, "Задачи Codex", access.ownerId);
+  assert.match(s.chat.sent.at(-1)!.view.text, /В каком проекте/u);
+});
+
+test("VK transport bounds persisted interactive panels for both send and edit without truncating ordinary messages", async t => {
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const vk = new VK({ token: "fixture-token" });
+  t.mock.method(vk.api, "callWithRequest", async ({ method, params }: { method: string; params: Record<string, unknown> }) => {
+    assert.ok(["messages.send", "messages.edit"].includes(method));
+    calls.push({ method, params });
+    return method === "messages.send" ? [{ peer_id: access.ownerId, conversation_message_id: 8, message_id: 99 }] : 1;
+  });
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, 0);
+  const header = "VKodex · менеджер\n";
+  const view = { text: header + "🚀".repeat(3500), buttons: [MENU_BUTTON], silent: true };
+  const params = vkSendParams(access.ownerId, view, 77);
+  assert.ok(params.message.length <= 4000, `legacy panel exceeds VK budget: ${params.message.length}`);
+  assert.ok(!/[\uD800-\uDBFF]$/u.test(params.message.split("\n")[1]!));
+  const handle = await gateway.send(access.ownerId, view, 77);
+  await gateway.edit(handle, view);
+  assert.equal(calls[0]!.params.message, params.message);
+  assert.equal(calls[1]!.params.message, params.message);
+  assert.equal(calls[0]!.params.random_id, 77);
+  assert.equal(calls[0]!.params.keyboard, vkKeyboard(view));
+  const ordinary = { text: "unmodified ".repeat(700) };
+  assert.equal(vkSendParams(access.ownerId, ordinary, 78).message, ordinary.text);
+  const exact = { text: header + "x".repeat(4000 - header.length), buttons: [MENU_BUTTON] };
+  assert.equal(vkSendParams(access.ownerId, exact, 79).message, exact.text);
+  assert.equal(vkSendParams(access.ownerId, { ...ordinary, buttons: [MENU_BUTTON] }, 80).message, ordinary.text,
+    "write-confirmation cards must never be silently shortened");
+  assert.equal(view.text.length, 7000 + header.length);
 });
 
 test("manager health button runs a fresh check and renders its component report", async t => {
@@ -1722,6 +1811,93 @@ function transferFixture(s: ReturnType<typeof setup>) {
     targetSourceId: "work", targetProjectId: null, phase: "forking" as const };
 }
 
+for (const displayProject of [undefined, "inferred-from-another-profile"] as const) {
+  test(`transfer uses confirmed native project instead of display project ${displayProject}`, async t => {
+    const s = setup(t); s.attach();
+    const displayedTask = { ...task };
+    delete displayedTask.projectId;
+    if (displayProject !== undefined) displayedTask.projectId = displayProject;
+    s.desktop.tasks = [displayedTask];
+    s.desktop.capabilities.transferTask = true;
+    s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+    s.desktop.sourceProjects = { "": [], work: [] };
+    let reads = 0;
+    Object.assign(s.desktop, { transferProjectId: async () => { reads++; return null; } });
+    await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+    await clickPanel(s, ".codex-work"); await clickPanel(s, "Без проекта"); await clickPanel(s, "Перенести");
+    assert.equal(reads, 2);
+    assert.equal(s.desktop.transfers.length, 1);
+  });
+}
+
+test("transfer never treats unreadable native project as no project", async t => {
+  const s = setup(t); s.attach(); s.desktop.tasks = [{ ...task, projectId: null }];
+  s.desktop.capabilities.transferTask = true;
+  s.desktop.sources = [{ id: "", label: ".codex" }, { id: "work", label: ".codex-work" }];
+  Object.assign(s.desktop, { transferProjectId: async () => { throw new DesktopUnavailableError("native project unavailable"); } });
+  await s.handle("/menu", peerId); await clickPanel(s, "Переместить"); await clickPanel(s, "В другой каталог");
+  await clickPanel(s, ".codex-work");
+  assert.equal(s.desktop.transfers.length, 0);
+  assert.ok(s.chat.sent.some(message => message.view.text.includes("native project unavailable")));
+});
+
+test("scoped transfer atomically claims only its requested operation before RPC", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const other = s.store.ensureBinding({ ...task, threadId: "unrelated-task", sourceId: "unrelated" });
+  s.store.setChat(other.id, peerId + 1, 18);
+  s.store.beginTransfer({ ...record, id: "unrelated-transfer", bindingId: other.id,
+    source: { ...task, threadId: other.threadId, sourceId: "unrelated" }, targetSourceId: "elsewhere", version: 2, revision: 0 });
+  assert.ok(s.store.claimTransfer(s.store.transfer(other.id)!, "unrelated-owner", process.pid, () => true));
+  const unrelated = s.store.transfer(other.id);
+  let competitorCalls = 0;
+  const competingDesktop = Object.create(s.desktop) as Desktop;
+  competingDesktop.transferCheckpoint = async () => { competitorCalls++; throw new Error("must not run"); };
+  const competitor = new TaskTransfers(s.store, competingDesktop, s.now);
+  const checkpoint = s.desktop.transferCheckpoint.bind(s.desktop);
+  s.desktop.transferCheckpoint = async () => {
+    const saved = s.store.transfer(record.bindingId)!;
+    assert.equal(saved.lease?.pid, process.pid);
+    assert.equal(s.store.transferBlocksInput(record.bindingId), true);
+    competitor.tick(); await competitor.idle();
+    // Both live claims remain pinned while the competitor scans.
+    assert.equal(s.store.transfer(record.bindingId)?.lease?.owner, saved.lease?.owner);
+    return checkpoint();
+  };
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await transfers.startScoped(record);
+  assert.equal(s.store.transfer(record.bindingId)?.phase, "complete");
+  assert.equal(s.store.transfer(record.bindingId)?.lease, null);
+  assert.equal(competitorCalls, 0);
+  assert.deepEqual(s.store.transfer(other.id), unrelated);
+  assert.equal(s.desktop.transfers.length, 1);
+});
+
+test("scoped transfer refuses a live source lease without leaving a new fence", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  const other = s.store.ensureBinding({ ...task, threadId: "leased-task" });
+  s.store.setChat(other.id, peerId + 1, 18);
+  s.store.beginTransfer({ ...record, id: "live-transfer", bindingId: other.id,
+    source: { ...task, threadId: other.threadId }, version: 2, revision: 0 });
+  const saved = s.store.transfer(other.id)!;
+  assert.ok(s.store.claimTransfer(saved, "other-owner", process.pid, () => true));
+  const before = s.store.streamGeneration(record.bindingId);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await assert.rejects(transfers.startScoped(record), /операци|process|lease/iu);
+  assert.equal(s.store.transfer(record.bindingId), null);
+  assert.equal(s.store.streamGeneration(record.bindingId), before);
+  assert.equal(s.desktop.transfers.length, 0);
+});
+
+test("scoped transfer never steals or replays an existing operation", async t => {
+  const s = setup(t); const record = transferFixture(s);
+  s.store.beginTransfer({ ...record, version: 2, revision: 0 });
+  const before = s.store.transfer(record.bindingId);
+  const transfers = new TaskTransfers(s.store, s.desktop, s.now);
+  await assert.rejects(transfers.startScoped(record), /операци|already/iu);
+  assert.deepEqual(s.store.transfer(record.bindingId), before);
+  assert.equal(s.desktop.transfers.length, 0);
+});
+
 test("transfer switches the VK observation epoch after copied history", async t => {
   const s = setup(t); const record = transferFixture(s);
   s.store.setValue(`projection:${record.bindingId}`, { since: 1, lastObservedAt: 2,
@@ -2447,7 +2623,17 @@ test("transfer checkpoints and leases survive reopening SQLite; only a dead owne
   first.beginTransfer(record);
   first.claimTransfer(record, "old-owner", 123, () => true);
   first.close();
-  const reopened = new BridgeStore(file); t.after(() => reopened.close());
+  const existing = new DatabaseConstructor(file);
+  existing.exec("DROP TABLE bridge_managed_queue_receipts; DROP TABLE bridge_managed_operation_authorities");
+  const schemaSql = "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name";
+  const oldSchema = existing.prepare(schemaSql).all();
+  const pin = createHash("sha256").update(JSON.stringify(oldSchema)).digest("hex");
+  existing.close();
+  assert.throws(() => new BridgeStore(file, { existingTransferSchemaSha256: "0".repeat(64) }), /schema changed/u);
+  const reopened = new BridgeStore(file, { existingTransferSchemaSha256: pin }); t.after(() => reopened.close());
+  const verify = new DatabaseConstructor(file, { readonly: true });
+  assert.deepEqual(verify.prepare(schemaSql).all(), oldSchema);
+  verify.close();
   const restored = reopened.transfer(binding.id)!;
   assert.equal(restored.checkpoint?.lastTurnId, "persisted-boundary");
   assert.equal(restored.forkSubmitted, true);
@@ -6444,7 +6630,10 @@ test("VK Long Poll replies and callback buttons use the native question handler"
   s.manager.questions.observeQuestions(binding, pendingCodexQuestions(state)); await s.worker.flush();
   const first = s.chat.sent[0]!;
   const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
-  t.mock.method(vk.api, "call", async () => 1);
+  t.mock.method(vk.api, "callWithRequest", async ({ method }: { method: string }) => {
+    assert.equal(method, "messages.sendMessageEventAnswer");
+    return 1;
+  });
   const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
   await gateway.start(input => s.manager.handle(input));
   await vk.updates.handleWebhookUpdate({ type: "message_event", group_id: access.groupId, event_id: "callback-test", v: "5.199", object: {

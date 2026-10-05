@@ -13,6 +13,7 @@ import path from "node:path";
 import os from "node:os";
 import { comparablePath } from "../core/paths.js";
 import { TaskQuestions } from "./questions.js";
+import { diagnosticEvent, diagnosticError, diagnosticScope, diagnosticOperation, diagnosticHasOperation, diagnosticUpdate } from "./diagnostics.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -124,6 +125,7 @@ export class TaskManager {
     if (input.action && input.senderId !== this.access.ownerId) return Promise.resolve();
     const key = JSON.stringify([input.peerId, input.eventId]);
     if (this.activeInputs.has(key) || !this.store.receiveInput(input)) return Promise.resolve();
+    diagnosticEvent("input.received", { peerId: input.peerId, eventId: input.eventId });
     this.activeInputs.add(key);
     try { return this.inputBatcher.handle(input).finally(() => this.activeInputs.delete(key)); }
     catch (error) { this.activeInputs.delete(key); throw error; }
@@ -143,10 +145,27 @@ export class TaskManager {
   }
 
   private enqueueInput(input: BridgeInput): Promise<void> {
+    let binding: Binding | null = null;
+    let generation: number | undefined;
+    try { binding = this.store.byPeer(input.peerId); generation = binding ? this.store.streamGeneration(binding.id) : undefined; }
+    catch { /* Metadata for a trace must not alter durable input processing. */ }
+    return diagnosticScope({ attemptId: randomUUID(), operationId: undefined,
+      bindingId: binding?.id, threadId: binding?.threadId, sourceId: binding?.sourceId ?? "",
+      streamGeneration: generation,
+      peerId: input.peerId, eventId: input.eventId }, () => this.enqueueTracedInput(input));
+  }
+
+  private enqueueTracedInput(input: BridgeInput): Promise<void> {
     // Each VK conversation is ordered independently. A disconnected Codex task
     // must never hold the manager or another linked conversation behind it.
     const previous = this.tails.get(input.peerId) ?? Promise.resolve();
-    const work = previous.then(() => this.watch(input));
+    const queuedAt = performance.now();
+    diagnosticEvent("input.queued", { mergedCount: input.mergedEventIds?.length ?? 0 });
+    for (const eventId of input.mergedEventIds ?? []) diagnosticEvent("input.associated", { eventId });
+    const work = previous.then(() => {
+      diagnosticEvent("input.started", { queueWaitMs: performance.now() - queuedAt });
+      return this.watch(input);
+    });
     const settled = work.catch(() => {});
     this.tails.set(input.peerId, settled);
     void settled.finally(() => { if (this.tails.get(input.peerId) === settled) this.tails.delete(input.peerId); });
@@ -159,6 +178,7 @@ export class TaskManager {
     const timer = setTimeout(() => {
       const inboxKey = JSON.stringify([input.peerId, input.eventId]);
       if (this.store.inputSettled(inboxKey)) return;
+      diagnosticEvent("input.watchdog", { outcome: "pending" });
       const binding = this.store.byPeer(input.peerId);
       this.store.enqueue(`watchdog:${input.peerId}:${input.eventId}`, input.peerId, {
         text: "Запрос всё ещё обрабатывается. Не отправляй его повторно: VKodex продолжает ждать подтверждения Codex и пришлёт итог отдельно. Остальные беседы продолжают работать.",
@@ -168,7 +188,7 @@ export class TaskManager {
     // The watchdog reports latency but cannot cancel a mutation. Retain this
     // peer's lock until dispatch settles; other peers keep their own queues.
     try { await this.dispatch(input); }
-    finally { clearTimeout(timer); }
+    finally { clearTimeout(timer); diagnosticEvent("input.finished", { outcome: "finished" }); }
   }
 
   private reply(input: BridgeInput, view: View): void {
@@ -201,6 +221,7 @@ export class TaskManager {
     let panelAction = false;
     let taskInputScope: TaskInputScope | undefined;
     let preparedTask: { binding: Binding; generation: number } | undefined;
+    let preparationRefused = false;
     const handleTask = (): Promise<void> => {
       if (preparedTask) {
         const current = this.store.byPeer(input.peerId);
@@ -209,7 +230,8 @@ export class TaskManager {
           throw new ActionRejectedError("Привязка задачи изменилась во время подготовки. Сообщение не отправлено; проверь /menu и повтори запрос.");
         }
       }
-      taskInputScope?.assertReady();
+      try { taskInputScope?.assertReady(); }
+      catch (error) { preparationRefused = true; diagnosticEvent("input.prepare", { stage: "verify", outcome: "failure", ...diagnosticError(error) }); throw error; }
       return this.handleTask(input, () => taskInputScope?.assertReady());
     };
     try {
@@ -223,6 +245,8 @@ export class TaskManager {
           this.inactiveInput(input, binding); finish(); return;
         }
         if (!await this.gate.check(input.peerId)) { finish(); return; }
+        try { diagnosticUpdate({ bindingId: binding.id, threadId: binding.threadId, sourceId: binding.sourceId ?? "",
+          streamGeneration: this.store.streamGeneration(binding.id) }); } catch { /* trace metadata only */ }
         // Local/help/recovery commands must remain usable when the owner is
         // unavailable. Only prompt-bearing input requires an observed writer.
         const needsTaskInput = !input.action && input.conversationTitle === undefined
@@ -231,7 +255,17 @@ export class TaskManager {
             || /^\/queue(?:\s|$)/u.test(input.text.trim()));
         if (needsTaskInput && this.beforeTaskInput) {
           preparedTask = { binding, generation: this.store.streamGeneration(binding.id) };
-          taskInputScope = await this.beforeTaskInput(binding);
+          diagnosticEvent("input.prepare", { stage: "prepare", outcome: "start" });
+          const started = performance.now();
+          try {
+            taskInputScope = await this.beforeTaskInput(binding);
+            diagnosticEvent("input.prepare", { stage: "prepare", outcome: "success", elapsedMs: performance.now() - started });
+          } catch (error) {
+            preparationRefused = true;
+            diagnosticEvent("input.prepare", { stage: "prepare", outcome: "failure", elapsedMs: performance.now() - started,
+              ...diagnosticError(error) });
+            throw error;
+          }
         }
       }
       if (!managerPeer && input.conversationTitle !== undefined) {
@@ -291,6 +325,9 @@ export class TaskManager {
       }
       finish();
     } catch (error) {
+      if (!diagnosticHasOperation()) diagnosticEvent("input.result", { outcome: preparationRefused ? "not-dispatched"
+        : error instanceof ActionRejectedError ? "rejected" : "unknown",
+        ...(preparationRefused ? { dispatched: false } : {}), ...diagnosticError(error) });
       // A missing task owner is a confirmed pre-dispatch rejection, not an
       // ambiguous mutation. Keep the durable inbox retry-safe without asking
       // health reconciliation to search for an input that was never sent.
@@ -817,11 +854,16 @@ export class TaskManager {
       return;
     }
     const operationId = randomUUID();
+    diagnosticOperation(operationId);
     const generation = this.store.streamGeneration(binding.id);
     const inboxKeys = [JSON.stringify([input.peerId, input.eventId]), ...(input.mergedEventIds ?? []).map(id => JSON.stringify([input.peerId, id]))];
     this.store.markInputPreparing(inboxKeys);
-    const prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []);
+    let prepared: Awaited<ReturnType<TaskFiles["prepare"]>> | undefined;
+    try { prepared = await this.files?.prepare(binding, operationId, input.attachments ?? []); }
+    catch (error) { diagnosticEvent("input.result", { outcome: "not-dispatched", dispatched: false,
+      ...diagnosticError(error) }); throw error; }
     this.store.beginPromptDispatch(operationId, binding, inboxKeys, binding.id);
+    diagnosticEvent("input.journal", { stage: "dispatch", outcome: "start" });
     try {
       const author = this.sharedAuthor(binding, input);
       const request = { task: binding, operationId, text, ...(author ? { author } : {}), ...prepared, beforeSend: async () => {
@@ -834,14 +876,17 @@ export class TaskManager {
       if (queued) {
         if (!this.desktop.queue) throw new ActionRejectedError("Штатная очередь недоступна в этом подключении Codex.");
         this.files?.markQueued(binding.id, operationId);
+        diagnosticEvent("input.adapter", { stage: "queue", outcome: "start" });
         const queuedId = await this.desktop.queue(request);
         this.store.rememberQueuedInput(binding.id, operationId, queuedId);
         this.store.settlePromptDispatch(operationId, "accepted");
         this.store.setValue(`route-failure:${binding.id}`, null);
         this.files?.finish(binding.id, operationId, "accepted");
+        diagnosticEvent("input.result", { outcome: "accepted", stage: "queue", submissionId: queuedId });
         this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
         return;
       }
+      diagnosticEvent("input.adapter", { stage: "dispatch", outcome: "start" });
       const receipt = this.desktop.submitWithReceipt
         ? await this.desktop.submitWithReceipt(request)
         : (await this.desktop.submit(request), null);
@@ -854,12 +899,15 @@ export class TaskManager {
           this.files?.finish(binding.id, operationId, "accepted");
         });
         this.reply(input, { text: "Запрос добавлен в штатную очередь Codex. Текущий ход не изменён.", silent: true });
+        diagnosticEvent("input.result", { outcome: "accepted", stage: "queue", submissionId: receipt.submissionId });
         return;
       }
       if (receipt?.turnId) this.store.rememberAcceptedTurn(binding.id, receipt.turnId, operationId);
       this.store.settlePromptDispatch(operationId, "accepted");
       this.store.setValue(`route-failure:${binding.id}`, null);
       this.files?.finish(binding.id, operationId, "accepted", receipt?.turnId ?? undefined);
+      diagnosticEvent("input.result", { outcome: receipt?.turnId ? "accepted" : "adapter-returned", stage: "receipt",
+        ...(receipt?.turnId ? { turnId: receipt.turnId } : {}) });
       const messageId = /^message:(\d+)$/u.exec(input.eventId)?.[1];
       if (messageId && receipt) this.store.saveEditableRequest(binding.id, {
         messageId: Number(messageId), senderId: input.senderId, operationId,
@@ -867,6 +915,7 @@ export class TaskManager {
         ...(request.author ? { author: request.author } : {}), ...prepared,
       });
     } catch (error) {
+      diagnosticEvent("input.adapter", { outcome: "failure", ...diagnosticError(error) });
       let reported = error;
       if (error instanceof ModelUnavailableForAccountError && error.diagnostic.operationId === operationId) {
         try { this.store.recordForegroundRejection(binding.id, { ...error.diagnostic, at: Date.now(),
@@ -889,6 +938,7 @@ export class TaskManager {
           this.store.settlePromptDispatch(operationId, "accepted");
           this.store.setValue(`route-failure:${binding.id}`, null);
           this.files?.finish(binding.id, operationId, "accepted", acceptedTurn);
+          diagnosticEvent("input.result", { outcome: "accepted", stage: "history-reconciled", turnId: acceptedTurn });
           this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
             { text: "Codex принял запрос; подтверждение ответа задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
           return;
@@ -900,6 +950,7 @@ export class TaskManager {
         if (outcome?.state === "rejected") {
           this.store.settlePromptDispatch(operationId, "rejected");
           this.files?.finish(binding.id, operationId, "rejected");
+          diagnosticEvent("input.result", { outcome: "rejected", stage: "history-reconciled" });
           throw new ActionRejectedError("Codex подтвердил отказ ранее неопределённого запроса. Повторной отправки не было.");
         }
         const submissionId = outcome?.state === "accepted" ? outcome.submissionId
@@ -915,6 +966,7 @@ export class TaskManager {
           });
           this.store.enqueue(`accepted-after-timeout:${input.peerId}:${input.eventId}`, input.peerId,
             { text: "Codex принял запрос в очередь; подтверждение задержалось. Ожидаю результат без повторной отправки.", silent: true }, binding.id);
+          diagnosticEvent("input.result", { outcome: "accepted", stage: "history-reconciled", submissionId });
           return;
         }
       }
@@ -922,12 +974,18 @@ export class TaskManager {
       // request before start/steer is dispatched. Treating it as uncertain
       // strands a prompt that Codex could not possibly have accepted and also
       // hides the actual routing failure behind the generic uncertainty check.
-      if (reported instanceof TaskNotOpenError) this.store.setValue(`route-failure:${binding.id}`, {
-        at: Date.now(), kind: "no-active-owner",
-      });
+      if (reported instanceof TaskNotOpenError) {
+        const current = this.store.getBinding(binding.id);
+        if (current?.attached && current.peerId === input.peerId && sameTask(current, binding)
+          && current.rolloutPath === binding.rolloutPath && this.store.streamGeneration(binding.id) === generation)
+          this.store.setValue(`route-failure:${binding.id}`, {
+            at: Date.now(), kind: "no-active-owner", streamGeneration: generation,
+          });
+      }
       const state = reported instanceof ActionRejectedError || reported instanceof TaskNotOpenError ? "rejected" : "uncertain";
       this.store.settlePromptDispatch(operationId, state);
       this.files?.finish(binding.id, operationId, state);
+      diagnosticEvent("input.result", { outcome: state === "rejected" ? "rejected" : "unknown", ...diagnosticError(reported) });
       throw reported;
     }
   }

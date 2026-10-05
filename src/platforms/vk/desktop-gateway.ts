@@ -1,5 +1,6 @@
 import { APIError, VK, MessageContext, UpdateSource, DocumentAttachment, type MessageEventContext } from "vk-io";
 import { BridgeStore } from "../../bridge/store.js";
+import { boundedInteractiveView } from "../../bridge/interactive-view.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
 import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
@@ -23,6 +24,8 @@ export function vkKeyboard(view: View): string {
 }
 
 export function vkSendParams(peerId: number, view: View, randomId: number) {
+  // Persisted panels from older versions can exceed the ceiling too.
+  view = boundedInteractiveView(view);
   return {
     peer_ids: [peerId], random_id: randomId, message: view.text,
     ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}),
@@ -91,6 +94,27 @@ export class DesktopVkGateway implements BridgeChat {
   private reconcileCheckedAt = 0;
   private reconcileError = false;
   private recoveredAt = 0;
+
+  /** Explicit dedicated-dot recovery. Does not read any other conversation or
+   * download attachments; ordinary Codex reconciliation remains unchanged. */
+  async readDotInputs(peerId: number, after: number): Promise<{ inputs: BridgeInput[]; cursor: number }> {
+    if (!Number.isSafeInteger(peerId) || peerId < 2_000_000_000 || !Number.isSafeInteger(after) || after < 0)
+      throw new TypeError("Invalid dot recovery binding");
+    const result = await this.vk.api.messages.getByConversationMessageId({ peer_id: peerId,
+      conversation_message_ids: Array.from({ length: 50 }, (_, index) => after + index + 1) });
+    const inputs: BridgeInput[] = []; let cursor = after;
+    for (const message of result.items.sort((a,b) => a.conversation_message_id! - b.conversation_message_id!)) {
+      const id = message.conversation_message_id;
+      if (!id || id <= after || message.peer_id !== peerId) continue;
+      if (message.date * 1000 > Date.now() - 5000) break;
+      if (message.from_id === this.config.access.ownerId && !message.action && !message.out) {
+        inputs.push({ eventId: `message:${id}`, peerId, senderId: message.from_id, text: message.text ?? "",
+          hasAttachments: hasVkAttachments(message) || !!message.fwd_messages?.length });
+      }
+      cursor = id;
+    }
+    return { inputs, cursor };
+  }
 
   startReconciliation(store: BridgeStore): void {
     if (this.reconcileTimer) return;
@@ -356,6 +380,7 @@ export class DesktopVkGateway implements BridgeChat {
   }
 
   async edit(handle: MessageHandle, view: View): Promise<void> {
+    view = boundedInteractiveView(view);
     await this.write(() => this.vk.api.messages.edit({ peer_id: handle.peerId, cmid: handle.conversationMessageId, message: view.text, ...(view.buttons ? { keyboard: vkKeyboard(view) } : {}), ...(view.attachments?.length ? { attachment: view.attachments.join(",") } : {}), dont_parse_links: 1, disable_mentions: 1 }));
   }
 
