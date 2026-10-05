@@ -299,7 +299,11 @@ export class TaskManager {
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
       if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
       if (!managerPeer && !input.action && await this.questions.text(input)) { finish(); return; }
-      if (input.attachments?.length && (!this.files || managerPeer || input.action || input.text.trim().startsWith("/"))) throw new ActionRejectedError("Вложения отправляй отдельным сообщением в связанную беседу задачи.");
+      if (input.attachments?.length) {
+        if (managerPeer) throw new ActionRejectedError("Менеджер VKodex не принимает вложения. Если у задачи нет VK-беседы, сначала подключи её через список задач.");
+        if (input.action || input.text.trim().startsWith("/")) throw new ActionRejectedError("Команду или кнопку нельзя отправить вместе с вложением. Пришли файл отдельным сообщением без команды.");
+        if (!this.files) throw new ActionRejectedError("Передача вложений сейчас не настроена в VKodex. Сообщение не отправлено.");
+      }
       if (input.action) {
         // This read-only shortcut always opens the current peer's menu, even
         // after older panel tokens expire. Manager ownership was checked above.
