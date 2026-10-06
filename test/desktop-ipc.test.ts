@@ -2691,6 +2691,36 @@ test("terminal observation closes its subscription even while final VK delivery 
   } finally { release(); }
 });
 
+test("explicit destination host stays in the request envelope with the supplied wire version", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  t.after(() => client.close());
+  await client.connect();
+  const params = { conversationId: "dot-fixture" };
+  await client.request("thread-follower-load-complete-history", 2, params, { hostId: "durable" });
+  const request = server.received.find(message => message.method === "thread-follower-load-complete-history")!;
+  assert.equal(request.hostId, "durable");
+  assert.equal(request.version, 2);
+  assert.equal(request.sourceClientId, "bridge-client");
+  assert.deepEqual(request.params, params);
+  assert.equal(Object.hasOwn(request, "targetClientId"), false);
+  assert.equal(Object.hasOwn(server.received[0]!, "hostId"), false);
+  await client.request("thread-owner-discovery", 1, { hostId: "local", conversationId: "ordinary" });
+  const ordinary = server.received.find(message => message.method === "thread-owner-discovery")!;
+  assert.equal(Object.hasOwn(ordinary, "hostId"), false);
+  assert.equal(ordinary.version, 1);
+});
+
+test("malformed destination hosts are refused before dispatch", async t => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  t.after(() => client.close());
+  await client.connect();
+  for (const hostId of ["", " ", "durable\n", "x".repeat(513), 42 as unknown as string]) {
+    await assert.rejects(client.request("thread-follower-load-complete-history", 2,
+      { conversationId: "dot-fixture" }, { hostId }), /Invalid IPC destination host/);
+  }
+  assert.equal(server.received.length, 1);
+});
+
 test("native owner request handling is opt-in and declines requests by default", async () => {
   const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
   const request = { type: "request", requestId: "owner-read", sourceClientId: "follower", method: "thread-owner-discovery",
