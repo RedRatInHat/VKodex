@@ -54,7 +54,7 @@ let entrySha256: string | undefined;
 const events = new Set(["input.received", "input.queued", "input.associated", "input.started", "input.watchdog", "input.prepare",
   "input.journal", "input.adapter", "input.result", "input.finished", "connection.start", "connection.join",
   "connection.skip", "connection.result", "connection.lifecycle", "route.selected", "route.fallback",
-  "rpc.stage", "subscription.stage"]);
+  "rpc.stage", "subscription.stage", "mirror.poll", "mirror.discovery", "delivery.queued", "delivery.attempt", "delivery.result"]);
 const words = new Set(["start", "success", "failure", "accepted", "rejected", "unknown", "not-dispatched", "finished",
   "prepare", "dispatch", "edit", "queue", "steer", "command", "observe", "passive", "profile-owner", "exclusive-owner",
   "connected-desktop", "base", "owner-conflict", "runtime-stopped", "current", "stale", "matching", "not-attached",
@@ -65,7 +65,7 @@ const words = new Set(["start", "success", "failure", "accepted", "rejected", "u
   "pending", "adapter-returned", "receipt", "history-reconciled", "invalid-response", "abandoned", "dropped",
   "no-passive-route", "connection-not-ready", "route-changed", "cancelled", "model-not-supported-for-account",
   "active-writer", "owner-busy", "task-not-open", "desktop-unavailable", "other",
-  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported"]);
+  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported", "dot-native"]);
 const methods = new Set(["initialize", "thread/read", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
   "thread/queue/add", "thread/queue/list", "thread/settings/update", "thread-owner-discovery", "thread-stream-subscribe",
   "thread-stream-unsubscribe", "thread-stream-state", "model/list", "thread/turns/list", "thread/goal/get"]);

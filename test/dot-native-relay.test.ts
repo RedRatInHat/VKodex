@@ -99,3 +99,89 @@ test("offline owner prompts stay queued and receive a single status notice",asyn
   assert.equal(messages.length,1);assert.match(messages[0]!,/остаётся в очереди/);assert.ok(store.nextInput());
  }finally{await relay.stop();store.close();}
 });
+
+test("dot delivery reuses shared safe diagnostics with correlated stages",async()=>{
+ const {withDiagnosticSink,readDiagnosticRecord}=await import("../src/bridge/diagnostics.js");
+ const records:import("../src/bridge/diagnostics.js").DiagnosticRecord[]=[];
+ await withDiagnosticSink(r=>{records.push(r);},async()=>{
+  const f=fixture();try {
+   await f.relay.tick();
+   await f.relay.handle(f.input("private-event-secret","private-prompt-secret"));await f.relay.tick();
+   f.setHead(snapshot([turn("t1",[item("private-item-secret","private-answer-secret")]),turn("t0")]));
+   await f.relay.tick();
+   for(const event of ["input.received","input.queued","input.started","input.result","mirror.poll","mirror.discovery","delivery.queued","delivery.attempt","delivery.result"])
+    assert.ok(records.some(r=>r.event===event),event);
+   const queued=records.find(r=>r.event==="delivery.queued")!;
+   const ack=records.find(r=>r.event==="delivery.result"&&r.outcome==="accepted")!;
+   assert.equal(queued.operationId,ack.operationId);
+   assert.ok(records.every(r=>readDiagnosticRecord(r)!==null));
+   assert.ok(records.every(r=>r.route==="dot-native"));
+   assert.doesNotMatch(JSON.stringify(records),/private-(?:event|prompt|item|answer)-secret/);
+   assert.equal(f.sent.length,1);assert.equal(f.vk.length,1);
+  }finally{await f.close();}
+ });
+});
+
+test("failed diagnostic sink cannot change delivery or uncertainty",async()=>{
+ const {withDiagnosticSink}=await import("../src/bridge/diagnostics.js");
+ await withDiagnosticSink(()=>{throw Error("diagnostics unavailable");},async()=>{
+  const f=fixture();try {
+   await f.relay.tick();f.failSend();
+   await f.relay.handle(f.input());await f.relay.tick();
+   assert.equal(f.sent.length,1);assert.equal(f.store.uncertain,true);
+  }finally{await f.close();}
+ });
+});
+
+test("queued VK output is sent before a slow native read completes",async()=>{
+ const store=new DotRelayStore(":memory:",binding);
+ store.enqueueText("queued-before-read","ready output");
+ let release!:()=>void;
+ const blocked=new Promise<void>(resolve=>{release=resolve;});
+ const delivered:string[]=[];
+ const relay=new DotNativeRelay(store,{send:async(peer,view)=>{
+  delivered.push(view.text);return {peerId:peer,conversationMessageId:1};
+ }},()=>({start:async()=>{},read:async()=>{await blocked;return snapshot([turn("t0")]);},send:async()=>({}),close:()=>{release();}}));
+ try {
+  const tick=relay.tick();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.deepEqual(delivered,["ready output"]);
+  release();await tick;
+  assert.equal(delivered.length,1);
+ }finally{release();await relay.stop();store.close();}
+});
+
+test("newly discovered replies are delivered before a blocked native submission",async()=>{
+ const store=new DotRelayStore(":memory:",binding);
+ let head=snapshot([turn("t0")]);
+ let release!:()=>void;
+ const blocked=new Promise<void>(resolve=>{release=resolve;});
+ const order:string[]=[];
+ const relay=new DotNativeRelay(store,{send:async(peer,view)=>{
+  order.push(view.text);return {peerId:peer,conversationMessageId:1};
+ }},()=>({start:async()=>{},read:async()=>head,
+  send:async()=>{order.push("native submission");await blocked;return {};},close:()=>{release();}}));
+ try {
+  await relay.tick();
+  head=snapshot([turn("t1",[item("reply","public reply")]),turn("t0")]);
+  store.queueInput("next-input","next prompt");
+  const tick=relay.tick();
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.deepEqual(order,["public reply","native submission"]);
+  release();await tick;
+  assert.equal(store.pendingOutbox().length,0);
+ }finally{release();await relay.stop();store.close();}
+});
+
+test("an unresolved first delivery holds later replies until the next tick",async()=>{
+ const f=fixture();try {
+  await f.relay.tick();f.failVk(true);
+  f.setHead(snapshot([turn("t1",[item("one","first"),item("two","second")]),turn("t0")]));
+  await f.relay.tick();
+  assert.deepEqual(f.vk.map(m=>m.text),["first"]);
+  f.failVk(false);await f.relay.tick();
+  assert.deepEqual(f.vk.map(m=>m.text),["first","first","second"]);
+  assert.equal(f.vk[0]!.id,f.vk[1]!.id);
+  assert.notEqual(f.vk[1]!.id,f.vk[2]!.id);
+ }finally{await f.close();}
+});
