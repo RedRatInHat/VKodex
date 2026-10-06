@@ -15,6 +15,10 @@ const noopBuild = async () => {};
 
 after(async () => {
   if (process.platform !== "win32") return; // Preserve files when no Recycle Bin exists.
+  // GitHub Windows runners do not provide a usable interactive Recycle Bin.
+  // Retain the generated fixtures there, as on Linux; never fall back to a
+  // permanent recursive deletion. This does not skip any test or assertion.
+  if (process.env.GITHUB_ACTIONS === "true") return;
   await execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
     "$ErrorActionPreference='Stop'; $target=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_TARGET); $parent=[IO.Path]::GetFullPath($env:VKODEX_TEST_RECYCLE_PARENT).TrimEnd([char]92)+[char]92; if(-not $target.StartsWith($parent,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($target) -notlike 'vkodex-release-preparation-fixture-*'){throw 'Unexpected recycle target'}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)"],
   { windowsHide: true, env: { ...process.env, VKODEX_TEST_RECYCLE_TARGET: root, VKODEX_TEST_RECYCLE_PARENT: parent } });
