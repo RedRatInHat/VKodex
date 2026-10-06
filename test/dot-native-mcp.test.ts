@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NativeDotMcpClient, NativeMcpError, nativeChildEnvironment } from "../src/dot-native/mcp-client.js";
 
-async function fixture(mode = "normal", timeoutMs = 2000) {
+// Successful subprocess tests measure protocol behavior, not shared-runner
+// scheduling latency. Keep the explicit 300 ms timeout-fault test separate.
+async function fixture(mode = "normal", timeoutMs = 10_000) {
   const dir = await mkdtemp(join(tmpdir(), "vkodex-mcp-test-"));
   await writeFile(join(dir, "server.mjs"), `
 import { createInterface } from 'node:readline';
