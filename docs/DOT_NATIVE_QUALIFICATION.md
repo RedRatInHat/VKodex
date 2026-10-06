@@ -1,6 +1,23 @@
 # Native dot route (experimental)
 
-Status: **native transport qualified; live VK acceptance pending** (2026-10-05).
+Status: **experimental transport; full conversation synchronization NOT qualified** (2026-10-06).
+
+## 2026-10-06 acceptance findings
+
+A dedicated VK peer delivered an owner message to the intended dot and the
+relay received VK API acknowledgements for public replies. This establishes a
+bounded transport round trip, not a usable mirror of the ChatGPT conversation.
+The owner reported roughly minute-long delays, missing lifecycle status,
+VK-origin requests absent from the visible ChatGPT conversation, and app-origin
+owner messages absent from VK. The existing journal lacked timestamps needed
+to assign the delay to a particular stage. No latency root cause is established.
+
+The next architecture must reuse the normal Codex bridge's mirroring, activity,
+delivery and recovery layers after qualifying a visible-conversation adapter.
+See [DOT_CONVERSATION_SYNC.md](DOT_CONVERSATION_SYNC.md). The earlier transport
+observations and the provisioning description below remain historical evidence;
+they do not certify that visible-conversation contract.
+
 The browser prototype was withdrawn. This route uses neither a browser session,
 an extension, DOM scraping, nor a second model to relay each message.
 
@@ -102,5 +119,5 @@ Before production readiness:
 4. With the owner, switch/close the dot tab while leaving the app running.
 5. Qualify app-restart endpoint refresh and uncertain-send reconciliation.
 
-No live VK success, complete app-lifecycle resilience, or research experiment
-is claimed by this document.
+The bounded live transport exchange above is confirmed. Complete conversation
+synchronization, app-lifecycle resilience and research experiments are not claimed.

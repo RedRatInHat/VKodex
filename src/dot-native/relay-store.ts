@@ -1,6 +1,7 @@
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import type { DotPublicReply } from "./public-replies.js";
+import { diagnosticEvent } from "../bridge/diagnostics.js";
 
 export interface DotBinding { readonly threadId: string; readonly peerId: number; readonly ownerId: number }
 export interface DotOutbox { readonly id: number; readonly text: string }
@@ -63,6 +64,7 @@ export class DotRelayStore {
       if (!this.initialized) throw new Error("Dot baseline is absent");
       for (const reply of replies) {
         if (!this.remember(reply)) continue;
+        diagnosticEvent("mirror.discovery", { route:"dot-native", threadId:this.binding.threadId, turnId:reply.turnId, eventId:reply.itemId });
         const text = reply.text + (reply.attachmentCount ? "\n\n[Вложения доступны в приложении dot.]" : "");
         this.enqueueText(`reply:${reply.itemId}`,text);
       }
@@ -77,7 +79,10 @@ export class DotRelayStore {
       part += point;
     }
     if(part) parts.push(part);
-    parts.forEach((body,index)=>this.db.prepare("INSERT OR IGNORE INTO dot_outbox(key,text) VALUES(?,?)").run(`${key}:${index}`,body));
+    parts.forEach((body,index)=>{
+      const result=this.db.prepare("INSERT OR IGNORE INTO dot_outbox(key,text) VALUES(?,?)").run(`${key}:${index}`,body);
+      if(result.changes) diagnosticEvent("delivery.queued", { route:"dot-native", threadId:this.binding.threadId, peerId:this.binding.peerId, eventId:key, operationId:`dot-outbox:${result.lastInsertRowid}` });
+    });
   }
 
   queueInput(id: string, prompt: string): boolean {
