@@ -146,11 +146,11 @@ async function artifactFixture(temporaryRoot = artifactFixtures) {
   const nativeRelative = `node_modules/${nativePackage}/vendor/${cpu}-${suffix}/codex/${process.platform === "win32" ? "codex.exe" : "codex"}`;
   const runtimeRelative = `runtime/${process.platform === "win32" ? "VKodex.exe" : "node"}`;
   const content: Record<string, string> = {
-    "package.json": JSON.stringify({ name: "vkodex", type: "module", dependencies: { "@openai/codex-sdk": "0.155.1" } }),
+    "package.json": JSON.stringify({ name: "vkodex", type: "module", dependencies: { "@openai/codex-sdk": "0.160.0" } }),
     "package-lock.json": JSON.stringify({ lockfileVersion: 3, packages: {
-      "": { dependencies: { "@openai/codex-sdk": "0.155.1" } },
-      "node_modules/@openai/codex-sdk": { version: "0.155.1" },
-      "node_modules/@openai/codex": { version: "0.155.1" },
+      "": { dependencies: { "@openai/codex-sdk": "0.160.0" } },
+      "node_modules/@openai/codex-sdk": { version: "0.160.0" },
+      "node_modules/@openai/codex": { version: "0.160.0" },
     } }),
     "dist/src/desktop-main.js": "throw new Error('Bridge must not run during validation');\n",
     "dist/src/codex/native-cli.js": "throw new Error('Native resolver must not execute');\n",
@@ -158,11 +158,11 @@ async function artifactFixture(temporaryRoot = artifactFixtures) {
     "scripts/watch-windows-bridge.ps1": "throw 'Watchdog must not run'\n",
     "scripts/VKodexSupervisor.cs": "// Fixture only; no executable launcher\n",
     "docs/logo.ico": "fixture-icon",
-    "node_modules/@openai/codex-sdk/package.json": JSON.stringify({ name: "@openai/codex-sdk", version: "0.155.1", exports: { ".": { import: "./dist/index.js", types: "./dist/index.d.ts" } } }),
+    "node_modules/@openai/codex-sdk/package.json": JSON.stringify({ name: "@openai/codex-sdk", version: "0.160.0", exports: { ".": { import: "./dist/index.js", types: "./dist/index.d.ts" } } }),
     "node_modules/@openai/codex-sdk/dist/index.js": "throw new Error('SDK package must not execute');\n",
     "node_modules/@openai/codex-sdk/dist/index.d.ts": "// Fixture types only\n",
-    "node_modules/@openai/codex/package.json": JSON.stringify({ name: "@openai/codex", version: "0.155.1" }),
-    [`node_modules/${nativePackage}/package.json`]: JSON.stringify({ name: "@openai/codex", version: `0.155.1-${process.platform}-${process.arch}` }),
+    "node_modules/@openai/codex/package.json": JSON.stringify({ name: "@openai/codex", version: "0.160.0" }),
+    [`node_modules/${nativePackage}/package.json`]: JSON.stringify({ name: "@openai/codex", version: `0.160.0-${process.platform}-${process.arch}` }),
     [nativeRelative]: "not-an-executable-native-fixture",
     [runtimeRelative]: "not-an-executable-runtime-fixture",
   };
@@ -174,7 +174,7 @@ async function artifactFixture(temporaryRoot = artifactFixtures) {
   const files = Object.fromEntries(Object.entries(content).map(([relative, text]) => [relative, { size: Buffer.byteLength(text), sha256: digest(text) }]));
   const manifest = { version: 1, sourceCommit: "a".repeat(40), sourceTree: "b".repeat(40),
     node: { version: process.version, platform: process.platform, arch: process.arch, modules: process.versions.modules },
-    sdkVersion: "0.155.1", files };
+    sdkVersion: "0.160.0", files };
   const descriptor = { version: 1, artifactRoot, configurationRoot,
     dataDirectory: path.join(configurationRoot, "custom", "data"), manifestSha256: "" };
   const descriptorPath = path.join(root, "deployment.json");
@@ -280,7 +280,7 @@ test("own dependency resolution cannot fall through to original or parent SDK", 
   await writeFile(originalPackage, JSON.stringify({ name: "@openai/codex", version: "0.160.0" }));
   assert.equal((await validateDeploymentArtifact(fixture.descriptorPath, fixture.expectedSha256)).nativeCodexPath,
     path.join(fixture.artifactRoot, fixture.nativeRelative));
-  fixture.manifest.sdkVersion = "0.160.0";
+  fixture.manifest.sdkVersion = "0.999.0";
   await assert.rejects(validateDeploymentArtifact(fixture.descriptorPath, await fixture.repin()));
 });
 
@@ -301,7 +301,7 @@ test("runtime ABI and SDK/lock metadata are part of artifact qualification", asy
   await assert.rejects(validateDeploymentArtifact(abi.descriptorPath, await abi.repin()));
   const sdk = await artifactFixture();
   const relative = "node_modules/@openai/codex-sdk/package.json";
-  const changed = JSON.stringify({ name: "@openai/codex-sdk", version: "0.160.0" });
+  const changed = JSON.stringify({ name: "@openai/codex-sdk", version: "0.999.0" });
   await writeFile(path.join(sdk.artifactRoot, relative), changed);
   sdk.manifest.files[relative] = { size: Buffer.byteLength(changed), sha256: digest(changed) };
   await assert.rejects(validateDeploymentArtifact(sdk.descriptorPath, await sdk.repin()));
@@ -372,7 +372,7 @@ test("inventory-listed SDK shadow packages cannot change resolution for desktop 
 test("SDK ESM import mapping cannot redirect a correctly versioned package", async () => {
   const fixture = await artifactFixture();
   const relative = "node_modules/@openai/codex-sdk/package.json";
-  const text = JSON.stringify({ name: "@openai/codex-sdk", version: "0.155.1", exports: { ".": { node: "../../foreign.js", import: "./dist/index.js" } } });
+  const text = JSON.stringify({ name: "@openai/codex-sdk", version: "0.160.0", exports: { ".": { node: "../../foreign.js", import: "./dist/index.js" } } });
   await writeFile(path.join(fixture.artifactRoot, relative), text);
   fixture.manifest.files[relative] = { size: Buffer.byteLength(text), sha256: digest(text) };
   await assert.rejects(validateDeploymentArtifact(fixture.descriptorPath, await fixture.repin()));

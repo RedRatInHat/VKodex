@@ -94,17 +94,17 @@ async function makePrivatePlanFixture(options: { mutateBindingAfterFirst?: boole
   await put(artifactRoot, "scripts/watch-windows-bridge.ps1", "throw 'Artifact watchdog sentinel must never execute'\n");
   await put(artifactRoot, "scripts/VKodexSupervisor.cs", "// Artifact data only; never compile or execute this file.\n");
   await put(artifactRoot, "docs/logo.ico", "fixture-only-icon-data");
-  await put(artifactRoot, "package.json", JSON.stringify({ name: "vkodex", type: "module", dependencies: { "@openai/codex-sdk": "0.155.1" } }));
+  await put(artifactRoot, "package.json", JSON.stringify({ name: "vkodex", type: "module", dependencies: { "@openai/codex-sdk": "0.160.0" } }));
   await put(artifactRoot, "package-lock.json", JSON.stringify({ lockfileVersion: 3, packages: {
-    "": { dependencies: { "@openai/codex-sdk": "0.155.1" } },
-    "node_modules/@openai/codex-sdk": { version: "0.155.1" },
-    "node_modules/@openai/codex": { version: "0.155.1" },
+    "": { dependencies: { "@openai/codex-sdk": "0.160.0" } },
+    "node_modules/@openai/codex-sdk": { version: "0.160.0" },
+    "node_modules/@openai/codex": { version: "0.160.0" },
   } }));
-  await put(artifactRoot, "node_modules/@openai/codex-sdk/package.json", JSON.stringify({ name: "@openai/codex-sdk", version: "0.155.1", exports: { ".": { import: "./dist/index.js", types: "./dist/index.d.ts" } } }));
+  await put(artifactRoot, "node_modules/@openai/codex-sdk/package.json", JSON.stringify({ name: "@openai/codex-sdk", version: "0.160.0", exports: { ".": { import: "./dist/index.js", types: "./dist/index.d.ts" } } }));
   await put(artifactRoot, "node_modules/@openai/codex-sdk/dist/index.js", "throw new Error('SDK sentinel must never execute');\n");
   await put(artifactRoot, "node_modules/@openai/codex-sdk/dist/index.d.ts", "// Fixture-only type sentinel.\n");
-  await put(artifactRoot, "node_modules/@openai/codex/package.json", JSON.stringify({ name: "@openai/codex", version: "0.155.1" }));
-  await put(artifactRoot, `node_modules/${nativePackage}/package.json`, JSON.stringify({ name: nativePackage, version: `0.155.1-${process.platform}-${process.arch}` }));
+  await put(artifactRoot, "node_modules/@openai/codex/package.json", JSON.stringify({ name: "@openai/codex", version: "0.160.0" }));
+  await put(artifactRoot, `node_modules/${nativePackage}/package.json`, JSON.stringify({ name: nativePackage, version: `0.160.0-${process.platform}-${process.arch}` }));
   await put(artifactRoot, nativeRelative, "Native executable sentinel; must never execute.\n");
   await fs.mkdir(path.dirname(stableRuntimePath), { recursive: true });
   await fs.copyFile(process.execPath, stableRuntimePath);
@@ -143,7 +143,7 @@ async function makePrivatePlanFixture(options: { mutateBindingAfterFirst?: boole
     artifactFiles[relative] = { size: bytes.length, sha256: sha256(bytes) };
   }
   const artifactManifest = { version: 1, sourceCommit: "a".repeat(40), sourceTree: "b".repeat(40),
-    node: { version: process.version, platform: process.platform, arch: process.arch, modules: process.versions.modules }, sdkVersion: "0.155.1", files: artifactFiles };
+    node: { version: process.version, platform: process.platform, arch: process.arch, modules: process.versions.modules }, sdkVersion: "0.160.0", files: artifactFiles };
   const artifactManifestBytes = Buffer.from(JSON.stringify(artifactManifest));
   await put(artifactRoot, "artifact-manifest.json", artifactManifestBytes);
   const descriptor = { version: 1, artifactRoot, configurationRoot,

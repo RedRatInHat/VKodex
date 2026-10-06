@@ -6,7 +6,7 @@ import path from "node:path";
 import { RuntimeSetupError } from "./runtime.js";
 
 const MANIFEST = "artifact-manifest.json";
-const SDK_VERSION = "0.155.1";
+const SDK_VERSION = "0.160.0";
 const MAX_METADATA = 16 * 1024 * 1024;
 const MAX_FILES = 50_000;
 const MAX_BYTES = 20 * 1024 ** 3;
