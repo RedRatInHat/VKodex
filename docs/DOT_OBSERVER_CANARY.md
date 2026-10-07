@@ -69,3 +69,10 @@ Only that attempt's barrier is released. Other unresolved inputs keep projection
 blocked. Original common-inbox uncertainty and observed history remain intact;
 manual resolution is separate evidence, not a fabricated DOM receipt. This is
 source-level recovery support, not a deployed reconciliation interface.
+
+Startup failure diagnostics distinguish script injection, observer handshake and
+room qualification. Content failures expose only fixed categories and aggregate
+row count / anchor-presence / exact-page-match flags. Raw exception text, row IDs
+and conversation contents are not copied to extension session state. Diagnostics
+do not relax qualification or permit automatic rearming. A previous `arm-failed`
+result alone does not identify which condition failed.
