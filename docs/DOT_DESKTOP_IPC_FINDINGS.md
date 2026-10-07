@@ -22,6 +22,47 @@ responding client identity were not established by the recorded response.
 
 No user-message start or steer was executed by that probe.
 
+A later, separately authorized temporary subscription obtained a correctly
+bound current durable-Aeon snapshot and was closed. One separately journaled
+native input canary then received `admissionOutcome: started`; the agent
+received plain input rather than a delegation wrapper. There was exactly one
+mutation attempt, with no resubmission. The saved evidence contains a pre-send
+snapshot and acknowledgement, not a post-send structured user-item observation.
+
+That acknowledgement did **not** complete the visible-conversation gate. The
+ordinary dot-room history read/search did not contain the canary as a user
+message, although the assistant's acknowledgement was present. Static source
+inspection also distinguishes a profile's `messaging_room_id` and its room
+composer from the native turn-state path. Do not equate these presentation paths
+or infer their server-side storage architecture from client code alone.
+
+An independent read-only inspection of the visible dot page in the cloud
+browser confirmed ordinary owner messages and public assistant replies in the
+same loaded interval. The canary acknowledgement was visible, but the canary
+input was not. This is a bounded observation of that interval, not a claim
+that the input can never appear or that all native input paths behave alike.
+
+The inspected room composer uses the room's messaging identity and a separate
+authenticated room-message submission implementation. The bounded main-process
+and bundled-tool inspection did not identify an exposed room-submit command.
+Renderer implementation details alone do not qualify an external API: do not
+extract credentials, call private HTTP endpoints, or fabricate author fields.
+
+## Browser fallback qualification
+
+The previously reverted browser relay cannot be restored unchanged. Its
+assumptions about ordinary chat message-role attributes and composer selectors
+do not qualify the dot-room UI. In particular, a markdown rendering style is
+not evidence of message authorship. A screenshot and accessibility inspection
+showed distinct owner and assistant bubbles even where a narrower DOM query
+had failed to identify owner messages.
+
+A browser fallback remains unqualified for stable author/message identities,
+unknown-outcome reconciliation, lifecycle semantics, and tab closure/rebinding.
+No extension was installed or enabled and no browser message was submitted by
+this read-only inspection. A visible composer alone does not resolve those
+gates or justify claiming full synchronization.
+
 ## Reuse existing transport
 
 `DesktopIpcClient.request` now accepts an optional destination `hostId` in its
@@ -59,3 +100,4 @@ Do not call a private service endpoint or fabricate a user identity to emulate i
 - Retain uncertain outcomes without automatic resubmission.
 
 Offline wire tests and the single history read do not satisfy these gates.
+The later native admission acknowledgement does not satisfy them either.
