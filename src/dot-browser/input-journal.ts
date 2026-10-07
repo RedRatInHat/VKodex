@@ -39,6 +39,8 @@ export class DotRoomInputJournal {
         !Number.isSafeInteger(scope.ownerId) || scope.ownerId <= 0 ||
         !/^[a-f0-9]{32}$/u.test(scope.roomId) ||
         !Number.isSafeInteger(scope.generation) || scope.generation < 1) throw new TypeError("Invalid room input scope");
+    if (store.databasePath === null || store.databaseFileIdentity === null)
+      throw new Error("Room dispatch requires a regular file-backed bridge journal");
     this.scope = { ...scope };
     this.prefix = `dot-room-input:${hash(JSON.stringify([scope.peerId, scope.ownerId, scope.roomId, scope.generation]))}:`;
   }

@@ -14,7 +14,8 @@ const key = JSON.stringify([input.peerId, input.eventId]);
 const messageId = `${scope.roomId}~${scope.roomId}~CalpicoMessage~Sentinel_${"b".repeat(32)}`;
 const observed = { phase: "observed" as const, messageId, evidence: "same-node-dom-transition" as const };
 function fixture(t: { after(fn: () => void): void }) {
-  const store = new BridgeStore(); t.after(() => store.close());
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "vkodex-room-journal-test-")), "fixture.sqlite");
+  const store = new BridgeStore(file); t.after(() => store.close());
   return { store, journal: new DotRoomInputJournal(store, scope) };
 }
 
@@ -153,4 +154,9 @@ test("file-backed reopen retains the fence and recovers without replay", t => {
   assert.equal(after.dispatch(input, "new-epoch"), null);
   assert.equal(after.settle(attempt, observed), "uncertain");
   assert.equal(second.inputState(key), "uncertain");
+});
+
+test("an in-memory store cannot authorize external room dispatch", t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  assert.throws(() => new DotRoomInputJournal(store, scope), /file-backed bridge journal/u);
 });

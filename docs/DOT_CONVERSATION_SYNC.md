@@ -60,7 +60,8 @@ Latency targets must be measured rather than invented: record ingress, native di
 long-poll client, synthetic Codex task or turn ID. Only provider receipt metadata
 and the active room attempt are namespaced in the existing value store.
 
-The caller must authenticate the VK sender, exclusively route a configured peer
+An in-memory or non-regular store is rejected before a dispatch journal can be
+constructed. The caller must authenticate the VK sender, exclusively route a configured peer
 and separately qualify browser execution. This class rejects another sender/peer,
 existing Codex bindings, silent room/generation rebinding, changed payloads under
 one event identity, and unsupported edits/replies/attachments/actions. Two equal
