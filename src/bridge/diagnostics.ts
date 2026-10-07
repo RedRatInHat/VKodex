@@ -65,11 +65,11 @@ const words = new Set(["start", "success", "failure", "accepted", "rejected", "u
   "pending", "adapter-returned", "receipt", "history-reconciled", "invalid-response", "abandoned", "dropped",
   "no-passive-route", "connection-not-ready", "route-changed", "cancelled", "model-not-supported-for-account",
   "active-writer", "owner-busy", "task-not-open", "desktop-unavailable", "other",
-  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported", "dot-native"]);
-const methods = new Set(["initialize", "thread/read", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
+  "history-gap", "uncertain-input", "stopped", "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported", "dot-native"]);
+const methods = new Set(["tools/list", "tools/call", "initialize", "thread/read", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
   "thread/queue/add", "thread/queue/list", "thread/settings/update", "thread-owner-discovery", "thread-stream-subscribe",
   "thread-stream-unsubscribe", "thread-stream-state", "model/list", "thread/turns/list", "thread/goal/get"]);
-const errors = new Set(["Error", "TypeError", "ActionRejectedError", "TaskNotOpenError", "TaskOwnedByClientError",
+const errors = new Set(["NativeMcpError", "Error", "TypeError", "ActionRejectedError", "TaskNotOpenError", "TaskOwnedByClientError",
   "TaskConnectionLostError", "DesktopUnavailableError", "DesktopRequestRejectedError", "UncertainActionError",
   "AppServerUnavailableError", "AppServerRejectedError", "AppServerUncertainError", "ModelUnavailableForAccountError"]);
 const ids = new Set(["attemptId", "parentAttemptId", "connectionAttemptId", "connectionId", "bindingId", "threadId",

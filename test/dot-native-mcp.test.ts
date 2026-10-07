@@ -18,7 +18,7 @@ createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line); appendFileSync('wire.jsonl',line+'\\n');
  if (!m.method || m.id === undefined) return;
  if(m.method==='initialize') return out({id:m.id,result:{protocolVersion:'2024-11-05'}});
- if(m.method==='tools/list') return out({id:m.id,result:{tools:[{name:'read_thread'},{name:'send_message_to_thread'}]}});
+ if(m.method==='tools/list') return out({id:m.id,result:{tools:mode==='catalog-missing'?[]:[{name:'read_thread'},{name:'send_message_to_thread'}]}});
  if(m.method==='tools/call') {
    const sending = m.params.name==='send_message_to_thread';
    if(sending && mode==='timeout') return;
@@ -86,4 +86,41 @@ test("native subprocess does not inherit VK or API credentials",()=>{
  assert.equal(env.VK_GROUP_TOKEN,undefined);assert.equal(env.OPENAI_API_KEY,undefined);
  assert.equal(env.Path,"runtime");assert.equal(env.NODE_OPTIONS,"guard");
  assert.equal(env.CODEX_APP_TOOLS_PIPE_PATH,"actual-pipe");
+});
+
+test("connection diagnostics distinguish successful handshake from missing catalog without data leakage", async () => {
+ const {withDiagnosticSink}=await import("../src/bridge/diagnostics.js");
+ for(const mode of ["normal","catalog-missing"]) {
+  const records:import("../src/bridge/diagnostics.js").DiagnosticRecord[]=[];
+  const f=await fixture(mode);
+  try {
+   await withDiagnosticSink(record=>{records.push(record);},async()=>{
+    if(mode==="normal") {await f.client.start();await f.client.start();}
+    else await assert.rejects(f.client.start(),/Required native tools/);
+   });
+   assert.equal(records.filter(r=>r.event==="connection.start").length,1);
+   const result=records.find(r=>r.event==="connection.result")!;
+   assert.equal(result.outcome,mode==="normal"?"success":"failure");
+   if(mode!=="normal") {assert.equal(result.reason,"unsupported");assert.equal(result.errorType,"NativeMcpError");}
+   assert.ok(records.some(r=>r.event==="rpc.stage"&&r.method==="initialize"&&r.stage==="response"));
+   assert.ok(records.some(r=>r.event==="rpc.stage"&&r.method==="tools/list"&&r.stage==="response"));
+   assert.equal(new Set(records.map(r=>r.connectionId)).size,1);
+   assert.doesNotMatch(JSON.stringify(records),/test-only-inherited-pipe|actual-caller|server\.mjs|vkodex-mcp-test/u);
+  } finally {await f.close();}
+ }
+});
+test("diagnostic timeout preserves uncertainty and throwing sinks cannot change transport", async () => {
+ const {withDiagnosticSink,diagnosticError}=await import("../src/bridge/diagnostics.js");
+ const f=await fixture("timeout",300), records:import("../src/bridge/diagnostics.js").DiagnosticRecord[]=[];
+ try {
+  await withDiagnosticSink(r=>{records.push(r);},async()=>{
+   await assert.rejects(f.client.send("PRIVATE PROMPT"), (error:unknown)=>error instanceof NativeMcpError && error.outcome==="uncertain");
+  });
+  assert.ok(records.some(r=>r.event==="rpc.stage"&&r.method==="tools/call"&&r.outcome==="failure"&&r.reason==="timeout"&&r.mutating));
+  assert.doesNotMatch(JSON.stringify(records),/PRIVATE PROMPT/u);
+  assert.deepEqual(diagnosticError(new NativeMcpError("rejected","PRIVATE BODY")),{errorType:"NativeMcpError",reason:"other"});
+ } finally {await f.close();}
+ const normal=await fixture();try {
+  await withDiagnosticSink(()=>{throw Error("sink failed");},()=>normal.client.read());
+ } finally {await normal.close();}
 });

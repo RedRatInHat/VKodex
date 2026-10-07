@@ -130,3 +130,21 @@ All evidence here is fixture-based (including the real common delivery worker
 with a fake chat transport). Live browser transport, authenticated admission,
 uncertainty reconciliation UI, startup/router integration, native-journal migration,
 recipient qualification and controlled deployment are still outstanding.
+
+### Native connection diagnosis
+
+Native connection attempts now have a per-client correlation ID and bounded
+initialize/catalog RPC stage timings. A successful connection result proves only
+handshake and the required tool-name catalog; it does not prove a successful
+thread read, visible room submission or delivery. RPC response success similarly
+means an envelope was received, not that an embedded tool result was accepted.
+The relay separately reports connect/snapshot/input-recovery/dispatch failure
+stages and health transitions through the existing redacted diagnostic sink.
+
+Native errors map only known constant messages to fixed reason categories. No
+raw MCP body, stderr, prompt, pipe path, environment or source filename is emitted.
+Unknown messages become `other`. Diagnostic sink failures do not affect transport
+semantics; uncertain sends still retain their original no-retry behavior. This
+instrumentation does not change caller binding, tool permissions or recovery
+intent policy, and does not authorize standalone impersonation of a configured
+route owner for debugging.
