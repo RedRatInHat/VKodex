@@ -60,3 +60,41 @@ enabled by configuration and has no production caller. A future qualified
 adapter should reuse existing mirroring/delivery/activity contracts rather than
 create a second VK long-poll or outbox. Submission and identity reconciliation
 must be qualified independently before a live route is enabled.
+
+## Subsequent single visible-composer check
+
+A separately authorized single UI submission into the same dot conversation
+was confirmed in both the room-history tool and the visible DOM. The room
+history attributed the input to the authenticated owner and the response to
+the assistant, with distinct stable message IDs. There was one click and no
+resubmission. This qualifies that visible round trip, not an automated VK bridge
+or failure/reconnect behavior. No extension or private API was used.
+
+## Submission evidence and uncertainty
+
+Static renderer inspection shows the optimistic message's `id` and `requestId`
+initially coincide. Pending `data-message-id` therefore exposes that client
+request ID. After confirmation the attribute becomes the canonical server ID.
+The renderer uses `requestId || id` as its React key, but React keys are not DOM
+attributes and do not guarantee physical article continuity. No dedicated
+request-ID/idempotency DOM attribute was found in the inspected renderer.
+
+`submission-observation.ts` is a pure, disconnected evidence tracker. It permits
+only a pending UUID to canonical room-ID transition on the **same physical
+article**, in the **same observer epoch**, after an externally persisted dispatch
+fence. The adapter must identify physical nodes with an epoch-local WeakMap;
+it must not derive node identities from text, position or React internals.
+Text equality is a consistency filter, never the proof of submission.
+
+Missing optimistic evidence, remounts, navigation, timeouts, changed epochs,
+interference, duplicate pending candidates and cross-room IDs remain uncertain.
+A new server row containing matching text cannot clear that uncertainty.
+Rehydrating an unfinished attempt after restart also remains uncertain. Even a
+complete transition is labelled DOM observation, not an authenticated server
+receipt. The tracker has no click, send, retry or persistence method.
+
+Synthetic tests cover these transitions. Physical pending-to-server article
+continuity has **not** been live-qualified. No MutationObserver driver or
+extension is installed by this change, and it does not enable automatic input.
+The future integration must commit evidence to the existing durable lifecycle
+before advancing its queue; losing that commit cannot authorize a replay.
