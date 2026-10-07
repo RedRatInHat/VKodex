@@ -411,6 +411,22 @@ export class BridgeStore {
   // cannot upgrade after another process commits, even with busy_timeout set.
   atomic<T>(operation: () => T): T { return this.db.transaction(operation).immediate(); }
 
+  /** Before a non-idempotent external dispatch, WAL NORMAL is insufficient:
+   * a power loss can forget its committed fence. Raise this connection to FULL
+   * without weakening an existing EXTRA mode; never change it in a transaction.
+   * This is a durability setting, not proof that storage hardware honors fsync.
+   */
+  requireDurableWrites(): void {
+    if (this.db.inTransaction) throw new Error("Durability must be established before the dispatch transaction");
+    const journal = this.db.pragma("journal_mode", { simple: true });
+    if (journal !== "wal" && journal !== "memory") throw new Error("Durable bridge dispatch requires WAL journal mode");
+    const mode = this.db.pragma("synchronous", { simple: true });
+    if (mode !== 2 && mode !== 3) this.db.pragma("synchronous = FULL");
+    const confirmed = this.db.pragma("synchronous", { simple: true });
+    if (confirmed !== 2 && confirmed !== 3) throw new Error("Durable dispatch requires SQLite FULL or EXTRA synchronization");
+  }
+
+
   assertOwner(ownerId: number, groupId: number): void {
     const fingerprint = createHash("sha256").update(JSON.stringify([ownerId, groupId])).digest("hex");
     this.atomic(() => {

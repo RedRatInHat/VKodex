@@ -51,3 +51,42 @@ The currently tested native `send_message_to_thread` and `read_thread` establish
 - Existing Codex chat mirroring, controls and recovery remain unchanged.
 
 Latency targets must be measured rather than invented: record ingress, native dispatch duration, snapshot duration, public-reply discovery, delivery enqueue, attempt and acknowledgement. Compare source visibility and VK visibility separately. These diagnostics are evidence only, not delivery authority.
+
+## Shared ingress adapter (experimental, not routed)
+
+`src/dot-browser/input-journal.ts` reuses `BridgeStore.receiveInput`, the existing
+`bridge_inbox` state machine, immediate SQLite transactions, and normal
+`BridgeStore.recover()` semantics. It does not introduce a second inbox, database,
+long-poll client, synthetic Codex task or turn ID. Only provider receipt metadata
+and the active room attempt are namespaced in the existing value store.
+
+An in-memory or non-regular store is rejected before a dispatch journal can be
+constructed. The caller must authenticate the VK sender, exclusively route a configured peer
+and separately qualify browser execution. This class rejects another sender/peer,
+existing Codex bindings, silent room/generation rebinding, changed payloads under
+one event identity, and unsupported edits/replies/attachments/actions. Two equal
+texts with different VK event IDs stay distinct. One room submission is fenced at
+a time. The sending state is committed before a caller may touch the composer.
+
+A same-node visible receipt settles the common inbox and stores the exact canonical
+message ID for echo suppression in one transaction. A timeout, crash, or normal
+startup recovery keeps the attempt uncertain. Late DOM observations and matching
+text cannot clear recovered uncertainty or authorize another submission. Received
+but undispatched messages remain in the shared replay queue. Explicit recovery
+only releases an attempt already classified uncertain by the common store.
+
+This is library code and fixture coverage only. Runtime ingress routing, browser
+transport/authentication, outbox projection, recipient lifecycle, migration and
+live qualification are still required before activation. The old native relay is
+not imported, replaced or enabled by this module.
+
+Before each room dispatch transaction, `BridgeStore.requireDurableWrites()` checks
+SQLite synchronization and raises that connection to FULL if needed, preserving
+EXTRA. A local file-backed fixture demonstrated WAL with synchronous=NORMAL under
+the installed SQLite build; NORMAL can lose committed fences on power loss. No
+inference is made about past outages or the live Windows DB. The new preflight is
+only invoked by this unactivated adapter; it changes neither global SQLite
+defaults nor any existing runtime entrypoint. It refuses an enclosing transaction.
+Hardware/fsync compliance and destructive power-loss behavior are not tested.
+The durability distinction follows the official SQLite
+[PRAGMA synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
