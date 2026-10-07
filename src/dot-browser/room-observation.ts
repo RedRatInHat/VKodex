@@ -31,6 +31,7 @@ export interface DotRoomObservation {
   readonly kind: "partial-room-observation";
   readonly completeHistory: false;
   readonly authoritativeAuthors: false;
+  readonly orderedMessageIds: readonly string[];
   readonly messages: readonly DotRoomTextObservation[];
   readonly unsupportedMessageIds: readonly string[];
 }
@@ -99,7 +100,7 @@ export function qualifyDotRoomRows(pageUrl: string, rows: readonly DotRoomRow[],
     messages.push({ messageId: row.messageId, text, displayRole: isOwner ? "owner" : "dot", evidence: "rendered-room" });
   }
   if (!ownerAnchor || !dotAnchor) reject("Role anchors are outside the observed window");
-  return { kind: "partial-room-observation", completeHistory: false, authoritativeAuthors: false, messages, unsupportedMessageIds };
+  return { kind: "partial-room-observation", completeHistory: false, authoritativeAuthors: false, orderedMessageIds: [...seen], messages, unsupportedMessageIds };
 }
 
 /** A conservative DOM collector for the observed room layout. Call only from

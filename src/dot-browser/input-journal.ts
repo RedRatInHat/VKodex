@@ -83,6 +83,7 @@ export class DotRoomInputJournal {
       const attempt: DotRoomInputAttempt = { operationId: randomUUID(), observerEpoch, inputKey: key, roomId: this.scope.roomId };
       this.store.setValue(this.prefix + key, { ...record, phase: "attempted", attempt } satisfies InputRecord);
       this.store.setValue(this.prefix + "active", key);
+      this.store.setValue(this.prefix + "outbound-barriers", this.barriers() + 1);
       return attempt;
     });
   }
@@ -115,6 +116,9 @@ export class DotRoomInputJournal {
         if (prior !== null && prior !== attempt.operationId) throw new Error("Message already belongs to another submission");
         this.store.setValue(receiptKey, attempt.operationId);
       }
+      const barriers = this.barriers();
+      if (barriers < 1) throw new Error("Missing outbound submission barrier");
+      if (observed) this.store.setValue(this.prefix + "outbound-barriers", barriers - 1);
       this.store.finishInput(attempt.inputKey, !observed);
       this.store.setValue(this.prefix + attempt.inputKey, { ...record, phase, messageId } satisfies InputRecord);
       this.store.setValue(this.prefix + "active", null);
@@ -133,10 +137,35 @@ export class DotRoomInputJournal {
       const record = this.read(key);
       if (!record?.attempt || record.phase !== "attempted") throw new Error("Invalid active room input record");
       if (this.store.inputState(key) !== "uncertain") return false;
+      if (this.barriers() === 0) this.store.setValue(this.prefix + "outbound-barriers", 1);
       this.store.setValue(this.prefix + key, { ...record, phase: "uncertain", messageId: null } satisfies InputRecord);
       this.store.setValue(this.prefix + "active", null);
       return true;
     });
+  }
+
+  /** Reserve the same provider scope for the shared outbox. No live route starts. */
+  bindProjection(store: BridgeStore): Readonly<{ peerId: number; roomId: string; scopeKey: string }> {
+    if (store !== this.store) throw new Error("Projection must use the same bridge store");
+    return this.store.atomic(() => {
+      this.assertDedicatedPeer();
+      this.store.setValue(`dot-room-input-scope:${this.scope.peerId}`, this.prefix);
+      return { peerId: this.scope.peerId, roomId: this.scope.roomId, scopeKey: this.prefix };
+    });
+  }
+  projectionAvailable(store: BridgeStore): boolean {
+    if (store !== this.store) return false;
+    this.assertDedicatedPeer();
+    return this.store.getValue(`dot-room-input-scope:${this.scope.peerId}`) === this.prefix;
+  }
+  projectionBlocked(): boolean {
+    this.assertDedicatedPeer();
+    return this.store.getValue(this.prefix + "active") !== null || this.barriers() > 0;
+  }
+  private barriers(): number {
+    const count = this.store.getValue<number>(this.prefix + "outbound-barriers") ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0 || count >= Number.MAX_SAFE_INTEGER) throw new Error("Invalid outbound barrier count");
+    return count;
   }
 
   /** Only an exact committed same-node receipt suppresses a VK-origin echo. */

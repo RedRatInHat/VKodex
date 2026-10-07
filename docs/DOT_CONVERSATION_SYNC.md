@@ -90,3 +90,43 @@ defaults nor any existing runtime entrypoint. It refuses an enclosing transactio
 Hardware/fsync compliance and destructive power-loss behavior are not tested.
 The durability distinction follows the official SQLite
 [PRAGMA synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
+## Shared outbound projection (experimental, not routed)
+
+`room-outbox.ts` projects qualified visible messages into the existing
+`BridgeStore.enqueue`/`DeliveryWorker` pipeline, reusing VK random IDs, saved
+handles, revisions, edits, chunking, retry/rate-limit handling and withdrawal.
+There is no second outbox or VK client and no fabricated native task/turn.
+The adapter reserves the same peer/room/generation as ingress, establishes FULL
+SQLite synchronization for its shared connection, and starts disabled. Baseline
+creation is explicit and irreversible through this interface; old rows are not
+replayed. Observation now retains the complete loaded ID order, including
+unsupported rows, so a gap cannot be hidden by filtering unsupported content.
+
+The common delivery worker has an optional additional recipient restriction,
+checked both before and after asynchronous access checks. The room composite gate
+requires the exact enabled route and registered delivery key. Unknown room keys
+cannot fall through to ordinary Codex access. A Codex binding taking that peer,
+or a disabled route, prevents further room sends. Other recipients retain the
+ordinary gate and queue behavior.
+
+Owner messages from the app are labelled as such in VK. Committed exact receipts
+suppress VK-origin echoes; identical text with distinct IDs remains distinct.
+Projection waits while a submission is active. An uncertain submission retains a
+persistent outbound barrier even after later inputs succeed: no text-based echo
+reconciliation or automatic reset is implemented. This deliberately blocks new
+projection until a future explicit reconciliation path resolves the uncertainty.
+Already queued valid deliveries remain independent of source polling.
+
+Missing anchors, unknown insertion before the anchor, author changes or malformed
+observations roll back the projection transaction. Unsupported content gets an
+explicit placeholder, not silent omission or invented attachment support. It may
+later be replaced by supported text under the same message handle. Unsupported
+links/attachments, baseline edits and VK-origin edits are not full-fidelity sync.
+No source completion/typing state is fabricated. Existing shared commentary edit
+throttling still applies; latency must be measured in the live integration.
+
+All evidence here is fixture-based (including the real common delivery worker
+with a fake chat transport). Live browser transport, authenticated admission,
+uncertainty reconciliation UI, startup/router integration, native-journal migration,
+recipient qualification and controlled deployment are still outstanding.

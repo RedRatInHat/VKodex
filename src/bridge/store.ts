@@ -1555,10 +1555,10 @@ export class BridgeStore {
       WHERE binding_id = ? AND turn_id = ? AND kind IN ('send', 'commentary', 'activity')`).run(bindingId, turnId);
   }
 
-  withdrawCommentary(key: string): void {
+  withdrawCommentary(key: string, replacementText = "(Этот фрагмент комментария удалён в Codex.)"): void {
     // Cancel unattempted fragments. Recover ambiguous sends with the original
     // random_id before editing away text that was removed from the comment.
-    const replacement = JSON.stringify({ text: "(Этот фрагмент комментария удалён в Codex.)", silent: true } satisfies View);
+    const replacement = JSON.stringify({ text: replacementText, silent: true } satisfies View);
     this.db.prepare(`UPDATE bridge_delivery SET view = ?, revision = revision + 1,
       delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END
       WHERE key = ? AND kind = 'commentary' AND view <> ?`).run(replacement, key, replacement);
