@@ -29,12 +29,24 @@ async function handle(message, sender) {
     throw new Error("Откройте именно настроенный чат перед наблюдением");
   const started = { phase: "arming", operationId: config.operationId, tabId: tabs[0].id, startedAt: Date.now() };
   await save(started); // A failed injection is not automatically retried.
+  let stage = "script-injection";
   try {
     await chrome.scripting.executeScript({ target: { tabId: started.tabId }, files: ["observer.bundle.js"] });
+    stage = "observer-handshake";
     const response = await chrome.tabs.sendMessage(started.tabId, { type: "arm", config });
-    if (response?.phase !== "awaiting-pending") throw new Error("Наблюдатель не готов");
+    if (response?.phase !== "awaiting-pending") {
+      const allowed = ["room-binding", "room-window", "room-row", "owner-anchor-layout", "dot-anchor-layout",
+        "room-text", "room-text-limit", "empty-anchor", "anchors-missing", "room-row-limit", "watch-options", "observer-start-failed"];
+      const diagnostics = {};
+      const supplied = response?.diagnostics;
+      if (Number.isSafeInteger(supplied?.rowCount) && supplied.rowCount >= 0) diagnostics.rowCount = supplied.rowCount;
+      for (const key of ["ownerAnchorPresent", "dotAnchorPresent", "pageMatches"])
+        if (typeof supplied?.[key] === "boolean") diagnostics[key] = supplied[key];
+      return await save({ ...started, phase: "uncertain", finishedAt: Date.now(), reason: "arm-failed", stage: "room-qualification",
+        category: allowed.includes(response?.reason) ? response.reason : "observer-start-failed", diagnostics });
+    }
     return await save({ ...started, phase: "armed" });
-  } catch { return await save({ ...started, phase: "uncertain", finishedAt: Date.now(), reason: "arm-failed" }); }
+  } catch { return await save({ ...started, phase: "uncertain", finishedAt: Date.now(), reason: "arm-failed", stage }); }
 }
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   const operation = queue.then(() => handle(message, sender));

@@ -52,7 +52,7 @@ test("configuration refuses extra fields, foreign anchors and unmarked payloads 
 });
 
 type State = { phase: string; [key: string]: unknown };
-async function background() {
+async function background(options: { injectionError?: boolean; handshakeError?: boolean; response?: unknown } = {}) {
   let listener!: (message: unknown, sender: unknown, respond: (value: unknown) => void) => boolean;
   let stored: State | undefined, injections = 0, messages = 0;
   const tab = { id: 7, url: config.pageUrl };
@@ -62,8 +62,8 @@ async function background() {
       runtime: { id: "fixture", getURL: (file: string) => `chrome-extension://fixture/${file}`,
         onMessage: { addListener: (fn: typeof listener) => { listener = fn; } } },
       storage: { session: { get: async () => ({ canary: stored }), set: async (value: { canary: State }) => { stored = value.canary; } } },
-      tabs: { query: async () => [tab], sendMessage: async () => { messages++; return { phase: "awaiting-pending" }; } },
-      scripting: { executeScript: async () => { injections++; } },
+      tabs: { query: async () => [tab], sendMessage: async () => { messages++; if (options.handshakeError) throw new Error("PRIVATE fixture error"); return options.response ?? { phase: "awaiting-pending" }; } },
+      scripting: { executeScript: async () => { injections++; if (options.injectionError) throw new Error("PRIVATE fixture error"); } },
     },
   });
   new Script(await readFile("extensions/dot-observer-canary/background.js", "utf8")).runInContext(context);
@@ -100,4 +100,43 @@ test("stop retains uncertainty and does not offer an automatic rearm", async () 
   assert.equal((await h.request({ type: "stop" })).state.phase, "uncertain");
   assert.equal((await h.request({ type: "arm" })).ok, false);
   assert.equal(h.counts().injections, 1);
+});
+
+test("arm diagnostics distinguish injection, handshake and room failure without raw errors", async () => {
+  for (const [options, stage] of [[{ injectionError: true }, "script-injection"], [{ handshakeError: true }, "observer-handshake"]] as const) {
+    const h = await background(options), result = await h.request({ type: "arm" });
+    assert.equal(result.state.phase, "uncertain"); assert.equal(result.state.stage, stage);
+    assert.equal(result.state.reason, "arm-failed"); assert.doesNotMatch(JSON.stringify(result), /PRIVATE/u);
+    assert.equal((await h.request({ type: "arm" })).ok, false);
+  }
+  const h = await background({ response: { phase: "uncertain", reason: "anchors-missing", diagnostics: {
+    rowCount: 24, ownerAnchorPresent: false, dotAnchorPresent: false, pageMatches: true, text: "PRIVATE" } } });
+  const result = await h.request({ type: "arm" });
+  assert.equal(result.state.stage, "room-qualification"); assert.equal(result.state.category, "anchors-missing");
+  assert.equal(JSON.stringify(result.state.diagnostics), JSON.stringify({ rowCount: 24, ownerAnchorPresent: false, dotAnchorPresent: false, pageMatches: true }));
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE/u);
+});
+test("unexpected content diagnostics are not copied into session storage", async () => {
+  const h = await background({ response: { phase: "uncertain", reason: "PRIVATE", diagnostics: { rowCount: -1, pageMatches: "PRIVATE", ownerAnchorPresent: {} } } });
+  const result = await h.request({ type: "arm" });
+  assert.equal(result.state.category, "observer-start-failed");
+  assert.equal(JSON.stringify(result.state.diagnostics), "{}"); assert.doesNotMatch(JSON.stringify(result), /PRIVATE/u);
+});
+test("content startup reports only whitelisted failure categories and presence counts", async () => {
+  const source = await readFile("extensions/dot-observer-canary/content-entry.js", "utf8");
+  for (const [failure, category] of [["Role anchors are outside the observed window", "anchors-missing"], ["PRIVATE error", "observer-start-failed"]]) {
+    let listener!: (message: unknown, sender: unknown, reply: (value: unknown) => void) => boolean;
+    const context = createContext({
+      vkodexLoad: () => ({ watchDotSubmission: () => { throw new Error(failure); } }),
+      document: { querySelectorAll: () => [{ getAttribute: () => config.ownerAnchorId }], defaultView: { location: { href: config.pageUrl } } },
+      chrome: { runtime: { id: "fixture", onMessage: { addListener: (fn: typeof listener) => { listener = fn; } } } },
+    });
+    new Script(source).runInContext(context);
+    let result: any;
+    listener({ type: "arm", config }, { id: "fixture" }, value => { result = value; });
+    assert.equal(result.phase, "uncertain"); assert.equal(result.reason, category);
+    assert.equal(result.diagnostics.rowCount, 1); assert.equal(result.diagnostics.ownerAnchorPresent, true);
+    assert.equal(result.diagnostics.dotAnchorPresent, false); assert.equal(result.diagnostics.pageMatches, true);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE/u);
+  }
 });
