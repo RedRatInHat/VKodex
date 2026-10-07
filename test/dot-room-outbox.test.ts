@@ -127,3 +127,27 @@ test("restart uncertainty keeps source mirroring blocked until explicit reconcil
   assert.equal(h.outbox.project(observation([...old, message(3, "owner")])), "submission-blocked");
   assert.equal(h.store.pendingDeliveries().length, 0);
 });
+
+test("confirmed operator reconciliation resumes shared delivery without reflecting the VK input", async t => {
+  const h = fixture(t), input = { peerId, senderId: 42, eventId: "message:4", text: "question" };
+  h.ingress.receive(input); const attempt = h.ingress.dispatch(input, "epoch")!;
+  h.ingress.settle(attempt, { phase: "uncertain" });
+  const snapshot = observation([...old, message(3, "owner", "question"), message(4, "dot", "answer")]);
+  assert.equal(h.outbox.project(snapshot), "submission-blocked");
+  h.ingress.resolveUncertain(attempt, { decisionId: "verified-owner-decision", kind: "confirmed-visible", messageId: id(3) });
+  assert.equal(h.outbox.project(snapshot), "projected"); await h.worker.flush();
+  assert.deepEqual(h.sends.map(s => s.view.text), ["answer"]);
+  h.outbox.project(snapshot); await h.worker.flush(); assert.equal(h.sends.length, 1);
+  assert.equal(h.ingress.dispatch(input, "new-epoch"), null);
+});
+
+test("unmatched operator release resumes mirroring but does not claim the owner row as an echo", async t => {
+  const h = fixture(t), input = { peerId, senderId: 42, eventId: "message:4", text: "question" };
+  h.ingress.receive(input); const attempt = h.ingress.dispatch(input, "epoch")!;
+  h.store.recover(); h.ingress.recoverInterrupted();
+  h.ingress.resolveUncertain(attempt, { decisionId: "release-owner-decision", kind: "release-without-retry", messageId: null });
+  h.outbox.project(observation([...old, message(3, "owner", "question"), message(4, "dot", "answer")]));
+  await h.worker.flush();
+  assert.deepEqual(h.sends.map(s => s.view.text), ["Вы (из приложения):\nquestion", "answer"]);
+  assert.equal(h.ingress.dispatch(input, "new-epoch"), null);
+});

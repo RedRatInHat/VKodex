@@ -15,6 +15,12 @@ export interface DotRoomInputAttempt {
   readonly inputKey: string;
   readonly roomId: string;
 }
+export interface DotRoomInputResolution {
+  /** Reference to a separately authenticated operator decision, never message text. */
+  readonly decisionId: string;
+  readonly kind: "confirmed-visible" | "release-without-retry";
+  readonly messageId: string | null;
+}
 interface InputRecord {
   readonly version: 1;
   readonly digest: string;
@@ -144,6 +150,48 @@ export class DotRoomInputJournal {
     });
   }
 
+  /** Explicit operator reconciliation only. The caller authenticates and confirms
+   * the decision for this exact attempt. A confirmed-visible decision additionally
+   * requires independent verification of owner, room and canonical message ID.
+   * This is not an automatic text-match recovery path and never permits replay.
+   * The original uncertain inbox and observation remain unchanged for audit.
+   */
+  resolveUncertain(attempt: DotRoomInputAttempt, resolution: DotRoomInputResolution): boolean {
+    if (!opaque(resolution.decisionId) ||
+        !["confirmed-visible", "release-without-retry"].includes(resolution.kind) ||
+        (resolution.kind === "confirmed-visible" ? !this.boundMessageId(resolution.messageId as string) : resolution.messageId !== null))
+      throw new TypeError("Invalid operator resolution");
+    this.store.requireDurableWrites();
+    return this.store.atomic(() => {
+      this.assertDedicatedPeer();
+      const record = this.read(attempt.inputKey);
+      if (!record?.attempt || !this.sameAttempt(record.attempt, attempt)) throw new Error("Submission attempt does not match");
+      if (record.phase !== "uncertain" || this.store.inputState(attempt.inputKey) !== "uncertain")
+        throw new Error("Only a settled uncertain submission can be reconciled");
+      const resolutionKey = this.prefix + "resolution:" + attempt.operationId;
+      const prior = this.store.getValue<DotRoomInputResolution>(resolutionKey);
+      if (prior !== null) {
+        if (prior.decisionId !== resolution.decisionId || prior.kind !== resolution.kind || prior.messageId !== resolution.messageId)
+          throw new Error("Conflicting operator resolution");
+        return false;
+      }
+      const decisionKey = this.prefix + "decision:" + resolution.decisionId;
+      if (this.store.getValue(decisionKey) !== null) throw new Error("Operator decision already used");
+      const barriers = this.barriers();
+      if (barriers < 1) throw new Error("Missing outbound submission barrier");
+      if (resolution.messageId !== null) {
+        const receiptKey = this.prefix + "message:" + resolution.messageId;
+        const previous = this.store.getValue<string>(receiptKey);
+        if (previous !== null && previous !== attempt.operationId) throw new Error("Message already belongs to another submission");
+        this.store.setValue(receiptKey, attempt.operationId);
+      }
+      this.store.setValue(resolutionKey, { decisionId: resolution.decisionId, kind: resolution.kind, messageId: resolution.messageId });
+      this.store.setValue(decisionKey, attempt.operationId);
+      this.store.setValue(this.prefix + "outbound-barriers", barriers - 1);
+      return true;
+    });
+  }
+
   /** Reserve the same provider scope for the shared outbox. No live route starts. */
   bindProjection(store: BridgeStore): Readonly<{ peerId: number; roomId: string; scopeKey: string }> {
     if (store !== this.store) throw new Error("Projection must use the same bridge store");
@@ -168,7 +216,7 @@ export class DotRoomInputJournal {
     return count;
   }
 
-  /** Only an exact committed same-node receipt suppresses a VK-origin echo. */
+  /** An exact committed receipt or explicit verified operator mapping suppresses an echo. */
   isOwnVisibleMessage(messageId: string): boolean {
     this.assertDedicatedPeer();
     return this.boundMessageId(messageId) && this.store.getValue(this.prefix + "message:" + messageId) !== null;
