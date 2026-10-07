@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "VKodex one-shot room observer",
+  "version": "0.1.0",
+  "description": "Observe one explicitly armed dot-room test. Does not type, send or access the network.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html" }
+}
