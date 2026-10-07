@@ -110,9 +110,14 @@ export function qualifyDotRoomRows(pageUrl: string, rows: readonly DotRoomRow[],
 export function readDotRoomDocument(document: Document, pageUrl: string, binding: DotRoomBinding): DotRoomObservation {
   const articles = [...document.querySelectorAll("article[data-message-id]")];
   if (articles.length > MAX_ROWS) reject("Room row limit");
+  const rows = articles.map(readDotRoomRow);
+  return qualifyDotRoomRows(pageUrl, rows, binding);
+}
+
+/** Shared conservative markup reader; IDs and authority are validated by the caller. */
+export function readDotRoomRow(article: Element): DotRoomRow {
   const allowed = new Set(["DIV", "SPAN", "P", "BR", "STRONG", "EM", "B", "I", "S", "DEL", "CODE", "PRE",
     "OL", "UL", "LI", "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5", "H6"]);
-  const rows = articles.map(article => {
     const bodies = [...article.querySelectorAll(".message-body")];
     const blocks = [...article.querySelectorAll(".message-body .message-text")];
     const unsupportedContent = article.querySelectorAll(".message-surface").length !== 1 ||
@@ -128,6 +133,4 @@ export function readDotRoomDocument(document: Document, pageUrl: string, binding
     return { tagName: article.tagName, classes: [...article.classList], messageId: article.getAttribute("data-message-id"),
       bodyIds: bodies.map(body => body.getAttribute("data-message-id")),
       textBlocks: blocks.map(block => (block as HTMLElement).innerText), unsupportedContent };
-  });
-  return qualifyDotRoomRows(pageUrl, rows, binding);
 }

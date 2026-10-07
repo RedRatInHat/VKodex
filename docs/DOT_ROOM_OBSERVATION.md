@@ -98,3 +98,27 @@ continuity has **not** been live-qualified. No MutationObserver driver or
 extension is installed by this change, and it does not enable automatic input.
 The future integration must commit evidence to the existing durable lifecycle
 before advancing its queue; losing that commit cannot authorize a replay.
+
+## One-operation DOM watcher (not installed)
+
+`submission-dom-observer.ts` connects the pure submission tracker to a real
+`MutationObserver` interface. Its caller must already own the composer exclusively
+and have committed a durable dispatch fence. It only reads the DOM and subscribes
+to DOM/navigation events. It does not click, fill, retry, connect to a browser,
+install an extension, or make network calls.
+
+The watcher qualifies the initial room with the same conservative row reader used
+by the history observation module. It retains physical article identities in a
+WeakMap. A later acceptance observation requires a captured pending snapshot and
+exactly one corresponding ID attribute transition on that same article. If the
+browser batches away the pending snapshot, the result is uncertainty, even when
+`oldValue` or matching text suggests what happened. Removing/reinserting a node,
+remounts, a second owner input, changed page, unsupported markup, missing evidence,
+timeout, or disconnect cannot authorize another send. All terminal paths disconnect
+the observer and clear its timer/listeners before invoking the persistence callback.
+
+The fixture tests exercise the watcher and lifecycle callbacks without a live
+browser, network, or user input. Physical pending-to-canonical continuity in the
+actual application remains unqualified. No production entrypoint imports this
+watcher. A browser adapter, durable dispatch ledger, common delivery queue wiring,
+and separately authorized installation are still needed for an operational bridge.
