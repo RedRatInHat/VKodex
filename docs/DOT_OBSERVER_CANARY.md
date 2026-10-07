@@ -46,3 +46,26 @@ or session loss are uncertainty. Never retry the same message because its receip
 is missing. Session storage is cleared by browser shutdown; the extension never
 reopens tabs or rearms on startup. It does not solve production reconnect or
 uncertainty reconciliation. Fixture tests are not a live browser qualification.
+
+## Explicit uncertainty reconciliation (library only)
+
+`DotRoomInputJournal.resolveUncertain` can record an operator decision for one
+exact settled uncertain attempt. The production command/UI that authenticates and
+confirms this decision is not connected yet. Do not call it automatically on a
+matching text, late observation, timeout, reconnect, or startup.
+
+- `confirmed-visible`: after independent verification of the owner's canonical
+  message in the intended room, record that exact ID and suppress its VK echo.
+- `release-without-retry`: acknowledge the unresolved outcome and permit outbound
+  projection to continue without claiming delivery. An eventual visible owner
+  message may therefore be mirrored to VK. No resend is performed or enabled.
+
+The caller supplies a unique reference to the authenticated operator decision,
+not the operator's message contents. The operation, observer epoch, input key,
+room, peer and generation must still match. Resolution and barrier decrement use
+one durable shared-store transaction. Repeating the identical decision is a no-op;
+changing a decision or reusing a message/decision for another attempt is refused.
+Only that attempt's barrier is released. Other unresolved inputs keep projection
+blocked. Original common-inbox uncertainty and observed history remain intact;
+manual resolution is separate evidence, not a fabricated DOM receipt. This is
+source-level recovery support, not a deployed reconciliation interface.

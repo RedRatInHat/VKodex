@@ -160,3 +160,75 @@ test("an in-memory store cannot authorize external room dispatch", t => {
   const store = new BridgeStore(); t.after(() => store.close());
   assert.throws(() => new DotRoomInputJournal(store, scope), /file-backed bridge journal/u);
 });
+
+test("operator confirmed identity releases only its barrier and never retries the input", t => {
+  const { store, journal } = fixture(t);
+  journal.receive(input); const attempt = journal.dispatch(input, "epoch")!;
+  journal.settle(attempt, { phase: "uncertain" });
+  const next = { ...input, eventId: "message:5" };
+  journal.receive(next); const second = journal.dispatch(next, "epoch")!;
+  journal.settle(second, { phase: "uncertain" });
+  const decision = { decisionId: "owner-confirmation-1", kind: "confirmed-visible" as const, messageId };
+  assert.equal(journal.resolveUncertain(attempt, decision), true);
+  assert.equal(journal.isOwnVisibleMessage(messageId), true);
+  assert.equal(journal.projectionBlocked(), true);
+  assert.equal(journal.resolveUncertain(attempt, decision), false);
+  assert.equal(journal.projectionBlocked(), true);
+  assert.equal(journal.dispatch(input, "later"), null);
+  assert.equal(store.inputState(key), "uncertain");
+  assert.equal(journal.settle(attempt, observed), "uncertain");
+  assert.throws(() => journal.resolveUncertain(second, decision), /already used/u);
+  assert.throws(() => journal.resolveUncertain(second, { ...decision, decisionId: "another" }), /already belongs/u);
+  assert.equal(journal.resolveUncertain(second, { decisionId: "owner-confirmation-2", kind: "release-without-retry", messageId: null }), true);
+  assert.equal(journal.projectionBlocked(), false);
+  assert.equal(journal.dispatch(next, "later"), null);
+});
+
+test("operator release without identity preserves uncertainty and creates no echo suppression", t => {
+  const { store, journal } = fixture(t);
+  journal.receive(input); const attempt = journal.dispatch(input, "epoch")!;
+  const decision = { decisionId: "release-1", kind: "release-without-retry" as const, messageId: null };
+  assert.throws(() => journal.resolveUncertain(attempt, decision), /Only a settled/u);
+  store.recover();
+  assert.throws(() => journal.resolveUncertain(attempt, decision), /Only a settled/u);
+  journal.recoverInterrupted();
+  assert.equal(journal.resolveUncertain(attempt, decision), true);
+  assert.equal(journal.projectionBlocked(), false);
+  assert.equal(journal.isOwnVisibleMessage(messageId), false);
+  assert.equal(journal.settle(attempt, observed), "uncertain");
+  assert.equal(journal.dispatch(input, "epoch-2"), null);
+  const reopened = new DotRoomInputJournal(store, scope);
+  assert.equal(reopened.resolveUncertain(attempt, decision), false);
+  assert.throws(() => reopened.resolveUncertain(attempt, { decisionId: "changed", kind: "confirmed-visible", messageId }), /Conflicting/u);
+});
+
+test("operator resolution rejects foreign attempts, scopes and malformed identities", t => {
+  const { journal, store } = fixture(t);
+  journal.receive(input); const attempt = journal.dispatch(input, "epoch")!;
+  journal.settle(attempt, { phase: "uncertain" });
+  const decision = { decisionId: "decision", kind: "confirmed-visible" as const, messageId };
+  for (const patch of [{ operationId: "other" }, { observerEpoch: "other" }, { roomId: "c".repeat(32) }])
+    assert.throws(() => journal.resolveUncertain({ ...attempt, ...patch }, decision), /does not match/u);
+  for (const patch of [{ messageId: null }, { messageId: "pending-uuid" }, { decisionId: "" },
+    { messageId: messageId.replaceAll(scope.roomId, "c".repeat(32)) }])
+    assert.throws(() => journal.resolveUncertain(attempt, { ...decision, ...patch }), /Invalid operator/u);
+  assert.throws(() => journal.resolveUncertain(attempt, { ...decision, kind: "release-without-retry" }), /Invalid operator/u);
+  const other = new DotRoomInputJournal(store, { ...scope, generation: 2 });
+  assert.throws(() => other.resolveUncertain(attempt, decision), /different journal scope/u);
+  assert.equal(journal.projectionBlocked(), true);
+});
+
+test("operator resolution is atomic when the final barrier write fails", t => {
+  const { store, journal } = fixture(t);
+  journal.receive(input); const attempt = journal.dispatch(input, "epoch")!;
+  journal.settle(attempt, { phase: "uncertain" });
+  const decision = { decisionId: "decision", kind: "confirmed-visible" as const, messageId };
+  const original = store.setValue.bind(store);
+  store.setValue = (name, value) => { if (name.endsWith(":outbound-barriers")) throw new Error("fixture resolution failure"); original(name, value); };
+  assert.throws(() => journal.resolveUncertain(attempt, decision), /fixture resolution failure/u);
+  store.setValue = original;
+  assert.equal(journal.isOwnVisibleMessage(messageId), false);
+  assert.equal(journal.projectionBlocked(), true);
+  assert.equal(journal.resolveUncertain(attempt, decision), true);
+  assert.equal(journal.projectionBlocked(), false);
+});
