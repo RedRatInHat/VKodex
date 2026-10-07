@@ -85,6 +85,10 @@ interface PendingRequest {
 }
 
 export interface IpcRequestOptions {
+  /** Explicit destination host in the native request envelope. This is routing,
+   * not ownership or authorization. The caller supplies the qualified wire
+   * version for a host-scoped request; this client never guesses or retries it. */
+  readonly hostId?: string;
   readonly targetClientId?: string;
   readonly mutating?: boolean;
   readonly timeoutMs?: number;
@@ -259,6 +263,10 @@ export class DesktopIpcClient {
   }
 
   request(method: string, version: number, params: IpcObject, options: IpcRequestOptions = {}): Promise<IpcObject> {
+    if (options.hostId !== undefined && (typeof options.hostId !== "string" ||
+        !options.hostId.trim() || options.hostId.length > 512 || /[\x00-\x1f\x7f]/u.test(options.hostId))) {
+      return Promise.reject(new TypeError("Invalid IPC destination host"));
+    }
     if (!this.stream || (method !== "initialize" && !this.clientId)) {
       return Promise.reject(new DesktopUnavailableError());
     }
@@ -275,6 +283,7 @@ export class DesktopIpcClient {
         this.write({
           type: "request", requestId, method, version, params, timeoutMs,
           sourceClientId: this.clientId ?? "initializing-client",
+          ...(options.hostId !== undefined ? { hostId: options.hostId } : {}),
           ...(options.targetClientId ? { targetClientId: options.targetClientId } : {}),
         });
       } catch {
