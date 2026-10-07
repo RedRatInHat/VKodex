@@ -23,6 +23,27 @@ import { readWindowsProcessIdentityAsync } from "../src/desktop/windows-process-
 import { isCurrentWindowsProcessCaptureTicket, type SelectedProcessIdentity } from "../src/desktop/windows-process-exit-witness.js";
 import { stopPinnedPredecessor, isVerifiedKnownPredecessorStop } from "../src/desktop/predecessor-cutover-controller.js";
 
+test("Windows production launcher builder preserves VKodex name and embedded icon", { skip: process.platform !== "win32" }, async () => {
+  // Keep native build evidence outside the checkout; never overwrite a live launcher.
+  const root = await mkdtemp(path.join(tmpdir(), "vkodex-branding-"));
+  const executable = path.join(root, "VKodexSupervisor.exe");
+  const script = fileURLToPath(new URL("../scripts/build-windows-launcher.ps1", import.meta.url));
+  const powershell = path.join(process.env.WINDIR ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const run = promisify(execFile);
+  await run(powershell, ["-NoProfile", "-File", script, "-Destination", executable], { windowsHide: true, timeout: 60_000 });
+  const result = await run(powershell, ["-NoProfile", "-Command", `$v=[Diagnostics.FileVersionInfo]::GetVersionInfo('${executable.replaceAll("'", "''")}'); @{description=$v.FileDescription;product=$v.ProductName} | ConvertTo-Json -Compress`], { windowsHide: true, timeout: 10_000 });
+  assert.deepEqual(JSON.parse(result.stdout), { description: "VKodex Bridge", product: "VKodex" });
+  const bytes = await fsPromises.readFile(executable);
+  const icon = await fsPromises.readFile(fileURLToPath(new URL("../docs/logo.ico", import.meta.url)));
+  const count = icon.readUInt16LE(4);
+  for (let index = 0; index < count; index++) {
+    const offset = 6 + index * 16;
+    const payload = icon.subarray(icon.readUInt32LE(offset + 12), icon.readUInt32LE(offset + 12) + icon.readUInt32LE(offset + 8));
+    assert.ok(bytes.includes(payload), `embedded VKodex icon image ${index} is present`);
+  }
+  await assert.rejects(run(powershell, ["-NoProfile", "-File", script, "-Destination", executable], { windowsHide: true, timeout: 10_000 }), "a running/versioned launcher must never be overwritten");
+});
+
 test("Windows runtime has a stable dedicated name outside the checkout and Node version directory", () => {
   assert.equal(windowsRuntimePath("C:\\Users\\fixture\\AppData\\Local"), "C:\\Users\\fixture\\AppData\\Local\\VKodex\\runtime\\VKodex.exe");
   assert.equal(windowsRuntimePath("D:\\Local Apps"), "D:\\Local Apps\\VKodex\\runtime\\VKodex.exe");

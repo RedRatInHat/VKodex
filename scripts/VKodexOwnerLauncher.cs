@@ -4,6 +4,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Web.Script.Serialization;
 using System.Threading.Tasks;
+using System.Reflection;
+
+[assembly: AssemblyTitle("VKodex Owner Adapter")]
+[assembly: AssemblyProduct("VKodex")]
+[assembly: AssemblyDescription("VKodex native client owner adapter")]
+[assembly: AssemblyCompany("VKodex")]
 
 // A console executable is required by VS Code's cliExecutable setting on Windows.
 // Native stdio is forwarded byte-for-byte; Node owns framing and the private channel.

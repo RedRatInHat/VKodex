@@ -113,8 +113,9 @@ async function makePrivatePlanFixture(options: { mutateBindingAfterFirst?: boole
   const compiler = path.join(process.env.WINDIR ?? "C:\\Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
   assert.equal((await fs.stat(compiler)).isFile(), true, "the reviewed .NET Framework compiler is available");
   await fs.mkdir(path.dirname(launcherPath), { recursive: true });
-  const supervisorSource = fileURLToPath(new URL("../scripts/VKodexSupervisor.cs", import.meta.url));
-  await execFileAsync(compiler, ["/nologo", "/target:exe", `/out:${launcherPath}`, supervisorSource], { windowsHide: true, timeout: 60_000, maxBuffer: 32 * 1024 });
+  const builder = fileURLToPath(new URL("../scripts/build-windows-launcher.ps1", import.meta.url));
+  await execFileAsync(path.join(process.env.WINDIR ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoProfile", "-File", builder, "-Destination", launcherPath], { windowsHide: true, timeout: 60_000, maxBuffer: 32 * 1024 });
 
   const artifactSourceFiles = [
     "dist/src/desktop/deployment-plan-private.js",

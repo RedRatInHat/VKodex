@@ -48,7 +48,7 @@ if ((Split-Path $extensionDirectory -Leaf) -like 'openai.chatgpt-*' -and (Test-P
 }
 [IO.File]::WriteAllText((Join-Path $target 'owner-launcher.json'), ($config | ConvertTo-Json), $utf8)
 $executable = Join-Path $target 'VKodexOwnerLauncher.exe'
-& $compiler /nologo /target:exe /reference:System.Web.Extensions.dll "/out:$executable" (Join-Path $PSScriptRoot 'VKodexOwnerLauncher.cs')
+& (Join-Path $PSScriptRoot 'build-windows-launcher.ps1') -Destination $executable -Kind Owner
 if ($LASTEXITCODE -ne 0) { throw 'Owner launcher compilation failed.' }
 Write-Output "Prepared: $executable"
 Write-Output 'No VS Code settings or running clients were changed.'

@@ -39,7 +39,7 @@ function Get-Sha256Prefix([string]$Path, [int]$Length) {
 $launcherVersion = "{0}-{1}" -f (Get-Sha256Prefix $launcherSource 12), (Get-Sha256Prefix $iconPath 8)
 $launcherPath = Join-Path $env:LOCALAPPDATA "VKodex\runtime\VKodexSupervisor-$launcherVersion.exe"
 if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
-  & $compiler /nologo /target:exe /platform:anycpu /optimize+ "/win32icon:$iconPath" "/out:$launcherPath" $launcherSource
+  & (Join-Path $PSScriptRoot 'build-windows-launcher.ps1') -Destination $launcherPath
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
     throw "VKodexSupervisor.exe could not be built."
   }

@@ -9,6 +9,12 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
+using System.Reflection;
+
+[assembly: AssemblyTitle("VKodex Bridge")]
+[assembly: AssemblyProduct("VKodex")]
+[assembly: AssemblyDescription("VKodex bridge supervisor")]
+[assembly: AssemblyCompany("VKodex")]
 
 internal static class Program
 {
@@ -93,6 +99,11 @@ internal static class Program
             {
                 var plan = trust.ValidatePlan();
                 if (operation == "plan-only") { Console.OutputEncoding = new UTF8Encoding(false); Console.WriteLine(plan.Json); return 0; }
+                if (operation == "supervise" || operation == "supervise-once")
+                {
+                    SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge");
+                    Console.Title = "VKodex Bridge - DO NOT CLOSE";
+                }
                 // Keep immutable bootstrap code/runtime open without write/delete
                 // sharing for the full child lifetime. Release mutable metadata:
                 // a later helper must refuse changes against the ORIGINAL pin.
