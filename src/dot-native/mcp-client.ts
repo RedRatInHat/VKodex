@@ -1,12 +1,23 @@
+import { randomUUID } from "node:crypto";
+import { diagnosticEvent, diagnosticError } from "../bridge/diagnostics.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { isAbsolute, join } from "node:path";
 import { existsSync } from "node:fs";
 
 type Obj = Record<string, unknown>;
 const object = (v: unknown): v is Obj => v !== null && typeof v === "object" && !Array.isArray(v);
+const nativeReasons: Readonly<Record<string, string>> = Object.freeze({
+  "Native session is closed": "closed", "Installed MCP server is absent": "source-missing",
+  "Unqualified MCP version": "protocol-mismatch", "Required native tools are absent": "unsupported",
+  "Native target mismatch": "source-mismatch", "Native send target mismatch": "source-mismatch",
+  "Native tool returned an error": "request-rejected", "Invalid native tool result": "invalid-response",
+  "Native session is disconnected": "disconnect", "Native request timed out": "timeout",
+  "Native RPC rejected or malformed": "invalid-response", "Native session disconnected": "disconnect",
+});
 export class NativeMcpError extends Error {
+  readonly reason: string;
   constructor(readonly outcome: "unavailable" | "rejected" | "uncertain", message: string) {
-    super(message); this.name = "NativeMcpError";
+    super(message); this.name = "NativeMcpError"; this.reason = Object.hasOwn(nativeReasons, message) ? nativeReasons[message]! : "other";
   }
 }
 export interface NativeMcpOptions {
@@ -39,6 +50,7 @@ interface Pending {
  * Native history stays inside the process until the public-reply allowlist runs.
  */
 export class NativeDotMcpClient {
+  private readonly connectionId = randomUUID();
   private child: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<number, Pending>();
   private nextId = 1;
@@ -60,7 +72,16 @@ export class NativeDotMcpClient {
   start(): Promise<void> {
     if (this.disposed) return Promise.reject(new NativeMcpError("unavailable", "Native session is closed"));
     if (this.ready) return Promise.resolve();
-    return this.starting ??= this.initialize();
+    if (this.starting) return this.starting;
+    const started = Date.now();
+    const fields = { route: "dot-native", connectionId: this.connectionId, threadId: this.options.targetThreadId };
+    diagnosticEvent("connection.start", { ...fields, stage: "initialize" });
+    return this.starting = this.initialize().then(() => {
+      diagnosticEvent("connection.result", { ...fields, outcome: "success", elapsedMs: Date.now() - started });
+    }, error => {
+      diagnosticEvent("connection.result", { ...fields, outcome: "failure", elapsedMs: Date.now() - started, ...diagnosticError(error) });
+      throw error;
+    });
   }
   private async initialize(): Promise<void> {
     if (!existsSync(join(this.options.pluginRoot, "server.mjs")))
@@ -125,7 +146,11 @@ export class NativeDotMcpClient {
   private request(method: string, params: Obj, mutation = false): Promise<Obj> {
     if (!this.child || this.disposed) return Promise.reject(new NativeMcpError("unavailable", "Native session is disconnected"));
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const fields = { route: "dot-native", connectionId: this.connectionId, threadId: this.options.targetThreadId,
+      requestId: id, method, mutating: mutation };
+    diagnosticEvent("rpc.stage", { ...fields, stage: "start" });
+    return new Promise<Obj>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new NativeMcpError(mutation ? "uncertain" : "unavailable", "Native request timed out"));
@@ -134,6 +159,12 @@ export class NativeDotMcpClient {
       this.pending.set(id, { mutation, resolve, reject, timer });
       try { this.write({ jsonrpc: "2.0", id, method, params }); }
       catch { this.fail(); }
+    }).then(result => {
+      diagnosticEvent("rpc.stage", { ...fields, stage: "response", outcome: "success", elapsedMs: Date.now() - started });
+      return result;
+    }, error => {
+      diagnosticEvent("rpc.stage", { ...fields, stage: "response", outcome: "failure", elapsedMs: Date.now() - started, ...diagnosticError(error) });
+      throw error;
     });
   }
   private receive(chunk: string): void {

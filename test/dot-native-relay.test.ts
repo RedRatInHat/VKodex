@@ -185,3 +185,24 @@ test("an unresolved first delivery holds later replies until the next tick",asyn
   assert.notEqual(f.vk[1]!.id,f.vk[2]!.id);
  }finally{await f.close();}
 });
+
+test("relay failures identify connect versus snapshot and status transitions without raw error text", async()=>{
+ const {withDiagnosticSink}=await import("../src/bridge/diagnostics.js");
+ const {NativeMcpError}=await import("../src/dot-native/mcp-client.js");
+ for(const stage of ["connect","snapshot"]) {
+  const store=new DotRelayStore(":memory:",binding), records:import("../src/bridge/diagnostics.js").DiagnosticRecord[]=[];
+  let sends=0;
+  const transport:DotNativeTransport={start:async()=>{if(stage==="connect")throw new NativeMcpError("unavailable","Required native tools are absent");},
+   read:async()=>{throw new NativeMcpError("rejected","Native tool returned an error");},
+   send:async()=>{sends++;return {};},close:()=>{}};
+  const relay=new DotNativeRelay(store,{send:async()=>{throw Error("No delivery expected");}},()=>transport);
+  try {
+   await withDiagnosticSink(r=>{records.push(r);},()=>relay.tick());
+   const failure=records.find(r=>r.event==="connection.result"&&r.stage===stage)!;
+   assert.equal(failure.outcome,"failure");assert.equal(failure.reason,stage==="connect"?"unsupported":"request-rejected");
+   assert.ok(records.some(r=>r.event==="connection.lifecycle"&&r.stage==="unavailable"));
+   assert.equal(sends,0);assert.equal(store.uncertain,false);
+   assert.doesNotMatch(JSON.stringify(records),/Required native tools|Native tool returned/u);
+  } finally {await relay.stop();store.close();}
+ }
+});

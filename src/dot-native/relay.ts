@@ -24,7 +24,7 @@ export class DotNativeRelay {
     private readonly onHealth:(state:DotRelayHealth)=>void = ()=>{},
     private readonly recoverInput?: (peerId:number,after:number)=>Promise<{inputs:BridgeInput[];cursor:number}>) {}
   get peerId():number { return this.store.binding.peerId; }
-  private status(state:DotRelayHealth):void { if(this.health!==state) { this.health=state; try {this.onHealth(state);} catch { /* Health reporting is observational. */ } } }
+  private status(state:DotRelayHealth):void { if(this.health!==state) { this.health=state; diagnosticEvent("connection.lifecycle", {route:"dot-native",threadId:this.store.binding.threadId,stage:state}); try {this.onHealth(state);} catch { /* Health reporting is observational. */ } } }
   start(intervalMs=10_000):void {
     if(this.timer || this.stopped) return;
     if(intervalMs<1000) throw new RangeError("Dot polling is too frequent");
@@ -63,20 +63,24 @@ export class DotNativeRelay {
     // Already-journaled deliveries must not wait for native reads or sends.
     // The existing outbox identity still owns retries; this is not a resubmit.
     try { await this.flush(attemptedDeliveries); } catch { this.status("unavailable"); }
+    let stage = "connect";
     try {
       this.transport ??= this.createTransport();
       await this.transport.start();
+      stage = "snapshot";
       await this.poll();
       if(this.stopped)return;
       // Publish newly discovered replies before potentially slow input recovery
       // or a native mutation. A failed VK send must not change input admission.
       try { await this.flush(attemptedDeliveries); } catch { this.status("unavailable"); }
       if(this.stopped)return;
+      stage = "observe";
       if(this.recoverInput) {
         const recovered=await this.recoverInput(this.peerId,this.store.inboundCursor);
         for(const input of recovered.inputs) await this.handle(input);
         this.store.advanceInboundCursor(recovered.cursor);
       }
+      stage = "dispatch";
       const input=this.store.nextInput();
       if(input) {
         this.store.markInput(input.id,"sending");
@@ -95,6 +99,7 @@ export class DotNativeRelay {
         }
       }
     } catch(error) {
+      diagnosticEvent("connection.result", {route:"dot-native",threadId:this.store.binding.threadId,stage,outcome:"failure",...diagnosticError(error)});
       this.status(error instanceof Error && error.message==="Dot history gap" ? "history-gap" : "unavailable");
       this.transport?.close(); this.transport=null;
       const waiting=this.store.nextInput();
