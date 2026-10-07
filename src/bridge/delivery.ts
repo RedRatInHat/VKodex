@@ -2,6 +2,12 @@ import type { BridgeChat, Delivery, OwnerAccess } from "./contracts.js";
 import { ChatRateLimitError } from "./contracts.js";
 import { BridgeStore } from "./store.js";
 
+/** Provider-specific restrictions are checked again after async access checks. */
+export interface DeliveryAccess {
+  check(peerId: number, fresh?: boolean): Promise<boolean>;
+  accepts?(delivery: Delivery): boolean;
+}
+
 export class AccessGate {
   constructor(private readonly access: OwnerAccess, private readonly store: BridgeStore) {}
 
@@ -28,7 +34,7 @@ export class DeliveryWorker {
   constructor(
     private readonly chat: BridgeChat,
     private readonly store: BridgeStore,
-    private readonly gate: AccessGate,
+    private readonly gate: DeliveryAccess,
     private readonly editIntervalMs = 20_000,
     private readonly now: () => number = Date.now,
     private readonly maxDeliveriesPerFlush = 5,
@@ -47,7 +53,7 @@ export class DeliveryWorker {
   async idle(): Promise<void> { await this.flushing; }
 
   private active(delivery: Delivery): boolean {
-    if (!this.store.isPending(delivery)) return false;
+    if (!this.store.isPending(delivery) || this.gate.accepts?.(delivery) === false) return false;
     if (!delivery.bindingId) return true;
     const binding = this.store.getBinding(delivery.bindingId);
     return !!binding?.attached && binding.peerId === delivery.peerId;
