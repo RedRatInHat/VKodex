@@ -38,7 +38,8 @@ test("source generation escapes embedded C# verbatim literals without interpreti
 
 test("validation refuses relative/control-character paths, invalid pins and invalid extension IDs", () => {
   for (const key of ["runtimePath", "entryPath", "configPath", "outputNewDirectory"] as const)
-    for (const value of ["relative", "", "C:relative", "\\root-relative", "/root-relative", "C:\\fixture\\bad\npath", "C:\\fixture\\bad\0path"])
+    for (const value of ["relative", "", "C:relative", "\\root-relative", "/root-relative", "\\\\server\\share\\file",
+      "\\\\?\\C:\\fixture\\file", "\\\\.\\pipe\\fixture", "C:\\fixture\\bad\npath", "C:\\fixture\\bad\0path"])
       assert.throws(() => generateWindowsNativeLauncherSource({ ...sourceOptions, [key]: value }));
   for (const key of ["runtimeSha256", "entrySha256", "configSha256"] as const)
     for (const value of ["a".repeat(63), "g".repeat(64), "A".repeat(64)])

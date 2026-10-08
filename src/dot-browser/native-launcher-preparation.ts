@@ -15,7 +15,7 @@ export interface WindowsNativeLauncherOptions {
   readonly outputNewDirectory: string;
 }
 const execFile = promisify(execFileCallback);
-const absolute = (value: string): boolean => /^[a-z]:[\\/]/iu.test(value) || /^\\\\[^\\/]+\\[^\\/]+(?:\\|$)/u.test(value);
+const absolute = (value: string): boolean => /^[a-z]:[\\/]/iu.test(value);
 function validate(options: WindowsNativeLauncherOptions): void {
   for (const value of [options.runtimePath, options.entryPath, options.configPath, options.outputNewDirectory])
     if (typeof value !== "string" || !absolute(value) || /[\x00-\x1f\x7f]/u.test(value))
