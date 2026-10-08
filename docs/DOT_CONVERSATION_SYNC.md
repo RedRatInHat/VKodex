@@ -54,6 +54,31 @@ Latency targets must be measured rather than invented: record ingress, native di
 
 ## Shared ingress adapter (experimental, not routed)
 
+### Edge connection admission (experimental, not routed)
+
+The owner selected an extension in the existing signed-in Edge profile. This
+does not inherit authentication from a Codex home and does not create a hidden
+browser. Full browser shutdown means disconnected; undispatched inputs remain
+in the common inbox. An attempted input with no receipt remains uncertain.
+
+`connection-gate.ts` provides an in-memory, single-port admission gate with
+short-lived room qualification and per-connection epochs. It starts disabled.
+Duplicate connects cannot replace the writer; stale events cannot revive an old
+connection or disconnect its replacement. Navigation, room mismatch, expiry,
+disable and clock rollback invalidate readiness. Clock values must come from
+the host, not extension messages. Availability is transport readiness only and
+must never be displayed as model thinking or delivery acknowledgement.
+
+This is not extension authentication or a transport. The caller must authenticate
+the port, qualify the selected room from the live tab, and close obsolete ports.
+It must check admission before the durable input fence and after awaited
+preparation. Any failure after fencing is handled as uncertainty by the existing
+input journal; the gate itself never sends, retries, clears fences or settles
+messages. No runtime entrypoint or installed extension imports it yet.
+
+Live observer qualification, extension-to-host integration and permission setup
+remain required. Fixture tests do not establish a functioning browser bridge.
+
 `src/dot-browser/input-journal.ts` reuses `BridgeStore.receiveInput`, the existing
 `bridge_inbox` state machine, immediate SQLite transactions, and normal
 `BridgeStore.recover()` semantics. It does not introduce a second inbox, database,
