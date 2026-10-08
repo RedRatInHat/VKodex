@@ -18,8 +18,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       binding: { pageUrl: config.pageUrl, roomId: config.roomId, ownerAnchorId: config.ownerAnchorId, dotAnchorId: config.dotAnchorId },
       expectedText: config.expectedText, operationId: config.operationId, observerEpoch: config.operationId,
       timeoutMs: 120_000,
-      onTerminal: result => { void chrome.runtime.sendMessage({ type: "receipt", operationId: config.operationId, phase: result.phase,
-        ...(result.phase === "observed" ? { messageId: result.messageId } : {}) }).catch(() => {}); } });
+      onTerminal: (result, reason) => { void chrome.runtime.sendMessage({ type: "receipt", operationId: config.operationId, phase: result.phase,
+        ...(result.phase === "observed" ? { messageId: result.messageId } : { reason }) }).catch(() => {}); } });
     respond({ phase: watch.state.phase });
   } catch (error) {
     const reason = knownFailures.get(error?.message) || "observer-start-failed";

@@ -101,6 +101,15 @@ test("stop retains uncertainty and does not offer an automatic rearm", async () 
   assert.equal((await h.request({ type: "arm" })).ok, false);
   assert.equal(h.counts().injections, 1);
 });
+test("terminal uncertainty retains only bounded failure reasons, never raw text", async () => {
+  for (const reason of ["interference", "navigation", "timeout", "PRIVATE prompt and token"]) {
+    const h = await background(); await h.request({ type: "arm" });
+    const result = await h.request({ type: "receipt", operationId: config.operationId, phase: "uncertain", reason }, h.content);
+    assert.equal(result.state.reason, reason.startsWith("PRIVATE") ? "unknown" : reason);
+    assert.doesNotMatch(JSON.stringify(result.state), /PRIVATE/u);
+    assert.equal((await h.request({ type: "arm" })).ok, false);
+  }
+});
 
 test("arm diagnostics distinguish injection, handshake and room failure without raw errors", async () => {
   for (const [options, stage] of [[{ injectionError: true }, "script-injection"], [{ handshakeError: true }, "observer-handshake"]] as const) {

@@ -13,8 +13,10 @@ async function handle(message, sender) {
     const prefix = `${config.roomId}~${config.roomId}~CalpicoMessage~`;
     if (message.phase === "observed" && (typeof message.messageId !== "string" || !message.messageId.startsWith(prefix) ||
         !/^Sentinel_[a-f0-9]{32}$/.test(message.messageId.slice(prefix.length)))) throw new Error("Неверный ID результата");
+    const reasons = ["gap", "disconnect", "navigation", "interference", "timeout", "transition-rejected"];
     return await save({ ...state, phase: message.phase, finishedAt: Date.now(),
-      ...(message.phase === "observed" ? { messageId: message.messageId, evidence: "same-node-dom-transition" } : {}) });
+      ...(message.phase === "observed" ? { messageId: message.messageId, evidence: "same-node-dom-transition" } :
+        { reason: reasons.includes(message.reason) ? message.reason : "unknown" }) });
   }
   if (sender.url !== chrome.runtime.getURL("popup.html")) throw new Error("Команда доступна только из окна расширения");
   if (message?.type === "status") return await read();

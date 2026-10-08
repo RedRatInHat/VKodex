@@ -60,19 +60,36 @@ function harness() {
   const articles = [new Article(id("b"), "owner anchor"), new Article(id("c"), "dot anchor", false)];
   const document = { defaultView: window, body: {}, querySelectorAll: () => articles };
   const results: SubmissionObservation[] = [];
+  const reasons: (string | undefined)[] = [];
   const watch = watchDotSubmission({ document: document as unknown as Document,
     binding: { pageUrl: url, roomId: room, ownerAnchorId: id("b"), dotAnchorId: id("c") },
     observerEpoch: "epoch-1", operationId: "operation-1", expectedText: "hello", timeoutMs: 100,
-    onTerminal: result => results.push(result) });
+    onTerminal: (result, reason) => { results.push(result); reasons.push(reason); } });
   const emit = (records: Partial<MutationRecord>[] = []) => callback!(records as MutationRecord[], {} as MutationObserver);
   const transition = (article: Article, nextId = id("d")) => {
     const oldValue = article.messageId; article.changeId(nextId);
     emit([{ type: "attributes", target: article as unknown as Node, attributeName: "data-message-id", oldValue, removedNodes: [] as unknown as NodeList }]);
   };
   const addPending = () => { const article = new Article(pendingId, "hello"); articles.push(article); emit(); return article; };
-  return { watch, articles, results, window, listeners, emit, transition, addPending,
+  return { watch, articles, results, reasons, window, listeners, emit, transition, addPending,
     expire: () => timeout?.(), disconnected: () => disconnected };
 }
+
+test("posting an armed-status report instead of the marker records interference", () => {
+  const h = harness();
+  h.articles.push(new Article(pendingId, '{"phase":"armed"}'));
+  h.emit();
+  assert.equal(h.watch.state.phase, "uncertain");
+  assert.deepEqual(h.reasons, ["interference"]);
+  h.expire();
+  assert.equal(h.reasons.length, 1);
+});
+test("terminal diagnostics distinguish expiry, disconnect and navigation", () => {
+  const timeout = harness(); timeout.expire(); assert.deepEqual(timeout.reasons, ["timeout"]);
+  const disconnected = harness(); disconnected.watch.disconnect(); assert.deepEqual(disconnected.reasons, ["disconnect"]);
+  const navigation = harness(); navigation.listeners.get("pagehide")!(); assert.deepEqual(navigation.reasons, ["navigation"]);
+  const success = harness(); success.transition(success.addPending()); assert.deepEqual(success.reasons, [undefined]);
+});
 
 test("DOM watch observes one same-physical-node transition and cleans up", () => {
   const h = harness(); const article = h.addPending();
