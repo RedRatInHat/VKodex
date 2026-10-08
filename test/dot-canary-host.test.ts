@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,7 +12,7 @@ import { NativeMessageDecoder, encodeNativeMessage } from "../src/dot-browser/na
 import { parseDotControlRequest } from "../src/dot-browser/control-protocol.js";
 const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", roomId = "a".repeat(32), extensionId = "b".repeat(32);
 function fixture() {
-  const directory = mkdtempSync(path.join(tmpdir(), "vkodex-host-test-"));
+  const directory = mkdtempSync(path.join(realpathSync(tmpdir()), "vkodex-host-test-"));
   const config: DotCanaryConfig = { version: 1, mode: "diagnostic-canary", databasePath: path.join(directory, "dot-control-canary.sqlite"),
     peerId: 2_000_000_032, ownerId: 42, roomId, generation: 1, pageUrl: "https://chatgpt.com/dots/" + uuid };
   const configFile = path.join(directory, "config.json"); writeFileSync(configFile, JSON.stringify(config));
