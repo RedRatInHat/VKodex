@@ -21,6 +21,8 @@ test("peer sends once and waits beyond acknowledgement for the visible receipt",
   assert.deepEqual(new NativeMessageDecoder().push(Buffer.concat(h.writes)), [request]);
   h.input.write(encodeNativeMessage({ ...response, result: { phase: "accepted" } }));
   await Promise.resolve(); assert.equal(settled, false);
+  h.input.write(encodeNativeMessage({ version: 1, requestId: id, scope: request.scope, kind: "stage", operationId: id, stage: "armed" }));
+  await Promise.resolve(); assert.equal(settled, false);
   h.input.write(encodeNativeMessage(response)); assert.deepEqual(await running, response);
   abort.abort(); assert.equal(h.disconnects(), 0);
 });

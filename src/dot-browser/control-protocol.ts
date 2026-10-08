@@ -17,10 +17,14 @@ export const dotControlRequestSchema = z.discriminatedUnion("method", [status, r
 export type DotControlRequest = z.infer<typeof dotControlRequestSchema>;
 
 const failure = z.enum(["interference", "navigation", "gap", "disconnect", "timeout", "transition-rejected",
-  "wrong-scope", "not-ready", "invalid-request", "unknown-operation", "operation-conflict", "other"]);
+  "wrong-scope", "not-ready", "invalid-request", "unknown-operation", "operation-conflict", "unqualified-controls", "draft-present", "aborted",
+  "tab-missing", "tab-ambiguous", "script-injection", "content-disconnected", "invalid-response", "other"]);
 const message = z.string().regex(/^[a-f0-9]{32}~[a-f0-9]{32}~CalpicoMessage~Sentinel_[a-f0-9]{32}$/u);
 const responseBase = { version: z.literal(1), requestId: uuid, scope };
 export const dotControlResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ ...responseBase, kind: z.literal("stage"), operationId: uuid,
+    stage: z.enum(["armed", "write-attempt", "write-returned"]),
+  }).strict(),
   z.object({ ...responseBase, kind: z.literal("status"), state: z.enum(["disconnected", "qualifying", "ready", "busy"])}).strict(),
   z.object({ ...responseBase, kind: z.literal("result"), operationId: uuid,
     result: z.discriminatedUnion("phase", [
@@ -52,10 +56,12 @@ export function parseDotControlResponse(value: unknown): DotControlResponse {
 /** A valid envelope still cannot settle a different command or connection. */
 export function matchDotControlResponse(request: DotControlRequest, value: unknown): DotControlResponse {
   const response = parseDotControlResponse(value);
-  if (response.requestId !== request.requestId || response.scope.roomId !== request.scope.roomId ||
-      response.scope.generation !== request.scope.generation || response.scope.epoch !== request.scope.epoch ||
-      response.kind !== "error" && (request.method === "status" ? response.kind !== "status" :
-        response.kind !== "result" || response.operationId !== request.operationId))
+  const scopeMatches = response.requestId === request.requestId && response.scope.roomId === request.scope.roomId &&
+    response.scope.generation === request.scope.generation && response.scope.epoch === request.scope.epoch;
+  const methodMatches = response.kind === "error" || (request.method === "status" ? response.kind === "status" :
+    (response.kind === "result" || request.method === "observe-and-submit" && response.kind === "stage") &&
+    response.operationId === request.operationId);
+  if (!scopeMatches || !methodMatches)
     throw new Error("Dot control response binding mismatch");
   return response;
 }
