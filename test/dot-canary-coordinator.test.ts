@@ -21,7 +21,7 @@ const room = "a".repeat(32);
 const messageId = `${room}~${room}~CalpicoMessage~Sentinel_${"b".repeat(32)}`;
 function configuration(): DotCanaryConfig {
   return { version: 1, mode: "diagnostic-canary", databasePath: path.join(mkdtempSync(path.join(tmpdir(), "dot-canary-test-")), "dot-control-canary.sqlite"),
-    peerId: 2_000_000_032, ownerId: 42, roomId: room, generation: 1,
+    peerId: 2_000_000_123, ownerId: 42, roomId: room, generation: 1,
     pageUrl: "https://chatgpt.com/dots/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" };
 }
 function fixture(t: { after(fn: () => void): void }, statusMs = 100, submitMs = 100) {
@@ -116,6 +116,16 @@ test("bounded readiness failure is logged without reserving or dispatching input
   assert.equal(h.store.inputState(h.key), "received");
   assert.ok(records.some(record => record.reason === "anchors-not-visible"));
   assert.doesNotMatch(JSON.stringify(records), /PRIVATE_CANARY_FIXTURE|VKODEX-DOT-CONTROL-CANARY/u);
+});
+
+test("explicit wrong-scope rejection invalidates the port epoch without dispatch", async t => {
+  const h = fixture(t); h.enqueue();
+  h.handler(request => h.respond(request, { kind: "error", reason: "wrong-scope" }));
+  assert.deepEqual(await h.coordinator.tick(h.lease), { phase: "queued" });
+  assert.equal(h.gate.availability(20_001), "disconnected");
+  assert.equal(h.gate.qualify(h.lease, { roomId: room, pageUrl: h.config.pageUrl, qualified: true }, 20_001), false);
+  assert.equal(h.journal.eventStatus(h.queued.eventId)?.operationId, null);
+  assert.deepEqual(h.requests.map(request => request.method), ["status"]);
 });
 
 test("only exactly scoped ready status admits one durable submission", async t => {

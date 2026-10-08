@@ -55,7 +55,10 @@ export class DotCanaryCoordinator {
       if (timer !== undefined) clearTimeout(timer);
       timer = undefined;
       reason = "not-ready";
-      if (response.kind === "error") { failure(response.reason); return { phase: "queued" }; }
+      if (response.kind === "error") {
+        if (response.reason === "wrong-scope") this.gate.disconnect(stableLease);
+        failure(response.reason); return { phase: "queued" };
+      }
       if (response.kind !== "status" || response.state !== "ready" ||
           !this.gate.qualify(stableLease, { roomId: this.config.roomId, pageUrl: this.config.pageUrl, qualified: true }, this.clock()) ||
           !this.gate.canDispatch(stableLease, this.clock())) {
