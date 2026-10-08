@@ -39,6 +39,9 @@ export class DotBrowserConnectionGate {
     this.enabled = enabled;
     this.invalidate();
   }
+  isBoundTo(roomId: string, generation: number): boolean {
+    return this.binding.roomId === roomId && this.binding.generation === generation;
+  }
 
   /** One authenticated port at a time; duplicate connects cannot steal a lease. */
   connect(now: number): DotBrowserLease | null {

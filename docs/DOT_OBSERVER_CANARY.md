@@ -37,6 +37,20 @@ private application APIs or extract browser credentials.
 After qualification, stop any remaining observer and remove the diagnostic
 extension as agreed. No persistent runtime bridge is implied by this test.
 
+Do not ask the operator to post an `armed` status report into the observed chat
+before submitting the marker. Any new owner message that is not exactly the
+expected marker is interference and terminates this exclusive one-message watch.
+The popup button is labelled "Начать одно наблюдение"; `arm` is its internal
+command name. After starting, submit only the marker, then inspect/report the
+result. Manual sequencing is diagnostic-only and is being replaced by an atomic
+observer-plus-submission command in the extension control API.
+
+Terminal receipts retain only a bounded reason: interference, navigation, gap,
+disconnect, timeout, transition-rejected or unknown. This is diagnostic evidence,
+not permission to retry a submission. Earlier receipts without reasons cannot
+be retrospectively classified as a known failure. Source updates do not update
+an already loaded extension or change its existing terminal state.
+
 ## Evidence and limits
 
 A successful result is same-node DOM-transition evidence only. Independently check

@@ -21,6 +21,11 @@ export interface DotRoomInputResolution {
   readonly kind: "confirmed-visible" | "release-without-retry";
   readonly messageId: string | null;
 }
+export interface DotRoomOperationStatus {
+  readonly operationId: string;
+  readonly phase: "attempted" | "observed" | "uncertain";
+  readonly messageId: string | null;
+}
 interface InputRecord {
   readonly version: 1;
   readonly digest: string;
@@ -89,9 +94,24 @@ export class DotRoomInputJournal {
       const attempt: DotRoomInputAttempt = { operationId: randomUUID(), observerEpoch, inputKey: key, roomId: this.scope.roomId };
       this.store.setValue(this.prefix + key, { ...record, phase: "attempted", attempt } satisfies InputRecord);
       this.store.setValue(this.prefix + "active", key);
+      this.store.setValue(this.prefix + "operation:" + attempt.operationId, key);
       this.store.setValue(this.prefix + "outbound-barriers", this.barriers() + 1);
       return attempt;
     });
+  }
+
+  /** Read-only result lookup for the control API. No text, retry or settlement. */
+  operationStatus(operationId: string): DotRoomOperationStatus | null {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(operationId))
+      throw new TypeError("Invalid room operation ID");
+    this.assertDedicatedPeer();
+    const key = this.store.getValue<string>(this.prefix + "operation:" + operationId);
+    if (key === null) return null;
+    const record = this.read(key);
+    if (!record?.attempt || record.attempt.operationId !== operationId || record.phase === "received")
+      throw new Error("Invalid room operation index");
+    const recovered = record.phase === "attempted" && this.store.inputState(key) === "uncertain";
+    return { operationId, phase: recovered ? "uncertain" : record.phase, messageId: recovered ? null : record.messageId };
   }
 
   settle(attempt: DotRoomInputAttempt, observation: SubmissionObservation): "observed" | "uncertain" {

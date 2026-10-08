@@ -1,6 +1,8 @@
 import { readDotRoomDocument, readDotRoomRow, type DotRoomBinding } from "./room-observation.js";
 import { DotSubmissionObservation, type SubmissionObservation } from "./submission-observation.js";
 
+export type DotSubmissionFailure = "gap" | "disconnect" | "navigation" | "interference" | "timeout" | "transition-rejected";
+
 export interface DotSubmissionWatchOptions {
   readonly document: Document;
   readonly binding: DotRoomBinding;
@@ -10,7 +12,7 @@ export interface DotSubmissionWatchOptions {
   readonly timeoutMs: number;
   /** Persist this result in the dispatch ledger. This callback cannot authorize
    * another send. A crash before persistence remains an uncertain operation. */
-  readonly onTerminal: (result: SubmissionObservation) => void;
+  readonly onTerminal: (result: SubmissionObservation, reason?: DotSubmissionFailure) => void;
 }
 export interface DotSubmissionWatch {
   readonly state: SubmissionObservation;
@@ -45,6 +47,7 @@ export function watchDotSubmission(options: DotSubmissionWatchOptions): DotSubmi
   const identities = new WeakMap<Element, string>();
   let serial = 0, pending: Element | null = null, previousId: string | null = null, closed = false;
   let timeout: number | undefined;
+  let failure: DotSubmissionFailure | undefined;
   const nodeId = (node: Element): string => {
     let id = identities.get(node);
     if (!id) { id = `article-${++serial}`; identities.set(node, id); }
@@ -57,10 +60,11 @@ export function watchDotSubmission(options: DotSubmissionWatchOptions): DotSubmi
     if (timeout !== undefined) window.clearTimeout(timeout);
     window.removeEventListener("pagehide", navigation);
     window.removeEventListener("popstate", navigation);
-    options.onTerminal(tracker.state);
+    options.onTerminal(tracker.state, tracker.state.phase === "uncertain" ? failure ?? "transition-rejected" : undefined);
   };
   const fail = (type: "gap" | "disconnect" | "navigation" | "interference" | "timeout"): void => {
     if (closed) return;
+    failure = type;
     tracker.observe({ type, observerEpoch: options.observerEpoch }); terminal();
   };
   const navigation = (): void => fail("navigation");
