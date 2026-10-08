@@ -1,10 +1,55 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, realpath, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { prepareDiagnosticDirectory } from "../src/desktop/diagnostic-private-directory.js";
+import { classifyDiagnosticAclResult, prepareDiagnosticDirectory, prepareDiagnosticDirectoryResult } from "../src/desktop/diagnostic-private-directory.js";
+
+test("ACL helper diagnostics are bounded and preserve exact quiet acknowledgement", () => {
+  const raw = "PRIVATE_PATH_ENV_STDERR";
+  const response = (overrides: Partial<SpawnSyncReturns<string>>) =>
+    ({ status: 0, stdout: "OK", stderr: "", ...overrides } as SpawnSyncReturns<string>);
+  assert.deepEqual(classifyDiagnosticAclResult(response({})), { ok: true });
+  for (const [code, reason] of [["ENOENT", "acl-helper-missing"], ["ETIMEDOUT", "acl-helper-timeout"],
+    ["EACCES", "acl-helper-error"], ["ENOBUFS", "acl-helper-error"], [raw, "acl-helper-error"]] as const) {
+    const error = Object.assign(new Error(raw), { code, path: raw });
+    const result = classifyDiagnosticAclResult(response({ error, stdout: raw, stderr: raw }));
+    assert.deepEqual(result, { ok: false, reason }); assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PATH_ENV_STDERR/u);
+  }
+  assert.deepEqual(classifyDiagnosticAclResult(response({ status: 15, stdout: raw, stderr: raw })),
+    { ok: false, reason: "acl-helper-exit", exitCode: 15 });
+  assert.deepEqual(classifyDiagnosticAclResult(response({ status: null, signal: "SIGTERM", stderr: raw })),
+    { ok: false, reason: "acl-helper-error" });
+  for (const overrides of [{ stdout: "OK\n" }, { stdout: raw }, { stderr: raw }])
+    assert.deepEqual(classifyDiagnosticAclResult(response(overrides)), { ok: false, reason: "acl-helper-invalid-ack" });
+});
+
+test("directory result distinguishes invalid paths and linked parents/leaves without relaxing the boolean gate", async () => {
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-bounded-diagnostic-"));
+  const target = path.join(parent, "target"); await mkdir(target);
+  const link = path.join(parent, "alias");
+  await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+  const leaf = path.join(parent, "diagnostics");
+  await symlink(target, leaf, process.platform === "win32" ? "junction" : "dir");
+  for (const [directory, reason] of [["diagnostics", "invalid-path"],
+    [path.join(link, "diagnostics"), "linked-parent"], [leaf, "linked-leaf"]] as const) {
+    assert.deepEqual(await prepareDiagnosticDirectoryResult(directory), { ok: false, reason });
+    assert.equal(await prepareDiagnosticDirectory(directory), false);
+  }
+  const missing = path.join(parent, "missing", "diagnostics");
+  assert.deepEqual(await prepareDiagnosticDirectoryResult(missing), { ok: false, reason: "filesystem-error" });
+});
+
+test("Unix mode result preserves refusal of an existing public leaf", { skip: process.platform === "win32" }, async () => {
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-mode-diagnostic-"));
+  const leaf = path.join(parent, "diagnostics"); await mkdir(leaf); await chmod(leaf, 0o755);
+  assert.deepEqual(await prepareDiagnosticDirectoryResult(leaf), { ok: false, reason: "unsuitable-unix-mode" });
+  assert.equal(await prepareDiagnosticDirectory(leaf), false);
+  assert.equal((await lstat(leaf)).mode & 0o077, 0o055);
+  await chmod(leaf, 0o700);
+  assert.deepEqual(await prepareDiagnosticDirectoryResult(leaf), { ok: true });
+});
 
 test("diagnostic directory preparation accepts only a private dedicated leaf", async () => {
   const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-private-diagnostic-"));

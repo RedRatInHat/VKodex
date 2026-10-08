@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { BridgeStore } from "../bridge/store.js";
 import { withDiagnosticSink, diagnosticEvent } from "../bridge/diagnostics.js";
-import { prepareDiagnosticDirectory } from "../desktop/diagnostic-private-directory.js";
+import { prepareDiagnosticDirectoryResult } from "../desktop/diagnostic-private-directory.js";
 import { createDiagnosticLog } from "../desktop/diagnostic-log.js";
 import { parseDotCanaryConfig } from "./canary-config.js";
 import { DotCanaryCoordinator } from "./canary-coordinator.js";
@@ -41,7 +41,9 @@ export async function runDotCanaryNativeHost(args: readonly string[], input: Rea
   let store: BridgeStore | undefined, peer: DotNativeControlPeer | undefined;
   try {
     const directory = path.join(path.dirname(config.databasePath), "diagnostics");
-    if (!await prepareDiagnosticDirectory(directory)) throw new Error("Private diagnostics unavailable");
+    const prepared = await prepareDiagnosticDirectoryResult(directory);
+    if (!prepared.ok) throw new Error(`Private diagnostics unavailable: ${prepared.reason}${
+      prepared.reason === "acl-helper-exit" ? ` (${prepared.exitCode})` : ""}`);
     const log = await createDiagnosticLog(directory);
     if (log.status().state !== "ready") throw new Error("Diagnostic log unavailable");
     try {

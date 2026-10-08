@@ -58,6 +58,21 @@ test("singleton acquisition failure cannot create a journal or dispatch", async 
   await assert.rejects(runDotCanaryNativeHost(f.args, new PassThrough(), new PassThrough(), async () => { throw new Error("already owned"); }));
   assert.deepEqual(readdirSync(f.directory), ["config.json"]);
 });
+
+test("host reports only bounded private diagnostic failure and releases ownership before dispatch", async () => {
+  const f = fixture(); writeFileSync(path.join(f.directory, "diagnostics"), "PRIVATE_FAILURE_PAYLOAD");
+  const input = new PassThrough(), output = new PassThrough(); let writes = 0, releases = 0;
+  output.on("data", () => { writes++; });
+  await assert.rejects(runDotCanaryNativeHost(f.args, input, output, async () => async () => { releases++; }),
+    error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Private diagnostics unavailable: linked-leaf");
+      assert.doesNotMatch(error.message, /PRIVATE_FAILURE_PAYLOAD|config.json|diagnostics[\\/]/u);
+      return true;
+    });
+  assert.equal(releases, 1); assert.equal(writes, 0);
+  assert.equal(readdirSync(f.directory).includes("dot-control-canary.sqlite"), false);
+});
 test("Windows OS singleton refuses a second host and releases without stale lock files", { skip: process.platform !== "win32" }, async () => {
   const f = fixture();
   const release = await acquireDotCanaryHostSingleton(f.config.databasePath);
