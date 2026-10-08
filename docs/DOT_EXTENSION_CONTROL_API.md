@@ -3,6 +3,11 @@
 Status: experimental core and fixture tests. No host registration, extension
 permission change, MCP registration or live browser submission is installed.
 
+The source now also contains the atomic DOM submission adapter, per-port
+extension controller and a separately built Chromium extension package.
+They have not been installed or qualified against the live page. The native
+host executable/CLI bootstrap and its scoped installation remain separate work.
+
 The owner selected existing Edge authentication and requested automatic control
 and logs instead of manually coordinating a popup, message, timer and screenshot.
 The previous one-shot test became uncertain after about 23.6 seconds. Posting
@@ -40,6 +45,27 @@ unqualified controls, duplicate operations and concurrent user interference.
 It must report armed/dispatch/receipt stages automatically. A disconnect after a
 send cannot be converted to not-sent, and late success cannot release recovered
 uncertainty automatically.
+
+The implemented worker accepts one native request at a time, including while
+tab lookup is asynchronous. It qualifies a single exact target tab, rejects
+ambiguous tabs and emits bounded injection/connection/response failures. It
+reconnects the native host on a one-minute browser alarm without replaying
+operations. It does not launch Edge, open a tab or access browser credentials.
+The content controller installs its observer before filling an empty qualified
+native textarea and clicks Send at most once. After that click, normal replacement
+of Send with Stop does not cancel receipt tracking. User interference, navigation
+and abort still terminate conservatively. The old read-only diagnostic extension
+is unchanged on the user's computer.
+
+Build a NEW directory with `scripts/build-dot-control-extension.mjs --config FILE
+--output ABSOLUTE_DIRECTORY`. The pinned config contains only page/room anchors,
+generation, fixed native host name and explicit enabled boolean. The package has
+`nativeMessaging`, `scripting`, `alarms` and `https://chatgpt.com/*` host permission;
+it has no cookies, debugger, externally-connectable or web-accessible-resource
+permission. Browser host permission applies to the origin even though application
+code restricts use to the one configured dot URL. The builder records hashes and
+does not install or register anything. User approval of the wider permission scope
+is required before installation.
 
 The Native Messaging host must validate the configured extension origin and
 establish the local authenticated bridge endpoint. The currently implemented peer

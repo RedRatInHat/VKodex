@@ -1,8 +1,9 @@
 import { diagnosticEvent, type DiagnosticFields } from "../bridge/diagnostics.js";
 
-export type DotControlStage = "received" | "acknowledged" | "qualified" | "armed" | "dispatch" | "receipt" | "finished" | "disconnected";
+export type DotControlStage = "received" | "acknowledged" | "qualified" | "armed" | "dispatch" | "write-returned" | "receipt" | "finished" | "disconnected";
 export type DotControlReason = "interference" | "navigation" | "gap" | "disconnect" | "timeout" | "transition-rejected" |
-  "wrong-scope" | "not-ready" | "invalid-request" | "unknown-operation" | "operation-conflict" | "other";
+  "wrong-scope" | "not-ready" | "invalid-request" | "unknown-operation" | "operation-conflict" | "unqualified-controls" | "draft-present" | "aborted" |
+  "tab-missing" | "tab-ambiguous" | "script-injection" | "content-disconnected" | "invalid-response" | "other";
 export interface DotControlTrace {
   readonly requestId: string;
   readonly operationId?: string;
@@ -15,6 +16,7 @@ export interface DotControlTrace {
 const stages: Record<DotControlStage, [string, string]> = {
   received: ["input.received", "command"], qualified: ["input.prepare", "verify"],
   acknowledged: ["rpc.stage", "response"],
+  "write-returned": ["input.adapter", "write-returned"],
   armed: ["input.adapter", "armed"], dispatch: ["input.adapter", "dispatch"],
   receipt: ["input.result", "receipt"], finished: ["input.finished", "finished"],
   disconnected: ["connection.lifecycle", "disconnect"],

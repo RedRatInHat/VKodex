@@ -79,6 +79,13 @@ export class DotNativeControlPeer {
         const pending = this.pending;
         if (!pending) throw new Error("Unsolicited control response");
         const response = matchDotControlResponse(pending.request, value);
+        if (response.kind === "stage") {
+          traceDotControl(response.stage === "write-attempt" ? "dispatch" : response.stage, {
+            requestId: pending.request.requestId, operationId: response.operationId,
+            epoch: pending.request.scope.epoch, generation: pending.request.scope.generation,
+            elapsedMs: performance.now() - pending.start, outcome: "success" });
+          continue;
+        }
         if (response.kind === "result" && response.result.phase === "accepted" && pending.request.method === "observe-and-submit") {
           traceDotControl("acknowledged", { requestId: pending.request.requestId, operationId: pending.request.operationId,
             epoch: pending.request.scope.epoch, generation: pending.request.scope.generation,
