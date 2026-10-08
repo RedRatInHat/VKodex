@@ -97,7 +97,9 @@ export class DotBrowserConnectionGate {
       throw new Error("Browser connection clock moved backwards");
     }
     this.lastTime = now;
-    if (this.epoch !== null && now >= this.deadline) this.invalidate();
+    // Freshness admits dispatch; it is not the lifetime of the authenticated port.
+    // Keep its epoch until an explicit disconnect, scope rejection or bad clock.
+    if (this.epoch !== null && now >= this.deadline) this.qualified = false;
   }
   private invalidate(): void {
     this.epoch = null;

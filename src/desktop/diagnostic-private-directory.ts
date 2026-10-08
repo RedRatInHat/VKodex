@@ -1,10 +1,30 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { isWindowsPrivateDirectoryAclAck } from "./windows-private-directory.js";
 
 const WINDOWS_ACL_TIMEOUT_MS = 5_000;
 const MAX_PATH_BYTES = 4_096;
+
+export type DiagnosticDirectoryPreparation = { readonly ok: true } |
+  { readonly ok: false; readonly reason: "acl-helper-exit"; readonly exitCode: number } |
+  { readonly ok: false; readonly reason: "invalid-path" | "linked-parent" | "linked-leaf" | "unsuitable-unix-mode" |
+    "acl-helper-missing" | "acl-helper-error" | "acl-helper-timeout" | "acl-helper-invalid-ack" | "filesystem-error" };
+
+/** Bounded classification only. Never return helper output or raw errors. */
+export function classifyDiagnosticAclResult(result: SpawnSyncReturns<string>): DiagnosticDirectoryPreparation {
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code;
+    return { ok: false, reason: code === "ENOENT" ? "acl-helper-missing" :
+      code === "ETIMEDOUT" ? "acl-helper-timeout" : "acl-helper-error" };
+  }
+  if (result.status !== 0) return Number.isSafeInteger(result.status) ?
+    { ok: false, reason: "acl-helper-exit", exitCode: result.status! } : { ok: false, reason: "acl-helper-error" };
+  if (typeof result.stdout !== "string" || typeof result.stderr !== "string" ||
+      !isWindowsPrivateDirectoryAclAck(Buffer.from(result.stdout, "utf8")) || result.stderr.length !== 0)
+    return { ok: false, reason: "acl-helper-invalid-ack" };
+  return { ok: true };
+}
 
 function validPath(directory: string): boolean {
   if (typeof directory !== "string" || Buffer.byteLength(directory, "utf8") > MAX_PATH_BYTES ||
@@ -62,38 +82,46 @@ const windowsCreate = "$ErrorActionPreference='Stop';$ProgressPreference='Silent
   "$acl.AddAccessRule($rule)};" +
   "[IO.Directory]::CreateDirectory($p,$acl)|Out-Null;" + windowsVerify;
 
-function windowsAcl(directory: string, create: boolean): boolean {
+function windowsAcl(directory: string, create: boolean): DiagnosticDirectoryPreparation {
   const systemRoot = process.env.SystemRoot;
-  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return false;
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return { ok: false, reason: "acl-helper-missing" };
   const executable = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const encoded = Buffer.from(create ? windowsCreate : windowsCheck, "utf16le").toString("base64");
-  const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    input: directory, encoding: "utf8", windowsHide: true, timeout: WINDOWS_ACL_TIMEOUT_MS,
-    maxBuffer: 4_096, env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
-  });
-  return !result.error && result.status === 0 &&
-    isWindowsPrivateDirectoryAclAck(Buffer.from(result.stdout, "utf8")) && result.stderr.length === 0;
+  try {
+    const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      input: directory, encoding: "utf8", windowsHide: true, timeout: WINDOWS_ACL_TIMEOUT_MS,
+      maxBuffer: 4_096, env: { ...process.env, PSModulePath: path.win32.join(path.dirname(executable), "Modules") },
+    });
+    return classifyDiagnosticAclResult(result);
+  } catch { return { ok: false, reason: "acl-helper-error" }; }
 }
 
 /** Create or verify only the dedicated diagnostics leaf. Failure disables local logging. */
-export async function prepareDiagnosticDirectory(directory: string): Promise<boolean> {
+export async function prepareDiagnosticDirectoryResult(directory: string): Promise<DiagnosticDirectoryPreparation> {
   try {
-    if (!validPath(directory)) return false;
+    if (!validPath(directory)) return { ok: false, reason: "invalid-path" };
     const parent = path.dirname(directory);
-    if (!await unlinkedDirectory(parent)) return false;
+    if (!await unlinkedDirectory(parent)) return { ok: false, reason: "linked-parent" };
     let exists = false;
     try { await lstat(directory); exists = true; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, reason: "filesystem-error" }; }
+    if (exists && !await unlinkedDirectory(directory)) return { ok: false, reason: "linked-leaf" };
     if (process.platform === "win32") {
-      if (!windowsAcl(directory, !exists)) return false;
+      const acl = windowsAcl(directory, !exists);
+      if (!acl.ok) return acl;
     } else if (!exists) {
       await mkdir(directory, { mode: 0o700 });
     }
-    if (!await unlinkedDirectory(directory)) return false;
+    if (!await unlinkedDirectory(directory)) return { ok: false, reason: "linked-leaf" };
     if (process.platform !== "win32") {
       const info = await lstat(directory);
-      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) return false;
+      if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) return { ok: false, reason: "unsuitable-unix-mode" };
     }
-    return true;
-  } catch { return false; }
+    return { ok: true };
+  } catch { return { ok: false, reason: "filesystem-error" }; }
+}
+
+/** Compatibility API: retain fail-closed boolean behavior for all callers. */
+export async function prepareDiagnosticDirectory(directory: string): Promise<boolean> {
+  return (await prepareDiagnosticDirectoryResult(directory)).ok;
 }

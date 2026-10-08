@@ -2,7 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { traceDotControl, type DotControlTrace, type DotControlStage } from "../src/dot-browser/control-diagnostics.js";
+import { dotReadinessReasonSchema } from "../src/dot-browser/control-protocol.js";
 const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+test("every bounded readiness reason survives diagnostic sanitization", () => {
+  const records: DiagnosticRecord[] = [];
+  withDiagnosticSink(record => { records.push(record); }, () => {
+    for (const reason of dotReadinessReasonSchema.options)
+      traceDotControl("qualified", { requestId: uuid, epoch: uuid, generation: 1, elapsedMs: 0, outcome: "failure", reason });
+  });
+  assert.deepEqual(records.map(record => record.reason), dotReadinessReasonSchema.options);
+});
 test("control stages share correlation, timing and ordered sanitized journal", () => {
   const records: DiagnosticRecord[] = [];
   withDiagnosticSink(record => { records.push(record); }, () => {

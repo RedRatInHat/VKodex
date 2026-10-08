@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DotBrowserConnectionGate } from "../src/dot-browser/connection-gate.js";
 
-const binding = { roomId: "a".repeat(32), pageUrl: "https://chatgpt.com/dots/01a10c1b-09a1-77cd-959b-17693f4120e2", generation: 1 };
+const binding = { roomId: "a".repeat(32), pageUrl: "https://chatgpt.com/dots/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", generation: 1 };
 const observation = { ...binding, qualified: true };
 function ready() {
   const gate = new DotBrowserConnectionGate(binding, 100);
@@ -37,11 +37,33 @@ test("disconnect invalidates old receipts; stale disconnect cannot close new con
   assert.equal(gate.qualify(next, observation, 4), true);
   assert.equal(gate.canDispatch(next, 4), true);
 });
-test("expiry is exact and cannot be revived by late renewal", () => {
+test("expiry forbids dispatch but fresh matching readiness requalifies the same port", () => {
   const { gate, lease } = ready();
   assert.equal(gate.canDispatch(lease, 100), true);
-  assert.equal(gate.qualify(lease, observation, 101), false);
-  assert.equal(gate.availability(101), "disconnected");
+  assert.equal(gate.canDispatch(lease, 101), false);
+  assert.equal(gate.availability(101), "qualifying");
+  assert.equal(gate.connect(101), null);
+  assert.equal(gate.canDispatch(lease, 200), false);
+  assert.equal(gate.qualify(lease, observation, 201), true);
+  assert.equal(gate.canDispatch(lease, 201), true);
+});
+
+test("an unqualified port remains unqualified beyond freshness without a new epoch", () => {
+  const gate = new DotBrowserConnectionGate(binding, 100);
+  gate.setEnabled(true); const lease = gate.connect(0)!;
+  assert.equal(gate.availability(1000), "qualifying");
+  assert.equal(gate.canDispatch(lease, 1000), false);
+  assert.equal(gate.connect(1000), null);
+  assert.equal(gate.qualify(lease, observation, 1001), true);
+});
+
+test("expired qualification cannot revive an epoch that was explicitly disconnected", () => {
+  const { gate, lease } = ready();
+  assert.equal(gate.canDispatch(lease, 101), false);
+  gate.disconnect(lease); const next = gate.connect(102)!;
+  assert.equal(gate.qualify(lease, observation, 103), false);
+  assert.equal(gate.canDispatch(lease, 103), false);
+  assert.equal(gate.qualify(next, observation, 103), true);
 });
 test("disable/re-enable needs a new qualified lease", () => {
   const { gate, lease } = ready(); gate.setEnabled(false); gate.setEnabled(true);

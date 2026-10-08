@@ -26,6 +26,11 @@ export interface DotRoomOperationStatus {
   readonly phase: "attempted" | "observed" | "uncertain";
   readonly messageId: string | null;
 }
+export interface DotRoomEventStatus {
+  readonly state: "received" | "attempted" | "observed" | "uncertain";
+  readonly operationId: string | null;
+  readonly messageId: string | null;
+}
 interface InputRecord {
   readonly version: 1;
   readonly digest: string;
@@ -112,6 +117,17 @@ export class DotRoomInputJournal {
       throw new Error("Invalid room operation index");
     const recovered = record.phase === "attempted" && this.store.inputState(key) === "uncertain";
     return { operationId, phase: recovered ? "uncertain" : record.phase, messageId: recovered ? null : record.messageId };
+  }
+
+  /** Exact event lookup in this pinned peer; never recovers or settles. */
+  eventStatus(eventId: string): DotRoomEventStatus | null {
+    if (!opaque(eventId)) throw new TypeError("Invalid room event ID");
+    this.assertDedicatedPeer();
+    const key = JSON.stringify([this.scope.peerId, eventId]), record = this.read(key);
+    if (!record) return null;
+    const recovered = record.phase === "attempted" && this.store.inputState(key) === "uncertain";
+    return { state: recovered ? "uncertain" : record.phase, operationId: record.attempt?.operationId ?? null,
+      messageId: recovered ? null : record.messageId };
   }
 
   settle(attempt: DotRoomInputAttempt, observation: SubmissionObservation): "observed" | "uncertain" {

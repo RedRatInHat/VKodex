@@ -67,6 +67,8 @@ const words = new Set(["start", "success", "failure", "accepted", "rejected", "u
   "active-writer", "owner-busy", "task-not-open", "desktop-unavailable", "other",
   "history-gap", "uncertain-input", "stopped", "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported", "dot-native",
   "dot-browser", "observer", "armed", "interference", "navigation", "gap", "transition-rejected", "wrong-scope", "not-ready", "invalid-request", "unknown-operation", "operation-conflict", "unqualified-controls", "draft-present", "aborted", "tab-missing", "tab-ambiguous", "script-injection", "content-disconnected"]);
+for (const reason of ["room-binding-rejected", "room-window-rejected", "room-row-rejected", "owner-anchor-mismatch",
+  "dot-anchor-mismatch", "anchors-not-visible", "controls-unqualified", "inspection-error"]) words.add(reason);
 const methods = new Set(["tools/list", "tools/call", "initialize", "thread/read", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
   "thread/queue/add", "thread/queue/list", "thread/settings/update", "thread-owner-discovery", "thread-stream-subscribe",
   "thread-stream-unsubscribe", "thread-stream-state", "model/list", "thread/turns/list", "thread/goal/get"]);

@@ -42,3 +42,12 @@ test("status cannot be mistaken for a submission result", () => {
   const response = { ...base, kind: "error", reason: "not-ready" };
   assert.deepEqual(matchDotControlResponse(parseDotControlRequest(command), response), response);
 });
+
+test("status reasons are optional, bounded and reject raw inspection details", () => {
+  const status = { ...base, kind: "status", state: "qualifying" };
+  assert.deepEqual(parseDotControlResponse(status), status);
+  assert.deepEqual(parseDotControlResponse({ ...status, reason: "anchors-not-visible" }), { ...status, reason: "anchors-not-visible" });
+  for (const patch of [{ reason: "PRIVATE_RAW_ERROR" }, { reason: "inspection-error", html: "PRIVATE_HTML" },
+    { reason: "draft-present", text: "PRIVATE_DRAFT" }])
+    assert.throws(() => parseDotControlResponse({ ...status, ...patch }), /^Error: Invalid dot control response$/u);
+});
