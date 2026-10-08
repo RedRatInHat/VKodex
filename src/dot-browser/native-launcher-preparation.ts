@@ -147,6 +147,8 @@ export async function prepareWindowsNativeLauncher(options: WindowsNativeLaunche
 }> {
   const stable = { ...options }, source = generateWindowsNativeLauncherSource(stable);
   if (process.platform !== "win32") throw new Error("Windows compiler required");
+  const compiler = path.join(process.env.SystemRoot ?? "C:/Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+  if (!absolute(compiler) || /[\x00-\x1f\x7f]/u.test(compiler)) throw new Error("Local drive-rooted compiler required");
   for (const filename of [stable.runtimePath, stable.entryPath, stable.configPath]) {
     const stat = lstatSync(filename);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Regular native launcher input required");
@@ -158,7 +160,6 @@ export async function prepareWindowsNativeLauncher(options: WindowsNativeLaunche
   const sourcePath = path.join(stable.outputNewDirectory, "VKodexNativeLauncher.cs");
   const launcherPath = path.join(stable.outputNewDirectory, "VKodexNativeLauncher.exe");
   writeFileSync(sourcePath, source, { encoding: "utf8", flag: "wx" });
-  const compiler = path.join(process.env.SystemRoot ?? "C:/Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
   try {
     await execFile(compiler, ["/nologo", "/target:exe", "/optimize+", "/out:" + launcherPath, sourcePath],
       { windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024 });

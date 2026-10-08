@@ -138,6 +138,20 @@ process.stdin.on('end', () => process.stdout.write(Buffer.alloc(0), () => proces
     assert.equal(existsSync(badOutput), false);
   });
 
+  await t.test("compiler path from SystemRoot must remain local and drive-rooted", async () => {
+    const previous = process.env.SystemRoot;
+    try {
+      for (const root of ["\\\\server\\share\\Windows", "\\\\?\\C:\\Windows", "relative", "C:\\bad\nroot"]) {
+        process.env.SystemRoot = root;
+        const output = path.join(folder, "refused compiler staging");
+        await assert.rejects(prepareWindowsNativeLauncher({ ...options, outputNewDirectory: output }), /Local drive-rooted compiler required/u);
+        assert.equal(existsSync(output), false);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.SystemRoot; else process.env.SystemRoot = previous;
+    }
+  });
+
   await t.test("verified entry/config remain locked against child writes throughout execution", async () => {
     const lockedEntry = path.join(folder, "locked.cjs");
     const lockedText = `const fs = require('node:fs');
