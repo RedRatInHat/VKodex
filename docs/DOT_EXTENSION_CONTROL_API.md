@@ -5,8 +5,9 @@ permission change, MCP registration or live browser submission is installed.
 
 The source now also contains the atomic DOM submission adapter, per-port
 extension controller and a separately built Chromium extension package.
-They have not been installed or qualified against the live page. The native
-host executable/CLI bootstrap and its scoped installation remain separate work.
+They have not been installed or qualified against the live page. A diagnostic
+native host/CLI bootstrap is implemented; scoped installation and live
+qualification remain separate work.
 
 The owner selected existing Edge authentication and requested automatic control
 and logs instead of manually coordinating a popup, message, timer and screenshot.
@@ -85,6 +86,47 @@ and an allowed-extension host manifest. Our cap is stricter on inbound messages
 than the browser's maximum. Source: [Microsoft Native Messaging documentation](https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/native-messaging).
 
 ## Qualification
+
+### Diagnostic host and CLI
+
+`dot-canary-main` has only `enqueue CONFIG UUID TEXT` and `status CONFIG UUID`.
+The text must start with `[VKODEX-DOT-CONTROL-CANARY:<UUID>]` followed by a newline
+and a non-empty body, with a 2,000-character cap. Status reads the existing DB
+read-only without migration/recovery and returns no message text. Reusing the
+same request ID and payload is a no-op; changed payload under that ID refuses.
+
+Configuration requires `version: 1`, `mode: diagnostic-canary`, an absolute local
+`databasePath` ending in `dot-control-canary.sqlite`, and pinned peer/owner/room,
+generation and page URL. This initial qualification uses an explicitly isolated
+diagnostic instance of the existing BridgeStore, never the production database.
+Production basenames, linked DB files and UNC paths are refused. This is not a
+new VK polling consumer or an alternative production inbox implementation.
+
+The Windows native host validates its launcher-supplied extension origin,
+acquires an OS-lifetime singleton pipe that accepts no commands, initializes the
+existing private bounded diagnostic log, and performs startup recovery only
+after exclusive ownership. It waits for a queued marked input, checks the live
+scoped browser status and invokes the shared control service once. Unknown
+post-send DB errors remain unknown, not queued. No source/classical task or
+production restart intent is used or modified.
+
+`native-launcher-preparation.ts` generates/compiles a separate Windows wrapper
+in an exclusive new directory. It pins and holds runtime/entry/config files
+against writes during child execution, validates the expected extension origin,
+clears NODE_OPTIONS/NODE_PATH, copies binary stdin/stdout, suppresses raw stderr,
+and bounds shutdown of only its own child. Incomplete output drain cannot return
+child-success. Source, pins and compiler paths are local-drive-only. This helper
+does not register a host or install an extension.
+
+`windowsUnpackedExtensionId` predicts a keyless unpacked extension's Windows ID
+from its exact path following Chromium's algorithm. It does not prove which
+extension is installed. Installation must still enforce a single allowed origin
+and verify the resulting Native Messaging connection; no wildcard fallback.
+
+Preparing files is not activation. Registering the host and granting the new
+extension permissions remain explicitly gated by owner approval. Existing
+diagnostic-extension state, its failed operation receipt and the old VK bridge
+remain separate from this new qualification path.
 
 Automated fixtures cover framing, wrong-scope replies, acknowledgement versus
 acceptance, duplicate/concurrent requests, disconnect, timeout/late result,

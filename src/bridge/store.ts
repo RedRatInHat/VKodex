@@ -255,18 +255,23 @@ export class BridgeStore {
   private static readonly MAX_STAGE_FILES_PER_OPERATION = 256;
   private static readonly MAX_STAGE_FILES_GLOBAL = 2_048;
 
-  constructor(filename = ":memory:", options: { readonly existingTransferSchemaSha256?: string } = {}) {
+  constructor(filename = ":memory:", options: { readonly existingTransferSchemaSha256?: string; readonly readOnly?: boolean } = {}) {
+    if (options.readOnly && (filename === ":memory:" || !path.isAbsolute(filename)))
+      throw new Error("Read-only bridge store requires an existing absolute file");
     const pinnedSchema = options.existingTransferSchemaSha256;
-    if (pinnedSchema !== undefined && (!path.isAbsolute(filename) || !/^[a-f0-9]{64}$/u.test(pinnedSchema))) {
+    if (pinnedSchema !== undefined && (options.readOnly || !path.isAbsolute(filename) || !/^[a-f0-9]{64}$/u.test(pinnedSchema))) {
       throw new Error("Invalid existing transfer database pin");
     }
-    this.db = new DatabaseConstructor(filename, { ...(pinnedSchema ? { fileMustExist: true } : {}) });
+    this.db = new DatabaseConstructor(filename, { ...(pinnedSchema ? { fileMustExist: true } : {}),
+      ...(options.readOnly ? { readonly: true, fileMustExist: true } : {}) });
     this.databasePath = filename === ":memory:" ? null : path.resolve(filename);
     try {
       const identity = this.databasePath ? statSync(this.databasePath, { bigint: true }) : null;
       this.databaseFileIdentity = identity?.isFile() && identity.nlink === 1n
         ? Object.freeze({ dev: String(identity.dev), ino: String(identity.ino) }) : null;
     } catch { this.databaseFileIdentity = null; }
+    // Diagnostic status lookup only: existing schema, no migration or recovery.
+    if (options.readOnly) return;
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     // A one-operation helper shares an older live store. It must not initialize
