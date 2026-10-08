@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,8 +12,8 @@ import { acquireDotCanaryHostSingleton, runDotCanaryNativeHost } from "../src/do
 import { NativeMessageDecoder, encodeNativeMessage } from "../src/dot-browser/native-message-framing.js";
 import { parseDotControlRequest } from "../src/dot-browser/control-protocol.js";
 const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", roomId = "a".repeat(32), extensionId = "b".repeat(32);
-function fixture() {
-  const directory = mkdtempSync(path.join(realpathSync(tmpdir()), "vkodex-host-test-"));
+async function fixture() {
+  const directory = await realpath(mkdtempSync(path.join(await realpath(tmpdir()), "vkodex-host-test-")));
   const config: DotCanaryConfig = { version: 1, mode: "diagnostic-canary", databasePath: path.join(directory, "dot-control-canary.sqlite"),
     peerId: 2_000_000_032, ownerId: 42, roomId, generation: 1, pageUrl: "https://chatgpt.com/dots/" + uuid };
   const configFile = path.join(directory, "config.json"); writeFileSync(configFile, JSON.stringify(config));
@@ -20,7 +21,7 @@ function fixture() {
   return { directory, config, configFile, args };
 }
 test("host uses the common journal and bounded logs for one automatic canary", { timeout: 60_000 }, async () => {
-  const f = fixture(), text = canaryMarker(uuid) + "\nPRIVATE_HOST_FIXTURE";
+  const f = await fixture(), text = canaryMarker(uuid) + "\nPRIVATE_HOST_FIXTURE";
   const initial = new BridgeStore(f.config.databasePath);
   new DotRoomInputJournal(initial, f.config).receive(canaryInput(f.config, uuid, text)); initial.close();
   const input = new PassThrough(), output = new PassThrough(), decoder = new NativeMessageDecoder();
@@ -46,7 +47,7 @@ test("host uses the common journal and bounded logs for one automatic canary", {
   assert.match(logs, /input.finished/u); assert.doesNotMatch(logs, /PRIVATE_HOST_FIXTURE|VKODEX-DOT-CONTROL-CANARY/u);
 });
 test("invalid origin and production DB names refuse before acquiring runtime resources", async () => {
-  const f = fixture(); let acquired = 0;
+  const f = await fixture(); let acquired = 0;
   const acquire = async () => { acquired++; return async () => {}; };
   await assert.rejects(runDotCanaryNativeHost([...f.args.slice(0, -1), "chrome-extension://" + "c".repeat(32) + "/"], new PassThrough(), new PassThrough(), acquire));
   writeFileSync(f.configFile, JSON.stringify({ ...f.config, databasePath: path.join(f.directory, "vkodex.sqlite") }));
@@ -54,13 +55,13 @@ test("invalid origin and production DB names refuse before acquiring runtime res
   assert.equal(acquired, 0);
 });
 test("singleton acquisition failure cannot create a journal or dispatch", async () => {
-  const f = fixture();
+  const f = await fixture();
   await assert.rejects(runDotCanaryNativeHost(f.args, new PassThrough(), new PassThrough(), async () => { throw new Error("already owned"); }));
   assert.deepEqual(readdirSync(f.directory), ["config.json"]);
 });
 
 test("host reports only bounded private diagnostic failure and releases ownership before dispatch", async () => {
-  const f = fixture(); writeFileSync(path.join(f.directory, "diagnostics"), "PRIVATE_FAILURE_PAYLOAD");
+  const f = await fixture(); writeFileSync(path.join(f.directory, "diagnostics"), "PRIVATE_FAILURE_PAYLOAD");
   const input = new PassThrough(), output = new PassThrough(); let writes = 0, releases = 0;
   output.on("data", () => { writes++; });
   await assert.rejects(runDotCanaryNativeHost(f.args, input, output, async () => async () => { releases++; }),
@@ -74,7 +75,7 @@ test("host reports only bounded private diagnostic failure and releases ownershi
   assert.equal(readdirSync(f.directory).includes("dot-control-canary.sqlite"), false);
 });
 test("Windows OS singleton refuses a second host and releases without stale lock files", { skip: process.platform !== "win32" }, async () => {
-  const f = fixture();
+  const f = await fixture();
   const release = await acquireDotCanaryHostSingleton(f.config.databasePath);
   try { await assert.rejects(acquireDotCanaryHostSingleton(f.config.databasePath)); }
   finally { await release(); }
