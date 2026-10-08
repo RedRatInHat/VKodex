@@ -21,11 +21,17 @@ const failure = z.enum(["interference", "navigation", "gap", "disconnect", "time
   "tab-missing", "tab-ambiguous", "script-injection", "content-disconnected", "invalid-response", "other"]);
 const message = z.string().regex(/^[a-f0-9]{32}~[a-f0-9]{32}~CalpicoMessage~Sentinel_[a-f0-9]{32}$/u);
 const responseBase = { version: z.literal(1), requestId: uuid, scope };
+export const dotReadinessReasonSchema = z.enum([
+  "room-binding-rejected", "room-window-rejected", "room-row-rejected", "owner-anchor-mismatch",
+  "dot-anchor-mismatch", "anchors-not-visible", "controls-unqualified", "draft-present", "inspection-error",
+]);
+export type DotReadinessReason = z.infer<typeof dotReadinessReasonSchema>;
 export const dotControlResponseSchema = z.discriminatedUnion("kind", [
   z.object({ ...responseBase, kind: z.literal("stage"), operationId: uuid,
     stage: z.enum(["armed", "write-attempt", "write-returned"]),
   }).strict(),
-  z.object({ ...responseBase, kind: z.literal("status"), state: z.enum(["disconnected", "qualifying", "ready", "busy"])}).strict(),
+  z.object({ ...responseBase, kind: z.literal("status"), state: z.enum(["disconnected", "qualifying", "ready", "busy"]),
+    reason: dotReadinessReasonSchema.optional() }).strict(),
   z.object({ ...responseBase, kind: z.literal("result"), operationId: uuid,
     result: z.discriminatedUnion("phase", [
       z.object({ phase: z.literal("accepted") }).strict(),

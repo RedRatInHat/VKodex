@@ -1,9 +1,10 @@
 import { diagnosticEvent, type DiagnosticFields } from "../bridge/diagnostics.js";
+import type { DotReadinessReason } from "./control-protocol.js";
 
 export type DotControlStage = "received" | "acknowledged" | "qualified" | "armed" | "dispatch" | "write-returned" | "receipt" | "finished" | "disconnected";
 export type DotControlReason = "interference" | "navigation" | "gap" | "disconnect" | "timeout" | "transition-rejected" |
   "wrong-scope" | "not-ready" | "invalid-request" | "unknown-operation" | "operation-conflict" | "unqualified-controls" | "draft-present" | "aborted" |
-  "tab-missing" | "tab-ambiguous" | "script-injection" | "content-disconnected" | "invalid-response" | "other";
+  "tab-missing" | "tab-ambiguous" | "script-injection" | "content-disconnected" | "invalid-response" | "other" | DotReadinessReason;
 export interface DotControlTrace {
   readonly requestId: string;
   readonly operationId?: string;

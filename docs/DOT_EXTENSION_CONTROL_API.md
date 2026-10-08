@@ -20,6 +20,12 @@ the old receipt lacked a reason, so the historical cause is not proven.
 - `control-protocol.ts`: strict status, result and observe-and-submit envelopes.
   Requests and replies bind room, generation, connection epoch, request ID and
   operation ID. No arbitrary JavaScript, selectors, URLs or credential arguments.
+  A qualifying status may include a bounded `reason`: `room-binding-rejected`,
+  `room-window-rejected`, `room-row-rejected`, `owner-anchor-mismatch`,
+  `dot-anchor-mismatch`, `anchors-not-visible`, `controls-unqualified`,
+  `draft-present` or `inspection-error`. Known room collector failures are mapped
+  explicitly; unexpected failures use `inspection-error`. Status and logs contain
+  no draft, message text, HTML or raw error. A reason never authorizes dispatch.
 - `control-service.ts`: receive into the existing `DotRoomInputJournal`, check
   connection admission, commit its durable dispatch fence, then call one combined
   observe-and-submit transport operation. Deadline or invalid/missing receipt

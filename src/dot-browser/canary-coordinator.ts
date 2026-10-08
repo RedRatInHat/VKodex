@@ -58,7 +58,10 @@ export class DotCanaryCoordinator {
       if (response.kind === "error") { failure(response.reason); return { phase: "queued" }; }
       if (response.kind !== "status" || response.state !== "ready" ||
           !this.gate.qualify(stableLease, { roomId: this.config.roomId, pageUrl: this.config.pageUrl, qualified: true }, this.clock()) ||
-          !this.gate.canDispatch(stableLease, this.clock())) { failure("not-ready"); return { phase: "queued" }; }
+          !this.gate.canDispatch(stableLease, this.clock())) {
+        failure(response.kind === "status" && response.state !== "ready" ? response.reason ?? "not-ready" : "not-ready");
+        return { phase: "queued" };
+      }
       traceDotControl("qualified", { requestId, epoch: stableLease.epoch, generation: stableLease.generation,
         elapsedMs: performance.now() - start, outcome: "success" });
       if (this.journal.projectionBlocked()) return { phase: "blocked" };

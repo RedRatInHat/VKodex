@@ -106,6 +106,18 @@ test("status timeout never reserves or dispatches queued input", async t => {
   assert.equal(h.store.reserveReplayableInputs(20_001, 1).length, 1);
 });
 
+test("bounded readiness failure is logged without reserving or dispatching input", async t => {
+  const h = fixture(t); h.enqueue();
+  h.handler(request => h.respond(request, { kind: "status", state: "qualifying", reason: "anchors-not-visible" }));
+  const records: DiagnosticRecord[] = [];
+  assert.deepEqual(await withDiagnosticSink(record => { records.push(record); }, () => h.coordinator.tick(h.lease)), { phase: "queued" });
+  assert.deepEqual(h.requests.map(request => request.method), ["status"]);
+  assert.equal(h.journal.eventStatus(h.queued.eventId)?.operationId, null);
+  assert.equal(h.store.inputState(h.key), "received");
+  assert.ok(records.some(record => record.reason === "anchors-not-visible"));
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE_CANARY_FIXTURE|VKODEX-DOT-CONTROL-CANARY/u);
+});
+
 test("only exactly scoped ready status admits one durable submission", async t => {
   const h = fixture(t); h.enqueue();
   h.handler(request => {
