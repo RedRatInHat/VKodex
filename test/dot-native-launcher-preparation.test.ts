@@ -22,8 +22,8 @@ test("source generation pins exact files/origin and uses byte streams and own-ch
     sourceOptions.runtimeSha256, sourceOptions.entrySha256, sourceOptions.configSha256]) assert.ok(source.includes(value));
   assert.match(source, /StringComparison.Ordinal/u);
   assert.match(source, /UseShellExecute = false/u); assert.match(source, /CreateNoWindow = true/u);
-  assert.match(source, /OpenStandardInput\(\)\.CopyTo\(child.StandardInput.BaseStream\)/u);
-  assert.match(source, /child.StandardOutput.BaseStream.CopyTo\(browser\)/u);
+  assert.match(source, /CopyChunks\(Console.OpenStandardInput\(\), child.StandardInput.BaseStream\)/u);
+  assert.match(source, /CopyChunks\(child.StandardOutput.BaseStream, browser\)/u);
   assert.match(source, /child.StandardError.BaseStream.CopyTo\(Stream.Null\)/u);
   assert.match(source, /EnvironmentVariables\["NODE_OPTIONS"\] = ""/u);
   assert.match(source, /EnvironmentVariables\["NODE_PATH"\] = ""/u);

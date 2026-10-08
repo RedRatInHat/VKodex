@@ -72,6 +72,15 @@ internal static class NativeLauncher {
     try { if (!child.HasExited) { child.Kill(); child.WaitForExit(DrainGraceMs); } }
     catch { /* Never enumerate or stop any other process. */ }
   }
+  private static void CopyChunks(Stream source, Stream destination) {
+    var buffer = new byte[8192];
+    int count;
+    while ((count = source.Read(buffer, 0, buffer.Length)) != 0) {
+      destination.Write(buffer, 0, count);
+      // Native frames must arrive while both endpoints keep their pipes open.
+      destination.Flush();
+    }
+  }
   public static int Main(string[] args) {
     if (args.Length < 1 || args.Length > 2 ||
         !String.Equals(args[0], "chrome-extension://" + Extension + "/", StringComparison.Ordinal) ||
@@ -100,14 +109,14 @@ internal static class NativeLauncher {
         started = true;
         int outputFailed = 0;
         var input = Task.Run(() => {
-          try { Console.OpenStandardInput().CopyTo(child.StandardInput.BaseStream); }
+          try { CopyChunks(Console.OpenStandardInput(), child.StandardInput.BaseStream); }
           catch { /* Browser EOF or this child's closed input. */ }
           finally { try { child.StandardInput.Close(); } catch { } }
         });
         var output = Task.Run(() => {
           try {
             var browser = Console.OpenStandardOutput();
-            child.StandardOutput.BaseStream.CopyTo(browser); browser.Flush();
+            CopyChunks(child.StandardOutput.BaseStream, browser); browser.Flush();
           } catch { Interlocked.Exchange(ref outputFailed, 1); }
         });
         var errors = Task.Run(() => {
