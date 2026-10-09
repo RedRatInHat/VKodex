@@ -6013,16 +6013,25 @@ test("projection excludes commands, tool calls and file changes entirely", () =>
   assert.equal(result.events.some(event => event.type === "progress"), false);
 });
 
-test("catalog includes API-created user tasks but excludes archived and subagent tasks", t => {
+test("catalog includes legacy and API-created user tasks but excludes archived and subagent tasks", t => {
   const db = new Database(":memory:"); t.after(() => db.close());
   db.exec(`CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, thread_source TEXT, source TEXT, archived INTEGER, updated_at_ms INTEGER, updated_at INTEGER, is_pinned INTEGER, recency_at_ms INTEGER);
     INSERT INTO threads VALUES ('main', 'Renamed by user', 'Old title', '/fixture', 'user', 'vscode', 0, 1000, 1, 0, 1000);
     INSERT INTO threads VALUES ('api', 'Created through API', '', '/fixture', 'agent_created_thread', 'vscode', 0, 900, 1, 0, 900);
     INSERT INTO threads VALUES ('agent', 'Agent', 'Agent', '/fixture', 'subagent', 'vscode', 0, 2000, 2, 0, 2000);
-    INSERT INTO threads VALUES ('archived', 'Archived', 'Archived', '/fixture', 'user', 'vscode', 1, 3000, 3, 0, 3000);`);
+    INSERT INTO threads VALUES ('archived', 'Archived', 'Archived', '/fixture', 'user', 'vscode', 1, 3000, 3, 0, 3000);
+    INSERT INTO threads VALUES ('legacy-vscode', 'Legacy VS Code', '', '/fixture', NULL, 'vscode', 0, 800, 1, 0, 800);
+    INSERT INTO threads VALUES ('legacy-cli', 'Legacy CLI', '', '/fixture', NULL, 'cli', 0, 700, 1, 0, 700);
+    INSERT INTO threads VALUES ('legacy-exec', 'Legacy exec', '', '/fixture', NULL, 'exec', 0, 600, 1, 0, 600);
+    INSERT INTO threads VALUES ('legacy-archived', 'Legacy archived', '', '/fixture', NULL, 'vscode', 1, 5000, 5, 0, 5000);
+    INSERT INTO threads VALUES ('legacy-subagent', 'Legacy subagent', '', '/fixture', NULL, 'subagent', 0, 4000, 4, 0, 4000);`);
+  const before = db.prepare("SELECT * FROM threads ORDER BY id").all();
   const tasks = readTaskCatalog(db);
-  assert.deepEqual(tasks.map(task => [task.threadId, task.title]), [["main", "Renamed by user"], ["api", "Created through API"]]);
-  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM threads").get(), { n: 4 });
+  assert.deepEqual(tasks.map(task => [task.threadId, task.title]), [
+    ["main", "Renamed by user"], ["api", "Created through API"],
+    ["legacy-vscode", "Legacy VS Code"], ["legacy-cli", "Legacy CLI"], ["legacy-exec", "Legacy exec"],
+  ]);
+  assert.deepEqual(db.prepare("SELECT * FROM threads ORDER BY id").all(), before);
   assert.equal(tasks[0]!.hostId, "local");
 });
 

@@ -27,12 +27,16 @@ export function readTaskCatalog(database: Database, limit: number | null = 100, 
   const columns = new Set((database.prepare("PRAGMA table_info(threads)").all() as { name: string }[]).map(column => column.name));
   const required = ["id", "name", "title", "cwd", "thread_source", "source", "archived", "updated_at_ms", "updated_at", "is_pinned", "recency_at_ms"];
   if (required.some(column => !columns.has(column))) throw new DesktopUnavailableError("Версия каталога Codex не поддерживается.");
+  // Older user threads predate thread_source. Their native source still
+  // distinguishes ordinary clients from subagents; never rewrite the catalog.
   const rows = database.prepare(`
     SELECT id, name, title, cwd, ${columns.has("rollout_path") ? "rollout_path" : "NULL"} AS rollout_path,
       ${columns.has("project_id") ? "project_id" : "NULL"} AS project_id,
       COALESCE(updated_at_ms, updated_at * 1000) AS updated_at
     FROM threads
-    WHERE archived = 0 AND thread_source IN ('user', 'agent_created_thread') AND source IN ('vscode', 'cli', 'exec')
+    WHERE archived = 0
+      AND (thread_source IS NULL OR thread_source IN ('user', 'agent_created_thread'))
+      AND source IN ('vscode', 'cli', 'exec')
     ORDER BY is_pinned DESC, COALESCE(recency_at_ms, updated_at_ms, updated_at * 1000) DESC, id
     LIMIT ?
   `).all(limit ?? -1) as { id: string; name: string | null; title: string | null; cwd: string; updated_at: number; rollout_path: string | null; project_id: string | null }[];
