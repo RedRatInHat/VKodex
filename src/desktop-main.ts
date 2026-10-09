@@ -32,6 +32,7 @@ import { createDesktopRouting } from "./desktop/desktop-routing.js";
 import { sameTask } from "./core/codex-tasks.js";
 import type { AppServerStreamDiagnostic } from "./codex/app-server-task-state.js";
 import { loadPredecessorMaintenance } from "./desktop/predecessor-maintenance.js";
+import { acquireRuntimeLease, RuntimeAlreadyRunningError } from "./desktop/runtime-lease.js";
 
 const formatFatalDetail = (value: unknown): string => {
   const detail = value instanceof Error ? (value.stack ?? value.message) : inspect(value, { depth: 4, breakLength: 120 });
@@ -44,6 +45,15 @@ let config: DesktopBridgeConfig;
 try { config = loadDesktopBridgeConfig(); }
 catch (error) {
   logger.fatal({ error: formatFatalDetail(error) }, "VKodex desktop bridge configuration is invalid");
+  process.exit(1);
+}
+// Admit exactly one runtime before opening bridge state, replaying ingress,
+// constructing owners or starting transports. Losers must not alter lifecycle.
+let runtimeLease: ReturnType<typeof acquireRuntimeLease>;
+try { runtimeLease = acquireRuntimeLease(config.dataDir); }
+catch (error) {
+  if (error instanceof RuntimeAlreadyRunningError) logger.error("VKodex runtime already owns this data directory");
+  else logger.fatal({ error: formatFatalDetail(error) }, "VKodex runtime lease could not be acquired");
   process.exit(1);
 }
 // This separate channel never serializes request bodies or exceptions. Only a
@@ -157,6 +167,10 @@ const shutdown = async (): Promise<void> => {
 writeRuntimeProcessState(config.dataDir, { status: "running", pid: process.pid, at: startedAt, startedAt });
 process.once("exit", code => {
   writeRuntimeProcessState(config.dataDir, { status: "stopped", pid: process.pid, at: Date.now(), startedAt, exitCode: code, reason: exitReason });
+  // The final state write precedes release so an exiting predecessor cannot
+  // overwrite a successor's running state. Early bootstrap failure/crash is
+  // also safe: OS process teardown releases the lock without a stale PID lease.
+  runtimeLease.close();
 });
 process.once("SIGINT", () => { exitReason = "SIGINT"; void shutdown(); });
 process.once("SIGTERM", () => { exitReason = "SIGTERM"; void shutdown(); });
