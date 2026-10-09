@@ -1,6 +1,7 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import os from "node:os";
 import { inspect } from "node:util";
 import { loadDesktopBridgeConfig, type DesktopBridgeConfig } from "./bridge/config.js";
 import { BridgeRuntime } from "./bridge/runtime.js";
@@ -14,7 +15,7 @@ import { SourceTaskLauncher } from "./desktop/launcher.js";
 import { ProfileAccountUsage, ProfileDesktopGoals, ProfileDesktopMetadata } from "./desktop/metadata.js";
 import { createDesktopLogger } from "./desktop/logging.js";
 import { createDiagnosticLog, type DiagnosticLog } from "./desktop/diagnostic-log.js";
-import { prepareDiagnosticDirectory } from "./desktop/diagnostic-private-directory.js";
+import { prepareRunDiagnosticDirectory } from "./desktop/diagnostic-private-directory.js";
 import { installDiagnosticSink } from "./bridge/diagnostics.js";
 import { writeRuntimeProcessState } from "./desktop/process-state.js";
 import { DesktopVkGateway } from "./platforms/vk/desktop-gateway.js";
@@ -47,9 +48,11 @@ catch (error) {
 }
 // This separate channel never serializes request bodies or exceptions. Only a
 // new dedicated leaf can receive a private ACL; existing Codex/data ACLs are untouched.
-const diagnosticDirectory = path.join(config.dataDir, "diagnostics");
+const diagnosticDataRoot = process.env.LOCALAPPDATA?.trim() || process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), ".local", "share");
+const diagnosticDirectory = path.isAbsolute(diagnosticDataRoot) && path.normalize(diagnosticDataRoot) === diagnosticDataRoot
+  ? await prepareRunDiagnosticDirectory(path.join(diagnosticDataRoot, "VKodex", "diagnostic-runs")) : null;
 let disabledDiagnosticDrops = 0;
-const diagnosticLog: DiagnosticLog = await prepareDiagnosticDirectory(diagnosticDirectory)
+const diagnosticLog: DiagnosticLog = diagnosticDirectory
   ? await createDiagnosticLog(diagnosticDirectory)
   : { write: () => { disabledDiagnosticDrops++; }, flush: async () => {},
     status: () => ({ state: "disabled", written: 0, dropped: disabledDiagnosticDrops, failed: 0 }) };
@@ -57,7 +60,7 @@ let entrySha256: string | undefined;
 try { entrySha256 = createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex"); }
 catch { /* Missing build evidence cannot turn diagnostics into a startup dependency. */ }
 installDiagnosticSink(diagnosticLog.write, entrySha256 ? { entrySha256 } : undefined);
-try { logger.info({ diagnostics: diagnosticLog.status() }, "Private lifecycle diagnostics initialized"); }
+try { logger.info({ diagnostics: diagnosticLog.status(), diagnosticDirectory }, "Private lifecycle diagnostics initialized"); }
 catch { /* Even the ordinary status channel is observational. */ }
 let lastDiagnosticLoss = "";
 const diagnosticStatusTimer = setInterval(() => {

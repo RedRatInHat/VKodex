@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { isWindowsPrivateDirectoryAclAck } from "./windows-private-directory.js";
@@ -96,4 +97,30 @@ export async function prepareDiagnosticDirectory(directory: string): Promise<boo
     }
     return true;
   } catch { return false; }
+}
+
+/** Each run gets its own bounded sink; old, full evidence stays untouched. */
+export async function prepareRunDiagnosticDirectory(baseDirectory: string, runId: string = randomUUID()): Promise<string | null> {
+  try {
+    if (!path.isAbsolute(baseDirectory) || path.normalize(baseDirectory) !== baseDirectory
+      || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(runId)) return null;
+    const parent = path.join(baseDirectory, runId);
+    let current = path.parse(parent).root;
+    if (!await unlinkedDirectory(current)) return null;
+    for (const part of parent.slice(current.length).split(path.sep).filter(Boolean)) {
+      const next = path.join(current, part);
+      try { await lstat(next); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+        // Check the existing parent before creating a single missing child.
+        if (!await unlinkedDirectory(current)) return null;
+        try { await mkdir(next, { mode: 0o700 }); }
+        catch (race) { if ((race as NodeJS.ErrnoException).code !== "EEXIST") return null; }
+      }
+      if (!await unlinkedDirectory(next)) return null;
+      current = next;
+    }
+    const directory = path.join(parent, "diagnostics");
+    return await prepareDiagnosticDirectory(directory) ? directory : null;
+  } catch { return null; }
 }

@@ -59,6 +59,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   constructor(
     private readonly catalog: Pick<LocalDesktopCatalog, "listTasks"> & Partial<Pick<LocalDesktopCatalog, "listModels">> & {
+      findTask?: (task: TaskRef) => Promise<import("./contracts.js").DesktopTask | null>;
       listProjects: (sourceId?: string) => Promise<readonly import("./contracts.js").DesktopProject[]>;
       catalogWarnings?: () => readonly string[];
       listSources?: () => readonly { readonly id: string; readonly label: string }[];
@@ -103,6 +104,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   }
 
   listTasks() { return this.catalog.listTasks(); }
+  private async catalogTask(task: TaskRef) {
+    return this.catalog.findTask ? this.catalog.findTask(task)
+      : (await this.listTasks()).find(candidate => sameTask(candidate, task)) ?? null;
+  }
   listSources() { return this.catalog.listSources?.() ?? [{ id: "", label: "Основной" }]; }
   listProjects(sourceId?: string) { return this.catalog.listProjects(sourceId); }
   async createProject(sourceId: string, name: string, roots: readonly string[], idempotencyKey: string) {
@@ -642,7 +647,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     if (this.live?.creator?.isActive(request.task)) {
       throw new ActionRejectedError("Первый ход новой задачи ещё выполняется. Дождись завершения или отправь /stop.");
     }
-    const task = (await this.listTasks()).find(task => sameTask(task, request.task));
+    const task = await this.catalogTask(request.task);
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
     // A temporary subscription must not close the shared event client's follower.
     if (this.compatibilityState.state === "failed") throw new ActionRejectedError(this.compatibilityState.message);
@@ -652,7 +657,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   async submitConnectedWithReceipt(request: SubmitTaskRequest): Promise<SubmitTaskReceipt> {
     const text = request.text.trim();
     if ((!text && !request.inputFiles?.length) || text.length > 64_000) throw new ActionRejectedError("Пришли текст до 64000 символов или вложение.");
-    const task = (await this.listTasks()).find(task => sameTask(task, request.task));
+    const task = await this.catalogTask(request.task);
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
     const prepared = taskInput(request);
     return this.submitLive(request, task, prepared, false, false);
@@ -717,7 +722,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   async editLastUserTurn(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult> {
     const prepared = taskInput(request);
-    const task = (await this.listTasks()).find(candidate => sameTask(candidate, request.task));
+    const task = await this.catalogTask(request.task);
     if (!task) throw new ActionRejectedError("Задача не найдена в каталоге Codex.");
     return this.follow(task, async (subscription, client) => {
       const currentTarget = () => {

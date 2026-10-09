@@ -8,6 +8,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "nod
 import os from "node:os";
 import path from "node:path";
 import { parseTaskTitles, readTaskCatalog } from "../src/desktop/catalog.js";
+import { MultiDesktopCatalog } from "../src/desktop/multi-catalog.js";
 import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, TransferPageTooLargeError, TaskNotOpenError, UncertainActionError, TransferConflictError, ProjectAssignmentUnconfirmedError, type DesktopTask, type DesktopTaskCreator, type TransferTaskRequest } from "../src/desktop/contracts.js";
 import { ConnectedDesktopTasks, submissionMode } from "../src/desktop/desktop-tasks.js";
 
@@ -43,6 +44,87 @@ test("native project assignment acknowledgement is not rejected by display infer
 import { withVkResponseFormat } from "../src/core/task-input.js";
 import { taskKey } from "../src/core/codex-tasks.js";
 import { AppServerTaskCreator } from "../src/desktop/app-server-creator.js";
+
+test("unavailable selected task source fails closed even when another source has the same thread ID", async () => {
+  const selected = { hostId: "local", threadId: "019cf2c2-0000-7000-8000-000000000000" };
+  let clients = 0;
+  const combined = new MultiDesktopCatalog(["D:/fixture/primary", "D:/fixture/secondary"], home => ({
+    listTasks: async () => home.endsWith("primary") ? [] : [{ ...selected, title: "Secondary copy", workspace: "/fixture", updatedAt: 1 }],
+    listProjects: async () => [], listModels: async () => [],
+    listSnapshot: async () => home.endsWith("primary")
+      ? { tasks: { status: "rejected", reason: new DesktopUnavailableError("primary unavailable") }, projects: { status: "fulfilled", value: [] } }
+      : { tasks: { status: "fulfilled", value: [{ ...selected, title: "Secondary copy", workspace: "/fixture", updatedAt: 1 }] }, projects: { status: "fulfilled", value: [] } },
+  }));
+  const desktop = new ConnectedDesktopTasks(combined, () => { clients++; return new DesktopIpcClient(); });
+  const request = { operationId: "selected-source-submit", task: selected, text: "Continue" };
+  await assert.rejects(desktop.submitWithReceipt(request), DesktopUnavailableError);
+  await assert.rejects(desktop.submitConnectedWithReceipt({ ...request, operationId: "selected-source-connected" }), DesktopUnavailableError);
+  await assert.rejects(desktop.editLastUserTurn({ task: selected, operationId: "selected-source-edit", expectedOperationId: "old-operation", expectedTurnId: "old-turn", text: "Corrected" }), DesktopUnavailableError);
+  assert.equal(clients, 0);
+});
+
+test("task lookup keeps true absence distinct and does not fall back from an unavailable secondary source", async () => {
+  const id = "019cf2c2-0000-7000-8000-000000000000";
+  const catalog = (primaryTasks: readonly DesktopTask[], secondaryFails: boolean) => new MultiDesktopCatalog(["D:/fixture/primary", "D:/fixture/secondary"], home => ({
+    listTasks: async () => home.endsWith("primary") ? primaryTasks : [],
+    listProjects: async () => [], listModels: async () => [],
+    listSnapshot: async () => home.endsWith("primary")
+      ? { tasks: { status: "fulfilled", value: primaryTasks }, projects: { status: "fulfilled", value: [] } }
+      : { tasks: secondaryFails
+        ? { status: "rejected", reason: new DesktopUnavailableError("secondary unavailable") }
+        : { status: "fulfilled", value: [] }, projects: { status: "fulfilled", value: [] } },
+  }));
+  const missingDesktop = new ConnectedDesktopTasks(catalog([], false));
+  await assert.rejects(missingDesktop.submitWithReceipt({ operationId: "true-missing", task: { hostId: "local", threadId: id }, text: "Continue" }), ActionRejectedError);
+
+  const primaryTask: DesktopTask = { hostId: "local", threadId: id, title: "Primary", workspace: "/fixture", updatedAt: 1 };
+  const combined = catalog([primaryTask], true);
+  const secondaryId = combined.listSources()[1]!.id;
+  const secondaryRef = { hostId: "local", threadId: id, sourceId: secondaryId };
+  const secondaryDesktop = new ConnectedDesktopTasks(combined);
+  await assert.rejects(secondaryDesktop.submitWithReceipt({ operationId: "unavailable-secondary", task: secondaryRef, text: "Continue" }), DesktopUnavailableError);
+});
+
+test("source-qualified task lookup uses one catalog snapshot and tolerates project read failure", async () => {
+  const id = "019cf2c2-0000-7000-8000-000000000000";
+  const reads = new Map<string, { snapshots: number; taskLists: number }>();
+  const combined = new MultiDesktopCatalog(["D:/fixture/primary", "D:/fixture/secondary"], home => {
+    const counts = { snapshots: 0, taskLists: 0 }; reads.set(home, counts);
+    const primary = home.endsWith("primary");
+    const task: DesktopTask = { hostId: "local", threadId: id, title: primary ? "Primary copy" : "Secondary copy",
+      workspace: primary ? "/primary" : "/secondary", updatedAt: 1, projectId: primary ? "primary-project" : "secondary-project" };
+    return {
+      listTasks: async () => { counts.taskLists++; return [task]; },
+      listProjects: async () => [], listModels: async () => [],
+      listSnapshot: async () => {
+        counts.snapshots++;
+        return {
+          tasks: { status: "fulfilled", value: [task] },
+          projects: primary
+            ? { status: "fulfilled", value: [{ id: "primary-project", title: "Primary project", workspace: "/primary" }] }
+            : { status: "rejected", reason: new DesktopUnavailableError("secondary project view unavailable") },
+        };
+      },
+    };
+  });
+  const secondaryId = combined.listSources()[1]!.id;
+  const primaryTask = await combined.findTask({ hostId: "local", threadId: id });
+  assert.equal(primaryTask?.title, "Primary copy");
+  assert.equal(primaryTask?.sourceId, undefined);
+  assert.equal((await combined.findTask({ hostId: "local", threadId: id, sourceId: "" }))?.title, "Primary copy");
+
+  const secondaryTask = await combined.findTask({ hostId: "local", threadId: id, sourceId: secondaryId });
+  assert.equal(secondaryTask?.title, "Secondary copy");
+  assert.equal(secondaryTask?.sourceId, secondaryId);
+  assert.equal(secondaryTask?.sourceLabel, "secondary");
+  assert.equal(secondaryTask?.projectId, JSON.stringify([secondaryId, "secondary-project"]));
+  await assert.rejects(combined.findTask({ hostId: "local", threadId: id, sourceId: "unknown-source" }), DesktopUnavailableError);
+
+  assert.equal(reads.get("D:/fixture/primary")?.snapshots, 4);
+  assert.equal(reads.get("D:/fixture/secondary")?.snapshots, 4);
+  assert.equal(reads.get("D:/fixture/primary")?.taskLists, 0);
+  assert.equal(reads.get("D:/fixture/secondary")?.taskLists, 0);
+});
 import { AppServerTaskTransfer, readTransferContext, rolloutContainsThread, stageTransferRollout, TransferRpc, transferCompatibleRecord } from "../src/desktop/app-server-transfer.js";
 import { completedHistoryDigest } from "../src/desktop/history-digest.js";
 import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, MutableQueuedInputTurnError, QueueHistoryReadError, readQueuedHistoryPage, scanTerminalQueuedInputTurn } from "../src/desktop/input-reconciliation.js";

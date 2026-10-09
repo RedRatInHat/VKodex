@@ -1,10 +1,42 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, realpath, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { prepareDiagnosticDirectory } from "../src/desktop/diagnostic-private-directory.js";
+import { prepareDiagnosticDirectory, prepareRunDiagnosticDirectory } from "../src/desktop/diagnostic-private-directory.js";
+import { createDiagnosticLog } from "../src/desktop/diagnostic-log.js";
+
+test("a full diagnostic run cannot silence the next run or overwrite its evidence", async () => {
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-diagnostic-runs-"));
+  assert.equal(await prepareRunDiagnosticDirectory(parent, "../other"), null);
+  const first = await prepareRunDiagnosticDirectory(parent, "10000000-0000-0000-0000-000000000001");
+  assert.ok(first);
+  for (let i = 0; i < 16; i++) await writeFile(path.join(first, `trace-${String(i).padStart(3, "0")}.jsonl`), "old evidence\n");
+  assert.equal((await createDiagnosticLog(first)).status().state, "full");
+  const second = await prepareRunDiagnosticDirectory(parent, "10000000-0000-0000-0000-000000000002");
+  assert.ok(second);
+  assert.notEqual(first, second);
+  const log = await createDiagnosticLog(second);
+  await log.write({ schema: "vkodex.diagnostic.v1", runId: "10000000-0000-0000-0000-000000000002",
+    pid: process.pid, seq: 1, at: new Date().toISOString(), event: "input.received" });
+  await log.flush();
+  assert.equal(log.status().state, "ready");
+  assert.equal(log.status().written, 1);
+  assert.equal(JSON.parse((await readFile(path.join(second, "trace-000.jsonl"), "utf8")).trim()).event, "input.received");
+  assert.equal(await readFile(path.join(first, "trace-000.jsonl"), "utf8"), "old evidence\n");
+});
+
+test("diagnostic runs refuse a linked base before creating children in its target", async () => {
+  const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-linked-runs-"));
+  const target = path.join(parent, "target");
+  await mkdir(target);
+  const linkedBase = path.join(parent, "linked");
+  await symlink(target, linkedBase, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(await prepareRunDiagnosticDirectory(linkedBase), null);
+  assert.deepEqual(await readdir(target), []);
+  assert.equal(await prepareRunDiagnosticDirectory("relative"), null);
+});
 
 test("diagnostic directory preparation accepts only a private dedicated leaf", async () => {
   const parent = await mkdtemp(path.join(await realpath(os.tmpdir()), "vkodex-private-diagnostic-"));

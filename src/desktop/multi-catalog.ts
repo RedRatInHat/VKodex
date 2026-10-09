@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { DesktopUnavailableError, type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type TaskRef } from "./contracts.js";
+import { DesktopUnavailableError, sameTask, type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type TaskRef } from "./contracts.js";
 import { LocalDesktopCatalog } from "./catalog.js";
 import { comparablePath } from "./paths.js";
+import { diagnosticEvent, diagnosticError } from "../bridge/diagnostics.js";
 
 type Catalog = Pick<LocalDesktopCatalog, "listTasks" | "listProjects" | "listModels"> &
   Partial<Pick<LocalDesktopCatalog, "listSnapshot">>;
@@ -100,6 +101,31 @@ export class MultiDesktopCatalog {
     const snapshot = await this.snapshot();
     const readable = this.updateWarnings(snapshot);
     if (!readable) throw new DesktopUnavailableError("Не удалось прочитать ни один настроенный каталог Codex.");
+    return this.tasksFromSnapshot(snapshot);
+  }
+
+  /** A partial browser list is not proof that a bound task is missing. */
+  async findTask(task: TaskRef): Promise<DesktopTask | null> {
+    const snapshot = await this.snapshot();
+    this.updateWarnings(snapshot);
+    const selected = snapshot.find(entry => entry.source.id === (task.sourceId ?? ""));
+    if (!selected || selected.tasks.status === "rejected") {
+      diagnosticEvent("input.adapter", { stage: "source-validation", outcome: "failure", ready: false,
+        threadId: task.threadId, sourceId: task.sourceId ?? "", reason: selected ? "unavailable" : "source-missing",
+        ...(selected?.tasks.status === "rejected" ? diagnosticError(selected.tasks.reason) : {}) });
+      throw new DesktopUnavailableError(selected
+        ? "Каталог этой задачи временно недоступен. Запрос не отправлен; повтори после восстановления каталога."
+        : "Каталог этой задачи больше не подключён в конфигурации VKodex.");
+    }
+    // Availability and identity use one read; never substitute a matching ID
+    // from another profile or a second snapshot with different availability.
+    const found = this.tasksFromSnapshot(snapshot).find(candidate => sameTask(candidate, task)) ?? null;
+    diagnosticEvent("input.adapter", { stage: "source-validation", outcome: found ? "success" : "rejected",
+      ready: true, threadId: task.threadId, sourceId: task.sourceId ?? "" });
+    return found;
+  }
+
+  private tasksFromSnapshot(snapshot: readonly SourceSnapshot[]): readonly DesktopTask[] {
     const active = snapshot.filter((entry): entry is SourceSnapshot & { tasks: PromiseFulfilledResult<readonly DesktopTask[]> } => entry.tasks.status === "fulfilled" && entry.tasks.value.length > 0);
     const showSource = active.length > 1;
     const projectSources = active.filter((entry): entry is typeof entry & { projects: PromiseFulfilledResult<readonly DesktopProject[]> } => entry.projects.status === "fulfilled" && entry.projects.value.length > 0);
