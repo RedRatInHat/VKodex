@@ -1148,8 +1148,8 @@ test('headless VK uses the same managed stock worker queue and durable accepted 
     assert.ok(queueFrame);
     const params = queueFrame.params as Record<string, unknown>;
     assert.equal(params.clientUserMessageId, operationId);
-    assert.match(JSON.stringify(params.input), /VK author.*VK fixture/);
-    assert.match(JSON.stringify(params.input), /VKodex file delivery/);
+    assert.match(JSON.stringify(params.input), /Автор VK.*VK fixture/);
+    assert.match(JSON.stringify(params.input), /Выдача файлов в VK/);
     assert.deepEqual(await own.daemon.submitVk(capability, request), accepted);
     assert.equal(own.backend.queueWrites, 1, 'exact duplicate did not write again');
     await assert.rejects(own.daemon.submitVk(capability, { ...request, text: 'changed' }),

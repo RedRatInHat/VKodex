@@ -3690,10 +3690,10 @@ test("active-task submit uses the existing task and inherits its model and permi
   assert.equal((request.params as IpcObject).conversationId, ref.threadId);
   assert.equal((request.params as IpcObject).clientUserMessageId, "client-message-fixture");
   const attributed = ((request.params as IpcObject).input as IpcObject[])[0]!.text;
-  assert.match(String(attributed), /VK author: "Second User"/u); assert.match(String(attributed), /VK sender ID: 999/u);
-  assert.match(String(attributed), /# User request\nA follow-up/u);
-  assert.match(String(attributed), /Не используй Markdown-таблицы/u);
-  assert.match(String(attributed), /Если последним станет запрос, отправленный напрямую через Codex.*полностью игнорируй/u);
+  assert.match(String(attributed), /Автор VK \(атрибуция\): "Second User", id=999/u);
+  assert.match(String(attributed), /^A follow-up\n\n\[VKodex · служебное\]/u);
+  assert.match(String(attributed), /без Markdown\/HTML/u);
+  assert.match(String(attributed), /До следующего прямого запроса из Codex/u);
   for (const forbidden of ["model", "approvalPolicy", "sandbox", "permissions", "serviceTier"]) assert.equal(Object.hasOwn(request.params as object, forbidden), false);
   assert.ok(server.destroyed);
 });
@@ -4062,9 +4062,9 @@ test("App Server creator materializes a new task with its atomic first turn", as
   } }) }) as never, async () => worktree);
   const task = await creator.createTask({ operationId: "create-op", projectId: "visible", sourceId: "work", title: "Created", prompt: "Initial prompt", model: "model-a", effort: "high", environment: "worktree" });
   assert.equal(calls.length, 1);
-  assert.match(calls[0]?.prompt ?? "", /^Initial prompt\n\n# VKodex response format/u);
-  assert.match(calls[0]?.prompt ?? "", /Не используй Markdown-таблицы/u);
-  assert.match(calls[0]?.prompt ?? "", /Если последним станет запрос, отправленный напрямую через Codex.*полностью игнорируй/u);
+  assert.match(calls[0]?.prompt ?? "", /^Initial prompt\n\n\[VKodex · служебное\]/u);
+  assert.match(calls[0]?.prompt ?? "", /без Markdown\/HTML/u);
+  assert.match(calls[0]?.prompt ?? "", /До следующего прямого запроса из Codex/u);
   assert.equal(task.threadId, "created-thread"); assert.equal(task.sourceId, "work"); assert.equal(task.workspace, worktree);
   assert.deepEqual(metadata, ["project:raw", "name:Created"]);
 });

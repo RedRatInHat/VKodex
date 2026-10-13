@@ -130,7 +130,7 @@ export class ManagedStockVkSubmitter {
     const snapshot = structuredClone({ operationId: request.operationId, task: request.task,
       text: request.text, author: request.author ?? null, inputFiles: request.inputFiles ?? [],
       outboxDir: request.outboxDir ?? null });
-    const prepared = taskInput({ operationId: snapshot.operationId, task: snapshot.task,
+    const prepared = taskInput({
       text: snapshot.text, ...(snapshot.author ? { author: snapshot.author } : {}),
       ...(snapshot.outboxDir ? { outboxDir: snapshot.outboxDir } : {}) });
     if (!prepared.text || prepared.input.length !== 1 || prepared.attachments.length !== 0) refuse();

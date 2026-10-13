@@ -2878,7 +2878,7 @@ test("a solo task chat omits attribution until a second author writes", async t 
   const s = setup(t); s.attach();
   await s.manager.handle({ ...s.input("owner only", peerId), senderName: "Owner User" });
   assert.equal(s.desktop.submissions[0]!.author, undefined);
-  assert.match(desktopTaskInput(s.desktop.submissions[0]!).text, /^owner only\n\n# VKodex response format/u);
+  assert.match(desktopTaskInput(s.desktop.submissions[0]!).text, /^owner only\n\n\[VKodex · служебное\]/u);
 
   await s.manager.handle({ ...s.input("shared request", peerId), senderId: 999, senderName: "Second User" });
   assert.deepEqual(s.desktop.submissions[1]!.author, { id: 999, name: "Second User" });

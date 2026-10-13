@@ -4,6 +4,7 @@ import type { AppConfig } from "../../config.js";
 import type { AgentRunRequest, AgentRunResult, CodingAgent } from "../../core/ports/coding-agent.js";
 import { collectOutboundFiles } from "../../lib/files.js";
 import { buildCodexEnvironment } from "./codex-environment.js";
+import { taskInput } from "../../core/task-input.js";
 
 export class CodexAgent implements CodingAgent {
   readonly kind = "codex";
@@ -80,24 +81,8 @@ export class CodexAgent implements CodingAgent {
   }
 
   private buildPrompt(request: AgentRunRequest): string {
-    const fileLines = request.inputFiles.length
-      ? request.inputFiles.map((file) => `- ${file.originalName}: ${file.path}`).join("\n")
-      : "- нет";
-
-    return [
-      "<vk_codex_bridge>",
-      "Ты работаешь через закрытый VK-бот.",
-      `Workspace: ${request.workspace}`,
-      `Входные файлы:\n${fileLines}`,
-      `Каталог для файлов пользователю: ${request.outboxDir}`,
-      "Если результат нужно отправить как файл или изображение, скопируй только готовый пользовательский артефакт в этот каталог.",
-      "Не копируй туда внутренние логи, временные файлы, зависимости, секреты или весь репозиторий.",
-      "Не распаковывай архивы без явной просьбы пользователя.",
-      "</vk_codex_bridge>",
-      "",
-      "<user_request>",
-      request.prompt.trim() || "Изучи приложенные файлы и сообщи результат.",
-      "</user_request>",
-    ].join("\n");
+    // The SDK already receives workingDirectory via threadOptions. Share the
+    // compact per-message context with Desktop and App Server transports.
+    return taskInput({ text: request.prompt, inputFiles: request.inputFiles, outboxDir: request.outboxDir }).text;
   }
 }
