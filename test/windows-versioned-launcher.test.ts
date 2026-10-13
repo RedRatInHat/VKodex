@@ -87,7 +87,7 @@ async function makePrivatePlanFixture(options: { mutateBindingAfterFirst?: boole
     : "";
   const stderrCompletion = options.stderrCompletionProbe
     ? `await new Promise((resolve, reject) => process.stderr.write("FIXTURE_ENTRY_STDERR_SENTINEL\\n", (error) => { const normalizedError = error ?? null; if (normalizedError === null) resolve(true); else reject(normalizedError); }));\nawait new Promise((resolve) => setTimeout(resolve, 300));\nlet launcherWriteStillBlocked = false; try { await writeFile(${JSON.stringify(launcherPath)}, "late replacement sentinel must not be installed"); } catch { launcherWriteStillBlocked = true; }\nlet codeFileWriteStillBlocked = false; try { await appendFile(${JSON.stringify(codeFilePath)}, "# late fixture write sentinel must not be installed\\n"); } catch { codeFileWriteStillBlocked = true; }\nawait appendFile(${JSON.stringify(stderrCompletionReceiptPath)}, JSON.stringify({ afterStderrCallback: true, stderrWriteCallbackErrorWasNull: true, waitMs: 300, launcherWriteStillBlocked, codeFileWriteStillBlocked, intendedExitCode: 7 }) + "\\n");\nprocess.exitCode = 7;\n`
-    : `process.stderr.write("FIXTURE_ENTRY_STDERR_SENTINEL\\n");\n`;
+    : `process.stdout.write("FIXTURE_ENTRY_STDOUT_SENTINEL\\n");\nprocess.stderr.write("FIXTURE_ENTRY_STDERR_SENTINEL\\n");\n`;
   await put(artifactRoot, "dist/src/desktop-main.js", `import { appendFile, writeFile } from "node:fs/promises";\n${launcherProbe}await appendFile(${JSON.stringify(resultPath)}, JSON.stringify({ executable: process.execPath, argv: process.argv, execArgv: process.execArgv, cwd: process.cwd(), BOT_DATA_DIR: process.env.BOT_DATA_DIR, NODE_OPTIONS: process.env.NODE_OPTIONS, NODE_PATH: process.env.NODE_PATH, VKODEX_RUN_ID: process.env.VKODEX_RUN_ID, launcherWriteBlocked, codeFileWriteBlocked }) + "\\n");\n${stderrCompletion}${bindingMutation}`);
   await put(artifactRoot, "dist/src/codex/native-cli.js", "throw new Error('Native CLI sentinel must never execute');\n");
   await put(artifactRoot, "scripts/run-windows-supervisor.ps1", "throw 'Artifact supervisor sentinel must never execute'\n");
@@ -452,6 +452,8 @@ test("pinned run-once launches only the harmless artifact entry with selected ab
     assert.equal(result.code, 0, `run-once #${run + 1} must succeed; exit=${result.code}; stderr=${result.stderr}`);
     assert.equal(result.stdout.length <= 8 * 1024, true, "private output stays bounded");
     assert.equal(result.stderr.length <= 8 * 1024, true, "diagnostic output stays bounded");
+    assert.match(result.stdout, /FIXTURE_ENTRY_STDOUT_SENTINEL/u);
+    assert.match(result.stderr, /FIXTURE_ENTRY_STDERR_SENTINEL/u);
   }
   const invocations = await assertFixtureInvocation(fixture, 2);
   const runIds = invocations.map((record) => String(record.VKODEX_RUN_ID));
@@ -475,6 +477,16 @@ test("pinned supervise-once performs one harmless iteration without starting an 
   assert.match(supervisorLog, /Bounded versioned run-once completed/iu, "the bounded run records its completed single iteration");
   assert.doesNotMatch(supervisorLog, /watchdog started/iu, "bounded fixture supervision must not start the watchdog");
   assert.doesNotMatch(supervisorLog, /restarting in/iu, "bounded fixture supervision must not enter the restart loop");
+});
+
+test("versioned supervision preserves runtime stdout and stderr in the owning console", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {
+  const fixture = await makePrivatePlanFixture();
+  const result = await runObservedLauncher(fixture, "supervise-once");
+  assert.equal(result.code, 0);
+  await assertFixtureInvocation(fixture, 1);
+  assert.match(result.stdout, /FIXTURE_ENTRY_STDOUT_SENTINEL/u, "runtime logs reach the supervising console");
+  assert.match(result.stderr, /FIXTURE_ENTRY_STDERR_SENTINEL/u, "runtime errors reach the supervising console");
+  assert.match(result.stdout, /Versioned supervisor started/u, "supervisor status is visible as well as persisted");
 });
 
 test("supervise revalidates the original binding before a second iteration and stops without retry", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {

@@ -20,7 +20,7 @@ $references = if ($Kind -eq 'Owner') { @('/r:System.Web.Extensions.dll') } else 
 & $compiler /nologo /target:exe /platform:anycpu /optimize+ "/win32icon:$icon" "/out:$output" @references $source
 if ($LASTEXITCODE -ne 0) { throw 'VKodex launcher compilation failed.' }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($output)
-$expectedTitle = if ($Kind -eq 'Supervisor') { 'VKodex Bridge' } else { 'VKodex Owner Adapter' }
+$expectedTitle = if ($Kind -eq 'Supervisor') { 'VKodex' } else { 'VKodex Owner Adapter' }
 if ($version.FileDescription -cne $expectedTitle -or $version.ProductName -cne 'VKodex') {
   throw 'VKodex launcher branding verification failed; do not deploy this executable.'
 }

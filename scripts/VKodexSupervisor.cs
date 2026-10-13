@@ -11,7 +11,7 @@ using System.Threading;
 using Microsoft.Win32.SafeHandles;
 using System.Reflection;
 
-[assembly: AssemblyTitle("VKodex Bridge")]
+[assembly: AssemblyTitle("VKodex")]
 [assembly: AssemblyProduct("VKodex")]
 [assembly: AssemblyDescription("VKodex bridge supervisor")]
 [assembly: AssemblyCompany("VKodex")]
@@ -20,6 +20,33 @@ internal static class Program
 {
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint ExtractIconEx(string file, int index, out IntPtr large, out IntPtr small, uint count);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr size, IntPtr icon, uint flags, uint timeout, out IntPtr result);
+    // The console uses these handles throughout supervision, not just while
+    // applying its icon. They are released with this process by Windows.
+    private static IntPtr consoleLargeIcon, consoleSmallIcon;
+
+    private static void ApplyConsoleBranding()
+    {
+        // Cosmetic failures must never become a backend lifecycle operation.
+        try
+        {
+            SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge");
+            Console.Title = "VKodex - DO NOT CLOSE";
+            Console.OutputEncoding = new UTF8Encoding(false);
+            IntPtr window = GetConsoleWindow(), result;
+            if (window == IntPtr.Zero) return;
+            if (ExtractIconEx(Process.GetCurrentProcess().MainModule.FileName, 0, out consoleLargeIcon, out consoleSmallIcon, 1) == 0) return;
+            if (consoleSmallIcon != IntPtr.Zero) SendMessageTimeout(window, 0x80, IntPtr.Zero, consoleSmallIcon, 2, 500, out result);
+            if (consoleLargeIcon != IntPtr.Zero) SendMessageTimeout(window, 0x80, new IntPtr(1), consoleLargeIcon, 2, 500, out result);
+        }
+        catch { /* Leave native console defaults if Windows cannot apply branding. */ }
+    }
 
     private static int Main(string[] args)
     {
@@ -47,8 +74,7 @@ internal static class Program
             return 2;
         }
 
-        SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge");
-        Console.Title = "VKodex Bridge - DO NOT CLOSE";
+        ApplyConsoleBranding();
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("VKodex Bridge - DO NOT CLOSE THIS WINDOW");
         Console.ResetColor();
@@ -101,8 +127,8 @@ internal static class Program
                 if (operation == "plan-only") { Console.OutputEncoding = new UTF8Encoding(false); Console.WriteLine(plan.Json); return 0; }
                 if (operation == "supervise" || operation == "supervise-once")
                 {
-                    SetCurrentProcessExplicitAppUserModelID("RedRatInHat.VKodex.Bridge");
-                    Console.Title = "VKodex Bridge - DO NOT CLOSE";
+                    ApplyConsoleBranding();
+                    Console.WriteLine("VKodex - DO NOT CLOSE THIS WINDOW");
                 }
                 // Keep immutable bootstrap code/runtime open without write/delete
                 // sharing for the full child lifetime. Release mutable metadata:
@@ -111,6 +137,9 @@ internal static class Program
                 if (operation == "run-once")
                 {
                     var info = ChildInfo(trust.Runtime, trust.Configuration);
+                    // Actual execution inherits the supervising console and
+                    // its stdout/stderr. Only the private validator is hidden.
+                    info.CreateNoWindow = false;
                     info.Arguments = Arguments(new string[] { "--env-file=" + trust.EnvironmentFile, trust.EntryPoint });
                     info.EnvironmentVariables["BOT_DATA_DIR"] = trust.DataDirectory;
                     info.EnvironmentVariables["VKODEX_RUN_ID"] = DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture)
@@ -119,6 +148,7 @@ internal static class Program
                 }
                 string powershell = SystemPowerShell();
                 var supervisor = ChildInfo(powershell, trust.Configuration);
+                supervisor.CreateNoWindow = false;
                 var command = new List<string> { "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                     trust.Supervisor, "-LaunchBinding", bindingPath, "-LaunchBindingSha256", bindingPin, "-LauncherPath", trust.Launcher, "-LauncherSha256", trust.LauncherSha256 };
                 if (operation == "supervise-once") command.Add("-Once");

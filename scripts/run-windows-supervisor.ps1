@@ -74,7 +74,9 @@ if ($PSCmdlet.ParameterSetName -eq "Versioned") {
       $startInfo.Arguments = '--launch-binding "' + $canonicalBinding + '" --launch-binding-sha256 ' + $LaunchBindingSha256 + ' --operation ' + $Operation
       $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
       $startInfo.UseShellExecute = $false
-      $startInfo.CreateNoWindow = $true
+      # Execution inherits the launcher console. Private plan capture stays
+      # hidden and keeps its machine-readable output isolated from run logs.
+      $startInfo.CreateNoWindow = [bool]$CapturePlan
       foreach ($key in @($startInfo.EnvironmentVariables.Keys)) {
         if ($startupVariables -icontains [string]$key) { $startInfo.EnvironmentVariables.Remove([string]$key) }
       }
@@ -193,6 +195,7 @@ if ($PSCmdlet.ParameterSetName -eq "Versioned") {
   function Write-VersionedSupervisorLog([string]$Message) {
     $line = "[$((Get-Date).ToString('yyyy-MM-ddTHH:mm:ss.fffK'))] $Message"
     try { Add-Content -LiteralPath $supervisorLog -Value $line -Encoding UTF8 } catch { }
+    try { [Console]::WriteLine($line) } catch { }
   }
   Write-VersionedSupervisorLog "Versioned supervisor started."
 

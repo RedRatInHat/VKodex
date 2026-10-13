@@ -32,7 +32,7 @@ test("Windows production launcher builder preserves VKodex name and embedded ico
   const run = promisify(execFile);
   await run(powershell, ["-NoProfile", "-File", script, "-Destination", executable], { windowsHide: true, timeout: 60_000 });
   const result = await run(powershell, ["-NoProfile", "-Command", `$v=[Diagnostics.FileVersionInfo]::GetVersionInfo('${executable.replaceAll("'", "''")}'); @{description=$v.FileDescription;product=$v.ProductName} | ConvertTo-Json -Compress`], { windowsHide: true, timeout: 10_000 });
-  assert.deepEqual(JSON.parse(result.stdout), { description: "VKodex Bridge", product: "VKodex" });
+  assert.deepEqual(JSON.parse(result.stdout), { description: "VKodex", product: "VKodex" });
   const bytes = await fsPromises.readFile(executable);
   const icon = await fsPromises.readFile(fileURLToPath(new URL("../docs/logo.ico", import.meta.url)));
   const count = icon.readUInt16LE(4);
