@@ -16,8 +16,10 @@ foreach ($required in @($source, $icon, $compiler)) {
   if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required launcher build input missing: $required" }
 }
 New-Item -ItemType Directory -Path (Split-Path $output -Parent) -Force | Out-Null
-$references = if ($Kind -eq 'Owner') { @('/r:System.Web.Extensions.dll') } else { @() }
-& $compiler /nologo /target:exe /platform:anycpu /optimize+ "/win32icon:$icon" "/out:$output" @references $source
+$compileArgs = @('/nologo', '/target:exe', '/platform:anycpu', '/optimize+')
+if ($Kind -eq 'Owner') { $compileArgs += '/r:System.Web.Extensions.dll' }
+$compileArgs += "/win32icon:$icon", "/out:$output", $source
+& $compiler @compileArgs
 if ($LASTEXITCODE -ne 0) { throw 'VKodex launcher compilation failed.' }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($output)
 $expectedTitle = if ($Kind -eq 'Supervisor') { 'VKodex' } else { 'VKodex Owner Adapter' }

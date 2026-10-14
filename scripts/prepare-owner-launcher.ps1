@@ -18,7 +18,9 @@ foreach ($file in $files) {
   if (-not (Test-Path -LiteralPath (Join-Path $repo "dist\src\desktop\$file") -PathType Leaf)) { throw 'Run npm run build before preparing the launcher.' }
 }
 $corePaths = Join-Path $repo 'dist\src\core\paths.js'
-if (-not (Test-Path -LiteralPath $corePaths -PathType Leaf)) { throw 'Run npm run build before preparing the launcher.' }
+$coreTaskGoals = Join-Path $repo 'dist\src\core\task-goals.js'
+$coreCodexTasks = Join-Path $repo 'dist\src\core\codex-tasks.js'
+if (-not (Test-Path -LiteralPath $corePaths -PathType Leaf) -or -not (Test-Path -LiteralPath $coreTaskGoals -PathType Leaf) -or -not (Test-Path -LiteralPath $coreCodexTasks -PathType Leaf)) { throw 'Run npm run build before preparing the launcher.' }
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'The Windows .NET Framework compiler is required.' }
 New-Item -ItemType Directory -Path $target | Out-Null
@@ -32,10 +34,22 @@ foreach ($directory in @($target, $registry)) {
   if ($LASTEXITCODE -ne 0) { throw 'Could not protect the local owner transport directory.' }
 }
 foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $repo "dist\src\desktop\$file") -Destination (Join-Path $target $file) }
+$utf8 = New-Object Text.UTF8Encoding($false)
+# The installed adapter is intentionally flat for launcher compatibility, while
+# goal parsing keeps its small core dependency graph in a private subdirectory.
+$coreDirectory = Join-Path $target 'core'
+New-Item -ItemType Directory -Path $coreDirectory | Out-Null
+Copy-Item -LiteralPath $coreTaskGoals -Destination (Join-Path $coreDirectory 'task-goals.js')
+Copy-Item -LiteralPath $coreCodexTasks -Destination (Join-Path $coreDirectory 'codex-tasks.js')
+foreach ($file in @('owner-channel.js', 'owner-transport.js')) {
+  $installed = Join-Path $target $file
+  $source = [IO.File]::ReadAllText($installed)
+  $source = $source.Replace('../core/task-goals.js', './core/task-goals.js').Replace('../core/codex-tasks.js', './core/codex-tasks.js')
+  [IO.File]::WriteAllText($installed, $source, $utf8)
+}
 # desktop/paths.js is a re-export of ../core/paths.js in the repository.
 # Ship the implementation as paths.js so this installation is self-contained.
 Copy-Item -LiteralPath $corePaths -Destination (Join-Path $target 'paths.js')
-$utf8 = New-Object Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $target 'package.json'), '{"private":true,"type":"module"}', $utf8)
 # Resolve the installed module graph before changing a client's CLI setting.
 & $runtimePath --input-type=module -e "import { pathToFileURL } from 'node:url'; await import(pathToFileURL(process.argv[1]).href)" (Join-Path $target 'owner-channel.js')
