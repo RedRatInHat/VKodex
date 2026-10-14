@@ -210,7 +210,7 @@ test("native goal activation cannot fall back from an owner to a legacy empty tu
   f.owner.continueGoal = async () => { f.calls.push("owner:legacy-empty-turn"); return { mode: "started", turnId: "ordinary-turn" }; };
   await assert.rejects(routed.activateGoalWithReceipt!(work, "native-goal"), /Подтверждение нативного хода цели недоступно/u);
   assert.deepEqual(f.calls, []);
-  await assert.rejects(routed.activateGoalWithReceipt!(primary, "native-goal"), /постоянный исполнитель цели/u);
+  await assert.rejects(routed.activateGoalWithReceipt!(primary, "native-goal"), /Подтверждение нативного хода цели недоступно/u);
   assert.deepEqual(f.calls, []);
 });
 
@@ -223,6 +223,26 @@ test("goal runtime preparation loads only its selected owner and refuses a trans
   f.owner.ensureOpen = async () => { throw new TaskOwnedByClientError(); };
   await assert.rejects(f.routed.prepareGoalRuntime!(work), /другом клиенте Codex/u);
   assert.deepEqual(f.calls, ["owner:open"]);
+});
+
+test("goal resume forwards the exact source to the native owner without touching a profile writer", async () => {
+  const f = fixture();
+  const goal = { threadId: work.threadId, objective: "Existing goal", status: "blocked" as const,
+    tokenBudget: null, tokensUsed: 12, timeUsedSeconds: 34, createdAt: 1, updatedAt: 2 };
+  const active = { ...goal, status: "active" as const };
+  const base: CodexTasks = { ...f.base, resumeGoalOnNativeOwner: async (task, expected) => {
+    assert.deepEqual(task, work); assert.equal(expected, goal); return active;
+  } };
+  assert.equal(await new RoutedCodexTasks(base, [f.owner]).resumeGoalOnNativeOwner(work, goal), active);
+  assert.deepEqual(f.calls, []);
+  base.resumeGoalOnNativeOwner = async () => { throw new UncertainActionError(); };
+  await assert.rejects(new RoutedCodexTasks(base, [f.owner]).resumeGoalOnNativeOwner(work, goal), UncertainActionError);
+  assert.deepEqual(f.calls, []);
+  let nativeCalls = 0;
+  base.resumeGoalOnNativeOwner = async () => { nativeCalls++; return active; };
+  await assert.rejects(new RoutedCodexTasks(base, [{ ...f.owner, routingPolicy: "exclusive" }])
+    .resumeGoalOnNativeOwner(work, goal), ActionRejectedError);
+  assert.equal(nativeCalls, 0);
 });
 
 test("health goal reads are isolated from the long-lived task owner", async () => {

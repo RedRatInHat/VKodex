@@ -10,6 +10,26 @@ import type { IpcObject } from "../src/desktop/ipc-client.js";
 import { TransferRpc } from "../src/desktop/app-server-transfer.js";
 import { ProfileDesktopGoals, ProfileDesktopMetadata } from "../src/desktop/metadata.js";
 import { TransferConflictError } from "../src/desktop/contracts.js";
+import { OwnerTransportError, objectiveHash } from "../src/desktop/owner-transport.js";
+
+test("profile goal resume uses the selected native owner and never the short-lived metadata writer", async () => {
+  const task = { hostId: "local", threadId: "thread", sourceId: "work" };
+  const goal = { threadId: task.threadId, objective: "Private objective", status: "blocked" as const,
+    tokenBudget: null, tokensUsed: 12, timeUsedSeconds: 34, createdAt: 1, updatedAt: 2 };
+  const goals = new ProfileDesktopGoals(ref => { assert.deepEqual(ref, task); return "selected-home"; },
+    () => { assert.fail("short-lived metadata must not write"); },
+    async (home, threadId, expected) => {
+      assert.equal(home, "selected-home"); assert.equal(threadId, task.threadId);
+      assert.deepEqual(expected, { createdAt: 1, updatedAt: 2, tokenBudget: null, objectiveHash: objectiveHash(goal.objective) });
+      return { ...goal, status: "active" };
+    });
+  assert.equal((await goals.resumeOnNativeOwner(task, goal))?.status, "active");
+  for (const outcome of ["unknown", "outdated", "rejected", "unavailable"] as const) {
+    const failed = new ProfileDesktopGoals(() => "selected-home", () => { assert.fail("no fallback"); },
+      async () => { throw new OwnerTransportError(outcome, "owner error"); });
+    await assert.rejects(failed.resumeOnNativeOwner(task, goal), outcome === "unknown" ? UncertainActionError : ActionRejectedError);
+  }
+});
 
 test("context uses last token usage, clamps at the window and keeps unknown data unknown", () => {
   const usage = { last: { totalTokens: 100 }, total: { totalTokens: 900_000 }, modelContextWindow: 1_000 };

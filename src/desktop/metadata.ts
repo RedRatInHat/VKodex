@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import DatabaseConstructor from "better-sqlite3";
@@ -11,7 +12,7 @@ import { preflightLegacyProjectAssignment } from "./projects.js";
 import type { ProjectCatalogMode } from "./catalog.js";
 import { comparablePath } from "./paths.js";
 import { closeAppServer } from "./app-server-process.js";
-import { archiveThroughOwner, inspectThroughOwner } from "./owner-channel.js";
+import { archiveThroughOwner, inspectThroughOwner, resumeGoalThroughOwner } from "./owner-channel.js";
 import { OwnerTransportError } from "./owner-transport.js";
 import { completedHistoryDigest } from "./history-digest.js";
 import { findAcceptedInputTurn, findRecentTerminalQueuedInputTurn, readQueuedHistoryPage, scanTerminalQueuedInputTurn } from "./input-reconciliation.js";
@@ -506,7 +507,24 @@ export class ProfileDesktopGoals implements DesktopGoals {
   constructor(
     private readonly sourceHome: (task: TaskRef) => string,
     private readonly createGoals: (home: string) => DesktopGoals = home => new NativeDesktopGoals(new MetadataRpc(home)),
+    private readonly resumeNativeGoal: typeof resumeGoalThroughOwner = resumeGoalThroughOwner,
   ) {}
+  async resumeOnNativeOwner(task: TaskRef, expected: TaskGoal): Promise<TaskGoal | null> {
+    if (task.hostId !== "local" || expected.threadId !== task.threadId)
+      throw new ActionRejectedError("Не удалось подтвердить каталог и цель для возобновления.");
+    try {
+      return await this.resumeNativeGoal(this.sourceHome(task), task.threadId, {
+        createdAt: expected.createdAt, updatedAt: expected.updatedAt,
+        objectiveHash: createHash("sha256").update(expected.objective).digest("hex"), tokenBudget: expected.tokenBudget,
+      });
+    } catch (error) {
+      if (!(error instanceof OwnerTransportError)) throw error;
+      if (error.outcome === "unknown") throw new UncertainActionError();
+      if (error.outcome === "outdated")
+        throw new ActionRejectedError("Адаптер текущего клиента Codex не поддерживает возобновление цели. Обнови адаптер и перезапусти этот клиент после завершения его ходов; цель не изменена.");
+      throw new ActionRejectedError("Текущий клиент Codex не подтвердил безопасное возобновление этой цели. Обнови /goal; цель не изменена.");
+    }
+  }
   async get(task: TaskRef): Promise<TaskGoal | null> {
     const home = this.sourceHome(task);
     try { return await this.createGoals(home).get(task); }

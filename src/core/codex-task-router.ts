@@ -351,9 +351,18 @@ export class RoutedCodexTasks implements CodexTasks {
       throw error;
     }
   }
+  async resumeGoalOnNativeOwner(task: TaskRef, expected: TaskGoal): Promise<TaskGoal | null> {
+    this.refuseExclusive(task);
+    // Errors, including uncertain writes, propagate. Only a proven discovery
+    // miss permits the caller to prepare the profile runtime.
+    return this.base.resumeGoalOnNativeOwner?.(task, expected) ?? null;
+  }
   async activateGoalWithReceipt(task: TaskRef, operationId: string): Promise<NativeGoalActivation> {
     const owner = this.owner(task);
-    if (!owner) throw new ActionRejectedError("Для задачи не назначен постоянный исполнитель цели; продолжи её в открытом Codex.");
+    // A native UI owner can exist without a configured profile executor. Let
+    // the status-only path discover it; prepareGoalRuntime still rejects a
+    // transient metadata fallback if no live owner exists.
+    if (!owner) throw new NativeGoalReceiptUnavailableError();
     if (owner?.routingPolicy === "exclusive") this.unsupportedExclusive();
     if (!owner.activateGoalWithReceipt) throw new NativeGoalReceiptUnavailableError();
     return owner.activateGoalWithReceipt(task, operationId);

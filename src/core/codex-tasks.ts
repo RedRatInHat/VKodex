@@ -167,6 +167,8 @@ export interface DesktopGoals {
   get(task: TaskRef): Promise<TaskGoal | null>;
   set(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal>;
   clear(task: TaskRef): Promise<boolean>;
+  /** Only the already loaded native owner; null is a proven discovery miss. */
+  resumeOnNativeOwner?(task: TaskRef, expected: TaskGoal): Promise<TaskGoal | null>;
 }
 
 export interface AccountRateLimitWindow {
@@ -375,6 +377,9 @@ export interface CodexTasks {
   clearGoal?(task: TaskRef): Promise<boolean>;
   /** Prepare only the selected in-process native goal runtime; never launch a UI. */
   prepareGoalRuntime?(task: TaskRef): Promise<void>;
+  /** Resume an existing goal on its UI owner without acquiring a competing writer.
+   * A confirmed active status is not a receipt for a newly started goal turn. */
+  resumeGoalOnNativeOwner?(task: TaskRef, expected: TaskGoal): Promise<TaskGoal | null>;
   activateGoalWithReceipt?(task: TaskRef, operationId: string): Promise<NativeGoalActivation>;
   /** Legacy ordinary empty-input turn; does not activate a native goal. */
   continueGoal?(task: TaskRef, operationId: string): Promise<GoalContinuationReceipt>;

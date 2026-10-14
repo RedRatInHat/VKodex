@@ -4,7 +4,11 @@ import { createConnection, createServer, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { comparablePath } from "./paths.js";
-import { OwnerTransportError, type OwnerTransport } from "./owner-transport.js";
+import { OwnerTransportError, type OwnerGoalResumeExpectation, type OwnerTransport } from "./owner-transport.js";
+import { parseTaskGoal } from "../core/task-goals.js";
+import type { TaskGoal } from "../core/codex-tasks.js";
+
+export type { OwnerGoalResumeExpectation } from "./owner-transport.js";
 
 interface Descriptor {
   version: 1;
@@ -13,7 +17,7 @@ interface Descriptor {
   token: string;
   pid: number;
 }
-interface VerifiedOwner extends Descriptor { readonly capabilities: readonly ("inspect" | "archive")[] }
+interface VerifiedOwner extends Descriptor { readonly capabilities: readonly ("inspect" | "archive" | "resumeExistingGoal")[] }
 const OWNER_PROTOCOL = 2;
 
 function registry(home: string, root?: string): string {
@@ -25,10 +29,11 @@ const taskId = (value: unknown): value is string => typeof value === "string" &&
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-/** Private local endpoint. It cannot execute arbitrary native methods or start turns. */
+/** Private local endpoint. No arbitrary RPC or ordinary turn submission.
+ * Goal resume is opt-in and runs only through the verified native owner. */
 export async function serveOwnerChannel(
   home: string,
-  owner: Pick<OwnerTransport, "ownsTask" | "archiveIdle"> & Partial<Pick<OwnerTransport, "inspectTask">>,
+  owner: Pick<OwnerTransport, "ownsTask" | "archiveIdle"> & Partial<Pick<OwnerTransport, "inspectTask" | "resumeExistingGoal">>,
   root?: string,
 ): Promise<{ close(): Promise<void> }> {
   const id = randomUUID();
@@ -53,17 +58,22 @@ export async function serveOwnerChannel(
         try { request = JSON.parse(buffer.trim()); } catch { socket.destroy(); return; }
         if (!object(request) || typeof request.token !== "string" || request.token.length !== token.length
           || !timingSafeEqual(Buffer.from(request.token), Buffer.from(token)) || !taskId(request.threadId)
-          || !["probe", "inspect", "archive"].includes(String(request.operation))) { socket.destroy(); return; }
+          || !["probe", "inspect", "archive", "resumeExistingGoal"].includes(String(request.operation))) { socket.destroy(); return; }
         try {
           if (request.operation === "probe") socket.end(JSON.stringify({ ok: true, owned: await owner.ownsTask(request.threadId),
-            protocol: OWNER_PROTOCOL, capabilities: owner.inspectTask ? ["inspect", "archive"] : ["archive"] }) + "\n");
+            protocol: OWNER_PROTOCOL, capabilities: ["archive", ...(owner.inspectTask ? ["inspect"] : []), ...(owner.resumeExistingGoal && request.goalResumeCapability === true ? ["resumeExistingGoal"] : [])] }) + "\n");
           else if (request.operation === "inspect") {
             if (!owner.inspectTask) throw new OwnerTransportError("unavailable", "Owner inspection is unavailable.");
             socket.end(JSON.stringify({ ok: true, status: await owner.inspectTask(request.threadId) }) + "\n");
           }
-          else { await owner.archiveIdle(request.threadId); socket.end('{"ok":true}\n'); }
+          else if (request.operation === "archive") { await owner.archiveIdle(request.threadId); socket.end('{"ok":true}\n'); }
+          else {
+            if (!owner.resumeExistingGoal || !object(request.expected)) throw new OwnerTransportError("rejected", "Goal resume is unavailable.");
+            const goal = await owner.resumeExistingGoal(request.threadId, request.expected as unknown as OwnerGoalResumeExpectation);
+            socket.end(JSON.stringify({ ok: true, goal }) + "\n");
+          }
         } catch (error) {
-          const outcome = error instanceof OwnerTransportError ? error.outcome : request.operation === "archive" ? "unknown" : "unavailable";
+          const outcome = error instanceof OwnerTransportError ? error.outcome : (request.operation === "archive" || request.operation === "resumeExistingGoal") ? "unknown" : "unavailable";
           socket.end(JSON.stringify({ ok: false, outcome }) + "\n");
         }
       })().catch(() => socket.destroy());
@@ -84,7 +94,7 @@ export async function serveOwnerChannel(
   };
 }
 
-function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "archive", threadId: string, timeoutMs: number): Promise<Record<string, unknown>> {
+function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "archive" | "resumeExistingGoal", threadId: string, timeoutMs: number, expected?: OwnerGoalResumeExpectation, goalResumeCapability = false): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(descriptor.endpoint); let sent = false; let done = false; let buffer = "";
     const finish = (error?: OwnerTransportError, result?: Record<string, unknown>) => {
@@ -92,21 +102,21 @@ function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "arc
       if (error) reject(error); else resolve(result!);
     };
     const failed = (cause?: NodeJS.ErrnoException) => finish(new OwnerTransportError(
-      sent && operation === "archive" ? "unknown" : "unavailable",
+      sent && (operation === "archive" || operation === "resumeExistingGoal") ? "unknown" : "unavailable",
       "Owner channel unavailable; no automatic retry.",
       !sent && (cause?.code === "ENOENT" || cause?.code === "ECONNREFUSED") ? "endpointMissing" : undefined,
     ));
     const timer = setTimeout(failed, timeoutMs);
     socket.on("error", failed); socket.on("end", () => failed()); socket.on("close", () => failed());
-    socket.on("connect", () => { sent = true; socket.write(JSON.stringify({ token: descriptor.token, operation, threadId }) + "\n"); });
+    socket.on("connect", () => { sent = true; socket.write(JSON.stringify({ token: descriptor.token, operation, threadId, ...(expected ? { expected } : {}), ...(goalResumeCapability ? { goalResumeCapability: true } : {}) }) + "\n"); });
     socket.setEncoding("utf8"); socket.on("data", (chunk: string) => {
-      buffer += chunk; if (buffer.length > 4096) { failed(); return; }
+      buffer += chunk; if (Buffer.byteLength(buffer, "utf8") > 64 * 1024) { failed(); return; }
       if (!buffer.includes("\n")) return;
       try {
         const result: unknown = JSON.parse(buffer.trim());
         if (!object(result) || typeof result.ok !== "boolean") { failed(); return; }
         if (result.ok) finish(undefined, result);
-        else finish(new OwnerTransportError(result.outcome === "rejected" ? "rejected" : result.outcome === "unknown" || operation === "archive" ? "unknown" : "unavailable", "Owner could not confirm the operation."));
+        else finish(new OwnerTransportError(result.outcome === "rejected" ? "rejected" : result.outcome === "unknown" || operation === "archive" || operation === "resumeExistingGoal" ? "unknown" : "unavailable", "Owner could not confirm the operation."));
       } catch { failed(); }
     });
   });
@@ -130,13 +140,13 @@ async function findOwner(home: string, threadId: string, root?: string, timeoutM
   }
   if (descriptors.length > 32) throw new OwnerTransportError("unavailable", "Too many owner endpoints.");
   const probes = await Promise.allSettled(descriptors.map(async d => {
-    const response = await callOwner(d, "probe", threadId, Math.min(timeoutMs, 3000));
+    const response = await callOwner(d, "probe", threadId, Math.min(timeoutMs, 3000), undefined, true);
     if (typeof response.owned !== "boolean") throw new OwnerTransportError("unavailable", "Invalid owner probe response.");
     if (!response.owned) return null;
     if (response.protocol !== OWNER_PROTOCOL) throw new OwnerTransportError("outdated", "Owner adapter protocol is outdated; restart the selected Codex client with the current VKodex adapter.");
-    if (!Array.isArray(response.capabilities) || response.capabilities.some(value => value !== "inspect" && value !== "archive"))
+    if (!Array.isArray(response.capabilities) || response.capabilities.some(value => value !== "inspect" && value !== "archive" && value !== "resumeExistingGoal"))
       throw new OwnerTransportError("unavailable", "Owner adapter reported invalid capabilities.");
-    return { ...d, capabilities: response.capabilities as ("inspect" | "archive")[] };
+    return { ...d, capabilities: response.capabilities as ("inspect" | "archive" | "resumeExistingGoal")[] };
   }));
   // A failed probe cannot prove absence or uniqueness of an owner. In particular,
   // do not switch to an external writer while a registered IDE is initializing.
@@ -174,4 +184,17 @@ export async function archiveThroughOwner(home: string, threadId: string, root?:
   if (!owner.capabilities.includes("archive")) throw new OwnerTransportError("outdated", "Owner adapter cannot archive tasks; restart the selected Codex client with the current VKodex adapter.");
   await callOwner(owner, "archive", threadId, timeoutMs);
   return true;
+}
+
+export async function resumeGoalThroughOwner(home: string, threadId: string, expected: OwnerGoalResumeExpectation,
+  root?: string, timeoutMs = 35_000): Promise<TaskGoal | null> {
+  const owner = await findOwner(home, threadId, root, timeoutMs);
+  if (!owner) return null;
+  if (!owner.capabilities.includes("resumeExistingGoal")) throw new OwnerTransportError("outdated", "Owner adapter cannot resume existing goals; restart the selected Codex client with the current VKodex adapter.");
+  const response = await callOwner(owner, "resumeExistingGoal", threadId, timeoutMs, expected);
+  let goal: TaskGoal | null;
+  try { goal = parseTaskGoal(response.goal, threadId); }
+  catch { throw new OwnerTransportError("unknown", "Owner could not verify the resumed goal; no automatic retry."); }
+  if (!goal) throw new OwnerTransportError("unknown", "Owner returned no resumed goal after dispatch.");
+  return goal;
 }

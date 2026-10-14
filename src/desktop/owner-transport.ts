@@ -1,5 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
+import type { TaskGoal } from "../core/codex-tasks.js";
+import { parseTaskGoal } from "../core/task-goals.js";
 
 type Message = Record<string, unknown>;
 const object = (value: unknown): value is Message => !!value && typeof value === "object" && !Array.isArray(value);
@@ -45,6 +47,17 @@ export class OwnerTransportError extends Error {
   ) { super(message); }
 }
 
+export interface OwnerGoalResumeExpectation {
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly objectiveHash: string;
+  readonly tokenBudget: number | null;
+}
+
+export function objectiveHash(objective: string): string {
+  return createHash("sha256").update(objective).digest("hex");
+}
+
 /** Experimental transport, not installed into production clients automatically.
  * One native connection and initialization. Extra requests never impersonate a second client. */
 export class OwnerTransport {
@@ -68,6 +81,10 @@ export class OwnerTransport {
   }>();
   private readonly archiving = new Set<string>();
   private readonly archiveGroups = new Map<string, Set<string>>();
+  private readonly resumingGoals = new Set<string>();
+  private readonly goalRevisions = new Map<string, number>();
+  private goalRevision(threadId: string): number { return this.goalRevisions.get(threadId) ?? 0; }
+  private bumpGoalRevision(threadId: string): void { this.goalRevisions.set(threadId, this.goalRevision(threadId) + 1); }
 
   constructor(
     private readonly nativeInput: Writable,
@@ -160,6 +177,7 @@ export class OwnerTransport {
         this.send(this.clientOutput, { id: message.id, error: { code: -32000, message: "VKodex is checking archival of this thread; retry after it finishes." } });
         return;
       }
+      if (typeof threadId === "string" && !["thread/read", "thread/goal/get", "thread/items/list", "thread/turns/list"].includes(message.method)) this.bumpGoalRevision(threadId);
       const id = this.prefix + ++this.sequence;
       const receipt = this.receiptContext(message.method, message.params);
       this.pending.set(id, { clientId: message.id, initialize: message.method === "initialize", ...(receipt ? { receipt } : {}) });
@@ -174,6 +192,8 @@ export class OwnerTransport {
   }
 
   private fromNative(message: Message): void {
+    if (object(message.params) && typeof message.params.threadId === "string"
+      && (message.method === "thread/goal/updated" || message.method === "thread/goal/cleared")) this.bumpGoalRevision(message.params.threadId);
     if (message.method === "thread/archived" && object(message.params) && typeof message.params.threadId === "string") {
       const group = this.archiveGroups.get(message.params.threadId);
       for (const id of group ?? [message.params.threadId]) this.archiving.delete(id);
@@ -251,8 +271,50 @@ export class OwnerTransport {
     return thread.status.type as "idle" | "active" | "systemError";
   }
 
+  async resumeExistingGoal(threadId: string, expected: OwnerGoalResumeExpectation): Promise<TaskGoal> {
+    const id = uuid(threadId);
+    if (!id || this.resumingGoals.has(id) || this.archiving.has(id)) throw new OwnerTransportError("rejected", "Invalid or busy goal resume request.");
+    if (!Number.isSafeInteger(expected.createdAt) || expected.createdAt <= 0
+      || !Number.isSafeInteger(expected.updatedAt) || expected.updatedAt <= 0
+      || !/^[0-9a-f]{64}$/u.test(expected.objectiveHash)
+      || !(expected.tokenBudget === null || (Number.isSafeInteger(expected.tokenBudget) && expected.tokenBudget > 0))) {
+      throw new OwnerTransportError("rejected", "Invalid goal identity.");
+    }
+    this.resumingGoals.add(id);
+    const revision = this.goalRevision(id);
+    let unknown = false;
+    try {
+      const status = await this.inspectTask(id);
+      if (status !== "idle" && status !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.");
+      const current = parseTaskGoal((await this.request("thread/goal/get", { threadId: id })).goal ?? null, id);
+      if (!current || (current.status !== "paused" && current.status !== "blocked")
+        || current.createdAt !== expected.createdAt || current.updatedAt !== expected.updatedAt
+        || current.tokenBudget !== expected.tokenBudget || objectiveHash(current.objective) !== expected.objectiveHash) {
+        throw new OwnerTransportError("rejected", "Goal identity or status changed before resume.");
+      }
+      if (this.goalRevision(id) !== revision) throw new OwnerTransportError("rejected", "Goal changed during resume preflight.");
+      const freshStatus = await this.inspectTask(id);
+      if (freshStatus !== "idle" && freshStatus !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.");
+      if (this.goalRevision(id) !== revision) throw new OwnerTransportError("rejected", "Goal changed during resume preflight.");
+      const result = await this.request("thread/goal/set", { threadId: id, status: "active" }, true);
+      let resumed: TaskGoal | null;
+      try { resumed = parseTaskGoal(result.goal, id); }
+      catch { throw new OwnerTransportError("unknown", "Native goal resume could not be verified; no automatic retry."); }
+      if (!resumed || resumed.status !== "active" || resumed.createdAt !== expected.createdAt
+        || resumed.tokenBudget !== expected.tokenBudget || objectiveHash(resumed.objective) !== expected.objectiveHash) {
+        throw new OwnerTransportError("unknown", "Native goal resume could not be verified; no automatic retry.");
+      }
+      return resumed;
+    } catch (error) {
+      unknown = error instanceof OwnerTransportError && error.outcome === "unknown";
+      throw error;
+    } finally {
+      if (!unknown) this.resumingGoals.delete(id);
+    }
+  }
+
   async archiveIdle(threadId: string): Promise<void> {
-    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(threadId) || this.archiving.has(threadId)) throw new OwnerTransportError("rejected", "Invalid or busy archive request.");
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(threadId) || this.archiving.has(threadId) || this.resumingGoals.has(threadId)) throw new OwnerTransportError("rejected", "Invalid or busy archive request.");
     this.archiving.add(threadId);
     const group = new Set([threadId]);
     this.archiveGroups.set(threadId, group);
@@ -285,13 +347,14 @@ export class OwnerTransport {
       };
       const descendants = await listDescendants();
       for (const id of descendants) {
-        if (this.archiving.has(id)) throw new OwnerTransportError("rejected", "A descendant is already being archived.");
+        if (this.archiving.has(id) || this.resumingGoals.has(id)) throw new OwnerTransportError("rejected", "A descendant already has a control operation in progress.");
         this.archiving.add(id); group.add(id);
       }
       // Gate the entire tree before checking it. Never resume an unloaded child:
       // it might belong to another client and its idle state is not established.
       for (const id of group) {
         checkDeadline();
+        if (this.resumingGoals.has(id)) throw new OwnerTransportError("rejected", "A goal resume is already in progress.");
         const result = await this.request("thread/read", { threadId: id, includeTurns: false });
         const thread = result.thread;
         // `systemError` is terminal and has no running turn. Requiring only

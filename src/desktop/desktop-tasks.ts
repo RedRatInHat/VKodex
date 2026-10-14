@@ -148,6 +148,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
 
   healthGoal(task: TaskRef) { return this.getGoal(task); }
 
+  resumeGoalOnNativeOwner(task: TaskRef, expected: import("./contracts.js").TaskGoal) {
+    return this.goals?.resumeOnNativeOwner?.(task, expected) ?? Promise.resolve(null);
+  }
+
   async setGoal(task: TaskRef, update: TaskGoalUpdate) {
     if (!this.goals) throw new ActionRejectedError("Управление целями недоступно в текущем подключении.");
     return this.goals.set(task, update);

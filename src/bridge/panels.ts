@@ -960,18 +960,19 @@ export class TaskPanels {
   private async requestGoalStatusActivation(binding: Binding, goal: TaskGoal,
     attempt: GoalContinuationState): Promise<string> {
     try {
-      // The native goal loop runs only in a loaded thread. This preparation
-      // stays on the selected owner and never launches a visible UI client.
-      if (!this.desktop.prepareGoalRuntime)
-        throw new ActionRejectedError("Для задачи не подтверждён постоянный исполнитель цели.");
-      await this.desktop.prepareGoalRuntime(binding);
-      // Loading the runtime can take minutes. A stale menu must not activate
-      // a different goal created while the owner was being prepared.
-      if (goalIntentKey(goal) !== goalIntentKey(await this.goal(binding)))
-        throw new ActionRejectedError("Цель изменилась во время подключения. Обнови /goal и проверь её состояние.");
-      const updated = await this.desktop.setGoal!(binding, { status: "active" });
+      // Prefer the native UI's loaded runtime. Errors/unknown mutations never
+      // authorize fallback to a competing writer or a short-lived metadata RPC.
+      let updated = await this.desktop.resumeGoalOnNativeOwner?.(binding, goal);
+      if (updated == null) {
+        if (!this.desktop.prepareGoalRuntime)
+          throw new ActionRejectedError("Для задачи не подтверждён постоянный исполнитель цели.");
+        await this.desktop.prepareGoalRuntime(binding);
+        if (goalIntentKey(goal) !== goalIntentKey(await this.goal(binding)))
+          throw new ActionRejectedError("Цель изменилась во время подключения. Обнови /goal и проверь её состояние.");
+        updated = await this.desktop.setGoal!(binding, { status: "active" });
+      }
       if (updated.threadId !== binding.threadId || updated.status !== "active"
-        || updated.objective !== goal.objective || updated.createdAt !== goal.createdAt)
+        || updated.objective !== goal.objective || updated.createdAt !== goal.createdAt || updated.tokenBudget !== goal.tokenBudget)
         throw new UncertainActionError();
       this.markGoalContinuation(binding, attempt, "statusOnlyActive", updated);
       return "Цель активна. Нативный запуск следующего хода не подтверждён отдельной квитанцией. Проверь ход в Codex; если цель осталась активной без хода, поставь её на паузу и возобнови после проверки.";

@@ -958,6 +958,43 @@ test("uncertain native status-only activation is fenced without a second write",
   assert.equal(writes, 1);
 });
 
+test("blocked goal resumes through its native UI owner without acquiring a profile writer", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "blocked",
+    tokenBudget: null, tokensUsed: 211628709, timeUsedSeconds: 703529, createdAt: 1, updatedAt: 2 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  let calls = 0;
+  Object.assign(s.desktop, { resumeGoalOnNativeOwner: async (_task: TaskRef, expected: TaskGoal) => {
+    assert.deepEqual(expected, s.desktop.goal); calls++;
+    return s.desktop.goal = { ...expected, status: "active", updatedAt: 3 };
+  } });
+  s.desktop.prepareGoalRuntime = async () => { assert.fail("must not acquire native UI's task"); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(calls, 1);
+  assert.equal(s.desktop.goal?.status, "active");
+  assert.deepEqual(s.desktop.goalUpdates, []);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "statusOnlyActive");
+  assert.match(panelView(s).text, /запуск.*хода.*не подтверждён/u);
+});
+
+test("unknown native-owner goal resume never falls back or blindly retries", async t => {
+  const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
+  s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "blocked",
+    tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
+  s.desktop.activateGoalWithReceipt = undefined as never;
+  let calls = 0;
+  Object.assign(s.desktop, { resumeGoalOnNativeOwner: async () => { calls++; throw new UncertainActionError(); } });
+  s.desktop.prepareGoalRuntime = async () => { assert.fail("unknown is not permission to fall back"); };
+  await s.handle("/goal", peerId);
+  await clickPanel(s, "Возобновить");
+  assert.equal(calls, 1);
+  assert.deepEqual(s.desktop.goalUpdates, []);
+  assert.equal(s.store.getValue<{ phase: string }>(`goal-continuation:${binding.id}`)?.phase, "uncertain");
+  await clickPanel(s, "Возобновить");
+  assert.equal(calls, 1);
+});
+
 test("goal runtime refusal does not activate the goal or write through another owner", async t => {
   const s = setup(t); const binding = s.attach(); s.desktop.capabilities.goals = true;
   s.desktop.goal = { threadId: task.threadId, objective: "Continue work", status: "paused",

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { createServer } from "node:net";
+import { createServer, createConnection } from "node:net";
 import test from "node:test";
 import { OwnerTransport, OwnerTransportError, type OwnerReceiptTrace } from "../src/desktop/owner-transport.js";
-import { archiveThroughOwner, inspectThroughOwner, serveOwnerChannel } from "../src/desktop/owner-channel.js";
+import { archiveThroughOwner, inspectThroughOwner, resumeGoalThroughOwner, serveOwnerChannel } from "../src/desktop/owner-channel.js";
 import { ProfileDesktopMetadata, unownedArchiveReady } from "../src/desktop/metadata.js";
 import { UncertainActionError } from "../src/desktop/contracts.js";
 import { createOwnerReceiptTraceSink, ownerEnvironment, resolveOwnerExecutable } from "../src/desktop/owner-launcher.js";
@@ -540,4 +540,153 @@ test("profile archive prefers the native owner and never falls back after an unc
   assert.equal(external, 0);
   await new ProfileDesktopMetadata(() => "selected-home", fallback, async () => false).archive(task);
   assert.equal(external, 1);
+});
+
+const resumableGoal = {
+  threadId, objective: "Resume the verified objective", status: "paused",
+  tokenBudget: 1000, tokensUsed: 10, timeUsedSeconds: 20, createdAt: 100, updatedAt: 200,
+};
+const resumeExpectation = {
+  createdAt: 100, updatedAt: 200,
+  objectiveHash: createHash("sha256").update(resumableGoal.objective).digest("hex"), tokenBudget: 1000,
+};
+
+test("owner resumes only the verified paused goal and verifies the active identity", async () => {
+  let goal: any = { ...resumableGoal };
+  const f = fixture({
+    "thread/goal/get": () => ({ goal }),
+    "thread/goal/set": m => { goal = { ...goal, status: m.params.status, updatedAt: 201 }; return { goal }; },
+  });
+  f.initialize();
+  const resumed = await f.transport.resumeExistingGoal(threadId, resumeExpectation);
+  assert.equal(resumed?.status, "active");
+  assert.equal(f.requests.filter(r => r.method === "thread/goal/set").length, 1);
+  assert.deepEqual(f.requests.find(r => r.method === "thread/goal/set")?.params, { threadId, status: "active" });
+  f.transport.close();
+});
+
+test("owner rejects a changed goal before writing and unknown resume is never retried", async () => {
+  const changed = fixture({ "thread/goal/get": () => ({ goal: { ...resumableGoal, updatedAt: 201 } }) });
+  changed.initialize();
+  await assert.rejects(changed.transport.resumeExistingGoal(threadId, resumeExpectation));
+  assert.equal(changed.requests.some(r => r.method === "thread/goal/set"), false);
+  changed.transport.close();
+
+  const unknown = fixture({ "thread/goal/get": () => ({ goal: resumableGoal }), "thread/goal/set": () => undefined }, 15);
+  unknown.initialize();
+  await assert.rejects(unknown.transport.resumeExistingGoal(threadId, resumeExpectation), (e: unknown) => e instanceof OwnerTransportError && e.outcome === "unknown");
+  await assert.rejects(unknown.transport.resumeExistingGoal(threadId, resumeExpectation));
+  assert.equal(unknown.requests.filter(r => r.method === "thread/goal/set").length, 1);
+  unknown.transport.close();
+});
+
+test("owner channel resume returns a goal larger than the request frame and keeps old capability clients valid", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-goal-channel-"));
+  const channel = await serveOwnerChannel(root, {
+    ownsTask: async () => true, archiveIdle: async () => {},
+    resumeExistingGoal: async () => ({ ...resumableGoal, status: "active", objective: "x".repeat(12_000) }),
+  } as any, root);
+  try {
+    const result = await resumeGoalThroughOwner(root, threadId, resumeExpectation, root);
+    assert.equal(result?.status, "active");
+    assert.equal(result?.objective.length, 12_000);
+  } finally { await channel.close(); }
+});
+
+test("resume fails closed for foreign ownership and disallowed goal statuses", async () => {
+  const foreign = fixture({ "thread/loaded/list": () => ({ data: [] }) }); foreign.initialize();
+  await assert.rejects(foreign.transport.resumeExistingGoal(threadId, resumeExpectation));
+  assert.equal(foreign.requests.some(r => r.method === "thread/goal/set"), false); foreign.transport.close();
+  for (const status of ["active", "complete", "budgetLimited", "usageLimited"]) {
+    const f = fixture({ "thread/goal/get": () => ({ goal: { ...resumableGoal, status } }) }); f.initialize();
+    await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation));
+    assert.equal(f.requests.some(r => r.method === "thread/goal/set"), false); f.transport.close();
+  }
+});
+
+test("unknown goal resume leaves native UI writable but rejects a second control mutation", async () => {
+  const f = fixture({ "thread/goal/get": () => ({ goal: resumableGoal }), "thread/goal/set": () => undefined }, 15); f.initialize();
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation), (e: unknown) => e instanceof OwnerTransportError && e.outcome === "unknown");
+  f.send({ id: 99, method: "turn/start", params: { threadId } });
+  assert.equal(f.requests.filter(r => r.method === "turn/start").length, 1);
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation));
+  assert.equal(f.requests.filter(r => r.method === "thread/goal/set").length, 1); f.transport.close();
+});
+
+test("old owner adapters remain usable for old operations and reject new resume without mutation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-old-goal-"));
+  const channel = await serveOwnerChannel(root, { ownsTask: async () => true, archiveIdle: async () => {} }, root);
+  try {
+    await assert.rejects(resumeGoalThroughOwner(root, threadId, resumeExpectation, root), (e: unknown) => e instanceof OwnerTransportError && e.outcome === "outdated");
+  } finally { await channel.close(); }
+});
+
+test("invalid goal response after dispatch is unknown and cannot be retried", async () => {
+  const f = fixture({ "thread/goal/get": () => ({ goal: resumableGoal }), "thread/goal/set": () => ({ goal: null }) }); f.initialize();
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation), (e: unknown) => e instanceof OwnerTransportError && e.outcome === "unknown");
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation));
+  assert.equal(f.requests.filter(r => r.method === "thread/goal/set").length, 1); f.transport.close();
+});
+
+test("frontend mutation during goal preflight invalidates resume without blocking UI", async () => {
+  const f = fixture({ "thread/goal/get": () => undefined }); f.initialize();
+  const pending = f.transport.resumeExistingGoal(threadId, resumeExpectation);
+  await new Promise(resolve => setImmediate(resolve));
+  const read = f.requests.find(r => r.method === "thread/goal/get")!;
+  f.send({ id: 100, method: "thread/goal/clear", params: { threadId } });
+  f.native({ id: read.id, result: { goal: resumableGoal } });
+  await assert.rejects(pending, (e: unknown) => e instanceof OwnerTransportError && e.outcome === "rejected");
+  assert.equal(f.requests.some(r => r.method === "thread/goal/clear"), true);
+  assert.equal(f.requests.some(r => r.method === "thread/goal/set"), false);
+  f.transport.close();
+});
+
+test("archive and goal resume exclude each other including a resuming descendant", async () => {
+  const child = "22222222-2222-4222-8222-222222222222";
+  const f = fixture({
+    "thread/loaded/list": () => ({ data: [threadId, child] }),
+    "thread/read": m => ({ thread: { id: m.params.threadId, status: { type: "idle" } } }),
+    "thread/list": () => ({ data: [{ id: child }], nextCursor: null }),
+    "thread/goal/get": () => undefined,
+  }); f.initialize();
+  const resume = f.transport.resumeExistingGoal(child, resumeExpectation);
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(f.transport.archiveIdle(child));
+  await assert.rejects(f.transport.archiveIdle(threadId));
+  assert.equal(f.requests.some(r => r.method === "thread/archive"), false);
+  const pendingRead = f.requests.find(r => r.method === "thread/goal/get")!;
+  f.native({ id: pendingRead.id, result: { goal: null } });
+  await assert.rejects(resume);
+  f.transport.close();
+  const g = fixture({ "thread/goal/get": () => undefined }); g.initialize();
+  const archive = g.transport.archiveIdle(threadId);
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(g.transport.resumeExistingGoal(threadId, resumeExpectation));
+  const archiveRead = g.requests.find(r => r.method === "thread/goal/get")!;
+  g.native({ id: archiveRead.id, result: { goal: { status: "active" } } });
+  await assert.rejects(archive);
+  assert.equal(g.requests.some(r => r.method === "thread/goal/set"), false);
+  g.transport.close();
+});
+
+test("old protocol-2 probe never sees opt-in capabilities and null resume response is unknown", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-probe-goal-"));
+  const channel = await serveOwnerChannel(root, {
+    ownsTask: async () => true, archiveIdle: async () => {}, inspectTask: async () => "idle",
+    resumeExistingGoal: async () => null as never,
+  }, root);
+  try {
+    const directory = path.join(root, createHash("sha256").update(comparablePath(root)).digest("hex"));
+    const descriptor = JSON.parse(await readFile(path.join(directory, (await readdir(directory))[0]!), "utf8"));
+    const reply = await new Promise<Message>((resolve, reject) => {
+      const socket = createConnection(descriptor.endpoint); let text = "";
+      socket.on("error", reject);
+      socket.on("connect", () => socket.write(JSON.stringify({ token: descriptor.token, operation: "probe", threadId }) + "\n"));
+      socket.on("data", chunk => { text += String(chunk); if (text.includes("\n")) { socket.destroy(); resolve(JSON.parse(text)); } });
+    });
+    assert.equal(reply.protocol, 2);
+    assert.deepEqual(reply.capabilities.sort(), ["archive", "inspect"]);
+    await assert.rejects(resumeGoalThroughOwner(root, threadId, resumeExpectation, root),
+      (e: unknown) => e instanceof OwnerTransportError && e.outcome === "unknown");
+  } finally { await channel.close(); }
 });
