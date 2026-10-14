@@ -3,7 +3,7 @@ import { createConnection } from "node:net";
 import type { Duplex } from "node:stream";
 import { StockAddNotWritten } from "../codex/native-stock-admission.js";
 import { ManagedNativeQueueRefusal } from "./managed-native-stock-queue-adapter.js";
-import { DesktopRequestRejectedError, DesktopUnavailableError, UncertainActionError } from "./contracts.js";
+import { ActionRejectedError, DesktopRequestRejectedError, DesktopUnavailableError, UncertainActionError } from "./contracts.js";
 
 export type IpcObject = Record<string, unknown>;
 // Match the desktop IPC limit: a task snapshot includes its full loaded history.
@@ -20,6 +20,29 @@ function validateFrameSize(size: number, limit = MAX_FRAME_BYTES): void {
   if (size > limit) throw new DesktopUnavailableError(limit === MAX_FRAME_BYTES
     ? "Пакет состояния Codex превышает лимит подключения 256 МиБ."
     : `Пакет состояния Codex превышает заданный лимит подключения ${limit} байт.`);
+}
+
+function normalizeTurnInput(method: string, version: number, params: IpcObject): IpcObject {
+  const start = method === "thread-follower-start-turn" && version === 2;
+  const steer = method === "thread-follower-steer-turn" && version === 1;
+  if (!start && !steer) return params;
+  const rawContainer = start ? (isObject(params.turnStart) ? params.turnStart.request : undefined) : params;
+  const container = isObject(rawContainer) ? rawContainer : null;
+  if (!container || container.input === undefined) return params;
+  if (!Array.isArray(container.input)) throw new ActionRejectedError("Некорректный формат входа turn: input должен быть массивом.");
+  let changed = false;
+  const input = container.input.map(item => {
+    if (!isObject(item) || item.type !== "text") return item;
+    if (item.text_elements !== undefined && !Array.isArray(item.text_elements)) {
+      throw new ActionRejectedError("Некорректный формат входа turn: text_elements должен быть массивом.");
+    }
+    if (item.text_elements !== undefined) return item;
+    changed = true; return { ...item, text_elements: [] };
+  });
+  if (!changed) return params;
+  // Native UI calls text_elements.some(...) before persistence canonicalization.
+  if (start) return { ...params, turnStart: { ...(params.turnStart as IpcObject), request: { ...container, input } } };
+  return { ...params, input };
 }
 
 export function isObject(value: unknown): value is IpcObject {
@@ -262,6 +285,9 @@ export class DesktopIpcClient {
     if (!this.stream || (method !== "initialize" && !this.clientId)) {
       return Promise.reject(new DesktopUnavailableError());
     }
+    let normalizedParams: IpcObject;
+    try { normalizedParams = normalizeTurnInput(method, version, params); }
+    catch (error) { return Promise.reject(error instanceof Error ? error : new DesktopUnavailableError("Некорректный формат входа turn.")); }
     const requestId = randomUUID();
     const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
     return new Promise((resolve, reject) => {
@@ -273,7 +299,7 @@ export class DesktopIpcClient {
         ...(options.targetClientId ? { targetClientId: options.targetClientId } : {}) });
       try {
         this.write({
-          type: "request", requestId, method, version, params, timeoutMs,
+          type: "request", requestId, method, version, params: normalizedParams, timeoutMs,
           sourceClientId: this.clientId ?? "initializing-client",
           ...(options.targetClientId ? { targetClientId: options.targetClientId } : {}),
         });

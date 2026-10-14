@@ -2988,6 +2988,34 @@ test("IPC decoding accepts large UTF-8 frames in chunks and continues with the n
   assert.deepEqual(messages[1], { type: "after-large-frame" });
 });
 
+test("turn input requests normalize missing text_elements before native dispatch", async () => {
+  const server = new Server(); const client = new DesktopIpcClient(() => server, 100);
+  const original = { conversationId: ref.threadId, turnStart: { request: { input: [
+    { type: "text", text: "hello" }, { type: "text", text: "kept", text_elements: [{ placeholder: "aeon-continuation" }] },
+    { type: "localImage", path: "C:/fixture.png" },
+  ] } } };
+  try {
+    await client.connect(); await client.request("thread-follower-start-turn", 2, original);
+    const sent = server.received.find(message => message.method === "thread-follower-start-turn")!;
+    assert.deepEqual(((sent.params as IpcObject).turnStart as IpcObject).request, { input: [
+      { type: "text", text: "hello", text_elements: [] }, { type: "text", text: "kept", text_elements: [{ placeholder: "aeon-continuation" }] },
+      { type: "localImage", path: "C:/fixture.png" },
+    ] });
+    assert.deepEqual(original.turnStart.request.input[0], { type: "text", text: "hello" });
+    const before = server.received.length;
+    await assert.rejects(client.request("thread-follower-steer-turn", 1, { input: null as unknown as never }), /input/u);
+    await assert.rejects(client.request("thread-follower-steer-turn", 1, { input: [{ type: "text", text: "bad", text_elements: null as unknown as never }] }), /text_elements/u);
+    await assert.rejects(client.request("thread-follower-steer-turn", 1, { input: [{ type: "text", text: "bad", text_elements: "bad" as unknown as never }] }), /text_elements/u);
+    assert.equal(server.received.length, before);
+    await client.request("thread-follower-steer-turn", 1, { input: [{ type: "text", text: "steer" }] });
+    const steer = server.received.find(message => message.method === "thread-follower-steer-turn")!;
+    assert.deepEqual((steer.params as IpcObject).input, [{ type: "text", text: "steer", text_elements: [] }]);
+    await client.request("unrelated-method", 2, { input: [{ type: "text", text: "untouched" }] });
+    const unrelated = server.received.find(message => message.method === "unrelated-method")!;
+    assert.deepEqual(unrelated.params, { input: [{ type: "text", text: "untouched" }] });
+  } finally { client.close(); }
+});
+
 test("runtime connects a large task and mirrors progress without forwarding tool output", async t => {
   const s = runtimeSetup(t);
   s.server.dataState = state([
