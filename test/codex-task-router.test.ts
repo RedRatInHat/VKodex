@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { withDiagnosticSink, type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 import { RoutedCodexTasks, type CodexTaskOwner } from "../src/core/codex-task-router.js";
-import { ActionRejectedError, DesktopUnavailableError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, LegacyExecutionFencedError, TaskOwnedByClientError, UncertainActionError, type CodexTasks, type EditLastUserTurnRequest, type TaskRef } from "../src/core/codex-tasks.js";
 import { PassiveTaskStateTransport, RoutedTaskStateTransport, TaskStateConnections, type TaskStateStream, type TaskStateTransport } from "../src/core/task-state.js";
 
 const primary = { hostId: "local", threadId: "primary" };
@@ -117,6 +117,63 @@ test("diagnostic exclusive owner refusal never records or executes a fallback", 
   assert.deepEqual(f.calls, []);
   assert.equal(records.find(record => record.event === "route.selected")?.route, "exclusive-owner");
   assert.equal(records.some(record => record.event === "route.fallback"), false);
+});
+
+test("a legacy execution fence routes one time through only the already-connected native submit", async () => {
+  const f = fixture();
+  f.owner.submitWithReceipt = async () => { f.calls.push("owner:fenced-submit"); throw new LegacyExecutionFencedError(); };
+
+  assert.deepEqual(await f.routed.submitWithReceipt({ task: work, operationId: "legacy-fence", text: "prompt" }),
+    { mode: "steer", turnId: "client-turn" });
+  assert.deepEqual(f.calls, ["owner:fenced-submit", "base:connectedSubmit"]);
+});
+
+test("a legacy fence without a connected native submit refuses without retry or launch", async () => {
+  const f = fixture();
+  const owner = { ...f.owner, submitWithReceipt: async () => {
+    f.calls.push("owner:fenced-submit"); throw new LegacyExecutionFencedError();
+  } };
+  const { submitConnectedWithReceipt: _connectedSubmit, ...base } = f.base;
+  void _connectedSubmit;
+  const typedBase = base satisfies CodexTasks;
+  const routed = new RoutedCodexTasks(typedBase, [owner]);
+
+  await assert.rejects(routed.submitWithReceipt({ task: work, operationId: "native-absent", text: "prompt" }), ActionRejectedError);
+  assert.deepEqual(f.calls, ["owner:fenced-submit"]);
+});
+
+test("a connected native timeout propagates without retrying the profile owner", async () => {
+  const f = fixture(); const timeout = new DesktopUnavailableError("connected native timed out");
+  f.owner.submitWithReceipt = async () => { f.calls.push("owner:fenced-submit"); throw new LegacyExecutionFencedError(); };
+  f.base.submitConnectedWithReceipt = async () => { f.calls.push("base:connectedSubmit"); throw timeout; };
+
+  await assert.rejects(f.routed.submitWithReceipt({ task: work, operationId: "native-timeout", text: "prompt" }),
+    error => error === timeout);
+  assert.deepEqual(f.calls, ["owner:fenced-submit", "base:connectedSubmit"]);
+});
+
+test("an exclusive owner never falls back after a legacy execution fence", async () => {
+  const f = fixture(); const fenced = new LegacyExecutionFencedError();
+  const owner = { ...f.owner, routingPolicy: "exclusive" as const,
+    submitWithReceipt: async () => { f.calls.push("exclusive:fenced-submit"); throw fenced; } };
+
+  await assert.rejects(new RoutedCodexTasks(f.base, [owner]).submitWithReceipt({
+    task: work, operationId: "exclusive-fence", text: "prompt",
+  }), error => error === fenced);
+  assert.deepEqual(f.calls, ["exclusive:fenced-submit"]);
+});
+
+test("generic action rejection and uncertain submit outcomes never use the legacy fence fallback", async () => {
+  const f = fixture(); const rejected = new ActionRejectedError("other refusal");
+  f.owner.submitWithReceipt = async () => { f.calls.push("owner:rejected-submit"); throw rejected; };
+  await assert.rejects(f.routed.submitWithReceipt({ task: work, operationId: "generic-reject", text: "prompt" }),
+    error => error === rejected);
+
+  const uncertain = new UncertainActionError();
+  f.owner.submitWithReceipt = async () => { f.calls.push("owner:uncertain-submit"); throw uncertain; };
+  await assert.rejects(f.routed.submitWithReceipt({ task: work, operationId: "uncertain-submit", text: "prompt" }),
+    error => error === uncertain);
+  assert.deepEqual(f.calls, ["owner:rejected-submit", "owner:uncertain-submit"]);
 });
 
 test("command router uses exactly the configured source owner", async () => {

@@ -1,6 +1,6 @@
 import type { CodexQuestions } from "./codex-questions.js";
 import { diagnosticEvent } from "../bridge/diagnostics.js";
-import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, sameTask, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
+import { ActionRejectedError, DesktopUnavailableError, LegacyExecutionFencedError, NativeGoalReceiptUnavailableError, TaskOwnedByClientError, sameTask, type AccountUsage, type CodexTasks, type CreateTaskRequest, type DesktopCompatibility,
   type DesktopModel, type DesktopProject, type DesktopSource, type DesktopTask, type EditLastUserTurnRequest,
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
@@ -96,9 +96,13 @@ export class RoutedCodexTasks implements CodexTasks {
     if (!owner) return this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
     try { return await owner.submitWithReceipt(request); }
     catch (error) {
-      if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError)) throw error;
-      if (!this.base.submitConnectedWithReceipt) throw new ActionRejectedError("Задача открыта в Codex, но её активное подключение недоступно. Повтори после восстановления клиента.");
-      diagnosticEvent("route.fallback", { operationId: request.operationId, route: "connected-desktop", reason: "owner-conflict" });
+      if (owner.routingPolicy === "exclusive" || !(error instanceof TaskOwnedByClientError || error instanceof LegacyExecutionFencedError)) throw error;
+      if (!this.base.submitConnectedWithReceipt) {
+        if (error instanceof LegacyExecutionFencedError) throw error;
+        throw new ActionRejectedError("Задача открыта в Codex, но её активное подключение недоступно. Повтори после восстановления клиента.");
+      }
+      diagnosticEvent("route.fallback", { operationId: request.operationId, route: "connected-desktop",
+        reason: error instanceof LegacyExecutionFencedError ? "restored-profile-fence" : "owner-conflict" });
       return this.base.submitConnectedWithReceipt(request);
     }
   }

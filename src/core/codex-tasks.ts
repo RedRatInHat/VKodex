@@ -462,6 +462,15 @@ export class ActionRejectedError extends Error {
   }
 }
 
+/** Local legacy admission refused before dispatch; only an already-connected
+ * native owner may accept the input. This is not proof of writer release. */
+export class LegacyExecutionFencedError extends ActionRejectedError {
+  constructor() {
+    super("Освобождение прежнего исполнителя ещё не подтверждено; новый запуск не отправлен.");
+    this.name = "LegacyExecutionFencedError";
+  }
+}
+
 export interface PromptRejectionContext {
   readonly operationId: string;
   readonly method: "turn/start" | "turn/steer" | "thread/queue/add";

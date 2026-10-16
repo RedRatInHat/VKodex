@@ -1,4 +1,4 @@
-import { ActionRejectedError, TaskOwnedByClientError, type ExecutionDrainResult, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, LegacyExecutionFencedError, TaskOwnedByClientError, type ExecutionDrainResult, type TaskRef } from "../core/codex-tasks.js";
 import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelope,
   type AppServerRequestOptions, type AppServerRpc } from "./app-server-connection.js";
 
@@ -100,6 +100,10 @@ export class LegacyExecutionLifecycle {
   private assertAdmissionExcept(task: TaskRef, allowed?: AcquisitionAttempt): void {
     const drain = this.drains.get(task.threadId);
     if (drain?.state === "released" && this.current(drain.generation)) throw new TaskOwnedByClientError();
+    // A restored fence still forbids this profile from acquiring a writer.
+    // Distinguish its pre-dispatch refusal so an already-open native owner
+    // can receive input without clearing or bypassing the profile fence.
+    if (drain?.restored) throw new LegacyExecutionFencedError();
     if (drain) throw new ActionRejectedError("Освобождение прежнего исполнителя ещё не подтверждено; новый запуск не отправлен.");
     if ([...(this.acquisitions.get(task.threadId) ?? [])].some(attempt => attempt !== allowed
       && (allowed !== undefined || attempt.state !== "pending")))

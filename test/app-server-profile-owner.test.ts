@@ -3,7 +3,7 @@ import test from "node:test";
 import { AppServerRejectedError, AppServerUnavailableError, AppServerUncertainError, type AppServerEnvelope, type AppServerInitializedSession,
   type AppServerRequestOptions, type AppServerRpc, type AppServerServerRequestHandler } from "../src/codex/app-server-connection.js";
 import { AppServerProfileOwner, AppServerOwnerStateRouter } from "../src/codex/app-server-profile-owner.js";
-import { ActionRejectedError, TaskOwnedByClientError } from "../src/core/codex-tasks.js";
+import { ActionRejectedError, LegacyExecutionFencedError, TaskOwnedByClientError } from "../src/core/codex-tasks.js";
 import { RoutedCodexTasks } from "../src/core/codex-task-router.js";
 import type { CodexTasks } from "../src/core/codex-tasks.js";
 import { LegacyExecutionLifecycle } from "../src/codex/legacy-execution-lifecycle.js";
@@ -623,6 +623,19 @@ test("a restored unavailable-generation fence blocks all owner entrypoints witho
       assert.equal(typeof restorer, "function", "the profile owner exposes the synchronous recovery fence");
     } finally { await owner.close(); }
   });
+});
+
+test("restored App Server owner submission surfaces typed legacy fence before RPC", async () => {
+  const rpc = new Rpc(); rpc.sessionAvailable = false;
+  const owner = new AppServerProfileOwner("work", rpc);
+  try {
+    owner.restoreExecutionDrain(taskRef);
+    await assert.rejects(owner.submitWithReceipt({ operationId: "restored-submit", task: taskRef, text: "fixture" }),
+      LegacyExecutionFencedError);
+    assert.equal(rpc.starts, 0, "the restored writer fence must not start the App Server");
+    assert.deepEqual(rpc.requests, [], "the restored writer fence must reject before every RPC request");
+    assert.deepEqual(rpc.calls, []);
+  } finally { await owner.close(); }
 });
 
 test("restoring an execution fence for a foreign source rejects before RPC", async () => {
