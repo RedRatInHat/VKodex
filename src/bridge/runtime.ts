@@ -1018,6 +1018,31 @@ export class BridgeRuntime {
     if (details && (details.status === "running" || details.status === "approval") || this.hasPendingTaskWork(binding.id)) {
       throw new ActionRejectedError("Задача ещё выполняется, ожидает ответа или сверки результата. Дождись завершения либо используй /stop; управление не передано приложению Codex.");
     }
+    // Opening a window is not a writer handoff. In particular, closing a
+    // legacy subscription outside its drain loses the original-session proof
+    // while the native backend may continue retaining the thread.
+    const needsDrain = this.desktop.drainIdleExecution && this.desktop.executionDrainSupported?.(binding) !== false
+      && (this.connections.has(binding.id) && !this.connections.isReadOnly(binding.id)
+        || this.executionLifecycle(binding) !== null || this.desktop.pendingLegacyAcquisition?.(binding));
+    if (needsDrain) {
+      const generation = this.store.streamGeneration(binding.id);
+      const matches = (): boolean => {
+        const current = this.store.getBinding(binding.id);
+        return !this.stopped && !!current?.attached && sameTask(current, binding)
+          && this.store.streamGeneration(binding.id) === generation;
+      };
+      await this.maintainExecutionLifecycle(binding, matches);
+      const lifecycle = this.executionLifecycle(binding);
+      if (!matches() || lifecycle?.state !== "released"
+        || this.releasedExecutionScopes.get(binding.id) !== JSON.stringify([taskKey(binding), generation])) {
+        throw new ActionRejectedError(lifecycle?.state === "waiting-unload"
+          ? "VKodex отписался от задачи, но Codex ещё не подтвердил освобождение владельца. Открытие Desktop отложено; повторять рабочий запрос не нужно."
+          : "Освобождение владельца задачи не подтверждено. Открытие окна не снимет блокировку Desktop; проверка health продолжается, рабочий запрос не повторялся.");
+      }
+      this.demanded.delete(binding.id);
+      this.pendingReacquire.delete(binding.id);
+      return;
+    }
     if (this.connections.isReadOnly(binding.id)) { this.releaseIdleSubscription(binding); return; }
     this.demanded.delete(binding.id);
     this.pendingReacquire.delete(binding.id);

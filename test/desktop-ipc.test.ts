@@ -702,6 +702,126 @@ test("health idle drain blocks an active Android writer and releases only after 
   assert.equal(s.store.acceptedTurns(s.binding.id).length, 2);
 });
 
+test("/open waits for the exact writer drain and does not reveal while blocked or waiting for unload", async t => {
+  for (const result of ["blocked", "waiting-unload"] as const) {
+    await t.test(result, async t => {
+      let writerStarts = 0, writerCloses = 0, drainCalls = 0, reveals = 0, releaseCallbacks = 0;
+      const writer: TaskStateTransport = {
+        subscribe(task, onState) {
+          return { task, start: async () => {
+            writerStarts++;
+            onState({ ...state([], "completed"), id: task.threadId }, true);
+          }, verifyOwner: async () => {}, close: () => { writerCloses++; } };
+        }, close() {},
+      };
+      const s = runtimeSetup(t, undefined, writer);
+      s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+        effort: null, nextModel: null, nextEffort: null, context: null });
+      Object.assign(s.desktop, {
+        executionDrainSupported: () => true,
+        drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void) => {
+          drainCalls++;
+          if (result === "blocked") return "blocked" as const;
+          beforeRelease(); releaseCallbacks++;
+          return "waiting-unload" as const;
+        },
+        revealTask: async () => { reveals++; },
+      });
+      await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+        .connectBinding(s.binding, ref);
+      assert.equal(writerStarts, 1, "the fixture begins with its existing command-capable writer");
+
+      await s.runtime.handle({ eventId: `open-${result}`, peerId: s.peerId, senderId: s.access.ownerId, text: "/open" });
+
+      assert.deepEqual({
+        drainCalls,
+        releaseCallbacks,
+        writerCloses,
+        reveals,
+        handoffStatus: s.store.getValue<{ status: string }>(`desktop-handoff:${s.binding.id}`)?.status ?? null,
+        reportedSuccess: /Команда открытия отправлена/u.test(s.sent.at(-1)?.view.text ?? ""),
+      }, {
+        drainCalls: 1,
+        releaseCallbacks: result === "blocked" ? 0 : 1,
+        writerCloses: result === "blocked" ? 0 : 1,
+        reveals: 0,
+        handoffStatus: "live",
+        reportedSuccess: false,
+      }, `${result}: /open may reveal and claim handoff only after physical release proof`);
+    });
+  }
+});
+
+test("/open reveals after released proof and with a passive follower that has no legacy ticket", async t => {
+  await t.test("released writer", async t => {
+    let writerStarts = 0, writerCloses = 0, drainCalls = 0, reveals = 0;
+    const writer: TaskStateTransport = {
+      subscribe(task, onState) {
+        return { task, start: async () => {
+          writerStarts++;
+          onState({ ...state([], "completed"), id: task.threadId }, true);
+        }, verifyOwner: async () => {}, close: () => { writerCloses++; } };
+      }, close() {},
+    };
+    const s = runtimeSetup(t, undefined, writer);
+    s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+      effort: null, nextModel: null, nextEffort: null, context: null });
+    Object.assign(s.desktop, {
+      executionDrainSupported: () => true,
+      drainIdleExecution: async (_task: typeof ref, beforeRelease: () => void) => {
+        drainCalls++; beforeRelease(); return "released" as const;
+      },
+      revealTask: async () => { reveals++; },
+    });
+    await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref): Promise<void> })
+      .connectBinding(s.binding, ref);
+    assert.equal(writerStarts, 1);
+
+    await s.runtime.handle({ eventId: "open-released", peerId: s.peerId, senderId: s.access.ownerId, text: "/open" });
+
+    assert.equal(drainCalls, 1);
+    assert.equal(writerCloses, 1);
+    assert.equal(reveals, 1, "the app opens only after released proof for the current writer");
+    assert.equal(s.store.getValue<{ status: string }>(`desktop-handoff:${s.binding.id}`)?.status, "live",
+      "opening the existing live task does not rewrite its observed handoff state");
+    assert.match(s.sent.at(-1)?.view.text ?? "", /Команда открытия отправлена/u);
+  });
+
+  await t.test("passive follower without legacy acquisition", async t => {
+    let passiveStarts = 0, passiveCloses = 0, drainCalls = 0, reveals = 0;
+    const passive: TaskStateTransport = {
+      readOnly: true,
+      subscribe(task, onState) {
+        return { task, readOnly: true, start: async () => {
+          passiveStarts++;
+          onState({ ...state([], "completed"), id: task.threadId }, true);
+        }, verifyOwner: async () => {}, close: () => { passiveCloses++; } };
+      }, close() {},
+    };
+    const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, passive);
+    s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null,
+      effort: null, nextModel: null, nextEffort: null, context: null });
+    Object.assign(s.desktop, {
+      executionDrainSupported: () => true,
+      pendingLegacyAcquisition: () => null,
+      drainIdleExecution: async () => { drainCalls++; return "blocked" as const; },
+      revealTask: async () => { reveals++; },
+    });
+    await (s.runtime as unknown as { connectBinding(binding: Binding, task: typeof ref, intent: "observe"): Promise<void> })
+      .connectBinding(s.binding, ref, "observe");
+    assert.equal(passiveStarts, 1);
+
+    await s.runtime.handle({ eventId: "open-passive", peerId: s.peerId, senderId: s.access.ownerId, text: "/open" });
+
+    assert.equal(drainCalls, 0, "a passive observer without a legacy acquisition needs no writer drain");
+    assert.equal(passiveCloses, 0, "the read-only observer remains attached while the UI opens");
+    assert.equal(reveals, 1);
+    assert.equal(s.store.getValue<{ status: string }>(`desktop-handoff:${s.binding.id}`)?.status, "live",
+      "opening the observed task does not rewrite its live handoff state");
+    assert.match(s.sent.at(-1)?.view.text ?? "", /Команда открытия отправлена/u);
+  });
+});
+
 test("maintenance wakes an exact orphan acquisition without a live stream and refuses a changed ticket", async t => {
   const s = runtimeSetup(t);
   let ticket = Symbol("original-acquisition");
