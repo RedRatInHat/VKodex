@@ -31,6 +31,20 @@ test("profile goal resume uses the selected native owner and never the short-liv
   }
 });
 
+test("profile goal resume explains that an active native turn blocks the paused goal", async () => {
+  const task = { hostId: "local", threadId: "thread", sourceId: "work" };
+  const goal = { threadId: task.threadId, objective: "Continue after this turn", status: "paused" as const,
+    tokenBudget: null, tokensUsed: 12, timeUsedSeconds: 34, createdAt: 1, updatedAt: 2 };
+  const activeTaskError = new OwnerTransportError("rejected", "Owner could not confirm the operation.", "nativeTaskActive");
+  const goals = new ProfileDesktopGoals(() => "selected-home", () => { assert.fail("no profile writer fallback"); },
+    async () => { throw activeTaskError; });
+  await assert.rejects(goals.resumeOnNativeOwner(task, goal), (error: unknown) => {
+    assert.ok(error instanceof ActionRejectedError);
+    assert.match(error.message, /Ход.*выполняется.*цель не изменена/iu);
+    return true;
+  });
+});
+
 test("context uses last token usage, clamps at the window and keeps unknown data unknown", () => {
   const usage = { last: { totalTokens: 100 }, total: { totalTokens: 900_000 }, modelContextWindow: 1_000 };
   assert.deepEqual(taskDetails({ latestTokenUsageInfo: usage }).context, { used: 100, window: 1_000, percent: 10 });

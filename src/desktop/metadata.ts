@@ -522,6 +522,8 @@ export class ProfileDesktopGoals implements DesktopGoals {
       if (error.outcome === "unknown") throw new UncertainActionError();
       if (error.outcome === "outdated")
         throw new ActionRejectedError("Адаптер текущего клиента Codex не поддерживает возобновление цели. Обнови адаптер и перезапусти этот клиент после завершения его ходов; цель не изменена.");
+      if (error.outcome === "rejected" && error.reason === "nativeTaskActive")
+        throw new ActionRejectedError("Ход ещё выполняется. Дождись его завершения и возобнови цель; цель не изменена. Текущий ход не прерывался.");
       throw new ActionRejectedError("Текущий клиент Codex не подтвердил безопасное возобновление этой цели. Обнови /goal; цель не изменена.");
     }
   }

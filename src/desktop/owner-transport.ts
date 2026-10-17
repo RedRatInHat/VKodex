@@ -43,7 +43,7 @@ export class OwnerTransportError extends Error {
   constructor(
     readonly outcome: "unavailable" | "outdated" | "rejected" | "unknown",
     message: string,
-    readonly reason?: "endpointMissing",
+    readonly reason?: "endpointMissing" | "nativeTaskActive",
   ) { super(message); }
 }
 
@@ -285,7 +285,7 @@ export class OwnerTransport {
     let unknown = false;
     try {
       const status = await this.inspectTask(id);
-      if (status !== "idle" && status !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.");
+      if (status !== "idle" && status !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.", status === "active" ? "nativeTaskActive" : undefined);
       const current = parseTaskGoal((await this.request("thread/goal/get", { threadId: id })).goal ?? null, id);
       if (!current || (current.status !== "paused" && current.status !== "blocked")
         || current.createdAt !== expected.createdAt || current.updatedAt !== expected.updatedAt
@@ -294,7 +294,7 @@ export class OwnerTransport {
       }
       if (this.goalRevision(id) !== revision) throw new OwnerTransportError("rejected", "Goal changed during resume preflight.");
       const freshStatus = await this.inspectTask(id);
-      if (freshStatus !== "idle" && freshStatus !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.");
+      if (freshStatus !== "idle" && freshStatus !== "systemError") throw new OwnerTransportError("rejected", "Goal resume requires a terminal native task.", freshStatus === "active" ? "nativeTaskActive" : undefined);
       if (this.goalRevision(id) !== revision) throw new OwnerTransportError("rejected", "Goal changed during resume preflight.");
       const result = await this.request("thread/goal/set", { threadId: id, status: "active" }, true);
       let resumed: TaskGoal | null;

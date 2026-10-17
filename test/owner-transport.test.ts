@@ -565,6 +565,58 @@ test("owner resumes only the verified paused goal and verifies the active identi
   f.transport.close();
 });
 
+test("owner refuses a paused goal while its native task is active before reading or writing the goal", async () => {
+  const f = fixture({ "thread/read": () => ({ thread: { id: threadId, status: { type: "active" } } }) });
+  f.initialize();
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation), (error: unknown) => {
+    assert.equal((error as OwnerTransportError).outcome, "rejected");
+    assert.equal(String((error as OwnerTransportError).reason), "nativeTaskActive");
+    return true;
+  });
+  assert.deepEqual(f.requests.filter(request => request.id !== undefined && request.method).map(request => request.method),
+    ["initialize", "thread/loaded/list", "thread/read"]);
+  assert.equal(f.requests.some(request => request.method === "thread/goal/get" || request.method === "thread/goal/set"), false);
+  f.transport.close();
+});
+
+test("owner repeats the native terminal check before goal write and refuses if a turn starts meanwhile", async () => {
+  let reads = 0;
+  const f = fixture({
+    "thread/read": () => ({ thread: { id: threadId, status: { type: ++reads === 1 ? "idle" : "active" } } }),
+    "thread/goal/get": () => ({ goal: resumableGoal }),
+  });
+  f.initialize();
+  await assert.rejects(f.transport.resumeExistingGoal(threadId, resumeExpectation), (error: unknown) => {
+    assert.equal((error as OwnerTransportError).outcome, "rejected");
+    assert.equal(String((error as OwnerTransportError).reason), "nativeTaskActive");
+    return true;
+  });
+  assert.equal(reads, 2, "preflight and immediate-before-write native checks both ran");
+  assert.equal(f.requests.filter(request => request.method === "thread/goal/get").length, 1);
+  assert.equal(f.requests.some(request => request.method === "thread/goal/set"), false);
+  f.transport.close();
+});
+
+test("owner channel carries the safe active-task reason without exposing native error text", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-owner-active-goal-"));
+  const f = fixture({ "thread/read": () => ({ thread: { id: threadId, status: { type: "active" } } }) });
+  f.initialize();
+  const channel = await serveOwnerChannel(root, {
+    ownsTask: id => f.transport.ownsTask(id), archiveIdle: async () => {},
+    resumeExistingGoal: (id, expected) => f.transport.resumeExistingGoal(id, expected),
+  }, root);
+  try {
+    await assert.rejects(resumeGoalThroughOwner(root, threadId, resumeExpectation, root), (error: unknown) => {
+      assert.ok(error instanceof OwnerTransportError);
+      assert.equal(error.outcome, "rejected");
+      assert.equal(String(error.reason), "nativeTaskActive");
+      assert.equal(error.message.includes("Goal resume requires a terminal native task"), false);
+      return true;
+    });
+    assert.equal(f.requests.some(request => request.method === "thread/goal/set"), false);
+  } finally { await channel.close(); f.transport.close(); }
+});
+
 test("owner rejects a changed goal before writing and unknown resume is never retried", async () => {
   const changed = fixture({ "thread/goal/get": () => ({ goal: { ...resumableGoal, updatedAt: 201 } }) });
   changed.initialize();

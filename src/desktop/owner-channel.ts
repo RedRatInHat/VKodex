@@ -74,7 +74,10 @@ export async function serveOwnerChannel(
           }
         } catch (error) {
           const outcome = error instanceof OwnerTransportError ? error.outcome : (request.operation === "archive" || request.operation === "resumeExistingGoal") ? "unknown" : "unavailable";
-          socket.end(JSON.stringify({ ok: false, outcome }) + "\n");
+          // Forward only a known pre-dispatch resume refusal, never raw native errors.
+          const reason = request.operation === "resumeExistingGoal" && outcome === "rejected"
+            && error instanceof OwnerTransportError && error.reason === "nativeTaskActive" ? error.reason : undefined;
+          socket.end(JSON.stringify({ ok: false, outcome, ...(reason ? { reason } : {}) }) + "\n");
         }
       })().catch(() => socket.destroy());
     });
@@ -116,7 +119,8 @@ function callOwner(descriptor: Descriptor, operation: "probe" | "inspect" | "arc
         const result: unknown = JSON.parse(buffer.trim());
         if (!object(result) || typeof result.ok !== "boolean") { failed(); return; }
         if (result.ok) finish(undefined, result);
-        else finish(new OwnerTransportError(result.outcome === "rejected" ? "rejected" : result.outcome === "unknown" || operation === "archive" || operation === "resumeExistingGoal" ? "unknown" : "unavailable", "Owner could not confirm the operation."));
+        else finish(new OwnerTransportError(result.outcome === "rejected" ? "rejected" : result.outcome === "unknown" || operation === "archive" || operation === "resumeExistingGoal" ? "unknown" : "unavailable", "Owner could not confirm the operation.",
+          operation === "resumeExistingGoal" && result.outcome === "rejected" && result.reason === "nativeTaskActive" ? "nativeTaskActive" : undefined));
       } catch { failed(); }
     });
   });
