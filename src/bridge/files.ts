@@ -3,6 +3,7 @@ import { lstat, mkdir, open, readdir, realpath, rm, statfs } from "node:fs/promi
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import { ActionRejectedError, type TaskDetails } from "../core/codex-tasks.js";
 import type { LocalInputFile, RemoteAttachment } from "../domain/models.js";
 import { safeFileName } from "../lib/files.js";
@@ -158,12 +159,35 @@ export function validateVkFileUrl(raw: string): URL {
   return url;
 }
 
+/** Retry only rejected GET responses, before consuming or writing file bytes.
+ * Keep the caller's one deadline and redirect allowlist; never replay a turn. */
+async function fetchVkAttachment(url: URL, signal: AbortSignal): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    signal.throwIfAborted();
+    const response = await fetch(url, { signal, redirect: "manual" });
+    if (response.ok || [301, 302, 303, 307, 308].includes(response.status)) return response;
+    await response.body?.cancel();
+    const refusal = new ActionRejectedError(`Не удалось скачать вложение из VK (HTTP ${response.status}, сервер ${url.hostname}, попытка ${attempt}). Сообщение не отправлено.`);
+    if (attempt >= 3 || ![404, 408, 429, 500, 502, 503, 504].includes(response.status)) throw refusal;
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    const requestedMs = retryAfter && /^\d+$/u.test(retryAfter) ? Number(retryAfter) * 1000
+      : retryAfter ? Date.parse(retryAfter) - Date.now() : NaN;
+    // Do not shorten a server's long rate-limit cooldown or hold a download
+    // worker indefinitely. The user may retry later instead.
+    if (requestedMs > 30_000) throw refusal;
+    const waitMs = Number.isFinite(requestedMs) ? Math.max(0, requestedMs)
+      : (response.status === 429 ? 2000 : 500) * attempt;
+    try { await delay(waitMs, undefined, { signal }); }
+    catch { throw refusal; }
+  }
+}
+
 export async function downloadVkFile(raw: string, maxBytes: number, timeoutMs = FILE_LIMITS.timeoutMs): Promise<Buffer> {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let url = validateVkFileUrl(raw);
     for (let redirects = 0; redirects <= 4; redirects++) {
-      const response = await fetch(url, { signal: controller.signal, redirect: "manual" });
+      const response = await fetchVkAttachment(url, controller.signal);
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         await response.body?.cancel();
         const location = response.headers.get("location");
@@ -243,7 +267,7 @@ export async function downloadVkFileToPath(raw: string, target: string, maxBytes
   try {
     let url = validateVkFileUrl(raw);
     for (let redirects = 0; redirects <= 5; redirects++) {
-      const response = await fetch(url, { signal: controller.signal, redirect: "manual" });
+      const response = await fetchVkAttachment(url, controller.signal);
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         await response.body?.cancel();
         const location = response.headers.get("location");

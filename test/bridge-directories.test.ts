@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { prepareBridgeTurnDirectories } from "../src/lib/files.js";
-import { batchOutputFiles, downloadVkFile, FILE_LIMITS, readOutputFiles, validateVkFileUrl } from "../src/bridge/files.js";
+import { batchOutputFiles, downloadVkFile, downloadVkFileToPath, FILE_LIMITS, readOutputFiles, validateVkFileUrl } from "../src/bridge/files.js";
 
 test("bridge turn directories are created inside the workspace and ignored by Git", async () => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "vkodex-workspace-"));
@@ -40,6 +40,54 @@ test("VK file download bounds streamed bytes and hides raw network exceptions", 
   await assert.rejects(downloadVkFile("https://sun1.userapi.com/file", 6), /лимит/u);
   mock.mock.mockImplementation(async () => { throw new Error("PRIVATE_SIGNED_URL"); });
   await assert.rejects(downloadVkFile("https://sun1.userapi.com/file", 100), error => error instanceof Error && !error.message.includes("PRIVATE_SIGNED_URL"));
+});
+
+test("VK attachment retries transient CDN refusals before creating the inbox file", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-cdn-retry-"));
+  const target = path.join(root, "photo.jpg");
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    if (calls <= 2) {
+      await assert.rejects(readFile(target), /ENOENT/u);
+      return new Response("CDN error", { status: calls === 1 ? 404 : 429, headers: { "retry-after": "0" } });
+    }
+    return new Response("photo");
+  });
+  assert.equal(await downloadVkFileToPath("https://sun9.vkuserphoto.ru/photo?secret=PRIVATE", target, 10), 5);
+  assert.equal(await readFile(target, "utf8"), "photo");
+  assert.equal(calls, 3);
+});
+
+test("VK CDN retries are bounded and report HTTP status without signed URLs", async t => {
+  let calls = 0;
+  const mock = t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return new Response("PRIVATE", { status: 429, headers: { "retry-after": "0" } });
+  });
+  await assert.rejects(downloadVkFile("https://sun9.vkuserphoto.ru/PRIVATE?token=PRIVATE", 10), error =>
+    error instanceof Error && /HTTP 429/u.test(error.message) && !error.message.includes("PRIVATE"));
+  assert.equal(calls, 3);
+  mock.mock.mockImplementation(async () => { calls++; return new Response("denied", { status: 403 }); });
+  await assert.rejects(downloadVkFile("https://sun9.vkuserphoto.ru/photo", 10), /HTTP 403/u);
+  assert.equal(calls, 4);
+});
+
+test("VK CDN Retry-After cannot outlive the attachment deadline or bypass redirect validation", async t => {
+  let calls = 0;
+  const mock = t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return new Response("busy", { status: 429, headers: { "retry-after": "10" } });
+  });
+  await assert.rejects(downloadVkFile("https://sun9.vkuserphoto.ru/photo", 10, 20));
+  assert.equal(calls, 1);
+  mock.mock.mockImplementation(async () => {
+    calls++;
+    return calls === 2 ? new Response("busy", { status: 503, headers: { "retry-after": "0" } })
+      : new Response(null, { status: 302, headers: { location: "https://127.0.0.1/private" } });
+  });
+  await assert.rejects(downloadVkFile("https://sun9.vkuserphoto.ru/photo", 10), /сервер/u);
+  assert.equal(calls, 3);
 });
 
 test("output file snapshots preserve bytes and reject oversized files, symlinks and hard links", async () => {
