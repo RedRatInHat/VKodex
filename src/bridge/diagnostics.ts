@@ -16,6 +16,9 @@ export interface DiagnosticContext {
   streamGeneration?: number | undefined;
 }
 export interface DiagnosticFields extends DiagnosticContext {
+  incidentId?: string;
+  subjectThreadId?: string;
+  retryAfterMs?: number;
   stage?: string;
   outcome?: string;
   route?: string;
@@ -65,7 +68,10 @@ const words = new Set(["start", "success", "failure", "accepted", "rejected", "u
   "pending", "adapter-returned", "receipt", "history-reconciled", "invalid-response", "abandoned", "dropped",
   "no-passive-route", "connection-not-ready", "route-changed", "cancelled", "model-not-supported-for-account",
   "active-writer", "owner-busy", "task-not-open", "desktop-unavailable", "other",
-  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported"]);
+  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "unsupported",
+  "execution-drain", "active-local", "unknown-local", "generation-mismatch", "family-pagination-incomplete",
+  "child-active", "goal-active", "queue-pending", "receipt-unknown", "unload-retention-window", "read-failure",
+  "checking", "blocked", "released", "waiting-unload", "predecessor-unverified"]);
 const methods = new Set(["initialize", "thread/read", "thread/resume", "turn/start", "turn/steer", "turn/interrupt",
   "thread/queue/add", "thread/queue/list", "thread/settings/update", "thread-owner-discovery", "thread-stream-subscribe",
   "thread-stream-unsubscribe", "thread-stream-state", "model/list", "thread/turns/list", "thread/goal/get"]);
@@ -73,9 +79,9 @@ const errors = new Set(["Error", "TypeError", "ActionRejectedError", "TaskNotOpe
   "TaskConnectionLostError", "DesktopUnavailableError", "DesktopRequestRejectedError", "UncertainActionError",
   "AppServerUnavailableError", "AppServerRejectedError", "AppServerUncertainError", "ModelUnavailableForAccountError"]);
 const ids = new Set(["attemptId", "parentAttemptId", "connectionAttemptId", "connectionId", "bindingId", "threadId",
-  "sourceId", "operationId", "turnId", "submissionId"]);
+  "sourceId", "operationId", "turnId", "submissionId", "incidentId", "subjectThreadId"]);
 const numbers = new Set(["peerId", "streamGeneration", "backendGeneration", "routeGeneration", "requestId", "mergedCount"]);
-const durations = new Set(["elapsedMs", "queueWaitMs"]);
+const durations = new Set(["elapsedMs", "queueWaitMs", "retryAfterMs"]);
 
 /** Nonstandard identifiers are hashed, never truncated (they can contain secret material). */
 export function diagnosticId(value: string): string {

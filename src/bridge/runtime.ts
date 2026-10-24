@@ -120,7 +120,7 @@ export class BridgeRuntime {
       && this.releasedExecutionScopes.get(binding.id) === JSON.stringify([taskKey(binding), lifecycle.generation]);
   }
   private nativeObservationRecovery(binding: Binding): { at: number; taskKey: string; rolloutPath: string;
-    generation: number; busyAt: number; busyRouteGeneration: number | null; recoveredAt?: number;
+    generation: number; failureAt?: number; busyAt?: number; busyRouteGeneration?: number | null; recoveredAt?: number;
     state: "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" | "recovered" } | null {
     return this.store.getValue(`native-observation-recovery:${binding.id}`);
   }
@@ -200,7 +200,7 @@ export class BridgeRuntime {
         && (!activeTransfer || ["complete", "cancelled"].includes(activeTransfer.phase));
     };
     const marker = { at: this.now(), taskKey: taskKey(original), rolloutPath: original.rolloutPath ?? "",
-      generation, busyAt: failure.at, busyRouteGeneration: null, state: "attempted" as const };
+      generation, failureAt: failure.at, state: "attempted" as const };
     this.background(`native-observation-recovery:${binding.id}`, "native-observation-recovery", async () => {
       if (!current()) return;
       // Persist before any async native discovery. A slow/timed-out launch must
@@ -236,7 +236,8 @@ export class BridgeRuntime {
     }, binding.id);
   }
   private executionLifecycle(binding: Binding): { state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
-    at: number; generation: number; firstSeenAt?: number; reason?: string; reasonSinceAt?: number; nextRetryAt?: number } | null {
+    at: number; generation: number; firstSeenAt?: number; reason?: string; reasonSinceAt?: number;
+    nextRetryAt?: number; subjectThreadId?: string } | null {
     const fact = this.store.getValue<{ taskKey: string; state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
       at: number; generation: number }>(`execution-lifecycle:${binding.id}`);
     return fact?.taskKey === taskKey(binding) && fact.generation === this.store.streamGeneration(binding.id) ? fact : null;
@@ -1117,13 +1118,18 @@ export class BridgeRuntime {
       this.store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state, at, generation,
         firstSeenAt: previous && previous.state !== "released" ? previous.firstSeenAt ?? previous.at : at,
         ...(proof ? { reason: proof.reason,
+          ...(proof.subjectThreadId ? { subjectThreadId: proof.subjectThreadId } : {}),
           ...(Number.isFinite(proof.elapsedMs) ? { reasonSinceAt: at - Math.max(0, proof.elapsedMs!) } : {}),
           ...(Number.isFinite(proof.retryAfterMs) ? { nextRetryAt: at + Math.max(0, proof.retryAfterMs!) } : {}) } :
           state === "checking" && previous?.reason ? { reason: previous.reason } : {}),
       });
       if (state !== "checking") diagnosticEvent("connection.lifecycle", { bindingId: binding.id,
         threadId: binding.threadId, sourceId: binding.sourceId ?? "", stage: "execution-drain", outcome: state === "released" ? "success" : "failure",
-        reason: proof?.reason ?? state, streamGeneration: generation, ready: false });
+        reason: proof?.reason ?? state, streamGeneration: generation, ready: false,
+        incidentId: JSON.stringify([binding.id, generation, previous?.firstSeenAt ?? previous?.at ?? at]),
+        elapsedMs: Math.max(0, at - (previous?.firstSeenAt ?? previous?.at ?? at)),
+        ...(proof?.subjectThreadId ? { subjectThreadId: proof.subjectThreadId } : {}),
+        ...(Number.isFinite(proof?.retryAfterMs) ? { retryAfterMs: Math.max(0, proof!.retryAfterMs!) } : {}) });
     };
     const assertScope = (): void => {
       if (orphanTicket) {

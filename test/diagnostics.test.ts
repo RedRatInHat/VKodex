@@ -3,6 +3,19 @@ import test from "node:test";
 import { captureDiagnostic, diagnosticEvent, diagnosticError, diagnosticId, diagnosticScope, withDiagnosticSink,
   type DiagnosticRecord } from "../src/bridge/diagnostics.js";
 
+test("drain diagnostics retain approved reasons, incident correlation and hashed proof subjects", () => {
+  const records: DiagnosticRecord[] = [];
+  withDiagnosticSink(record => { records.push(record); }, () => diagnosticEvent("connection.lifecycle", {
+    stage: "execution-drain", outcome: "failure", reason: "goal-active", elapsedMs: 40_000,
+    incidentId: "fixture-incident", subjectThreadId: "private-subject", retryAfterMs: 1_000,
+  }));
+  assert.equal(records[0]?.stage, "execution-drain");
+  assert.equal(records[0]?.reason, "goal-active");
+  assert.equal(records[0]?.incidentId, diagnosticId("fixture-incident"));
+  assert.equal(records[0]?.subjectThreadId, diagnosticId("private-subject"));
+  assert.equal(records[0]?.retryAfterMs, 1_000);
+});
+
 test("diagnostic allowlist excludes payloads, secret-bearing errors and arbitrary scalars", () => {
   const secret = "vk1.a.private-token-and-user-text";
   const records: DiagnosticRecord[] = [];
