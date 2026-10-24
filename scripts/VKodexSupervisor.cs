@@ -108,6 +108,9 @@ internal static class Program
     // not authenticate a substituted parent or implement a same-user sandbox.
     // Never add a kill-on-close job or a native/backend process-tree kill here.
     private const int ValidationRefused = 86;
+    private const string ValidationReason = "validation-refused";
+    private static readonly string[] ValidationStages = { "args", "binding", "bootstrap", "runtime", "descriptor", "plan", "child-start", "child-wait" };
+    private static string validationStage = "args";
     private static readonly string[] BundleFiles = {
         "launcher/VKodexSupervisor.exe", "package.json", "dist/src/desktop/deployment-plan-private.js",
         "dist/src/desktop/deployment-binding.js", "dist/src/desktop/deployment-artifact.js", "dist/src/desktop/runtime.js",
@@ -118,11 +121,15 @@ internal static class Program
     {
         try
         {
+            Stage("args");
             Require(args.Length == 6 && args[0] == "--launch-binding" && args[2] == "--launch-binding-sha256" && args[4] == "--operation");
-            string bindingPath = Absolute(args[1]), bindingPin = Pin(args[3]), operation = args[5];
+            string bindingPin = Pin(args[3]), operation = args[5];
             Require(operation == "plan-only" || operation == "run-once" || operation == "supervise" || operation == "supervise-once");
+            Stage("binding");
+            string bindingPath = Absolute(args[1]);
             using (var trust = new Trust(bindingPath, bindingPin))
             {
+                Stage("plan");
                 var plan = trust.ValidatePlan();
                 if (operation == "plan-only") { Console.OutputEncoding = new UTF8Encoding(false); Console.WriteLine(plan.Json); return 0; }
                 if (operation == "supervise" || operation == "supervise-once")
@@ -144,8 +151,10 @@ internal static class Program
                     info.EnvironmentVariables["BOT_DATA_DIR"] = trust.DataDirectory;
                     info.EnvironmentVariables["VKODEX_RUN_ID"] = DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture)
                         + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
-                    using (var child = Process.Start(info)) { Require(child != null); child.WaitForExit(); return child.ExitCode; }
+                    Stage("child-start");
+                    using (var child = Process.Start(info)) { Require(child != null); Stage("child-wait"); child.WaitForExit(); return child.ExitCode; }
                 }
+                Stage("child-start");
                 string powershell = SystemPowerShell();
                 var supervisor = ChildInfo(powershell, trust.Configuration);
                 supervisor.CreateNoWindow = false;
@@ -155,7 +164,7 @@ internal static class Program
                 supervisor.Arguments = Arguments(command.ToArray());
                 using (var child = Process.Start(supervisor))
                 {
-                    Require(child != null); Process watchdog = null;
+                    Require(child != null); Stage("child-wait"); Process watchdog = null;
                     try
                     {
                         if (operation == "supervise")
@@ -170,6 +179,7 @@ internal static class Program
                                 "-VersionedLauncherPath", trust.Launcher, "-BridgeExecutable", trust.Runtime });
                             try { watchdog = Process.Start(watcher); } catch { Console.Error.WriteLine("VKodex diagnostic watchdog could not start."); }
                         }
+                        Stage("child-wait");
                         child.WaitForExit();
                         if (watchdog != null && !watchdog.WaitForExit(30000))
                             Console.Error.WriteLine("VKodex diagnostic watchdog did not finish promptly.");
@@ -179,7 +189,144 @@ internal static class Program
                 }
             }
         }
-        catch { Console.Error.WriteLine("VKodex versioned launch validation refused."); return ValidationRefused; }
+        catch { EmitValidationRefusal(); return ValidationRefused; }
+    }
+
+    private static void Stage(string value)
+    {
+        foreach (string stage in ValidationStages) if (stage == value) { validationStage = stage; return; }
+        validationStage = "args";
+        throw new InvalidOperationException();
+    }
+
+    private static void EmitValidationRefusal()
+    {
+        string at = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+        int pid = Process.GetCurrentProcess().Id;
+        TryAppendFailureJournal(at, pid, validationStage);
+        try
+        {
+            Console.Error.WriteLine("{\"at\":" + JsonString(at) + ",\"pid\":" + pid.ToString(CultureInfo.InvariantCulture) +
+                ",\"stage\":" + JsonString(validationStage) + ",\"reasonCode\":" + JsonString(ValidationReason) + "}");
+        }
+        catch { }
+    }
+
+    private static void TryAppendFailureJournal(string at, int pid, string stage)
+    {
+        try
+        {
+            string local = Environment.GetEnvironmentVariable("LOCALAPPDATA"); Require(local != null);
+            string root = Absolute(local); Canonical(root, true, false);
+            string vkodex = Path.Combine(root, "VKodex"); EnsureJournalDirectory(vkodex);
+            string diagnostics = Path.Combine(vkodex, "launch-diagnostics"); EnsureJournalDirectory(diagnostics);
+            string journal = Path.Combine(diagnostics, "failures.json");
+            using (var stream = OpenWritableJournal(journal))
+            {
+                Require(stream.Length <= 32 * 1024);
+                byte[] existing = ReadBounded(stream, 32 * 1024);
+                var records = ParseFailureJournal(existing);
+                records.Add(new Dictionary<string, object>(StringComparer.Ordinal) {
+                    { "at", at }, { "pid", (long)pid }, { "stage", stage }, { "reasonCode", ValidationReason }
+                });
+                while (records.Count > 64) records.RemoveAt(0);
+                byte[] bytes = Encoding.UTF8.GetBytes(SerializeFailureJournal(records));
+                Require(bytes.Length <= 32 * 1024);
+                FileInformation before = Inspect(stream.SafeFileHandle, journal, false); Require(before.Links == 1);
+                stream.Position = 0; stream.SetLength(bytes.Length); stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+                FileInformation after = Inspect(stream.SafeFileHandle, journal, false); Require(after.Links == 1);
+                Require(after.Volume == before.Volume && after.IndexHigh == before.IndexHigh && after.IndexLow == before.IndexLow);
+            }
+        }
+        catch { }
+    }
+
+    private static void EnsureJournalDirectory(string directory)
+    {
+        Canonical(directory, true, true);
+        if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
+        Canonical(directory, true, false);
+    }
+
+    private static FileStream OpenWritableJournal(string journal)
+    {
+        if (File.Exists(journal) || Directory.Exists(journal)) Canonical(journal, false, false);
+        var handle = CreateFile(journal, 0xC0000000u, 0u, IntPtr.Zero, 4, 0x00200000u, IntPtr.Zero);
+        try
+        {
+            FileInformation info = Inspect(handle, journal, false); Require(info.Links == 1);
+            return new FileStream(handle, FileAccess.ReadWrite);
+        }
+        catch { handle.Dispose(); throw; }
+    }
+
+    private static byte[] ReadBounded(FileStream stream, int maximum)
+    {
+        Require(stream.Length >= 0 && stream.Length <= maximum);
+        byte[] bytes = new byte[(int)stream.Length]; int offset = 0;
+        while (offset < bytes.Length)
+        {
+            int count = stream.Read(bytes, offset, bytes.Length - offset); Require(count > 0); offset += count;
+        }
+        return bytes;
+    }
+
+    private static List<Dictionary<string, object>> ParseFailureJournal(byte[] bytes)
+    {
+        if (bytes.Length == 0) return new List<Dictionary<string, object>>();
+        string text = new UTF8Encoding(false, true).GetString(bytes);
+        var values = new JsonReader(text).Read() as List<object>; Require(values != null && values.Count <= 64);
+        var result = new List<Dictionary<string, object>>();
+        foreach (object value in values)
+        {
+            var record = Object(value, "at", "pid", "stage", "reasonCode");
+            string at = Text(record["at"]); DateTime timestamp;
+            Require(at.Length <= 32 && DateTime.TryParseExact(at,
+                new string[] { "yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'" },
+                CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out timestamp));
+            long pid = Integer(record["pid"]); Require(pid > 0 && pid <= Int32.MaxValue);
+            string stage = Text(record["stage"]); Require(IsValidationStage(stage));
+            Require(Text(record["reasonCode"]) == ValidationReason);
+            result.Add(new Dictionary<string, object>(StringComparer.Ordinal) { { "at", at }, { "pid", pid }, { "stage", stage }, { "reasonCode", ValidationReason } });
+        }
+        return result;
+    }
+
+    private static bool IsValidationStage(string value)
+    {
+        foreach (string stage in ValidationStages) if (stage == value) return true;
+        return false;
+    }
+
+    private static string SerializeFailureJournal(List<Dictionary<string, object>> records)
+    {
+        var result = new StringBuilder("[");
+        for (int index = 0; index < records.Count; index++)
+        {
+            if (index != 0) result.Append(',');
+            var record = records[index];
+            result.Append("{\"at\":").Append(JsonString((string)record["at"]));
+            result.Append(",\"pid\":").Append(((long)record["pid"]).ToString(CultureInfo.InvariantCulture));
+            result.Append(",\"stage\":").Append(JsonString((string)record["stage"]));
+            result.Append(",\"reasonCode\":").Append(JsonString((string)record["reasonCode"])).Append('}');
+        }
+        return result.Append(']').ToString();
+    }
+
+    private static string JsonString(string value)
+    {
+        var result = new StringBuilder("\"");
+        foreach (char ch in value)
+        {
+            switch (ch)
+            {
+                case '\\': result.Append("\\\\"); break; case '"': result.Append("\\\""); break;
+                case '\b': result.Append("\\b"); break; case '\f': result.Append("\\f"); break;
+                case '\n': result.Append("\\n"); break; case '\r': result.Append("\\r"); break; case '\t': result.Append("\\t"); break;
+                default: if (ch < 32) result.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture)); else result.Append(ch); break;
+            }
+        }
+        return result.Append('"').ToString();
     }
 
     private static void Require(bool condition) { if (!condition) throw new InvalidOperationException(); }
@@ -333,12 +480,14 @@ internal static class Program
             bindingPath = file; bindingPin = pin;
             try
             {
+                Stage("binding");
                 var binding = Object(Metadata(file, pin, 32768).Json(), "version", "descriptorPath", "descriptorSha256", "bootstrapRoot", "bootstrapManifestSha256", "stableRuntimePath", "stableRuntimeSha256");
                 Require(Integer(binding["version"]) == 1);
                 string descriptorPath = Absolute(binding["descriptorPath"]); descriptorPin = Pin(binding["descriptorSha256"]);
                 bootstrap = Absolute(binding["bootstrapRoot"]); bootstrapPin = Pin(binding["bootstrapManifestSha256"]);
                 Runtime = Absolute(binding["stableRuntimePath"]); runtimePin = Pin(binding["stableRuntimeSha256"]);
                 foreach (string other in new string[] { bindingPath, descriptorPath, Runtime }) Require(!Within(bootstrap, other) && !Within(other, bootstrap));
+                Stage("bootstrap");
                 Canonical(bootstrap, true, false); directories.Add(Open(bootstrap, true, true));
                 var manifest = Object(Code(Join(bootstrap, "bootstrap-manifest.json"), bootstrapPin, 131072).Json(), "version", "protocol", "files");
                 Require(Integer(manifest["version"]) == 1 && Text(manifest["protocol"]) == "deployment-plan-v1");
@@ -354,7 +503,9 @@ internal static class Program
                 Require(Text(package["type"]) == "module");
                 Launcher = Join(bootstrap, BundleFiles[0]); Supervisor = Join(bootstrap, "scripts/run-windows-supervisor.ps1"); Watchdog = Join(bootstrap, "scripts/watch-windows-bridge.ps1");
                 Require(EqualPath(Absolute(Process.GetCurrentProcess().MainModule.FileName), Launcher));
+                Stage("runtime");
                 Code(Runtime, runtimePin, 2147483648L);
+                Stage("descriptor");
                 var descriptor = Object(Metadata(descriptorPath, descriptorPin, 32768).Json(), "version", "artifactRoot", "configurationRoot", "dataDirectory", "manifestSha256");
                 Require(Integer(descriptor["version"]) == 1);
                 artifact = Absolute(descriptor["artifactRoot"]); Configuration = Absolute(descriptor["configurationRoot"]); DataDirectory = Absolute(descriptor["dataDirectory"]); manifestPin = Pin(descriptor["manifestSha256"]);
@@ -392,6 +543,7 @@ internal static class Program
         }
         public Plan ValidatePlan()
         {
+            Stage("plan");
             string cli = Join(bootstrap, "dist/src/desktop/deployment-plan-private.js");
             var info = ChildInfo(Runtime, bootstrap); info.Arguments = Arguments(new string[] { cli, "--launch-binding", bindingPath, "--launch-binding-sha256", bindingPin });
             info.RedirectStandardOutput = true; info.RedirectStandardError = true;

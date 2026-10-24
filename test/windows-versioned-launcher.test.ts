@@ -226,6 +226,28 @@ async function runLauncher(fixture: Fixture, operation: Operation, options: { ex
   return runObservedLauncher(fixture, operation, options);
 }
 
+async function runRawRefusal(fixture: Fixture) {
+  const scope = { root: fixture.root, launcherPath: fixture.launcherPath, stableRuntimePath: fixture.stableRuntimePath,
+    bootstrapRoot: fixture.bootstrapRoot };
+  fixtureAuditScopes.set(fixture.root, scope);
+  const child = spawn(fixture.launcherPath,
+    ["--launch-binding", fixture.bindingPath, "--launch-binding-sha256", "0".repeat(64), "--operation", "plan-only"],
+    { cwd: fixture.configurationRoot, shell: false, windowsHide: true,
+      env: { ...process.env, LOCALAPPDATA: fixture.root, NODE_OPTIONS: "", NODE_PATH: "" } });
+  return naturalClose(child, 60_000);
+}
+
+function failureDiagnostic(stderr: string): Record<string, unknown> {
+  assert.equal(stderr.endsWith("\r\n") || stderr.endsWith("\n"), true, "refusal diagnostic is one newline-terminated JSON record");
+  const value = JSON.parse(stderr.trim()) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(value).sort(), ["at", "pid", "reasonCode", "stage"]);
+  assert.match(String(value.at), /^\d{4}-\d{2}-\d{2}T[^\r\n]+Z$/u);
+  assert.equal(typeof value.pid, "number");
+  assert.equal(value.reasonCode, "validation-refused");
+  assert.match(String(value.stage), /^(args|binding|bootstrap|runtime|descriptor|plan|child-start|child-wait)$/u);
+  return value;
+}
+
 async function runObservedLauncher(fixture: Fixture, operation: Operation,
   options: { cp866Parent?: boolean; expectedSha256?: string; expectedExitCode?: 0 | 7 | 86 } = {}) {
   const suffix = "run-" + String(++fixture.monitorInvocationCount).padStart(2, "0");
@@ -579,4 +601,70 @@ test("supervise-once waits for a stderr flush and post-stderr completion before 
   assert.match(supervisorLog, /Bounded versioned run-once completed with exit code 7\./u);
   assert.doesNotMatch(supervisorLog, /watchdog started/iu);
   assert.doesNotMatch(supervisorLog, /restarting in/iu);
+});
+
+test("early binding refusal emits a fixed-stage diagnostic and bounded journal", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {
+  const fixture = await makePrivatePlanFixture();
+  const result = await runRawRefusal(fixture);
+  assert.equal(result.code, 86);
+  assert.equal(result.stdout, "", "validation refusal never changes plan-only stdout");
+  const diagnostic = failureDiagnostic(result.stderr);
+  assert.equal(diagnostic.stage, "binding");
+  const journalPath = path.join(fixture.root, "VKodex", "launch-diagnostics", "failures.json");
+  const journal = JSON.parse(await fs.readFile(journalPath, "utf8")) as unknown;
+  assert.ok(Array.isArray(journal));
+  assert.equal(journal.length, 1);
+  assert.deepEqual(journal[0], diagnostic);
+});
+
+test("malformed or oversized diagnostic journals refuse safely without overwrite", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {
+  for (const original of ["{malformed\n", "x".repeat(32 * 1024 + 1),
+    '[{"at":"2026-10-24Tprivate-dataZ","pid":1,"stage":"binding","reasonCode":"validation-refused"}]']) {
+    const fixture = await makePrivatePlanFixture();
+    const journalPath = path.join(fixture.root, "VKodex", "launch-diagnostics", "failures.json");
+    await fs.mkdir(path.dirname(journalPath), { recursive: true });
+    await fs.writeFile(journalPath, original, "utf8");
+    const result = await runRawRefusal(fixture);
+    assert.equal(result.code, 86);
+    assert.equal(result.stdout, "");
+    assert.equal(failureDiagnostic(result.stderr).stage, "binding");
+    assert.equal(await fs.readFile(journalPath, "utf8"), original, "rejected journal is never overwritten");
+  }
+});
+
+test("hardlink and junction diagnostic targets are refused before journal writes", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {
+  const hardlinkFixture = await makePrivatePlanFixture();
+  const hardlinkPath = path.join(hardlinkFixture.root, "VKodex", "launch-diagnostics", "failures.json");
+  const hardlinkTarget = path.join(hardlinkFixture.root, "hardlink-target.json");
+  await fs.mkdir(path.dirname(hardlinkPath), { recursive: true });
+  await fs.writeFile(hardlinkTarget, "[]\n", "utf8");
+  await fs.link(hardlinkTarget, hardlinkPath);
+  const hardlinkResult = await runRawRefusal(hardlinkFixture);
+  assert.equal(hardlinkResult.code, 86);
+  assert.equal(failureDiagnostic(hardlinkResult.stderr).stage, "binding");
+  assert.equal(await fs.readFile(hardlinkTarget, "utf8"), "[]\n");
+
+  const junctionFixture = await makePrivatePlanFixture();
+  const junctionPath = path.join(junctionFixture.root, "VKodex", "launch-diagnostics", "failures.json");
+  const junctionTarget = path.join(junctionFixture.root, "junction-target");
+  await fs.mkdir(path.dirname(junctionPath), { recursive: true });
+  await fs.mkdir(junctionTarget, { recursive: true });
+  await fs.symlink(junctionTarget, junctionPath, "junction");
+  const junctionResult = await runRawRefusal(junctionFixture);
+  assert.equal(junctionResult.code, 86);
+  assert.equal(failureDiagnostic(junctionResult.stderr).stage, "binding");
+});
+
+test("diagnostic journal retains only the latest 64 refusals", { skip: process.platform !== "win32", timeout: 120_000 }, async () => {
+  const fixture = await makePrivatePlanFixture();
+  for (let attempt = 0; attempt < 65; attempt++) {
+    const result = await runRawRefusal(fixture);
+    assert.equal(result.code, 86);
+    assert.equal(result.stdout, "");
+    failureDiagnostic(result.stderr);
+  }
+  const journalPath = path.join(fixture.root, "VKodex", "launch-diagnostics", "failures.json");
+  const journal = JSON.parse(await fs.readFile(journalPath, "utf8")) as unknown[];
+  assert.equal(journal.length, 64);
+  for (const record of journal) assert.equal((record as Record<string, unknown>).reasonCode, "validation-refused");
 });
