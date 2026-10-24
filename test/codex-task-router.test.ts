@@ -56,6 +56,44 @@ function fixture() {
   return { calls, base, owner, routed: new RoutedCodexTasks(base, [owner]) };
 }
 
+test("a native handoff routes fresh commands to the connected client while preserving original receipts", async () => {
+  const s = fixture();
+  let fences = 0;
+  s.owner.restoreExecutionDrain = () => { fences++; };
+  s.owner.ownsOperation = (_task, operationId) => operationId === "legacy-operation";
+  const routed = s.routed as RoutedCodexTasks & { requireNativeExecution(task: TaskRef): void };
+  routed.requireNativeExecution(work);
+  assert.equal(fences, 1);
+  const receipt = await routed.submitWithReceipt({ task: work, text: "new input", operationId: "new-operation" });
+  assert.deepEqual(receipt, { mode: "steer", turnId: "client-turn" });
+  await routed.selectModel(work, "fixture-model", "low");
+  assert.deepEqual(s.calls, ["base:connectedSubmit", "base:model"]);
+  assert.equal(await routed.findAcceptedInput(work, "legacy-operation"), "accepted");
+  s.base.submitConnectedWithReceipt = async () => { throw new DesktopUnavailableError("native offline"); };
+  await assert.rejects(routed.submitWithReceipt({ task: work, text: "offline input", operationId: "offline-operation" }), DesktopUnavailableError);
+  assert.ok(!s.calls.includes("owner:submit"), "a lost client does not authorize legacy recapture");
+});
+
+test("native handoff policy never bypasses an exclusive claim", async () => {
+  const s = fixture();
+  const owner = { ...s.owner, routingPolicy: "exclusive" as const };
+  const routed = new RoutedCodexTasks(s.base, [owner]) as RoutedCodexTasks & { requireNativeExecution(task: TaskRef): void };
+  routed.requireNativeExecution(work);
+  await routed.submitWithReceipt({ task: work, text: "exclusive input", operationId: "exclusive-operation" });
+  assert.deepEqual(s.calls, ["owner:submit"]);
+});
+
+test("native operation reconciliation follows durable provenance while old profile receipts remain readable", async () => {
+  const s = fixture();
+  const base: CodexTasks = { ...s.base, findAcceptedInput: async () => "native-turn" };
+  const routed = new RoutedCodexTasks(base, [s.owner], (_task, operationId) => operationId === "native-operation");
+  routed.requireNativeExecution(work);
+  assert.equal(await routed.findAcceptedInput(work, "native-operation"), "native-turn");
+  assert.equal(await routed.findAcceptedInput(work, "old-operation"), "accepted");
+  await assert.rejects(routed.setGoal(work, { status: "active" }), ActionRejectedError,
+    "a route change cannot activate a goal in a transient metadata process");
+});
+
 test("native observation recovery never consults a profile owner and rechecks exclusive claims before launch", async () => {
   const s = fixture();
   let exclusive = false, opens = 0;

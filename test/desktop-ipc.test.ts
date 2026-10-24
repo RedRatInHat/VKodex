@@ -556,6 +556,54 @@ test("runtime restores the owner fence before command callbacks and never treats
   assert.deepEqual(s.server.received, [], "rehydration never contacts or starts a backend");
 });
 
+test("a stale execution fence permits a verified native prompt without restoring legacy admission", async t => {
+  let fences = 0;
+  const passive: TaskStateTransport = { readOnly: true,
+    subscribe(task, onState) { return { task, readOnly: true,
+      start: async () => onState(state([], "completed"), true), verifyOwner: async () => {},
+      diagnostic: () => ({ kind: "native-observer" as const }), close() {} }; }, close() {} };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, passive,
+    (store, binding, desktop) => {
+      store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "unavailable",
+        at: 1, generation: store.streamGeneration(binding.id) });
+      Object.assign(desktop, { executionDrainSupported: () => true,
+        restoreExecutionDrain: () => { fences++; }, requireNativeExecution: () => {} });
+    });
+  await s.runtime.tick();
+  await s.runtime.handle({ peerId: s.peerId, senderId: s.access.ownerId, eventId: "native-fenced-input", text: "Native input after restart" });
+  assert.ok(s.server.received.some(item => item.method === "thread-follower-start-turn" || item.method === "thread-follower-steer-turn"),
+    "a verified native owner accepts input despite historical legacy uncertainty");
+  assert.equal(fences, 1, "the old executor remains fenced");
+  assert.equal(s.store.getValue<{ state: string }>(`execution-lifecycle:${s.binding.id}`)?.state, "unavailable",
+    "native success must not forge old-writer release proof");
+  const open = (s.runtime as unknown as { releaseForExternalClient(binding: Binding): Promise<void> }).releaseForExternalClient.bind(s.runtime);
+  await open(s.store.getBinding(s.binding.id)!);
+  assert.equal(s.store.observationHandoff(s.store.getBinding(s.binding.id)!), null,
+    "opening an existing native owner cannot leave an unfinishable handoff obligation");
+});
+
+test("native-only recovery survives restart and discovers a missing client without historical busy events", async t => {
+  let opens = 0;
+  const passive: TaskStateTransport = { readOnly: true,
+    subscribe(task) { return { task, readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+      verifyOwner: async () => {}, close() {} }; }, close() {} };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, passive,
+    (store, binding, desktop) => {
+      store.requireNativeExecution(store.getBinding(binding.id)!, 1, store.streamGeneration(binding.id));
+      store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "released",
+        at: 1, generation: store.streamGeneration(binding.id) });
+      Object.assign(desktop, { requireNativeExecution: () => {}, restoreExecutionDrain: () => {}, executionDrainSupported: () => true,
+        openNativeObservation: async (_task: typeof ref, assertCurrent: () => void) => { assertCurrent(); opens++; return "opened"; } });
+    });
+  await s.runtime.tick();
+  s.advance(61_000);
+  await s.runtime.tick();
+  assert.equal(opens, 1, "a persisted native policy can recover despite a historical lifecycle fence");
+  s.advance(61_000);
+  await s.runtime.tick();
+  assert.equal(opens, 1, "an unconfirmed open is not repeated by later health checks");
+});
+
 test("health idle drain releases only the exact MS writer while preserving its old queue ACK", async t => {
   let writerStarts = 0, writerCloses = 0, passiveStarts = 0, passiveCloses = 0;
   let publishPassive!: (snapshot: IpcObject, initial: boolean) => void;

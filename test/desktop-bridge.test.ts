@@ -38,6 +38,48 @@ const task: DesktopTask = { hostId: "local", threadId: "task-a", title: "Existin
 const peerId = 2_000_000_017;
 const STAGED_FILE_PILOT_FOR_TEST = Object.freeze({ mode: "single-chat" as const, peerId });
 
+test("repair handoff keeps the VK attachment and cannot revive intentional detachment", () => {
+  const store = new BridgeStore();
+  try {
+    const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17);
+    const current = store.getBinding(binding.id)!;
+    const generation = store.streamGeneration(current.id);
+    const operationId = store.beginObservationHandoff(current, generation, 10);
+    assert.equal(store.getBinding(current.id)?.attached, true);
+    assert.equal(store.beginObservationHandoff(current, generation, 20), operationId,
+      "repeated maintenance continues the original obligation");
+    assert.equal(store.observationHandoff(current)?.firstSeenAt, 10);
+    assert.equal(store.completeObservationHandoff(current, "other-operation", generation), false);
+    store.stopStreaming(current.id);
+    store.setAttached(current.id, true);
+    const reattached = store.getBinding(current.id)!;
+    assert.equal(store.observationHandoff(reattached), null, "intentional detach cancels repair ownership");
+    assert.equal(store.completeObservationHandoff(reattached, operationId, generation), false);
+    assert.throws(() => store.requireNativeExecution(current, 30, generation), /scope changed/);
+  } finally { store.close(); }
+});
+
+test("native execution policy preserves original operation provenance and survives observation revisions", () => {
+  const store = new BridgeStore();
+  try {
+    const binding = store.ensureBinding(task); store.setChat(binding.id, peerId, 17);
+    const current = store.getBinding(binding.id)!;
+    store.recordOperation("old-profile", current, undefined, current.id);
+    store.requireNativeExecution(current, 10, store.streamGeneration(current.id));
+    store.recordOperation("new-native", current, undefined, current.id);
+    assert.equal(store.nativeOperation(current, "old-profile"), false);
+    assert.equal(store.nativeOperation(current, "new-native"), true);
+    assert.equal(store.nativeOperation({ ...current, sourceId: "other" }, "new-native"), false);
+    store.stopStreaming(current.id); store.setAttached(current.id, true);
+    assert.equal(store.nativeExecutionRequired(store.getBinding(current.id)!), true,
+      "reconnecting the same physical chat cannot authorize legacy recapture");
+    const rebound = { ...current, id: "a-new-binding-after-transfer", rolloutPath: "C:/fixture/rotated.jsonl" };
+    assert.equal(store.nativeExecutionRequired(rebound), true,
+      "the physical task policy survives a new binding and rollout rotation");
+    assert.equal(store.nativeExecutionRequired({ ...rebound, threadId: "new-target-thread" }), false);
+  } finally { store.close(); }
+});
+
 test("diagnostic trace explains preparation refusal without claiming prompt dispatch", async t => {
   const s = setup(t); s.attach();
   const records: DiagnosticRecord[] = [];

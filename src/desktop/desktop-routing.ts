@@ -10,13 +10,14 @@ type NativeRoute = CodexTaskOwner & TaskStateOwnerRoute;
 /** Install the durable managed-claim fence in both command and state routing.
  * A claim without a qualified worker is unavailable, never a Desktop fallback. */
 export function createDesktopRouting(baseTasks: CodexTasks, baseStates: TaskStateTransport,
-  nativeOwners: readonly NativeRoute[], managedStore: Pick<BridgeStore, 'managedOwner'>,
+  nativeOwners: readonly NativeRoute[], managedStore: Pick<BridgeStore, 'managedOwner'> & Partial<Pick<BridgeStore, 'nativeOperation' | 'nativeExecutionRequired'>>,
   observer?: ManagedOwnerRouteObserver, preferNativeFallback?: (task: TaskRef) => Promise<boolean>, ingress?: ManagedOwnerIngress):
   Readonly<{ tasks: CodexTasks; states: TaskStateTransport; passiveStates?: TaskStateTransport }> {
   const managed = new ManagedOwnerExclusiveRouteGuard(managedStore, observer, ingress);
   const owners = [managed, ...nativeOwners];
   return {
-    tasks: new RoutedCodexTasks(baseTasks, owners),
+    tasks: new RoutedCodexTasks(baseTasks, owners, (task, operationId) => managedStore.nativeOperation?.(task, operationId) === true,
+      task => managedStore.nativeExecutionRequired?.(task) === true),
     states: new RoutedTaskStateTransport(baseStates, owners, preferNativeFallback),
     ...(baseStates.readOnly === true ? { passiveStates: new PassiveTaskStateTransport(baseStates, owners) } : {}),
   };

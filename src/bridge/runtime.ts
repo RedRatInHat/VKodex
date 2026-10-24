@@ -101,6 +101,24 @@ export class BridgeRuntime {
   private readonly releasedExecutionScopes = new Map<string, string>();
   /** A durable attempt is consumed before the native discovery/launch await. */
   private readonly nativeObservationRecoveryCooldownMs = 60_000;
+  private nativeExecutionRequired(binding: Binding): boolean {
+    return this.store.nativeExecutionRequired(binding);
+  }
+  private requireNativeExecution(binding: Binding, generation: number): void {
+    if (!this.desktop.requireNativeExecution || this.store.managedOwner(binding)) return;
+    this.store.requireNativeExecution(binding, this.now(), generation);
+    this.desktop.requireNativeExecution(binding);
+  }
+  private nativeConnectionReady(binding: Binding): boolean {
+    return this.matchesConnection(binding) && this.connections.connected(binding.id)
+      && this.connections.isReadOnly(binding.id)
+      && this.connections.diagnostic(binding.id)?.kind === "native-observer";
+  }
+  private nativeObservationLaunchAllowed(binding: Binding): boolean {
+    const lifecycle = this.executionLifecycle(binding);
+    return !lifecycle || this.nativeExecutionRequired(binding) || lifecycle.state === "released"
+      && this.releasedExecutionScopes.get(binding.id) === JSON.stringify([taskKey(binding), lifecycle.generation]);
+  }
   private nativeObservationRecovery(binding: Binding): { at: number; taskKey: string; rolloutPath: string;
     generation: number; busyAt: number; busyRouteGeneration: number | null; recoveredAt?: number;
     state: "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" | "recovered" } | null {
@@ -110,7 +128,7 @@ export class BridgeRuntime {
     const attempt = this.nativeObservationRecovery(binding);
     return !!attempt && attempt.state === "recovered" && attempt.recoveredAt !== undefined
       && this.nativeObservationRecoveryScopeMatches(binding)
-      && !this.store.managedOwner(binding) && !this.executionLifecycle(binding)
+      && !this.store.managedOwner(binding)
       && this.connections.isReadOnly(binding.id) && this.connections.connected(binding.id)
       && this.connections.diagnostic(binding.id)?.kind === "native-observer";
   }
@@ -125,7 +143,7 @@ export class BridgeRuntime {
     const attempt = this.nativeObservationRecovery(binding);
     if (!attempt || !this.nativeObservationRecoveryScopeMatches(binding)) return null;
     if (attempt.state !== "recovered") return attempt.state;
-    if (this.store.managedOwner(binding) || this.executionLifecycle(binding)) return "unavailable";
+    if (this.store.managedOwner(binding)) return "unavailable";
     if (this.nativeObservationRecoveryReady(binding)) return "ready";
     const failure = this.store.getValue<{ at?: number; kind?: string }>(`route-failure:${binding.id}`);
     return failure?.kind === "no-active-owner" && typeof failure.at === "number"
@@ -136,7 +154,7 @@ export class BridgeRuntime {
     if (!attempt || attempt.taskKey !== taskKey(binding)
       || attempt.rolloutPath !== (binding.rolloutPath ?? "") || attempt.generation !== generation
       || attempt.state === "recovered"
-      || this.store.managedOwner(binding) || this.executionLifecycle(binding)
+      || this.store.managedOwner(binding)
       || !this.connections.isReadOnly(binding.id) || !this.connections.connected(binding.id)
       || this.connections.diagnostic(binding.id)?.kind !== "native-observer") return;
     this.store.setValue(`native-observation-recovery:${binding.id}`, {
@@ -151,29 +169,23 @@ export class BridgeRuntime {
       || binding.hostId !== "local" || (binding.sourceId ?? "") !== ""
       || !binding.attached || binding.peerId === null || this.connections.connected(binding.id)
       || this.desktop.isCreationActive?.(binding) || this.store.managedOwner(binding)
-      || this.executionLifecycle(binding)
+      || !this.nativeObservationLaunchAllowed(binding)
       || this.store.transferBlocksInput(binding.id) || this.pendingReacquire.has(binding.id)
       || this.connecting.has(binding.id)) return;
+    if ([...this.maintenance.values()].filter(job => job.phase === "native-observation-recovery").length >= 2) return;
     const transfer = this.store.transfer(binding.id);
     if (transfer && !["complete", "cancelled"].includes(transfer.phase)) return;
     const failure = this.store.getValue<{ at: number; kind: string; streamGeneration?: number }>(`route-failure:${binding.id}`);
     if (failure?.kind !== "no-active-owner" || !Number.isSafeInteger(failure.at)
       || failure.streamGeneration !== generation) return;
     const events = this.store.connectionDiagnostics(binding.id, binding);
-    const busyIndex = events.findLastIndex(event => event.phase === "resume" && event.outcome === "failed"
-      && event.reason === "owner-busy");
-    const busy = events[busyIndex];
-    const absentIndex = events.findIndex((event, index) => index > busyIndex && event.outcome === "failed"
-      && event.reason === "task-not-open");
-    const absent = events[absentIndex];
-    if (!busy || !absent || events.slice(absentIndex + 1).some(event => event.outcome === "confirmed")) return;
-    if (failure.at < absent.at || this.now() < busy.at || this.now() - busy.at > 5 * 60_000
-      || this.now() < absent.at || this.now() - absent.at > 5 * 60_000) return;
+    // Current scoped failure authorizes discovery, not a historical error sequence.
+    // The adapter still requires an exact broker miss before opening a window.
+    if (failure.at > this.now() || events.some(event => event.outcome === "confirmed" && event.at >= failure.at)) return;
     const prior = this.nativeObservationRecovery(binding);
     if (prior && (this.now() < prior.at || this.now() - prior.at < this.nativeObservationRecoveryCooldownMs)) return;
     if (prior?.taskKey === taskKey(binding) && prior.rolloutPath === (binding.rolloutPath ?? "")
-      && prior.generation === generation && (!prior.recoveredAt || busy.at <= prior.recoveredAt
-        || failure.at <= prior.recoveredAt)) return;
+      && prior.generation === generation && (!prior.recoveredAt || failure.at <= prior.recoveredAt)) return;
     const original = binding;
     const current = (): boolean => {
       const latest = this.store.getBinding(original.id);
@@ -182,13 +194,13 @@ export class BridgeRuntime {
         && sameTask(latest, original) && latest.rolloutPath === original.rolloutPath
         && this.store.streamGeneration(original.id) === generation
         && !this.connections.connected(original.id) && !this.desktop.isCreationActive?.(latest)
-        && !this.store.managedOwner(latest) && !this.executionLifecycle(latest)
+        && !this.store.managedOwner(latest) && this.nativeObservationLaunchAllowed(latest)
         && !this.store.transferBlocksInput(original.id) && !this.pendingReacquire.has(original.id)
         && !this.connecting.has(original.id)
         && (!activeTransfer || ["complete", "cancelled"].includes(activeTransfer.phase));
     };
     const marker = { at: this.now(), taskKey: taskKey(original), rolloutPath: original.rolloutPath ?? "",
-      generation, busyAt: busy.at, busyRouteGeneration: busy.routeGeneration ?? null, state: "attempted" as const };
+      generation, busyAt: failure.at, busyRouteGeneration: null, state: "attempted" as const };
     this.background(`native-observation-recovery:${binding.id}`, "native-observation-recovery", async () => {
       if (!current()) return;
       // Persist before any async native discovery. A slow/timed-out launch must
@@ -224,7 +236,7 @@ export class BridgeRuntime {
     }, binding.id);
   }
   private executionLifecycle(binding: Binding): { state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
-    at: number; generation: number } | null {
+    at: number; generation: number; firstSeenAt?: number; reason?: string; reasonSinceAt?: number; nextRetryAt?: number } | null {
     const fact = this.store.getValue<{ taskKey: string; state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
       at: number; generation: number }>(`execution-lifecycle:${binding.id}`);
     return fact?.taskKey === taskKey(binding) && fact.generation === this.store.streamGeneration(binding.id) ? fact : null;
@@ -275,12 +287,14 @@ export class BridgeRuntime {
     // Controls (model/goal/rename/stop/archive) bypass prompt preparation.
     // Restore the exact owner's fence before installing ANY command callback.
     if (!this.startupAdmission) for (const binding of store.bindings()) {
+      if (store.nativeExecutionRequired(binding)) desktop.requireNativeExecution?.(binding);
       const lifecycle = this.executionLifecycle(binding);
       if (!lifecycle || lifecycle.state === "blocked" || !desktop.restoreExecutionDrain
         || desktop.executionDrainSupported?.(binding) === false) continue;
       desktop.restoreExecutionDrain(binding);
       store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "unavailable",
-        at: now(), generation: lifecycle.generation, previousState: lifecycle.state, previousAt: lifecycle.at });
+        at: now(), generation: lifecycle.generation, firstSeenAt: lifecycle.firstSeenAt ?? lifecycle.at,
+        reason: "predecessor-unverified", previousState: lifecycle.state, previousAt: lifecycle.at });
     }
     this.startedAt = now(); this.lastTickAt = this.startedAt;
     this.connections = new TaskStateConnections(adapters.states, now, (bindingId, event, task) => {
@@ -412,6 +426,8 @@ export class BridgeRuntime {
         lastConnectionDiagnostic: recentConnectionHistory.findLast(event => event.outcome === "failed" || event.outcome === "blocked")
           ?? connectionHistory.at(-1) ?? null,
         ...(route ? { route } : {}),
+        nativeCommandRoute: this.nativeExecutionRequired(binding) && this.nativeConnectionReady(binding),
+        ...(this.store.observationHandoff(binding) ? { observationHandoff: this.store.observationHandoff(binding)! } : {}),
         ...(this.executionLifecycle(binding) ? { executionLifecycle: this.executionLifecycle(binding)! } : {}) };
     });
     const actionableFailure = (binding: (typeof bindings)[number]): boolean => binding.failure !== null
@@ -657,9 +673,10 @@ export class BridgeRuntime {
   private async prepareTaskInput(binding: Binding): Promise<TaskInputScope> {
     if (this.stopped) throw new TaskNotOpenError();
     const lifecycle = this.executionLifecycle(binding);
-    if (lifecycle && lifecycle.state !== "blocked" && !(lifecycle.state === "released"
-      && this.releasedExecutionScopes.get(binding.id) === JSON.stringify([taskKey(binding), lifecycle.generation])))
-      throw new ActionRejectedError("Освобождение прежнего исполнителя ещё не подтверждено для текущего процесса. Наблюдение продолжается; повторный захват задачи не выполнялся.");
+    const nativeOnly = this.nativeExecutionRequired(binding) || !!this.store.observationHandoff(binding)
+      || !!lifecycle && lifecycle.state !== "blocked";
+    if (nativeOnly && !this.desktop.requireNativeExecution)
+      throw new ActionRejectedError("Подтверждённый native маршрут недоступен. Прежний исполнитель остаётся заблокирован.");
     this.prepareBindingObservation(binding);
     const generation = this.store.streamGeneration(binding.id);
     const matches = (): boolean => {
@@ -706,6 +723,10 @@ export class BridgeRuntime {
           this.store.setValue(`route-failure:${binding.id}`, { at: this.now(), kind: "no-active-owner",
             streamGeneration: generation });
           throw new TaskNotOpenError();
+        }
+        if (nativeOnly) {
+          if (!this.nativeConnectionReady(binding)) throw new TaskNotOpenError();
+          this.requireNativeExecution(binding, generation);
         }
       }
       if (this.stopped) throw new TaskNotOpenError();
@@ -1014,10 +1035,18 @@ export class BridgeRuntime {
   }
 
   private async releaseForExternalClient(binding: Binding): Promise<void> {
+    if (this.nativeConnectionReady(binding)) {
+      const generation = this.store.streamGeneration(binding.id);
+      this.requireNativeExecution(binding, generation);
+      const handoff = this.store.observationHandoff(binding);
+      if (handoff) this.store.completeObservationHandoff(binding, handoff.operationId, generation);
+      return;
+    }
     const details = this.store.getValue<TaskDetails>(`task-details:${binding.id}`);
     if (details && (details.status === "running" || details.status === "approval") || this.hasPendingTaskWork(binding.id)) {
       throw new ActionRejectedError("Задача ещё выполняется, ожидает ответа или сверки результата. Дождись завершения либо используй /stop; управление не передано приложению Codex.");
     }
+    this.store.beginObservationHandoff(binding, this.store.streamGeneration(binding.id), this.now());
     // Opening a window is not a writer handoff. In particular, closing a
     // legacy subscription outside its drain loses the original-session proof
     // while the native backend may continue retaining the thread.
@@ -1041,6 +1070,7 @@ export class BridgeRuntime {
       }
       this.demanded.delete(binding.id);
       this.pendingReacquire.delete(binding.id);
+      this.requireNativeExecution(binding, generation);
       return;
     }
     if (this.connections.isReadOnly(binding.id)) { this.releaseIdleSubscription(binding); return; }
@@ -1081,7 +1111,19 @@ export class BridgeRuntime {
     const generation = this.store.streamGeneration(binding.id);
     let retiredWriter = false;
     const writeFact = (state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable"): void => {
-      this.store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state, at: this.now(), generation });
+      const previous = this.executionLifecycle(binding);
+      const at = this.now();
+      const proof = state !== "checking" && state !== "released" ? this.desktop.executionDrainDiagnostic?.(binding) : null;
+      this.store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state, at, generation,
+        firstSeenAt: previous && previous.state !== "released" ? previous.firstSeenAt ?? previous.at : at,
+        ...(proof ? { reason: proof.reason,
+          ...(Number.isFinite(proof.elapsedMs) ? { reasonSinceAt: at - Math.max(0, proof.elapsedMs!) } : {}),
+          ...(Number.isFinite(proof.retryAfterMs) ? { nextRetryAt: at + Math.max(0, proof.retryAfterMs!) } : {}) } :
+          state === "checking" && previous?.reason ? { reason: previous.reason } : {}),
+      });
+      if (state !== "checking") diagnosticEvent("connection.lifecycle", { bindingId: binding.id,
+        threadId: binding.threadId, sourceId: binding.sourceId ?? "", stage: "execution-drain", outcome: state === "released" ? "success" : "failure",
+        reason: proof?.reason ?? state, streamGeneration: generation, ready: false });
     };
     const assertScope = (): void => {
       if (orphanTicket) {
@@ -1309,7 +1351,8 @@ export class BridgeRuntime {
   private async maintainBinding(listed: Binding, generation: number, setPhase: (phase: string) => void): Promise<void> {
     // Keep the ordinary passive reconnect from racing a one-shot native
     // discovery/launch. Other bindings continue on their own maintenance jobs.
-    if (this.maintenance.has(`native-observation-recovery:${listed.id}`)) return;
+    const recovery = this.maintenance.get(`native-observation-recovery:${listed.id}`);
+    if (recovery) await recovery.work;
     const matches = (): boolean => {
       const current = this.store.getBinding(listed.id);
       return !this.stopped && !!current?.attached && sameTask(current, listed)
@@ -1404,7 +1447,8 @@ export class BridgeRuntime {
       return Promise.resolve();
     }
     const lifecycle = this.executionLifecycle(current);
-    if (intent === "command" && lifecycle && ["checking", "waiting-unload", "released", "unavailable"].includes(lifecycle.state))
+    if (intent === "command" && (this.nativeExecutionRequired(current) || this.store.observationHandoff(current)
+      || lifecycle && ["checking", "waiting-unload", "released", "unavailable"].includes(lifecycle.state)))
       intent = "observe"; // Persisted drain intent never authorizes legacy writer reacquisition after restart.
     if (this.matchesConnection(binding)) {
       diagnosticEvent("connection.skip", { bindingId: binding.id, threadId: task.threadId, intent, reason: "matching",
@@ -1531,6 +1575,11 @@ export class BridgeRuntime {
           return;
         }
         trace("connection.result", { outcome: "success", stage: "ready", elapsedMs: this.now() - connectStartedAt });
+        if (!this.startupAdmission && this.nativeConnectionReady(binding)) this.requireNativeExecution(binding, generation);
+        if (!this.startupAdmission && this.nativeConnectionReady(binding)) {
+          const handoff = this.store.observationHandoff(binding);
+          if (handoff) this.store.completeObservationHandoff(binding, handoff.operationId, generation);
+        }
         if (passiveSnapshotObserved && transport === this.passiveStates)
           this.markNativeObservationRecovered(binding, generation);
         if (!this.startupAdmission) this.store.markDesktopHandoff(binding.id, task, "live", this.now());
@@ -1539,6 +1588,8 @@ export class BridgeRuntime {
           ...diagnosticError(error) });
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !currentGeneration() || !current?.attached || !sameTask(current, task)) return;
+        if (transport === this.passiveStates && error instanceof TaskNotOpenError)
+          this.store.setValue(`route-failure:${binding.id}`, { at: this.now(), kind: "no-active-owner", streamGeneration: generation });
         if (this.connections.matches(binding.id, task)) this.closeSubscription(binding.id);
         this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
         this.enableRolloutFallback(current, connectStartedAt);

@@ -18,10 +18,12 @@ class Rpc implements AppServerRpc {
   generation = 1; sessionAvailable = true;
   failResume: Error | null = null;
   threadListResponse: JsonObject = { data: [], nextCursor: null };
+  readonly threadListPages = new Map<string, JsonObject>();
   loadedListResponse: JsonObject = { data: ["task"], nextCursor: null };
   turnsListResponse: JsonObject = { data: [{ id: "accepted-turn", items: [
     { type: "userMessage", clientId: "accepted-operation" },
   ] }], nextCursor: null };
+  readonly turnsListPages = new Map<string, JsonObject>();
   queueListResponse: JsonObject = { data: [], nextCursor: null };
   goalResponse: JsonObject = { goal: null };
   readonly threadReadResponses = new Map<string, JsonObject>();
@@ -76,11 +78,17 @@ class Rpc implements AppServerRpc {
           status: { type: threadId === "task" ? this.threadStatus : "idle" } } });
     }
     if (method === "thread/metadata/update") { this.projectId = _params.projectId ? String(_params.projectId) : null; return {}; }
-    if (method === "thread/list") return structuredClone(this.threadListResponse);
+    if (method === "thread/list") {
+      const cursor = typeof _params.cursor === "string" ? _params.cursor : null;
+      return structuredClone(cursor ? this.threadListPages.get(cursor) ?? { data: [], nextCursor: null } : this.threadListResponse);
+    }
     if (method === "thread/loaded/list") return structuredClone(this.loadedListResponse);
     if (method === "thread/goal/get") return structuredClone(this.goalResponse);
     if (method === "thread/queue/list") return structuredClone(this.queueListResponse);
-    if (method === "thread/turns/list") return structuredClone(this.turnsListResponse);
+    if (method === "thread/turns/list") {
+      const cursor = typeof _params.cursor === "string" ? _params.cursor : null;
+      return structuredClone(cursor ? this.turnsListPages.get(cursor) ?? { data: [], nextCursor: null } : this.turnsListResponse);
+    }
     if (method === "thread/archive") return {};
     throw new Error(method);
   }
@@ -671,15 +679,15 @@ test("routed recovered owners never fall back to native base operations", async 
 });
 
 test("active descendants, goals, and queued inputs fail closed before releasing the owner", async t => {
-  const cases: Array<{ name: string; configure(rpc: Rpc): void }> = [
-    { name: "active root", configure: rpc => { rpc.threadStatus = "active"; } },
+  const cases: Array<{ name: string; reason: string; configure(rpc: Rpc): void }> = [
+    { name: "active root", reason: "active-local", configure: rpc => { rpc.threadStatus = "active"; } },
     { name: "active descendant", configure: rpc => {
       rpc.threadListResponse = { data: [{ id: "child" }], nextCursor: null };
       rpc.threadReadResponses.set("child", { thread: { id: "child", status: { type: "active" } } });
-    } },
-    { name: "active goal", configure: rpc => { rpc.goalResponse = { goal: { id: "goal", status: "active" } }; } },
-    { name: "nonempty native queue", configure: rpc => { rpc.queueListResponse = { data: [{ id: "queued" }], nextCursor: null }; } },
-    { name: "malformed native queue page", configure: rpc => { rpc.queueListResponse = { data: {}, nextCursor: null }; } },
+    }, reason: "child-active" },
+    { name: "active goal", reason: "goal-active", configure: rpc => { rpc.goalResponse = { goal: { id: "goal", status: "active" } }; } },
+    { name: "nonempty native queue", reason: "queue-pending", configure: rpc => { rpc.queueListResponse = { data: [{ id: "queued" }], nextCursor: null }; } },
+    { name: "malformed native queue page", reason: "read-failure", configure: rpc => { rpc.queueListResponse = { data: {}, nextCursor: null }; } },
   ];
   for (const scenario of cases) await t.test(scenario.name, async () => {
     const rpc = new Rpc(); scenario.configure(rpc);
@@ -692,6 +700,7 @@ test("active descendants, goals, and queued inputs fail closed before releasing 
       const before = rpc.calls.length;
       const status = await drainIdle(owner, beforeRelease);
       assert.ok(isBlocked(status), `unsafe snapshot must return blocked/unavailable, got ${status}`);
+      assert.equal(owner.executionDrainDiagnostic(taskRef)?.reason, scenario.reason);
       assert.equal(releaseCalls, 0, "uncertain or non-idle task must retain its owner stream");
       assert.equal(rpc.calls.slice(before).includes("thread/unsubscribe"), false);
       assert.equal(rpc.calls.slice(before).some(method => ["thread/resume", "turn/start", "turn/steer", "thread/queue/add"].includes(method)), false);
@@ -775,6 +784,73 @@ test("an oversized native descendant page fails closed without release", async (
     assert.equal(drainCalls.filter(method => method === "thread/list").length, 1);
     assert.equal(drainCalls.includes("thread/unsubscribe"), false);
     assert.equal(drainCalls.some(method => ["thread/resume", "turn/start", "turn/steer", "thread/queue/add"].includes(method)), false);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("a paginated descendant family is fully inspected and exposes no incomplete-page diagnostic", async () => {
+  const rpc = new Rpc();
+  const first = Array.from({ length: 100 }, (_, index) => ({ id: `child-${index}` }));
+  rpc.threadListResponse = { data: first, nextCursor: "family-2" };
+  rpc.threadListPages.set("family-2", { data: [{ id: "child-100" }], nextCursor: null });
+  const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  try {
+    assert.equal(await drainIdle(owner, () => stream.close()), "waiting-unload");
+    assert.equal(rpc.calls.filter(method => method === "thread/list").length, 4,
+      "both family snapshots must consume the bounded cursor pages");
+    const diagnostic = owner.executionDrainDiagnostic(taskRef);
+    assert.equal(diagnostic?.reason, "unload-retention-window");
+    assert.ok((diagnostic?.elapsedMs ?? -1) >= 0);
+    assert.ok((diagnostic?.retryAfterMs ?? -1) >= 0);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("an old receipt beyond the first page is reconciled before drain", async () => {
+  const rpc = new Rpc();
+  rpc.turnsListResponse = { data: Array.from({ length: 100 }, (_, index) => ({ id: `old-${index}`, status: "completed", items: [] })), nextCursor: "turns-2" };
+  rpc.turnsListPages.set("turns-2", { data: [{ id: "turn", status: "completed", items: [] }], nextCursor: null });
+  const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  await owner.submitWithReceipt({ operationId: "old-receipt", task: taskRef, text: "fixture" });
+  try {
+    assert.equal(await drainIdle(owner, () => stream.close()), "waiting-unload");
+    assert.equal(rpc.calls.filter(method => method === "thread/turns/list").length, 2);
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("conflicting receipt pages fail closed instead of latching the first match", async () => {
+  const rpc = new Rpc();
+  rpc.turnsListResponse = { data: [{ id: "turn-a", status: "completed", items: [
+    { type: "userMessage", clientId: "conflicting-receipt" },
+  ] }], nextCursor: "turns-conflict" };
+  rpc.turnsListPages.set("turns-conflict", { data: [{ id: "turn-b", status: "completed", items: [
+    { type: "userMessage", clientId: "conflicting-receipt" },
+  ] }], nextCursor: null });
+  const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  await owner.queue({ operationId: "conflicting-receipt", task: taskRef, text: "fixture" });
+  try {
+    assert.equal(await drainIdle(owner, () => stream.close()), "unavailable");
+    assert.equal(owner.executionDrainDiagnostic(taskRef)?.reason, "receipt-unknown");
+  } finally { stream.close(); await owner.close(); }
+});
+
+test("exact reasons retain firstSeenAt across repeated drain attempts", async () => {
+  const rpc = new Rpc(); rpc.goalResponse = { goal: { status: "active" } };
+  const owner = new AppServerProfileOwner("work", rpc);
+  const stream = owner.states.subscribe(taskRef, () => {}, () => {}); await stream.start();
+  try {
+    assert.equal(await drainIdle(owner, () => stream.close()), "blocked");
+    const first = owner.executionDrainDiagnostic(taskRef);
+    assert.equal(first?.reason, "goal-active");
+    assert.equal(first?.subjectThreadId, taskRef.threadId);
+    assert.equal(typeof first?.firstSeenAt, "number");
+    assert.ok((first?.elapsedMs ?? -1) >= 0);
+    assert.equal(await drainIdle(owner, () => stream.close()), "blocked");
+    const second = owner.executionDrainDiagnostic(taskRef);
+    assert.equal(second?.reason, "goal-active");
+    assert.equal(second?.firstSeenAt, first?.firstSeenAt);
+    assert.ok((second?.at ?? 0) >= (first?.at ?? 0));
   } finally { stream.close(); await owner.close(); }
 });
 

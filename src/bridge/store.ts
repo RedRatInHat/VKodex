@@ -589,7 +589,12 @@ export class BridgeStore {
   setChat(id: string, peerId: number, chatId: number): void {
     this.db.prepare("UPDATE bridge_bindings SET peer_id = ?, chat_id = ?, chat_state = 'ready' WHERE id = ?").run(peerId, chatId, id);
   }
-  setAttached(id: string, attached: boolean): void { this.db.prepare("UPDATE bridge_bindings SET attached = ? WHERE id = ?").run(Number(attached), id); }
+  setAttached(id: string, attached: boolean): void {
+    this.atomic(() => {
+      this.db.prepare("UPDATE bridge_bindings SET attached = ? WHERE id = ?").run(Number(attached), id);
+      if (!attached) this.setValue(`observation-handoff:${id}`, null);
+    });
+  }
   setPaused(id: string, paused: boolean): void { this.db.prepare("UPDATE bridge_bindings SET paused = ? WHERE id = ?").run(Number(paused), id); }
 
   observeTaskSender(bindingId: string, senderId: number): number {
@@ -602,6 +607,61 @@ export class BridgeStore {
   }
 
   streamGeneration(id: string): number { return this.getValue<number>(`stream-generation:${id}`) ?? 0; }
+
+  /** Desired command route, not proof that an old executor has exited. */
+  nativeExecutionRequired(binding: TaskRef): boolean {
+    const policy = this.getValue<{ taskKey: string; rolloutPath: string; generation: number }>(`native-execution:${taskKey(binding)}`);
+    // A prohibition on execution acquisition survives detach and rollout rotation.
+    // Only changing the physical task/source retires this policy.
+    return policy?.taskKey === taskKey(binding);
+  }
+
+  requireNativeExecution(binding: Binding, at: number, generation: number): void {
+    this.atomic(() => {
+      const current = this.getBinding(binding.id);
+      if (!current?.attached || taskKey(current) !== taskKey(binding)
+        || current.peerId !== binding.peerId || current.rolloutPath !== binding.rolloutPath || generation !== this.streamGeneration(binding.id))
+        throw new Error("Native execution scope changed");
+      if (!this.nativeExecutionRequired(current)) this.setValue(`native-execution:${taskKey(current)}`, {
+        taskKey: taskKey(current), rolloutPath: current.rolloutPath ?? "",
+        generation, at,
+      });
+    });
+  }
+
+  observationHandoff(binding: Binding): { operationId: string; firstSeenAt: number; generation: number } | null {
+    const saved = this.getValue<{ operationId: string; firstSeenAt: number; generation: number;
+      taskKey: string; rolloutPath: string; peerId: number }>(`observation-handoff:${binding.id}`);
+    return binding.attached && saved?.taskKey === taskKey(binding) && saved.peerId === binding.peerId
+      && saved.rolloutPath === (binding.rolloutPath ?? "") && saved.generation === this.streamGeneration(binding.id) ? saved : null;
+  }
+
+  /** Suspend acquisition during a repair without dropping the desired VK attachment. */
+  beginObservationHandoff(binding: Binding, generation: number, at: number): string {
+    return this.atomic(() => {
+      const current = this.getBinding(binding.id);
+      if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== taskKey(binding)
+        || current.rolloutPath !== binding.rolloutPath || this.streamGeneration(binding.id) !== generation)
+        throw new Error("Observation handoff scope changed");
+      const pending = this.observationHandoff(current);
+      if (pending) return pending.operationId;
+      const operationId = randomUUID();
+      this.setValue(`observation-handoff:${binding.id}`, { operationId, taskKey: taskKey(binding),
+        rolloutPath: binding.rolloutPath ?? "", peerId: binding.peerId, generation, firstSeenAt: at });
+      return operationId;
+    });
+  }
+
+  completeObservationHandoff(binding: Binding, operationId: string, generation: number): boolean {
+    return this.atomic(() => {
+      const current = this.getBinding(binding.id);
+      const pending = current && this.observationHandoff(current);
+      if (!pending || taskKey(current!) !== taskKey(binding) || pending.operationId !== operationId
+        || pending.generation !== generation) return false;
+      this.setValue(`observation-handoff:${binding.id}`, null);
+      return true;
+    });
+  }
 
   deferredMirrors(options: Readonly<{ includeLegacy?: boolean }> = {}):
     readonly { bindingId: string; turnId: string; firstSeenAt: number | null; count: number }[] {
@@ -626,6 +686,7 @@ export class BridgeStore {
       const binding = this.getBinding(id);
       if (!binding) return;
       this.db.prepare("UPDATE bridge_bindings SET attached = 0, paused = 0 WHERE id = ?").run(id);
+      this.setValue(`observation-handoff:${id}`, null);
       // Retain delivery IDs and handles, but never retry a cancelled send or edit.
       this.db.prepare("UPDATE bridge_delivery SET delivered_revision = revision WHERE binding_id = ? OR peer_id = ?").run(id, binding.peerId);
       this.setValue(`projection:${id}`, null);
@@ -1254,9 +1315,21 @@ export class BridgeStore {
   recordOperation(id: string, task: TaskRef, inboxKey?: string, bindingId?: string, now = Date.now()): void {
     this.atomic(() => {
       this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
+      this.recordNativeOperation(id, task, bindingId);
       if (inboxKey && bindingId) this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, inbox_keys, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(id, bindingId, inboxKey, JSON.stringify([inboxKey]), now);
     });
+  }
+
+  private recordNativeOperation(id: string, task: TaskRef, bindingId?: string): void {
+    const binding = bindingId && this.getBinding(bindingId);
+    if (binding && taskKey(binding) === taskKey(task) && !this.managedOwner(binding) && this.nativeExecutionRequired(binding))
+      this.setValue(`native-operation:${id}`, { taskKey: taskKey(task) });
+  }
+
+  nativeOperation(task: TaskRef, operationId: string): boolean {
+    return this.isOwnOperation(operationId, task)
+      && this.getValue<{ taskKey: string }>(`native-operation:${operationId}`)?.taskKey === taskKey(task);
   }
   /** Once reserved, even an absent worker row is not permission to replay. */
   captureManagedOperationAuthority(operationId: string, task: TaskRef, claim: ManagedOwnerBinding,
@@ -1361,6 +1434,7 @@ export class BridgeStore {
         if (this.inputState(key) !== "preparing") throw new Error("VK input is not prepared for Codex dispatch");
       }
       this.db.prepare("INSERT INTO bridge_operations(id, task_key, state) VALUES (?, ?, 'sending')").run(id, taskKey(task));
+      this.recordNativeOperation(id, task, bindingId);
       this.db.prepare("INSERT INTO bridge_operation_inputs(operation_id, binding_id, inbox_key, inbox_keys, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(id, bindingId, inboxKeys[0], JSON.stringify(inboxKeys), now);
       for (const key of inboxKeys) this.db.prepare("UPDATE bridge_inbox SET state = 'sending' WHERE id = ?").run(key);

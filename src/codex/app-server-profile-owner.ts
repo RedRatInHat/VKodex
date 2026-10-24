@@ -9,7 +9,7 @@ import { nativeCodexPath } from "./native-cli.js";
 import { AppServerTaskExecutor } from "./app-server-task-executor.js";
 import { AppServerTaskStateTransport, observeAppServerTaskState, type AppServerStreamDiagnostic } from "./app-server-task-state.js";
 import { createDetachedProfileConnection, detachedProfileDirectory } from "./detached-profile-capability.js";
-import { LegacyExecutionLifecycle } from "./legacy-execution-lifecycle.js";
+import { LegacyExecutionLifecycle, type ExecutionDrainDiagnostic } from "./legacy-execution-lifecycle.js";
 
 /** One explicit task owner: one CODEX_HOME, one long-lived App Server connection. */
 export class AppServerProfileOwner {
@@ -85,6 +85,10 @@ export class AppServerProfileOwner {
     if (this.routingPolicy === "exclusive") return Promise.resolve("unavailable");
     return this.lifecycle.drain(task, beforeRelease, () => this.executor.executionSnapshot(task),
       () => this.nativeStates.subscriptionSnapshot(task), assertScope);
+  }
+  executionDrainDiagnostic(task: TaskRef): ExecutionDrainDiagnostic | null {
+    this.assertOwner(task);
+    return this.routingPolicy === "exclusive" ? null : this.lifecycle.diagnostic(task);
   }
   pendingLegacyAcquisition(task: TaskRef): symbol | null {
     this.assertOwner(task);

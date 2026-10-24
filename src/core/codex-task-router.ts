@@ -5,7 +5,7 @@ import { ActionRejectedError, DesktopUnavailableError, LegacyExecutionFencedErro
   type EditLastUserTurnResult, type QueuedSubmissionOutcome, type SubmitTaskReceipt, type SubmitTaskRequest, type TaskCreationUpdate,
   type TaskDetails, type TaskGoal, type TaskGoalUpdate, type TaskRef, type TaskRenameResult,
   type TransferCheckpoint, type TransferTaskRequest, type UsageResetOutcome, type GoalContinuationReceipt,
-  type NativeGoalActivation, type ExecutionDrainResult } from "./codex-tasks.js";
+  type NativeGoalActivation, type ExecutionDrainResult, type ExecutionDrainDiagnostic, taskKey } from "./codex-tasks.js";
 
 export interface CodexTaskOwner {
   /** An exclusive claim is independent of transient adapter readiness. */
@@ -17,6 +17,7 @@ export interface CodexTaskOwner {
   pendingLegacyAcquisition?(task: TaskRef): symbol | null;
   legacyAcquisitionState?(task: TaskRef): "pending" | "unknown" | "abandoned" | null;
   restoreExecutionDrain?(task: TaskRef): void;
+  executionDrainDiagnostic?(task: TaskRef): ExecutionDrainDiagnostic | null;
   owns(task: TaskRef): boolean;
   /** Original immutable operation route, independent of fresh command ownership. */
   ownsOperation?(task: TaskRef, operationId: string): boolean;
@@ -51,16 +52,34 @@ export interface CodexTaskOwner {
 
 /** Routes execution-sensitive commands to the one configured owner of a source. */
 export class RoutedCodexTasks implements CodexTasks {
-  constructor(private readonly base: CodexTasks, private readonly owners: readonly CodexTaskOwner[]) {}
-  private owner(task: TaskRef): CodexTaskOwner | undefined {
+  private readonly nativeRequired = new Set<string>();
+  constructor(private readonly base: CodexTasks, private readonly owners: readonly CodexTaskOwner[],
+    private readonly nativeOperation: (task: TaskRef, operationId: string) => boolean = () => false,
+    private readonly nativePolicy: (task: TaskRef) => boolean = () => false) {}
+  private nativeOnly(task: TaskRef): boolean {
+    return this.nativeRequired.has(taskKey(task)) || this.nativePolicy(task);
+  }
+  private configuredOwner(task: TaskRef): CodexTaskOwner | undefined {
     const exclusive = this.owners.filter(owner => owner.routingPolicy === "exclusive" && owner.owns(task));
     if (exclusive.length > 1) throw new ActionRejectedError("Для задачи найдено несколько исключительных владельцев.");
     return exclusive[0] ?? this.owners.find(owner => owner.routingPolicy !== "exclusive" && owner.owns(task));
   }
+  private owner(task: TaskRef): CodexTaskOwner | undefined {
+    const owner = this.configuredOwner(task);
+    if (owner?.routingPolicy === "exclusive" || !this.nativeOnly(task)) return owner;
+    if (!this.nativeRequired.has(taskKey(task))) this.requireNativeExecution(task);
+    return undefined;
+  }
+  requireNativeExecution(task: TaskRef): void {
+    const owner = this.configuredOwner(task);
+    if (owner?.routingPolicy === "exclusive") return;
+    owner?.restoreExecutionDrain?.(task);
+    this.nativeRequired.add(taskKey(task));
+  }
   private operationOwner(task: TaskRef, operationId: string): CodexTaskOwner | undefined {
     const original = this.owners.filter(owner => owner.ownsOperation?.(task, operationId) === true);
     if (original.length > 1) throw new ActionRejectedError("Неоднозначный исходный исполнитель операции.");
-    return original[0] ?? this.owner(task);
+    return original[0] ?? (this.nativeOperation(task, operationId) ? undefined : this.configuredOwner(task));
   }
   private refuseExclusive(task: TaskRef): void {
     if (this.owner(task)?.routingPolicy === "exclusive")
@@ -93,6 +112,10 @@ export class RoutedCodexTasks implements CodexTasks {
     const owner = this.owner(request.task);
     diagnosticEvent("route.selected", { operationId: request.operationId, threadId: request.task.threadId,
       sourceId: request.task.sourceId ?? "", route: !owner ? "base" : owner.routingPolicy === "exclusive" ? "exclusive-owner" : "profile-owner" });
+    if (!owner && this.nativeOnly(request.task)) {
+      if (!this.base.submitConnectedWithReceipt) throw new ActionRejectedError("Подключённый native исполнитель недоступен. Повторный захват VKodex запрещён.");
+      return this.base.submitConnectedWithReceipt(request);
+    }
     if (!owner) return this.base.submitWithReceipt?.(request) ?? this.base.submit(request).then(() => ({ mode: "start" as const, turnId: null }));
     try { return await owner.submitWithReceipt(request); }
     catch (error) {
@@ -263,22 +286,25 @@ export class RoutedCodexTasks implements CodexTasks {
   }
   async drainIdleExecution(task: TaskRef, beforeRelease: () => void, assertScope?: () => void): Promise<ExecutionDrainResult> {
     // A metadata reader or another client cannot attest the original writer.
-    return this.owner(task)?.drainIdleExecution?.(task, beforeRelease, assertScope) ?? "unavailable";
+    return this.configuredOwner(task)?.drainIdleExecution?.(task, beforeRelease, assertScope) ?? "unavailable";
   }
   pendingLegacyAcquisition(task: TaskRef): symbol | null {
-    return this.owner(task)?.pendingLegacyAcquisition?.(task) ?? null;
+    return this.configuredOwner(task)?.pendingLegacyAcquisition?.(task) ?? null;
   }
   legacyAcquisitionState(task: TaskRef): "pending" | "unknown" | "abandoned" | null {
-    const owner = this.owner(task);
+    const owner = this.configuredOwner(task);
     return owner?.routingPolicy === "exclusive" ? null : owner?.legacyAcquisitionState?.(task) ?? null;
   }
   executionDrainSupported(task: TaskRef): boolean {
-    const owner = this.owner(task);
+    const owner = this.configuredOwner(task);
     return !!owner?.drainIdleExecution && owner.routingPolicy !== "exclusive";
   }
   restoreExecutionDrain(task: TaskRef): void {
-    const owner = this.owner(task);
+    const owner = this.configuredOwner(task);
     if (owner?.routingPolicy !== "exclusive") owner?.restoreExecutionDrain?.(task);
+  }
+  executionDrainDiagnostic(task: TaskRef): ExecutionDrainDiagnostic | null {
+    return this.configuredOwner(task)?.executionDrainDiagnostic?.(task) ?? null;
   }
   async renameTask(task: TaskRef, title: string): Promise<TaskRenameResult> {
     const owner = this.owner(task); if (!owner) return this.base.renameTask(task, title);
@@ -332,6 +358,8 @@ export class RoutedCodexTasks implements CodexTasks {
   async setGoal(task: TaskRef, update: TaskGoalUpdate): Promise<TaskGoal> {
     const owner = this.owner(task);
     if (owner) return owner.setGoal(task, update);
+    if (this.nativeOnly(task) && update.status === "active")
+      throw new ActionRejectedError("Возобновление цели требует подтверждённого native исполнителя. Используй штатное продолжение цели; краткоживущий metadata-процесс не запускает её цикл.");
     if (!this.base.setGoal) throw new ActionRejectedError("Управление целью недоступно."); return this.base.setGoal(task, update);
   }
   async clearGoal(task: TaskRef): Promise<boolean> {

@@ -1,4 +1,5 @@
-import { ActionRejectedError, LegacyExecutionFencedError, TaskOwnedByClientError, type ExecutionDrainResult, type TaskRef } from "../core/codex-tasks.js";
+import { ActionRejectedError, LegacyExecutionFencedError, TaskOwnedByClientError, type ExecutionDrainDiagnostic as CoreExecutionDrainDiagnostic,
+  type ExecutionDrainResult, type TaskRef } from "../core/codex-tasks.js";
 import { AppServerRejectedError, AppServerUnavailableError, type AppServerEnvelope,
   type AppServerRequestOptions, type AppServerRpc } from "./app-server-connection.js";
 
@@ -9,6 +10,23 @@ const scopeId = (value: unknown): string | null => typeof value === "string" && 
   && value.length <= 256 && !/[\s\x00-\x1f\x7f]/u.test(value) ? value : null;
 const MAX_TASK_REVISIONS = 4096;
 const UNLOAD_READBACK_INTERVAL_MS = 31 * 60_000;
+const MAX_PAGINATION_PAGES = 64;
+
+export type ExecutionDrainDiagnosticReason =
+  | "active-local" | "unknown-local" | "generation-mismatch" | "family-pagination-incomplete"
+  | "child-active" | "goal-active" | "queue-pending" | "receipt-unknown"
+  | "unload-retention-window" | "read-failure";
+export type ExecutionDrainDiagnostic = CoreExecutionDrainDiagnostic & {
+  readonly reason: ExecutionDrainDiagnosticReason;
+  readonly elapsedMs: number;
+  readonly retryAfterMs?: number;
+};
+type StoredExecutionDrainDiagnostic = CoreExecutionDrainDiagnostic & { readonly reason: ExecutionDrainDiagnosticReason };
+class DrainDiagnosticError extends Error {
+  constructor(readonly diagnosticReason: ExecutionDrainDiagnosticReason, readonly subjectThreadId?: string) {
+    super("Execution drain proof unavailable."); this.name = "DrainDiagnosticError";
+  }
+}
 interface Drain { generation: number; state: ExecutionDrainResult | "checking"; unloaded: boolean;
   release: Promise<ObjectValue> | null; restored?: true; assertRelease?: () => void;
   nextRefreshAt?: number; refresh?: Promise<ExecutionDrainResult>; family?: readonly string[] }
@@ -40,6 +58,7 @@ export class LegacyExecutionLifecycle {
   private readonly unknown = new Set<string>();
   private readonly receipts = new Map<string, WorkReceipt[]>();
   private readonly acquisitions = new Map<string, Set<AcquisitionAttempt>>();
+  private readonly diagnostics = new Map<string, StoredExecutionDrainDiagnostic>();
   private revision = 0;
   private unscopedRevision = 0;
   private readonly taskRevisions = new Map<string, number>();
@@ -139,9 +158,42 @@ export class LegacyExecutionLifecycle {
     return "pending";
   }
   isDraining(task: TaskRef): boolean { return this.drains.has(task.threadId); }
+  diagnostic(task: TaskRef): ExecutionDrainDiagnostic | null {
+    const diagnostic = this.diagnostics.get(task.threadId);
+    if (!diagnostic) return null;
+    const now = this.now();
+    return {
+      ...diagnostic,
+      elapsedMs: Math.max(0, now - diagnostic.firstSeenAt),
+      ...(diagnostic.nextRetryAt === undefined ? {} : { retryAfterMs: Math.max(0, diagnostic.nextRetryAt - now) }),
+    };
+  }
+  private setDiagnostic(threadId: string, reason: ExecutionDrainDiagnosticReason,
+    subjectThreadId?: string, nextRetryAt?: number): void {
+    const at = this.now();
+    const previous = this.diagnostics.get(threadId);
+    const firstSeenAt = previous?.reason === reason && previous.subjectThreadId === subjectThreadId
+      ? previous.firstSeenAt : at;
+    if (!previous && this.diagnostics.size >= MAX_TASK_REVISIONS) {
+      const oldest = this.diagnostics.keys().next().value;
+      if (typeof oldest === "string") this.diagnostics.delete(oldest);
+    }
+    this.diagnostics.set(threadId, {
+      reason, firstSeenAt, at,
+      ...(nextRetryAt === undefined ? {} : { nextRetryAt }),
+      ...(subjectThreadId === undefined ? {} : { subjectThreadId }),
+    });
+  }
+  private clearDiagnostic(threadId: string): void { this.diagnostics.delete(threadId); }
+  private blocked(task: TaskRef, reason: ExecutionDrainDiagnosticReason, subjectThreadId?: string): ExecutionDrainResult {
+    this.setDiagnostic(task.threadId, reason, subjectThreadId);
+    return "blocked";
+  }
   restore(task: TaskRef): void {
-    if (!this.drains.has(task.threadId)) this.drains.set(task.threadId,
-      { generation: 0, state: "unavailable", unloaded: false, release: null, restored: true });
+    if (!this.drains.has(task.threadId)) {
+      this.drains.set(task.threadId, { generation: 0, state: "unavailable", unloaded: false, release: null, restored: true });
+      this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+    }
   }
   /** Spans preparation, beforeSend and idempotent-setting retry gaps. */
   beginCommand(task: TaskRef, currentWorkControl = false): () => void {
@@ -275,6 +327,7 @@ export class LegacyExecutionLifecycle {
     if (event.method === "thread/closed" && scopeValid && drain && this.current(drain.generation)) {
       drain.unloaded = true;
       if (drain.state === "waiting-unload" || drain.state === "unavailable") drain.state = "released";
+      if (drain.state === "released") this.clearDiagnostic(threadId);
     }
     if (event.method === "turn/completed" && object(event.params.turn)
       && ["completed", "failed", "interrupted"].includes(String(event.params.turn.status))) {
@@ -284,31 +337,81 @@ export class LegacyExecutionLifecycle {
   }
   private async read(method: string, params: ObjectValue, generation: number, deadline: number): Promise<ObjectValue> {
     const remaining = deadline - performance.now();
-    if (!this.current(generation) || remaining <= 0) throw new AppServerUnavailableError();
-    const result = await this.original.request(method, params, { expectedGeneration: generation, timeoutMs: Math.min(5_000, Math.ceil(remaining)) });
-    if (!this.current(generation) || performance.now() >= deadline) throw new AppServerUnavailableError();
+    if (!this.current(generation)) throw new DrainDiagnosticError("generation-mismatch");
+    if (remaining <= 0) throw new DrainDiagnosticError("read-failure");
+    let result: ObjectValue;
+    try {
+      result = await this.original.request(method, params, { expectedGeneration: generation, timeoutMs: Math.min(5_000, Math.ceil(remaining)) });
+    } catch {
+      throw new DrainDiagnosticError(this.current(generation) ? "read-failure" : "generation-mismatch");
+    }
+    if (!this.current(generation)) throw new DrainDiagnosticError("generation-mismatch");
+    if (performance.now() >= deadline) throw new DrainDiagnosticError("read-failure");
     return result;
   }
   private async family(root: string, generation: number, deadline: number): Promise<string[]> {
-    const page = await this.read("thread/list", { ancestorThreadId: root, archived: false, limit: 100,
-      sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact",
-        "subAgentThreadSpawn", "subAgentOther", "unknown"] }, generation, deadline);
-    if (!Array.isArray(page.data) || page.data.length > 100 || page.nextCursor !== null) throw new AppServerUnavailableError();
-    const values = page.data.map(value => object(value) ? id(value.id) : null);
-    if (values.some(value => !value || value === root) || new Set(values).size !== values.length) throw new AppServerUnavailableError();
-    return (values as string[]).sort();
+    const values: string[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < MAX_PAGINATION_PAGES; pageNumber++) {
+      const page = await this.read("thread/list", { ancestorThreadId: root, archived: false, limit: 100,
+        sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact",
+          "subAgentThreadSpawn", "subAgentOther", "unknown"], ...(cursor ? { cursor } : {}) }, generation, deadline);
+      if (!Array.isArray(page.data) || page.data.length > 100)
+        throw new DrainDiagnosticError("family-pagination-incomplete", root);
+      for (const value of page.data) values.push(object(value) ? id(value.id) ?? "" : "");
+      if (page.nextCursor === null) {
+        if (values.some(value => !value || value === root) || new Set(values).size !== values.length)
+          throw new DrainDiagnosticError("family-pagination-incomplete", root);
+        return values.sort();
+      }
+      if (typeof page.nextCursor !== "string" || !page.nextCursor || seenCursors.has(page.nextCursor))
+        throw new DrainDiagnosticError("family-pagination-incomplete", root);
+      seenCursors.add(page.nextCursor); cursor = page.nextCursor;
+    }
+    throw new DrainDiagnosticError("family-pagination-incomplete", root);
   }
   private async terminalReceipts(threadId: string, generation: number, activeTurnId: string | null, deadline: number): Promise<boolean> {
-    const receipts = [...(this.receipts.get(threadId) ?? []), ...(activeTurnId ? [{ turnId: activeTurnId }] : [])];
+    const receipts: WorkReceipt[] = [];
+    const receiptKeys = new Set<string>();
+    for (const receipt of [...(this.receipts.get(threadId) ?? []), ...(activeTurnId ? [{ turnId: activeTurnId }] : [])]) {
+      const key = receipt.turnId ? `turn:${receipt.turnId}` : `client:${receipt.clientId ?? ""}`;
+      if (!receiptKeys.has(key)) { receiptKeys.add(key); receipts.push(receipt); }
+    }
     if (!receipts.length) return true;
-    const page = await this.read("thread/turns/list", { threadId, limit: 100, sortDirection: "desc", itemsView: "full" }, generation, deadline);
-    if (!Array.isArray(page.data)) throw new AppServerUnavailableError();
-    return receipts.every(receipt => {
-      const matches = (page.data as unknown[]).filter(turn => object(turn) &&
-        (receipt.turnId ? turn.id === receipt.turnId : Array.isArray(turn.items) && turn.items.some(item =>
-          object(item) && item.type === "userMessage" && item.clientId === receipt.clientId)));
-      return matches.length === 1 && object(matches[0]) && ["completed", "failed", "interrupted"].includes(String(matches[0].status));
-    });
+    const matches = new Map<WorkReceipt, ObjectValue | null>(receipts.map(receipt => [receipt, null]));
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < MAX_PAGINATION_PAGES; pageNumber++) {
+      const page = await this.read("thread/turns/list", {
+        threadId, limit: 100, sortDirection: "desc", itemsView: "full", ...(cursor ? { cursor } : {}),
+      }, generation, deadline);
+      if (!Array.isArray(page.data)) throw new DrainDiagnosticError("receipt-unknown", threadId);
+      for (const receipt of receipts) {
+        const pageMatches = (page.data as unknown[]).filter(turn => object(turn) &&
+          (receipt.turnId ? turn.id === receipt.turnId : Array.isArray(turn.items) && turn.items.some(item =>
+            object(item) && item.type === "userMessage" && item.clientId === receipt.clientId)));
+        if (pageMatches.length > 1) throw new DrainDiagnosticError("receipt-unknown", threadId);
+        if (pageMatches.length === 1) {
+          if (matches.get(receipt) !== null) throw new DrainDiagnosticError("receipt-unknown", threadId);
+          matches.set(receipt, pageMatches[0] as ObjectValue);
+        }
+      }
+      const nextCursor = page.nextCursor;
+      const allDirectTerminal = receipts.every(receipt => receipt.turnId
+        && matches.get(receipt) !== null
+        && ["completed", "failed", "interrupted"].includes(String(matches.get(receipt)?.status)));
+      const hasClientReceipt = receipts.some(receipt => !receipt.turnId);
+      if (nextCursor === null) {
+        return receipts.every(receipt => matches.get(receipt) !== null
+          && ["completed", "failed", "interrupted"].includes(String(matches.get(receipt)?.status)));
+      }
+      if (typeof nextCursor !== "string" || !nextCursor || seenCursors.has(nextCursor))
+        throw new DrainDiagnosticError("receipt-unknown", threadId);
+      if (allDirectTerminal && !hasClientReceipt) return true;
+      seenCursors.add(nextCursor); cursor = nextCursor;
+    }
+    throw new DrainDiagnosticError("receipt-unknown", threadId);
   }
   private async refreshWaiting(task: TaskRef, drain: Drain,
     local: () => { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending?: boolean },
@@ -324,9 +427,13 @@ export class LegacyExecutionLifecycle {
       && !this.busy.has("__unscoped_server_request__") && !this.unknown.has("__unscoped_server_request__")
       && !(drain.family ?? [task.threadId]).some(threadId => this.hasOtherAcquisition(threadId))
       && !this.changedSince(drain.family ?? [task.threadId], revision, unscopedRevision);
-    if (!safe()) return !this.current(generation) || this.drains.get(task.threadId) !== drain
-      ? "unavailable" : drain.state === "released" ? "released" : "waiting-unload";
+    if (!safe()) {
+      if (!this.current(generation)) this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+      return !this.current(generation) || this.drains.get(task.threadId) !== drain
+        ? "unavailable" : drain.state === "released" ? "released" : "waiting-unload";
+    }
     drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;
+    this.setDiagnostic(task.threadId, "unload-retention-window", task.threadId, drain.nextRefreshAt);
     try {
       const response = await this.original.request("thread/read", { threadId: task.threadId, includeTurns: false },
         { expectedGeneration: generation, timeoutMs: 5_000,
@@ -336,9 +443,16 @@ export class LegacyExecutionLifecycle {
         drain.unloaded = true;
         drain.state = "released";
       }
-    } catch { /* A failed metadata read cannot prove unload. */ }
-    if (!this.current(generation) || this.drains.get(task.threadId) !== drain) return "unavailable";
-    return drain.state === "released" ? "released" : "waiting-unload";
+    } catch {
+      this.setDiagnostic(task.threadId, "read-failure", task.threadId, drain.nextRefreshAt);
+      /* A failed metadata read cannot prove unload. */
+    }
+    if (!this.current(generation) || this.drains.get(task.threadId) !== drain) {
+      this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+      return "unavailable";
+    }
+    if (drain.state === "released") { this.clearDiagnostic(task.threadId); return "released"; }
+    return "waiting-unload";
   }
   async drain(task: TaskRef, beforeRelease: () => void,
     local: () => { readonly activeTurnId: string | null; readonly blocked: boolean; readonly releasePending?: boolean },
@@ -346,10 +460,19 @@ export class LegacyExecutionLifecycle {
     assertScope: () => void = () => {}): Promise<ExecutionDrainResult> {
     const existing = this.drains.get(task.threadId);
     if (existing) {
-      if (!this.current(existing.generation)) return "unavailable";
-      if (existing.state !== "waiting-unload") return existing.state === "checking" ? "blocked" : existing.state;
+      if (!this.current(existing.generation)) {
+        this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+        return "unavailable";
+      }
+      if (existing.state !== "waiting-unload") {
+        if (existing.state === "checking") return this.blocked(task, "active-local", task.threadId);
+        return existing.state;
+      }
       if (existing.refresh) return existing.refresh;
-      if (existing.nextRefreshAt === undefined || this.now() < existing.nextRefreshAt) return "waiting-unload";
+      if (existing.nextRefreshAt === undefined || this.now() < existing.nextRefreshAt) {
+        this.setDiagnostic(task.threadId, "unload-retention-window", task.threadId, existing.nextRefreshAt);
+        return "waiting-unload";
+      }
       const refresh = this.refreshWaiting(task, existing, local, subscription);
       existing.refresh = refresh;
       try { return await refresh; } finally { if (existing.refresh === refresh) delete existing.refresh; }
@@ -357,13 +480,23 @@ export class LegacyExecutionLifecycle {
     const session = this.original.currentInitializedSession?.();
     const attempts = [...(this.acquisitions.get(task.threadId) ?? [])];
     const orphan = attempts.length === 1 && attempts[0]?.state === "abandoned" ? attempts[0] : null;
-    if (attempts.length && !orphan) return "blocked";
-    if (!session || !orphan && this.acquired.get(task.threadId) !== session.generation) return "unavailable";
-    if (orphan && orphan.generation !== session.generation) return "unavailable";
+    if (attempts.length && !orphan) return this.blocked(task, "unknown-local", task.threadId);
+    if (!session || !orphan && this.acquired.get(task.threadId) !== session.generation) {
+      this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+      return "unavailable";
+    }
+    if (orphan && orphan.generation !== session.generation) {
+      this.setDiagnostic(task.threadId, "generation-mismatch", task.threadId);
+      return "unavailable";
+    }
     const generation = session.generation;
     const scoped = subscription();
-    if (scoped.count !== (orphan ? 0 : 1) || local().blocked || local().releasePending || this.busy.has(task.threadId) || this.unknown.has(task.threadId)
-      || this.busy.has("__unscoped_server_request__") || this.unknown.has("__unscoped_server_request__")) return "blocked";
+    const localState = local();
+    if (scoped.count !== (orphan ? 0 : 1)) return this.blocked(task, "active-local", task.threadId);
+    if (localState.blocked || localState.releasePending || this.busy.has(task.threadId))
+      return this.blocked(task, "active-local", task.threadId);
+    if (this.unknown.has(task.threadId) || this.busy.has("__unscoped_server_request__") || this.unknown.has("__unscoped_server_request__"))
+      return this.blocked(task, "unknown-local", task.threadId);
     const drain: Drain = { generation, state: "checking", unloaded: false, release: null };
     this.drains.set(task.threadId, drain);
     const revision = this.revision;
@@ -373,30 +506,40 @@ export class LegacyExecutionLifecycle {
     try {
       const family = [task.threadId, ...await this.family(task.threadId, generation, deadline)];
       for (const threadId of family) {
-        if (this.busy.has(threadId) || this.unknown.has(threadId)
-          || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined)) return "blocked";
+        if (this.busy.has(threadId) || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined))
+          return this.blocked(task, threadId === task.threadId ? "active-local" : "child-active", threadId);
+        if (this.unknown.has(threadId))
+          return this.blocked(task, threadId === task.threadId ? "unknown-local" : "child-active", threadId);
         const response = await this.read("thread/read", { threadId, includeTurns: false }, generation, deadline);
         const thread = object(response.thread) && response.thread.id === threadId ? response.thread : null;
-        if (!thread || !object(thread.status)) throw new AppServerUnavailableError();
+        if (!thread || !object(thread.status)) throw new DrainDiagnosticError("read-failure", threadId);
         // notLoaded on a separate child reader cannot prove another writer idle.
-        if (thread.status.type !== "idle") return "blocked";
+        if (thread.status.type !== "idle")
+          return this.blocked(task, thread.status.type === "active"
+            ? threadId === task.threadId ? "active-local" : "child-active" : "read-failure", threadId);
         const goal = await this.read("thread/goal/get", { threadId }, generation, deadline);
         if (goal.goal !== null && (!object(goal.goal) || !["paused", "complete", "blocked", "usageLimited", "budgetLimited"]
-          .includes(String(goal.goal.status)))) return "blocked";
+          .includes(String(goal.goal.status)))) return this.blocked(task, "goal-active", threadId);
         const queue = await this.read("thread/queue/list", { threadId }, generation, deadline);
-        if (!Array.isArray(queue.data) || queue.nextCursor !== null) throw new AppServerUnavailableError();
-        if (queue.data.length || !await this.terminalReceipts(threadId, generation,
-          threadId === task.threadId ? local().activeTurnId : null, deadline)) return "blocked";
+        if (!Array.isArray(queue.data) || queue.nextCursor !== null) throw new DrainDiagnosticError("read-failure", threadId);
+        if (queue.data.length) return this.blocked(task, "queue-pending", threadId);
+        if (!await this.terminalReceipts(threadId, generation,
+          threadId === task.threadId ? local().activeTurnId : null, deadline))
+          return this.blocked(task, "receipt-unknown", threadId);
       }
       const confirmed = await this.family(task.threadId, generation, deadline);
-      if (JSON.stringify(confirmed) !== JSON.stringify(family.slice(1))) return "blocked";
+      if (JSON.stringify(confirmed) !== JSON.stringify(family.slice(1)))
+        return this.blocked(task, "family-pagination-incomplete", task.threadId);
       assertScope();
       if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision) || local().blocked
         || local().releasePending
         || family.some(threadId => this.busy.has(threadId) || this.unknown.has(threadId)
           || this.hasOtherAcquisition(threadId, threadId === task.threadId ? orphan ?? undefined : undefined))
         || subscription().count !== (orphan ? 0 : 1) || subscription().revision !== scoped.revision
-        || orphan && this.pendingLegacyAcquisition(task) !== orphan.token) return "blocked";
+        || orphan && this.pendingLegacyAcquisition(task) !== orphan.token) {
+        this.setDiagnostic(task.threadId, !this.current(generation) ? "generation-mismatch" : "unknown-local", task.threadId);
+        return "blocked";
+      }
       drain.assertRelease = () => {
         assertScope();
         if (performance.now() >= deadline || !this.current(generation) || this.changedSince(family, revision, unscopedRevision)
@@ -412,14 +555,27 @@ export class LegacyExecutionLifecycle {
       beforeRelease(); // No await: exact binding/stream validation and close are atomic with admission revocation.
       if (orphan) void this.rpc.request("thread/unsubscribe", { threadId: task.threadId },
         { expectedGeneration: generation, timeoutMs: 30_000 }).catch(() => {});
-      if (!drain.release || subscription().count !== 0) { drain.state = "unavailable"; return "unavailable"; }
+      if (!drain.release || subscription().count !== 0) {
+        drain.state = "unavailable"; this.setDiagnostic(task.threadId, "read-failure", task.threadId); return "unavailable";
+      }
       const release = await drain.release;
       if (orphan) this.forgetAcquisition(task.threadId, orphan);
       drain.state = !this.current(generation) ? "unavailable" : drain.unloaded ? "released" : "waiting-unload";
-      if (drain.state === "waiting-unload" && release.status === "unsubscribed")
+      if (drain.state === "waiting-unload" && release.status === "unsubscribed") {
         drain.nextRefreshAt = this.now() + UNLOAD_READBACK_INTERVAL_MS;
+        this.setDiagnostic(task.threadId, "unload-retention-window", task.threadId, drain.nextRefreshAt);
+      } else if (drain.state === "released") this.clearDiagnostic(task.threadId);
       return drain.state;
-    } catch { drain.state = closing && drain.unloaded && this.current(generation) ? "released" : "unavailable"; return drain.state; }
+    } catch (error) {
+      if (closing && drain.unloaded && this.current(generation)) {
+        drain.state = "released"; this.clearDiagnostic(task.threadId); return "released";
+      }
+      drain.state = "unavailable";
+      const reason = error instanceof DrainDiagnosticError ? error.diagnosticReason
+        : !this.current(generation) ? "generation-mismatch" : "read-failure";
+      this.setDiagnostic(task.threadId, reason, error instanceof DrainDiagnosticError ? error.subjectThreadId : task.threadId);
+      return drain.state;
+    }
     finally { if (!closing) this.drains.delete(task.threadId); }
   }
   close(): void { this.unsubscribe(); }

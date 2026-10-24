@@ -202,6 +202,18 @@ export type UsageResetOutcome = "reset" | "nothingToReset" | "noCredit" | "alrea
 /** Subscription release and physical native unload are different facts. */
 export type ExecutionDrainResult = "waiting-unload" | "released" | "blocked" | "unavailable";
 
+/** Local proof diagnostics only. No raw RPC payloads or error messages. */
+export interface ExecutionDrainDiagnostic {
+  readonly reason: string;
+  readonly firstSeenAt: number;
+  readonly at: number;
+  readonly nextRetryAt?: number;
+  readonly subjectThreadId?: string;
+  /** Process-relative durations, normalized to wall time by the runtime. */
+  readonly elapsedMs?: number;
+  readonly retryAfterMs?: number;
+}
+
 export interface AccountUsageProvider {
   read(task?: TaskRef): Promise<readonly AccountUsage[]>;
   consumeReset?(task: TaskRef, idempotencyKey: string): Promise<UsageResetOutcome>;
@@ -360,6 +372,10 @@ export interface CodexTasks {
   executionDrainSupported?(task: TaskRef): boolean;
   /** Restore an admission fence only, never infer current ownership/unload. */
   restoreExecutionDrain?(task: TaskRef): void;
+  /** Durable caller policy: future commands require an already connected native owner.
+   * This revokes legacy admission without claiming that the previous writer exited. */
+  requireNativeExecution?(task: TaskRef): void;
+  executionDrainDiagnostic?(task: TaskRef): ExecutionDrainDiagnostic | null;
   inspectTask(task: TaskRef): Promise<TaskDetails>;
   listModels(task?: TaskRef): Promise<readonly DesktopModel[]>;
   selectModel(task: TaskRef, model: string, effort: string): Promise<void>;

@@ -93,6 +93,25 @@ function setupWithBindings(t: { after(fn: () => void): void }, bindings: () => R
   return { store, chat, desktop, monitor };
 }
 
+test("health reports the precise drain wait and distinguishes a historical fence from current native access", async t => {
+  let native = false;
+  const s = setupWithBindings(t, () => [{ id: "drain-diagnostics", title: "Drain fixture", source: ".codex",
+    status: "idle", connected: native, lastConfirmedAt: native ? 100_000 : null, failure: null,
+    nativeCommandRoute: native, ...(native ? { route: { kind: "native-observer" as const } } : {}),
+    executionLifecycle: { state: "waiting-unload", at: 99_000, firstSeenAt: 40_000,
+      generation: 1, reason: "unload-retention-window", nextRetryAt: 110_000 } }]);
+  const check = async () => (await s.monitor.check(true)).checks.find(item => item.name === "codex_execution_lifecycle:drain-diagnostics")!;
+  const waiting = await check();
+  assert.equal(waiting.state, "degraded");
+  assert.match(waiting.detail, /Возраст случая: 60 с/);
+  assert.match(waiting.detail, /через 10 с/);
+  assert.match(waiting.detail, /частые проверки могут продлевать удержание/);
+  native = true;
+  const restored = await check();
+  assert.equal(restored.state, "ok");
+  assert.match(restored.detail, /историческая/);
+});
+
 test("native observation recovery health separates opening from verified and historical snapshots", async t => {
   let state: "opened" | "ready" | "recovered" | "unavailable" = "opened";
   const s = setupWithBindings(t, () => [{ id: "native-recovery", title: "Native fixture", source: ".codex",

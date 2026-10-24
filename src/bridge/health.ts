@@ -56,6 +56,8 @@ export interface RuntimeHealthState {
     readonly lastConnectionDiagnostic?: ConnectionDiagnostic | null;
     /** Local route evidence, never a claim of physical native writer ownership. */
     readonly route?: TaskStateRouteDiagnostic;
+    readonly nativeCommandRoute?: boolean;
+    readonly observationHandoff?: Readonly<{ operationId: string; firstSeenAt: number; generation: number }>;
     /** Opening the client is only an attempt; passive snapshot proves readiness. */
     readonly nativeObservationRecovery?: Readonly<{ readonly state:
       "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" |
@@ -65,6 +67,10 @@ export interface RuntimeHealthState {
       readonly state: "checking" | "waiting-unload" | "released" | "blocked" | "unavailable";
       readonly at: number;
       readonly generation: number;
+      readonly firstSeenAt?: number;
+      readonly reason?: string;
+      readonly reasonSinceAt?: number;
+      readonly nextRetryAt?: number;
     }>;
   }[];
 }
@@ -347,13 +353,35 @@ export class BridgeHealthMonitor {
               : lifecycle.state === "unavailable"
                 ? "Состояние исполнения недоступно; освобождение writer не доказано."
                 : "Освобождение исполнения подтверждено для этого binding и поколения; это не подтверждает доступность всей Desktop/native UI.";
+        const nativeReady = binding.nativeCommandRoute === true && binding.connected && binding.route?.kind === "native-observer";
+        const age = Number.isFinite(lifecycle.firstSeenAt) ? Math.max(0, Math.floor((this.now() - lifecycle.firstSeenAt!) / 1_000)) : null;
+        const retry = Number.isFinite(lifecycle.nextRetryAt) ? Math.max(0, Math.ceil((lifecycle.nextRetryAt! - this.now()) / 1_000)) : null;
+        const reasons: Record<string, string> = {
+          "active-local": "есть активная работа или меняется локальная подписка",
+          "unknown-local": "результат прежней операции ещё не сверён",
+          "generation-mismatch": "исходная сессия исполнителя недоступна",
+          "predecessor-unverified": "прежний исполнитель после перезапуска ещё не проверен",
+          "family-pagination-incomplete": "полный состав дочерних задач не подтверждён",
+          "child-active": "корневая или дочерняя задача выполняется",
+          "goal-active": "цель может запускать следующие ходы",
+          "queue-pending": "штатная очередь не пуста",
+          "receipt-unknown": "завершение прежнего запроса не подтверждено",
+          "unload-retention-window": "ожидается безопасная выгрузка Codex; частые проверки могут продлевать удержание",
+          "read-failure": "не удалось получить доказательство состояния исполнителя",
+        };
         checks.push({ name: `codex_execution_lifecycle:${binding.id}`,
-          state: lifecycle.state === "released" ? "ok" : "degraded",
-          detail: `«${binding.title.slice(0, 120)}»: ${detail} Наблюдение ${at}; поколение ${generation}.` });
+          state: nativeReady || lifecycle.state === "released" ? "ok" : "degraded",
+          detail: `«${binding.title.slice(0, 120)}»: ${nativeReady
+            ? "Native-подключение подтверждено; прежний legacy исполнитель остаётся заблокирован. Запись освобождения ниже историческая. " : ""}${detail} Наблюдение ${at}; поколение ${generation}.`
+            + (lifecycle.reason ? ` Причина: ${reasons[lifecycle.reason] ?? "не классифицирована"}.` : "")
+            + (age === null ? "" : ` Возраст случая: ${age} с.`)
+            + (retry === null ? "" : ` Следующая проверка не раньше чем через ${retry} с.`) });
       } else if (binding.connected && binding.streamMode === "attached" && binding.route?.kind === "app-server") {
         checks.push({ name: `codex_native_access:${binding.id}`, state: "degraded",
           detail: `«${binding.title.slice(0, 120)}»: подключённая legacy execution subscription через App Server не подтверждает совместный native доступ или освобождение writer; lifecycle-факт для этого binding отсутствует.` });
       }
+      if (binding.observationHandoff) checks.push({ name: `codex_observation_handoff:${binding.id}`, state: "degraded",
+        detail: `«${binding.title.slice(0, 120)}»: передача в native клиент ещё не завершена; VK-привязка сохранена. Ожидание ${Math.max(0, Math.floor((this.now() - binding.observationHandoff.firstSeenAt) / 1_000))} с.` });
       if (!binding.connected && diagnostic && ["running", "approval"].includes(binding.status)) {
         const date = Number.isFinite(diagnostic.at) ? new Date(diagnostic.at) : new Date(Number.NaN);
         const at = Number.isFinite(date.getTime()) ? date.toISOString() : "время неизвестно";
