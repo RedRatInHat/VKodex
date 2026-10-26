@@ -6194,7 +6194,7 @@ test("a newer failed turn stops an older thinking indicator despite a stale acti
   assert.equal(s.edits.length, edits);
 });
 
-test("snapshot projection does not mirror quiet scheduler heartbeats", () => {
+test("snapshot projection preserves live heartbeat commentary without replaying completed heartbeat history", () => {
   const initial = projectSnapshot(state([], "completed"), null, 100);
   const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
   const completed = state([
@@ -6204,10 +6204,18 @@ test("snapshot projection does not mirror quiet scheduler heartbeats", () => {
   ], "completed");
   const next = projectSnapshot(completed, initial.checkpoint, 200);
   assert.deepEqual(next.events.filter(event => event.type !== "status"), []);
+  assert.deepEqual(projectSnapshot(completed, next.checkpoint, 250).events, [],
+    "an upgrade cannot replay previously suppressed completed heartbeat commentary");
   const partial = projectSnapshot(state([
     { type: "agentMessage", id: "partial-progress", phase: "commentary", text: "Still quiet" },
+    { type: "agentMessage", id: "technical-progress", phase: "commentary", text: "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>" },
   ]), next.checkpoint, 300);
-  assert.deepEqual(partial.events.filter(event => event.type !== "status"), []);
+  assert.deepEqual(partial.events.filter(event => event.type !== "status"), [
+    { type: "progress", id: "partial-progress", turnId: "fixture-turn", text: "Still quiet" },
+  ]);
+  assert.deepEqual(projectSnapshot(state([
+    { type: "agentMessage", id: "partial-progress", phase: "commentary", text: "Still quiet" },
+  ]), partial.checkpoint, 400).events, []);
 });
 
 test("a reconnect recovers the terminal status of an accepted interrupted turn", () => {

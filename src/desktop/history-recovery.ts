@@ -59,7 +59,15 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
         if (path && checkpoint?.rolloutCursor && checkpoint.rolloutPath
           && comparablePath(checkpoint.rolloutPath) === path) await this.tailer.restore(task, checkpoint.rolloutCursor);
       }
-      const events = await this.tailer.poll(task, since, checkpoint?.quietTurnIds);
+      // Quiet progress was not checkpointed by older versions. Do not pull its
+      // completed backlog into VK when an old receipt widens final recovery.
+      // Persist this separate window so restart mid-batch cannot lose new work.
+      const heartbeatProgressWindow = !historyRebuilt && checkpoint?.rolloutPath && task.rolloutPath
+        && checkpoint.heartbeatProgressWindow
+        ? checkpoint.heartbeatProgressWindow
+        : { since: checkpoint?.lastObservedAt ?? checkpoint?.since ?? enabledSince,
+          activeTurnIds: checkpoint?.active ?? [] };
+      const events = await this.tailer.poll(task, since, checkpoint?.quietTurnIds, heartbeatProgressWindow);
       // A rebuilt rollout contains both the old branch and anything that was
       // written directly in Codex while VKodex was detached.  The old code
       // allowed only accepted VK turns through the first poll, which silently
@@ -74,6 +82,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
         active: checkpoint?.active ?? [],
         seen: checkpoint?.seen ?? {},
         semanticByIdentity: checkpoint?.semanticByIdentity ?? {},
+        heartbeatProgressWindow,
         ...(this.tailer.quietTurnIds(task).length ? { quietTurnIds: this.tailer.quietTurnIds(task) } : {}),
         ...(task.rolloutPath ? { rolloutPath: comparablePath(task.rolloutPath) } : {}),
         ...(task.rolloutPath && this.tailer.durableCursor(task)

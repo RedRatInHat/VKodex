@@ -120,8 +120,11 @@ export function observeAppServerTaskState(state: TaskState, previous: TaskObserv
         // Codex streams final_answer text before the turn completes. Its first
         // delta must not be mirrored as a separate VK commentary message.
         if (item.phase === "commentary") {
-          if (!automationHeartbeat) emit({ type: "progress", id, turnId: turn.id, text: item.text }, false,
-            startedWhileDisconnected && turn.status === "inProgress");
+          if (!automationHeartbeat || turn.status === "inProgress") {
+            const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
+            if (text) emit({ type: "progress", id, turnId: turn.id, text }, false,
+              startedWhileDisconnected && turn.status === "inProgress");
+          }
         } else if (turn.status === "completed" && (item.phase === "final_answer" || item.phase == null) && id === lastAgentId) {
           const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
           if (text) {

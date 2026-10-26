@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { RolloutTaskHistoryRecovery } from "../src/desktop/history-recovery.js";
 import { RolloutRecordTooLargeError, RolloutTailer } from "../src/desktop/rollout-tailer.js";
+import { BridgeStore } from "../src/bridge/store.js";
+import { TaskMirror } from "../src/bridge/mirror.js";
 
 const task = (rolloutPath: string) => ({ hostId: "local", threadId: "thread", rolloutPath });
 const line = (timestamp: string, item: unknown) => JSON.stringify({ timestamp, type: "response_item", payload: item }) + "\n";
@@ -96,7 +98,45 @@ test("rollout tailer ignores old history and incrementally reads new visible ass
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), []);
 });
 
-test("rollout recovery suppresses quiet heartbeats and unwraps notifications", async () => {
+test("heartbeat recovery separates old quiet backlog from live work across bounded reads and restart", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-heartbeat-migration-"));
+  const rollout = path.join(root, "rollout.jsonl");
+  const at = (second: number) => Date.parse("2026-09-03T10:00:00.000Z") + second * 1_000;
+  const stamp = (second: number) => new Date(at(second)).toISOString();
+  const prefix = userLine(stamp(0), "scheduler", "old", "<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-03T10:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>")
+    + line(stamp(1), message("old-progress", "old", "commentary", "Old completed work"))
+    + line(stamp(2), message("active-progress", "active", "commentary", "Known active work"));
+  await writeFile(rollout, prefix
+    + JSON.stringify({ timestamp: stamp(2.5), type: "event_msg", payload: { type: "task_complete", turn_id: "old" } }) + "\n"
+    + line(stamp(3.5), message("fresh-progress", "fresh", "commentary", "Fresh scheduled work")));
+  const store = new BridgeStore(); t.after(() => store.close());
+  const binding = store.ensureBinding({ ...task(rollout), title: "Heartbeat migration", workspace: root, updatedAt: 1 });
+  store.setChat(binding.id, 200_000_0001, 17);
+  let now = at(5); const mirror = new TaskMirror(store, 3_500, () => now);
+  let recovery = new RolloutTaskHistoryRecovery(new RolloutTailer(16_384, Buffer.byteLength(prefix)));
+  recovery.enable(binding.id, at(0));
+  const checkpoint = { since: at(0), lastObservedAt: at(3), activeAtAttach: [], active: ["active"],
+    seen: {}, quietTurnIds: ["old", "active", "fresh"], rolloutPath: rollout };
+  const first = (await recovery.poll(binding.id, task(rollout), checkpoint, at(0), new Set(), now))!;
+  assert.deepEqual(first.events.filter(e => e.type === "progress").map(e => e.text), ["Known active work"],
+    "an old receipt cannot lower the heartbeat progress migration boundary");
+  store.setValue(`projection:${binding.id}`, first.checkpoint);
+  mirror.acceptObservation(binding.id, first.events, [], ["active"]);
+  now += 2_001; mirror.tick();
+  assert.deepEqual(store.pendingDeliveries().map(d => d.view.text), ["Known active work"]);
+  // A fresh reader resumes the durable cursor, but must not replace the old
+  // progress cutoff with lastObservedAt=5 and lose the unread timestamp 3.5.
+  recovery = new RolloutTaskHistoryRecovery(); recovery.enable(binding.id, now);
+  const second = (await recovery.poll(binding.id, task(rollout), first.checkpoint!, at(0), new Set(), now))!;
+  assert.deepEqual(second.events.filter(e => e.type === "progress").map(e => e.text), ["Fresh scheduled work"]);
+  store.setValue(`projection:${binding.id}`, second.checkpoint);
+  mirror.acceptObservation(binding.id, second.events, [], []);
+  now += 2_001; mirror.tick();
+  assert.deepEqual(store.pendingDeliveries().map(d => d.view.text), ["Known active work", "Fresh scheduled work"]);
+  assert.deepEqual((await recovery.poll(binding.id, task(rollout), second.checkpoint!, at(0), new Set(), now))?.events, []);
+});
+
+test("rollout recovery forwards heartbeat commentary while suppressing quiet finals and scheduler inputs", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-rollout-")); const rollout = path.join(root, "rollout.jsonl");
   const quiet = "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>";
   const notify = "<heartbeat><automation_id>monitor</automation_id><decision>NOTIFY</decision><message>Needs attention.</message></heartbeat>";
@@ -105,19 +145,25 @@ test("rollout recovery suppresses quiet heartbeats and unwraps notifications", a
       content: [{ type: "input_text", text: "<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-03T09:59:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>" }],
       internal_chat_message_metadata_passthrough: { turn_id: "quiet-turn" } })
     + line("2026-09-03T09:59:30.000Z", message("quiet-progress", "quiet-turn", "commentary", "Private scheduler progress"))
+    + line("2026-09-03T09:59:31.000Z", message("technical-progress", "quiet-turn", "commentary", quiet))
     + line("2026-09-03T10:00:00.000Z", message("quiet", "quiet-turn", "final_answer", quiet))
     + line("2026-09-03T10:01:00.000Z", message("notify", "notify-turn", "final_answer", notify)));
   const tailer = new RolloutTailer(4096, 4096);
   assert.deepEqual(await tailer.poll(task(rollout), Date.parse("2026-09-03T00:00:00.000Z")), [
+    { type: "progress", id: "quiet-progress", turnId: "quiet-turn", text: "Private scheduler progress" },
     { type: "final", id: "notify", turnId: "notify-turn", text: "Needs attention.", showMenu: false },
   ]);
   assert.deepEqual(tailer.quietTurnIds(task(rollout)), ["quiet-turn"]);
-  // A restarted reader can inherit explicit visibility policy when the input
+  // A restarted reader can inherit heartbeat origin when the input
   // is no longer inside its read window.
   await writeFile(rollout, line("2026-09-03T10:02:00.000Z", message("late-quiet", "quiet-turn", "commentary", "Still quiet")));
-  assert.deepEqual(await new RolloutTailer().poll(task(rollout), 0, ["quiet-turn"]), []);
+  assert.deepEqual(await new RolloutTailer().poll(task(rollout), 0, ["quiet-turn"]), [
+    { type: "progress", id: "late-quiet", turnId: "quiet-turn", text: "Still quiet" },
+  ]);
   // An empty read must not erase policy learned by the primary transport.
-  assert.deepEqual(await tailer.poll(task(rollout), 0, ["another-quiet-turn"]), []);
+  assert.deepEqual(await tailer.poll(task(rollout), 0, ["another-quiet-turn"]), [
+    { type: "progress", id: "late-quiet", turnId: "quiet-turn", text: "Still quiet" },
+  ]);
   assert.deepEqual(await tailer.poll(task(rollout), 0, ["new-quiet-turn"]), []);
   assert.ok(tailer.quietTurnIds(task(rollout)).includes("new-quiet-turn"));
 });

@@ -62,7 +62,8 @@ export class RolloutTailer {
     } catch { return false; }
   }
 
-  async poll(task: TaskRef, since: number, knownQuietTurns: readonly string[] = []): Promise<readonly TaskEvent[]> {
+  async poll(task: TaskRef, since: number, knownQuietTurns: readonly string[] = [],
+    heartbeatProgressWindow: Readonly<{ since: number; activeTurnIds: readonly string[] }> = { since, activeTurnIds: [] }): Promise<readonly TaskEvent[]> {
     const key = this.key(task);
     const generation = this.generations.get(key) ?? 0;
     const current = (): boolean => (this.generations.get(key) ?? 0) === generation;
@@ -109,8 +110,15 @@ export class RolloutTailer {
       if (Buffer.byteLength(line) > this.maxRecordBytes) throw new RolloutRecordTooLargeError();
       const record = parseRecord(line);
       if (record?.quietTurnId) quietTurns.add(record.quietTurnId);
-      if (record?.event && record.timestamp >= since
-        && !(record.event.type === "progress" && quietTurns.has(record.event.turnId))) events.push(record.event);
+      if (record?.event && record.timestamp >= since) {
+        const event = record.event;
+        if (event.type === "progress" && quietTurns.has(event.turnId)) {
+          if (record.timestamp < heartbeatProgressWindow.since
+            && !heartbeatProgressWindow.activeTurnIds.includes(event.turnId)) continue;
+          const text = visibleAutomationHeartbeatOutput(event.text);
+          if (text) events.push({ ...event, text });
+        } else events.push(event);
+      }
     }
     this.quiet.set(key, [...quietTurns].slice(-256));
     const offset = start + bytesRead - pending.length;

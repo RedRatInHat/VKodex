@@ -189,7 +189,13 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         // with progress that happened before the user connected it. A later edit
         // to the same item (or genuinely new content) is emitted.
         if (item.phase === "commentary") {
-          if (!automationHeartbeat) emitSemantic({ type: "progress", id, turnId, text: item.text });
+          // Heartbeat origin hides scheduler metadata, not visible live work.
+          // Old versions never checkpointed its suppressed commentary: do not
+          // replay that backlog from already terminal heartbeat turns on upgrade.
+          if (!automationHeartbeat || activeTurnIds.has(turnId)) {
+            const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;
+            if (text) emitSemantic({ type: "progress", id, turnId, text });
+          }
         }
         else if ((item.phase === "final_answer" || item.phase === "final") && turn.status === "completed") {
           const text = automationHeartbeat ? visibleAutomationHeartbeatOutput(item.text) : item.text;

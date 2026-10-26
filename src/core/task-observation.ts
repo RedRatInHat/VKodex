@@ -20,7 +20,10 @@ export interface TaskObservationCheckpoint {
   readonly rolloutPath?: string;
   /** Valid only for rolloutPath; never contains source file bytes. */
   readonly rolloutCursor?: RolloutCursorCheckpoint;
-  /** Explicit scheduler visibility policy, independent of turn initiation. */
+  /** Same rolloutPath as the cursor; frozen across bounded reads and restart.
+   * Old accepted receipts may widen final recovery, never heartbeat progress. */
+  readonly heartbeatProgressWindow?: Readonly<{ since: number; activeTurnIds: readonly string[] }>;
+  /** Durable heartbeat origin for private scheduler input/final envelopes; not a live-progress mute. */
   readonly quietTurnIds?: readonly string[];
 }
 

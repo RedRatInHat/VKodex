@@ -613,7 +613,7 @@ test("native observer baselines old history and emits live progress and final on
   assert.deepEqual(repeated.events, []);
 });
 
-test("native observer hides scheduler input and quiet heartbeat output", () => {
+test("native observer forwards heartbeat work progress but hides scheduler input and quiet finals", () => {
   const prompt = `<heartbeat><automation_id>monitor</automation_id><current_time_iso>2026-09-19T17:00:00Z</current_time_iso><instructions>Check.</instructions></heartbeat>`;
   const empty: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
     runtimeStatus: "idle", context: null, turns: [] };
@@ -622,17 +622,45 @@ test("native observer hides scheduler input and quiet heartbeat output", () => {
   running.turns = [turn("heartbeat", "inProgress", [
     { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
     item("progress", "Internal automation progress", "commentary"),
+    item("technical-progress", "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>", "commentary"),
   ], 11_000)];
   const live = observeAppServerTaskState(running, first.checkpoint, 12_000);
-  assert.deepEqual(live.events.map(event => event.type), ["status"]);
+  assert.deepEqual(live.events.map(event => event.type), ["progress", "status"]);
+  assert.equal(live.events.some(event => event.type === "user"), false);
+  assert.deepEqual(observeAppServerTaskState(running, live.checkpoint, 12_500).events, []);
 
   const completed = structuredClone(running); completed.runtimeStatus = "idle";
   (completed.turns as JsonObject[])[0] = turn("heartbeat", "completed", [
     { type: "userMessage", id: "scheduler", content: [{ type: "text", text: prompt }] },
+    item("historically-suppressed", "Do not replay completed heartbeat commentary", "commentary"),
     item("final", "<heartbeat><automation_id>monitor</automation_id><decision>DONT_NOTIFY</decision><message>Quiet.</message></heartbeat>"),
   ], 11_000);
   const done = observeAppServerTaskState(completed, live.checkpoint, 13_000);
   assert.deepEqual(done.events, [{ type: "status", id: "status:heartbeat", turnId: "heartbeat", status: "completed" }]);
+});
+
+test("heartbeat partial progress without a user item reaches VK after ordering grace", t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const binding = store.ensureBinding({ hostId: "local", threadId: "task", title: "Heartbeat work", workspace: "D:\\work", updatedAt: 1 });
+  store.setChat(binding.id, 200_000_0001, 17);
+  let now = 20_000;
+  const mirror = new TaskMirror(store, 3_500, () => now);
+  const state: TaskState = { kind: "app-server", threadId: "task", title: null, cwd: null, model: null, effort: null,
+    runtimeStatus: "active", context: null,
+    turns: [turn("heartbeat", "inProgress", [item("work", "Visible work", "commentary")], 11_000)] };
+  const baseline = observeAppServerTaskState({ ...state, turns: [] }, null, 10_000);
+  const previous = { ...baseline.checkpoint, quietTurnIds: ["heartbeat"] };
+  const live = observeAppServerTaskState(state, previous, now);
+  store.setValue(`projection:${binding.id}`, live.checkpoint);
+  mirror.acceptObservation(binding.id, live.events, live.inputTurnIds, ["heartbeat"]);
+  assert.equal(store.pendingDeliveries().length, 0, "ordering grace does not depend on a scheduler input item");
+  now += 2_001; mirror.tick();
+  assert.deepEqual(store.pendingDeliveries().map(d => ({ text: d.view.text, silent: d.view.silent })),
+    [{ text: "Visible work", silent: true }]);
+  const repeated = observeAppServerTaskState(state, live.checkpoint, now);
+  assert.deepEqual(repeated.events, []);
+  mirror.acceptObservation(binding.id, repeated.events, [], ["heartbeat"]); mirror.tick();
+  assert.equal(store.pendingDeliveries().length, 1);
 });
 
 test("native observer unwraps a notifying heartbeat", () => {

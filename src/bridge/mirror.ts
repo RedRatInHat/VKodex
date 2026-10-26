@@ -80,9 +80,6 @@ export class TaskMirror {
         const key = this.deferredKey(bindingId, turnId);
         const pending = this.store.getValue<DeferredMirror | TaskEvent[]>(key);
         if (!binding?.attached || binding.peerId === null) { this.store.setValue(key, null); continue; }
-        if (this.store.getValue<{ quietTurnIds?: readonly string[] }>(`projection:${bindingId}`)?.quietTurnIds?.includes(turnId)) {
-          this.store.setValue(key, null); continue;
-        }
         if (!pending || Array.isArray(pending)) continue;
         if (!this.matches(binding, pending) || this.matches(binding, this.store.getValue(`mirror-terminal:${bindingId}:${turnId}`))) {
           this.store.setValue(key, null); continue;
