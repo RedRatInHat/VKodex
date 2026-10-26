@@ -410,10 +410,10 @@ export class RoutedCodexTasks implements CodexTasks {
     return this.base.continueGoal(task, operationId);
   }
   async revealTask(task: TaskRef): Promise<void> { this.refuseExclusive(task); return this.base.revealTask?.(task) ?? Promise.resolve(); }
-  async openNativeObservation(task: TaskRef, assertCurrent: () => void): Promise<import("./codex-tasks.js").NativeObservationOpenResult> {
+  async openNativeObservation(task: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean = () => true): Promise<import("./codex-tasks.js").NativeObservationOpenResult> {
     const assertRoute = (): void => { assertCurrent(); this.refuseExclusive(task); };
     assertRoute();
-    const result = await this.base.openNativeObservation?.(task, assertRoute) ?? "unsupported";
+    const result = await this.base.openNativeObservation?.(task, assertRoute, () => { assertRoute(); return reserveOpen(); }) ?? "unsupported";
     assertRoute();
     return result;
   }

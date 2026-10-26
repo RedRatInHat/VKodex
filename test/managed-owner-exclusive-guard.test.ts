@@ -42,9 +42,9 @@ test('health opens a missing native observation once after owner-busy command re
   const states = new RoutedTaskStateTransport(native, [{ owns: () => true, states: profile }]);
   const desktop = { listTasks: async () => [nativeTask],
     submitWithReceipt: async () => { writes++; throw new Error('refused command must not reach a writer'); },
-    openNativeObservation: async (requested: TaskRef, assertCurrent: () => void) => {
+    openNativeObservation: async (requested: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean) => {
       assert.equal(requested.threadId, nativeTask.threadId);
-      assertCurrent(); launches++; nativeOnline = true; return 'opened' as const;
+      assertCurrent(); assert.equal(reserveOpen(), true); launches++; nativeOnline = true; return 'opened' as const;
     },
   } as unknown as CodexTasks;
   const chat = { members: async () => [101, -202],
@@ -155,7 +155,7 @@ test('native health recovery rejects stale, foreign, quarantined and superseded 
   }
 });
 
-test('native health recovery consumes an outage before probe and does not relaunch for later busy retries', async () => {
+test('native health recovery stays single-flight, bounds unconfirmed opens and keeps discovery after exhaustion', async () => {
   const store = new BridgeStore(); const peerId = 2_000_000_020;
   const candidate = { hostId: 'local', threadId: 'native-outage', sourceId: '', title: 'Native fixture',
     workspace: 'C:\\Fixture', updatedAt: 1 };
@@ -175,8 +175,12 @@ test('native health recovery consumes an outage before probe and does not relaun
     readOnly: true, start: async () => { throw new TaskNotOpenError(); },
     verifyOwner: async () => {}, close() {} }), close() {} };
   const desktop = { listTasks: async () => [candidate],
-    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
-      probes++; await probePending; assertCurrent(); launches++; return 'opened' as const;
+    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean) => {
+      probes++; await probePending; assertCurrent();
+      if (!reserveOpen()) return 'activation-unconfirmed' as const;
+      assert.equal(store.getValue<{ openAttempts: number }>(`native-observation-recovery:${binding.id}`)?.openAttempts,
+        launches + 1, 'each UI effect is durably reserved first');
+      launches++; return 'opened' as const;
     } } as unknown as CodexTasks;
   const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
     edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
@@ -196,13 +200,19 @@ test('native health recovery consumes an outage before probe and does not relaun
     assert.equal(launches, 1);
     now += 61_000; evidence(now - 2, 2);
     await runtime.tick(true, binding.id);
-    assert.equal(launches, 1, 'a new command refusal in the same unverified outage cannot refocus');
-    assert.equal(probes, 1, 'a durable attempt is consumed before native discovery');
-    assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'opened');
+    assert.equal(launches, 2, 'a missing owner after an ACK permits the remaining bounded attempt');
+    assert.equal(probes, 2);
+    for (let i = 0; i < 2; i++) {
+      now += 61_000; evidence(now - 2, 3 + i);
+      await runtime.tick(true, binding.id);
+    }
+    assert.equal(launches, 2, 'fresh failure timestamps cannot reset the outage budget');
+    assert.equal(probes, 4, 'read-only discovery continues after popup exhaustion');
+    assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'activation-unconfirmed');
   } finally { await runtime.stop(); store.close(); }
 });
 
-test('native health retries a failed discovery after cooldown without repeating a possible launch', async () => {
+test('native health preserves recovery budget across restart, generation and legacy unknown results', async () => {
   const store = new BridgeStore(); const peerId = 2_000_000_023;
   const candidate = { hostId: 'local', threadId: 'native-discovery-retry', sourceId: '', title: 'Native fixture',
     workspace: 'C:\\Fixture', updatedAt: 1 };
@@ -213,10 +223,11 @@ test('native health retries a failed discovery after cooldown without repeating 
     readOnly: true, start: async () => { throw new TaskNotOpenError(); },
     verifyOwner: async () => {}, close() {} }), close() {} };
   const desktop = { listTasks: async () => [candidate],
-    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
+    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean) => {
       assertCurrent(); probes++;
       assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'attempted');
       if (probes === 1) return 'discovery-unavailable';
+      if (!reserveOpen()) return 'activation-unconfirmed';
       launches++; return 'opened';
     } } as unknown as CodexTasks;
   const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
@@ -236,14 +247,22 @@ test('native health retries a failed discovery after cooldown without repeating 
     now += 2_000; await runtime.tick(true, binding.id);
     assert.equal(probes, 2, 'a failed read-only probe does not consume recovery forever');
     assert.equal(launches, 1);
-    now += 61_000; await runtime.tick(true, binding.id);
-    assert.equal(probes, 2, 'the successful launch remains consumed until a passive snapshot');
-    assert.equal(launches, 1);
     const saved = store.getValue<Record<string, unknown>>(`native-observation-recovery:${binding.id}`)!;
-    store.setValue(`native-observation-recovery:${binding.id}`, { ...saved, state: 'unknown' });
+    const { openAttempts: _attempts, lastOpenAt: _lastOpen, ...legacy } = saved;
+    store.setValue(`native-observation-recovery:${binding.id}`, { ...legacy, state: 'unknown' });
+    store.setValue(`stream-generation:${binding.id}`, 1);
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 1 });
     await runtime.stop(); runtime = makeRuntime(); now += 61_000;
     await runtime.tick(true, binding.id);
-    assert.equal(probes, 2, 'historical unknown attempts stay consumed after restart');
+    assert.equal(probes, 3, 'legacy unknown results permit fresh discovery after restart');
+    assert.equal(launches, 2, 'legacy unknown conservatively consumes one of two opens');
+    await runtime.stop();
+    store.ensureBinding({ ...candidate, rolloutPath: 'C:\\Fixture\\rotated.jsonl' });
+    runtime = makeRuntime(); now += 61_000;
+    await runtime.tick(true, binding.id);
+    assert.equal(probes, 4);
+    assert.equal(launches, 2, 'restart, stream generation and rollout rotation cannot replenish the budget');
+    assert.equal(store.getValue<{ openAttempts: number }>(`native-observation-recovery:${binding.id}`)?.openAttempts, 2);
   } finally { await runtime.stop(); store.close(); }
 });
 
@@ -304,10 +323,11 @@ test('native opening rechecks task, transfer and foreground fences after asynchr
       readOnly: true, start: async () => { throw new TaskNotOpenError(); },
       verifyOwner: async () => {}, close() {} }), close() {} };
     const desktop = { listTasks: async () => [candidate],
-      openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
+      openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean) => {
         scopeChecks++; await Promise.resolve();
         if (changed === 'postlaunch') {
-          assertCurrent(); launches++;
+          assertCurrent(); if (!reserveOpen()) return 'activation-unconfirmed' as const;
+          launches++;
           (runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire.add(binding.id);
           assertCurrent();
         }
@@ -317,7 +337,8 @@ test('native opening rechecks task, transfer and foreground fences after asynchr
           .pendingReacquire.add(binding.id);
         if (changed === 'detached') store.setAttached(binding.id, false);
         if (changed === 'stopped') (runtime as unknown as { stopped: boolean }).stopped = true;
-        assertCurrent(); launches++; return 'opened' as const;
+        assertCurrent(); if (!reserveOpen()) return 'activation-unconfirmed' as const;
+        launches++; return 'opened' as const;
       } } as unknown as CodexTasks;
     const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
       edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
@@ -341,8 +362,12 @@ test('native opening rechecks task, transfer and foreground fences after asynchr
           reason: 'task-not-open', routeGeneration: 2 }, candidate);
         store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
         await runtime.tick(true, binding.id);
-        assert.equal(launches, 1, 'a possibly completed launch cannot repeat in the same outage');
-        assert.equal(scopeChecks, 1);
+        assert.equal(launches, 2, 'unknown postlaunch effect consumes its budget before a bounded retry');
+        assert.equal(scopeChecks, 2);
+        (runtime as unknown as { pendingReacquire: Set<string> }).pendingReacquire.delete(binding.id);
+        now += 61_000;
+        await runtime.tick(true, binding.id);
+        assert.equal(launches, 2, 'two unknown effects cannot be followed by a third popup');
       }
     } finally { await runtime.stop(); store.close(); }
   }

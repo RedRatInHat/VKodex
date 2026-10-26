@@ -12,6 +12,8 @@ test("drain diagnostics retain approved reasons, incident correlation and hashed
     });
     diagnosticEvent("connection.lifecycle", { stage: "native-observation-recovery", outcome: "failure",
       reason: "discovery-unavailable" });
+    diagnosticEvent("connection.lifecycle", { stage: "native-observation-recovery", outcome: "failure",
+      reason: "activation-unconfirmed" });
   });
   assert.equal(records[0]?.stage, "execution-drain");
   assert.equal(records[0]?.reason, "goal-active");
@@ -19,6 +21,7 @@ test("drain diagnostics retain approved reasons, incident correlation and hashed
   assert.equal(records[0]?.subjectThreadId, diagnosticId("private-subject"));
   assert.equal(records[0]?.retryAfterMs, 1_000);
   assert.equal(records[1]?.reason, "discovery-unavailable");
+  assert.equal(records[2]?.reason, "activation-unconfirmed");
 });
 
 test("diagnostic allowlist excludes payloads, secret-bearing errors and arbitrary scalars", () => {

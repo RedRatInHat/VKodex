@@ -425,7 +425,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     await this.live.launcher.open(resolved);
   }
 
-  async openNativeObservation(task: TaskRef, assertCurrent: () => void): Promise<import("./contracts.js").NativeObservationOpenResult> {
+  async openNativeObservation(task: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean = () => true): Promise<import("./contracts.js").NativeObservationOpenResult> {
     const launcher = this.live?.launcher;
     if (task.hostId !== "local" || (task.sourceId ?? "") !== ""
       || !launcher?.canOpenNativeObservation?.(task) || this.live?.creator?.isActive(task)) return "unsupported";
@@ -462,6 +462,8 @@ export class ConnectedDesktopTasks implements DesktopTasks {
       || !launcher.canOpenNativeObservation?.(latest) || this.live?.creator?.isActive(latest)) return "unsupported";
     diagnosticEvent("connection.lifecycle", { stage: "native-observation-recovery", outcome: "start",
       reason: "no-client-found", intent: "observe", mutating: false, ready: false });
+    if (!reserveOpen()) return "activation-unconfirmed";
+    assertCurrent();
     await launcher.open(latest);
     assertCurrent();
     return "opened";

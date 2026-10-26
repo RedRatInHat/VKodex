@@ -68,7 +68,7 @@ const words = new Set(["start", "success", "failure", "accepted", "rejected", "u
   "pending", "adapter-returned", "receipt", "history-reconciled", "invalid-response", "abandoned", "dropped",
   "no-passive-route", "connection-not-ready", "route-changed", "cancelled", "model-not-supported-for-account",
   "active-writer", "owner-busy", "task-not-open", "desktop-unavailable", "other",
-  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "discovery-unavailable", "unsupported",
+  "native-observation-recovery", "passive-snapshot", "opened", "owner-present", "discovery-unavailable", "activation-unconfirmed", "unsupported",
   "execution-drain", "active-local", "unknown-local", "generation-mismatch", "family-pagination-incomplete",
   "child-active", "goal-active", "queue-pending", "receipt-unknown", "unload-retention-window", "read-failure",
   "checking", "blocked", "released", "waiting-unload", "predecessor-unverified"]);

@@ -96,24 +96,29 @@ test("native operation reconciliation follows durable provenance while old profi
 
 test("native observation recovery never consults a profile owner and rechecks exclusive claims before launch", async () => {
   const s = fixture();
-  let exclusive = false, opens = 0;
+  let exclusive = false, opens = 0, reservations = 0;
   const owner: CodexTaskOwner = { ...s.owner, routingPolicy: "exclusive", owns: () => exclusive };
-  const base: CodexTasks = { ...s.base, openNativeObservation: async (_task, assertCurrent) => {
+  const base: CodexTasks = { ...s.base, openNativeObservation: async (_task, assertCurrent, reserveOpen) => {
     await Promise.resolve();
     assertCurrent();
+    if (!reserveOpen!()) return "activation-unconfirmed";
     opens++;
     return "opened";
   } };
   const routed = new RoutedCodexTasks(base, [owner]);
-  assert.equal(await routed.openNativeObservation(primary, () => {}), "opened");
+  const reserve = () => { reservations++; return true; };
+  assert.equal(await routed.openNativeObservation(primary, () => {}, reserve), "opened");
+  assert.equal(reservations, 1, "router forwards the durable UI reservation");
+  assert.equal(await routed.openNativeObservation(primary, () => {}, () => false), "activation-unconfirmed");
   assert.deepEqual(s.calls, []);
   exclusive = true;
-  await assert.rejects(routed.openNativeObservation(primary, () => {}), ActionRejectedError);
+  await assert.rejects(routed.openNativeObservation(primary, () => {}, reserve), ActionRejectedError);
   exclusive = false;
-  const pending = routed.openNativeObservation(primary, () => {});
+  const pending = routed.openNativeObservation(primary, () => {}, reserve);
   exclusive = true;
   await assert.rejects(pending, ActionRejectedError);
   assert.equal(opens, 1);
+  assert.equal(reservations, 1, "an exclusive claim prevents both reservation and UI effect");
 });
 
 test("an exclusive passive observer cannot advertise the shared native observation recovery route", async () => {

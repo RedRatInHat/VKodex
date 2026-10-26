@@ -307,7 +307,7 @@ export interface DesktopTaskLauncher {
 }
 
 /** Opening UI does not prove readiness. discovery-unavailable proves no launch; unknown may have side effects. */
-export type NativeObservationOpenResult = "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported";
+export type NativeObservationOpenResult = "opened" | "owner-present" | "discovery-unavailable" | "activation-unconfirmed" | "unknown" | "unsupported";
 
 export interface DesktopCompatibility {
   readonly state: "checking" | "ok" | "unverified" | "failed";
@@ -404,8 +404,9 @@ export interface CodexTasks {
   /** Repair native owner discovery through the configured primary Desktop UI.
    * Must probe the native broker first, launch only on exact no-client-found,
    * and call assertCurrent after asynchronous boundaries and before launch.
+   * reserveOpen must succeed synchronously immediately before any UI effect.
    * Never resume, submit, queue, change goals/settings, or acquire a writer. */
-  openNativeObservation?(task: TaskRef, assertCurrent: () => void): Promise<NativeObservationOpenResult>;
+  openNativeObservation?(task: TaskRef, assertCurrent: () => void, reserveOpen?: () => boolean): Promise<NativeObservationOpenResult>;
   /** One-time handoff used after a task or transfer is first linked to VK. */
   ensureOpen?(task: TaskRef): Promise<void>;
   isCreationActive?(task: TaskRef): boolean;

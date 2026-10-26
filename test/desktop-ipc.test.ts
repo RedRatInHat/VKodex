@@ -593,7 +593,10 @@ test("native-only recovery survives restart and discovers a missing client witho
       store.setValue(`execution-lifecycle:${binding.id}`, { taskKey: taskKey(binding), state: "released",
         at: 1, generation: store.streamGeneration(binding.id) });
       Object.assign(desktop, { requireNativeExecution: () => {}, restoreExecutionDrain: () => {}, executionDrainSupported: () => true,
-        openNativeObservation: async (_task: typeof ref, assertCurrent: () => void) => { assertCurrent(); opens++; return "opened"; } });
+        openNativeObservation: async (_task: typeof ref, assertCurrent: () => void, reserveOpen: () => boolean) => {
+          assertCurrent(); if (!reserveOpen()) return "activation-unconfirmed";
+          opens++; return "opened";
+        } });
     });
   await s.runtime.tick();
   s.advance(61_000);
@@ -601,7 +604,10 @@ test("native-only recovery survives restart and discovers a missing client witho
   assert.equal(opens, 1, "a persisted native policy can recover despite a historical lifecycle fence");
   s.advance(61_000);
   await s.runtime.tick();
-  assert.equal(opens, 1, "an unconfirmed open is not repeated by later health checks");
+  assert.equal(opens, 2, "an unconfirmed open permits the remaining bounded recovery attempt");
+  s.advance(61_000);
+  await s.runtime.tick();
+  assert.equal(opens, 2, "a native policy does not allow unlimited window refocusing");
 });
 
 test("health idle drain releases only the exact MS writer while preserving its old queue ACK", async t => {
@@ -5643,9 +5649,9 @@ test("read-only task operations never invoke the configured launcher", async () 
 });
 
 test("native observation recovery opens only after an exact missing-owner discovery, without following or writing", async () => {
-  for (const scenario of ["missing", "found", "malformed", "rejected", "disconnect"] as const) {
+  for (const scenario of ["missing", "found", "malformed", "rejected", "disconnect", "budget-exhausted"] as const) {
     const server = new Server();
-    server.rejectDiscovery = scenario === "missing" || scenario === "rejected";
+    server.rejectDiscovery = scenario === "missing" || scenario === "rejected" || scenario === "budget-exhausted";
     if (scenario === "rejected") server.discoveryError = "private backend error";
     if (scenario === "malformed") server.ownerId = "";
     if (scenario === "disconnect") server.onDiscovery = () => server.destroy();
@@ -5654,8 +5660,8 @@ test("native observation recovery opens only after an exact missing-owner discov
     const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] },
       () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
       { launcher: { canOpenNativeObservation: () => true, open: async () => { opens++; } } });
-    const result = await adapter.openNativeObservation(task, () => { guards++; });
-    assert.equal(result, scenario === "missing" ? "opened" : scenario === "found" ? "owner-present" : "discovery-unavailable", scenario);
+    const result = await adapter.openNativeObservation(task, () => { guards++; }, () => scenario !== "budget-exhausted");
+    assert.equal(result, scenario === "missing" ? "opened" : scenario === "found" ? "owner-present" : scenario === "budget-exhausted" ? "activation-unconfirmed" : "discovery-unavailable", scenario);
     assert.equal(opens, scenario === "missing" ? 1 : 0, scenario);
     assert.ok(guards >= 3);
     assert.deepEqual(server.received.filter(message => message.type === "request").map(message => message.method),

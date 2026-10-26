@@ -99,7 +99,7 @@ export class BridgeRuntime {
   private readonly diagnosticConnectionIds = new Map<string, string>();
   private readonly drainAttempts = new Map<string, { readonly since: number; readonly routeGeneration: number }>();
   private readonly releasedExecutionScopes = new Map<string, string>();
-  /** A durable attempt is consumed before the native discovery/launch await. */
+  /** Space read-only probes and durably reserved UI opens without popup loops. */
   private readonly nativeObservationRecoveryCooldownMs = 60_000;
   private nativeExecutionRequired(binding: Binding): boolean {
     return this.store.nativeExecutionRequired(binding);
@@ -121,7 +121,8 @@ export class BridgeRuntime {
   }
   private nativeObservationRecovery(binding: Binding): { at: number; taskKey: string; rolloutPath: string;
     generation: number; failureAt?: number; busyAt?: number; busyRouteGeneration?: number | null; recoveredAt?: number;
-    state: "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported" | "recovered" } | null {
+    openAttempts?: number; lastOpenAt?: number;
+    state: "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "activation-unconfirmed" | "unknown" | "unsupported" | "recovered" } | null {
     return this.store.getValue(`native-observation-recovery:${binding.id}`);
   }
   private nativeObservationRecoveryReady(binding: Binding): boolean {
@@ -139,7 +140,7 @@ export class BridgeRuntime {
       && attempt.generation === this.store.streamGeneration(binding.id);
   }
   private nativeObservationRecoveryStatus(binding: Binding): "ready" | "recovered" | "unavailable" |
-    "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported" | null {
+    "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "activation-unconfirmed" | "unknown" | "unsupported" | null {
     const attempt = this.nativeObservationRecovery(binding);
     if (!attempt || !this.nativeObservationRecoveryScopeMatches(binding)) return null;
     if (attempt.state !== "recovered") return attempt.state;
@@ -184,9 +185,15 @@ export class BridgeRuntime {
     if (failure.at > this.now() || events.some(event => event.outcome === "confirmed" && event.at >= failure.at)) return;
     const prior = this.nativeObservationRecovery(binding);
     if (prior && (this.now() < prior.at || this.now() - prior.at < this.nativeObservationRecoveryCooldownMs)) return;
-    if (prior?.taskKey === taskKey(binding) && prior.rolloutPath === (binding.rolloutPath ?? "")
-      && prior.generation === generation && prior.state !== "discovery-unavailable"
-      && (!prior.recoveredAt || failure.at <= prior.recoveredAt)) return;
+    // A failed probe or an unconfirmed UI launch does not end recovery. Preserve
+    // the physical task's UI budget across restarts, generation and path changes.
+    const sameOutage = prior?.taskKey === taskKey(binding)
+      && !(prior.recoveredAt !== undefined && failure.at > prior.recoveredAt);
+    const openAttempts = !sameOutage ? 0 : prior.openAttempts === undefined
+      ? ["attempted", "opened", "unknown"].includes(prior.state) ? 1 : 0
+      : Number.isSafeInteger(prior.openAttempts) && prior.openAttempts >= 0 && prior.openAttempts <= 2
+        ? prior.openAttempts : 2;
+    const lastOpenAt = sameOutage ? prior.lastOpenAt ?? (openAttempts > 0 ? prior.at : undefined) : undefined;
     const original = binding;
     const current = (): boolean => {
       const latest = this.store.getBinding(original.id);
@@ -201,11 +208,12 @@ export class BridgeRuntime {
         && (!activeTransfer || ["complete", "cancelled"].includes(activeTransfer.phase));
     };
     const marker = { at: this.now(), taskKey: taskKey(original), rolloutPath: original.rolloutPath ?? "",
-      generation, failureAt: failure.at, state: "attempted" as const };
+      generation, failureAt: failure.at, openAttempts, ...(lastOpenAt === undefined ? {} : { lastOpenAt }),
+      state: "attempted" as const };
     this.background(`native-observation-recovery:${binding.id}`, "native-observation-recovery", async () => {
       if (!current()) return;
-      // Persist before any async discovery, consuming even a previous safe
-      // failure. Only a result proving no launch happened permits a later retry.
+      // Persist the probe before any await; reserve each UI attempt separately,
+      // synchronously, only after the adapter has proved an exact broker miss.
       this.store.setValue(`native-observation-recovery:${original.id}`, marker);
       await diagnosticScope({ bindingId: original.id, threadId: original.threadId,
         sourceId: original.sourceId ?? "", streamGeneration: generation }, async () => {
@@ -213,9 +221,19 @@ export class BridgeRuntime {
         trace("connection.lifecycle", { stage: "native-observation-recovery", outcome: "start", ready: false });
         const scopeChanged = new ActionRejectedError("Native observation recovery scope changed");
         try {
-          const result = await this.desktop.openNativeObservation!(original, () => {
-            if (!current()) throw scopeChanged;
-          });
+          const assertCurrent = (): void => { if (!current()) throw scopeChanged; };
+          const result = await this.desktop.openNativeObservation!(original, assertCurrent, () => this.store.atomic(() => {
+            assertCurrent();
+            const saved = this.nativeObservationRecovery(original);
+            if (!saved || saved.at !== marker.at || saved.taskKey !== marker.taskKey || saved.generation !== generation)
+              throw scopeChanged;
+            if (marker.openAttempts >= 2 || marker.lastOpenAt !== undefined
+              && (this.now() < marker.lastOpenAt || this.now() - marker.lastOpenAt < this.nativeObservationRecoveryCooldownMs)) return false;
+            marker.openAttempts++;
+            marker.lastOpenAt = this.now();
+            this.store.setValue(`native-observation-recovery:${original.id}`, marker);
+            return true;
+          }));
           const saved = this.nativeObservationRecovery(original);
           if (saved?.at === marker.at && saved.taskKey === marker.taskKey && saved.generation === generation
             && saved.state !== "recovered")
@@ -223,15 +241,14 @@ export class BridgeRuntime {
           trace("connection.lifecycle", { stage: "native-observation-recovery", outcome: result === "opened" ? "success" : "failure",
             reason: result, ready: false });
         } catch (error) {
-          // A changed scope may be reported after the launcher has already
-          // opened a window. Keep the durable attempt consumed for this outage.
+          // A changed scope may follow a UI effect. Keep its reserved budget;
+          // subsequent probes never infer whether an unknown launch succeeded.
           const saved = this.nativeObservationRecovery(original);
           if (saved?.at === marker.at && saved.taskKey === marker.taskKey && saved.generation === generation
             && saved.state !== "recovered")
             this.store.setValue(`native-observation-recovery:${original.id}`, { ...marker, state: "unknown" });
           trace("connection.lifecycle", { stage: "native-observation-recovery", outcome: "failure",
             reason: error === scopeChanged ? "guard-refused" : "unknown", ready: false });
-          /* Unknown native discovery/launch remains a consumed, health-visible attempt. */
         }
       });
     }, binding.id);

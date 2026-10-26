@@ -113,7 +113,7 @@ test("health reports the precise drain wait and distinguishes a historical fence
 });
 
 test("native observation recovery health separates opening from verified and historical snapshots", async t => {
-  let state: "opened" | "ready" | "recovered" | "unavailable" | "discovery-unavailable" = "opened";
+  let state: "opened" | "ready" | "recovered" | "unavailable" | "discovery-unavailable" | "activation-unconfirmed" = "opened";
   const s = setupWithBindings(t, () => [{ id: "native-recovery", title: "Native fixture", source: ".codex",
     status: "idle", connected: state === "ready", lastConfirmedAt: state === "ready" ? 100_000 : null,
     failure: null, nativeObservationRecovery: { state, at: 90_000 } }]);
@@ -124,6 +124,10 @@ test("native observation recovery health separates opening from verified and his
   const transient = await check();
   assert.equal(transient.state, "degraded");
   assert.match(transient.detail, /запуск клиента не выполнялся.*повторит проверку/);
+  state = "activation-unconfirmed";
+  const exhausted = await check();
+  assert.equal(exhausted.state, "degraded");
+  assert.match(exhausted.detail, /продолжает проверять подключение без новых окон/);
   state = "ready";
   assert.equal((await check()).state, "ok");
   state = "recovered";
