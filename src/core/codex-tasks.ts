@@ -306,8 +306,8 @@ export interface DesktopTaskLauncher {
   canOpenNativeObservation?(task: TaskRef): boolean;
 }
 
-/** An opened UI is not evidence of a verified subscription or accepted input. */
-export type NativeObservationOpenResult = "opened" | "owner-present" | "unknown" | "unsupported";
+/** Opening UI does not prove readiness. discovery-unavailable proves no launch; unknown may have side effects. */
+export type NativeObservationOpenResult = "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported";
 
 export interface DesktopCompatibility {
   readonly state: "checking" | "ok" | "unverified" | "failed";

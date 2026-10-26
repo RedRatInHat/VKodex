@@ -60,7 +60,7 @@ export interface RuntimeHealthState {
     readonly observationHandoff?: Readonly<{ operationId: string; firstSeenAt: number; generation: number }>;
     /** Opening the client is only an attempt; passive snapshot proves readiness. */
     readonly nativeObservationRecovery?: Readonly<{ readonly state:
-      "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" |
+      "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported" |
       "ready" | "unavailable" | "recovered"; readonly at: number }>;
     /** Per-binding execution writer lifecycle evidence from the runtime. */
     readonly executionLifecycle?: Readonly<{
@@ -419,6 +419,8 @@ export class BridgeHealthMonitor {
             ? "Наблюдение native восстановлено подтверждённым пассивным снимком; отклонённый VK-запрос не повторялся."
             : recovery.state === "recovered"
               ? "Наблюдение native ранее восстановлено пассивным снимком; свежесть текущего соединения проверяется отдельно. Отклонённый VK-запрос не повторялся."
+            : recovery.state === "discovery-unavailable"
+              ? "Проверка native-владельца временно недоступна; запуск клиента не выполнялся. Health повторит проверку после паузы не менее 60 с. Отклонённый VK-запрос не повторялся."
             : `Восстановление native-наблюдения: ${recovery.state}; открытие клиента и локальная аренда не доказывают готовность. Отклонённый VK-запрос не повторялся.` });
       }
       if (routeFailure?.kind === "no-active-owner") {

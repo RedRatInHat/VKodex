@@ -202,6 +202,51 @@ test('native health recovery consumes an outage before probe and does not relaun
   } finally { await runtime.stop(); store.close(); }
 });
 
+test('native health retries a failed discovery after cooldown without repeating a possible launch', async () => {
+  const store = new BridgeStore(); const peerId = 2_000_000_023;
+  const candidate = { hostId: 'local', threadId: 'native-discovery-retry', sourceId: '', title: 'Native fixture',
+    workspace: 'C:\\Fixture', updatedAt: 1 };
+  const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 23);
+  let now = Date.now(), probes = 0, launches = 0;
+  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+  const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
+    readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+    verifyOwner: async () => {}, close() {} }), close() {} };
+  const desktop = { listTasks: async () => [candidate],
+    openNativeObservation: async (_requested: TaskRef, assertCurrent: () => void) => {
+      assertCurrent(); probes++;
+      assert.equal(store.getValue<{ state: string }>(`native-observation-recovery:${binding.id}`)?.state, 'attempted');
+      if (probes === 1) return 'discovery-unavailable';
+      launches++; return 'opened';
+    } } as unknown as CodexTasks;
+  const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+    edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+  const makeRuntime = () => new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+    { states: native, passiveStates: native, observe: observeAppServerTaskState,
+      history: { enable() {}, disable() {}, poll: async () => null } }, () => now,
+    undefined, undefined, 10_000_000,
+    async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+  let runtime = makeRuntime();
+  try {
+    await runtime.tick(true, binding.id);
+    assert.equal(probes, 1); assert.equal(launches, 0);
+    await runtime.stop(); runtime = makeRuntime();
+    now += 59_000; await runtime.tick(true, binding.id);
+    assert.equal(probes, 1, 'read-only discovery respects the existing cooldown');
+    now += 2_000; await runtime.tick(true, binding.id);
+    assert.equal(probes, 2, 'a failed read-only probe does not consume recovery forever');
+    assert.equal(launches, 1);
+    now += 61_000; await runtime.tick(true, binding.id);
+    assert.equal(probes, 2, 'the successful launch remains consumed until a passive snapshot');
+    assert.equal(launches, 1);
+    const saved = store.getValue<Record<string, unknown>>(`native-observation-recovery:${binding.id}`)!;
+    store.setValue(`native-observation-recovery:${binding.id}`, { ...saved, state: 'unknown' });
+    await runtime.stop(); runtime = makeRuntime(); now += 61_000;
+    await runtime.tick(true, binding.id);
+    assert.equal(probes, 2, 'historical unknown attempts stay consumed after restart');
+  } finally { await runtime.stop(); store.close(); }
+});
+
 test('a passive snapshot cannot mark native recovery ready after an exclusive claim appears', async () => {
   const store = new BridgeStore(); const peerId = 2_000_000_021; const now = Date.now();
   const candidate = { hostId: 'local', threadId: 'native-claim-race', sourceId: '', title: 'Native fixture',

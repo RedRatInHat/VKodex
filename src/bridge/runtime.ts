@@ -121,7 +121,7 @@ export class BridgeRuntime {
   }
   private nativeObservationRecovery(binding: Binding): { at: number; taskKey: string; rolloutPath: string;
     generation: number; failureAt?: number; busyAt?: number; busyRouteGeneration?: number | null; recoveredAt?: number;
-    state: "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" | "recovered" } | null {
+    state: "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported" | "recovered" } | null {
     return this.store.getValue(`native-observation-recovery:${binding.id}`);
   }
   private nativeObservationRecoveryReady(binding: Binding): boolean {
@@ -139,7 +139,7 @@ export class BridgeRuntime {
       && attempt.generation === this.store.streamGeneration(binding.id);
   }
   private nativeObservationRecoveryStatus(binding: Binding): "ready" | "recovered" | "unavailable" |
-    "attempted" | "opened" | "owner-present" | "unknown" | "unsupported" | null {
+    "attempted" | "opened" | "owner-present" | "discovery-unavailable" | "unknown" | "unsupported" | null {
     const attempt = this.nativeObservationRecovery(binding);
     if (!attempt || !this.nativeObservationRecoveryScopeMatches(binding)) return null;
     if (attempt.state !== "recovered") return attempt.state;
@@ -185,7 +185,8 @@ export class BridgeRuntime {
     const prior = this.nativeObservationRecovery(binding);
     if (prior && (this.now() < prior.at || this.now() - prior.at < this.nativeObservationRecoveryCooldownMs)) return;
     if (prior?.taskKey === taskKey(binding) && prior.rolloutPath === (binding.rolloutPath ?? "")
-      && prior.generation === generation && (!prior.recoveredAt || failure.at <= prior.recoveredAt)) return;
+      && prior.generation === generation && prior.state !== "discovery-unavailable"
+      && (!prior.recoveredAt || failure.at <= prior.recoveredAt)) return;
     const original = binding;
     const current = (): boolean => {
       const latest = this.store.getBinding(original.id);
@@ -203,8 +204,8 @@ export class BridgeRuntime {
       generation, failureAt: failure.at, state: "attempted" as const };
     this.background(`native-observation-recovery:${binding.id}`, "native-observation-recovery", async () => {
       if (!current()) return;
-      // Persist before any async native discovery. A slow/timed-out launch must
-      // not be repeated by another tick or process restart.
+      // Persist before any async discovery, consuming even a previous safe
+      // failure. Only a result proving no launch happened permits a later retry.
       this.store.setValue(`native-observation-recovery:${original.id}`, marker);
       await diagnosticScope({ bindingId: original.id, threadId: original.threadId,
         sourceId: original.sourceId ?? "", streamGeneration: generation }, async () => {

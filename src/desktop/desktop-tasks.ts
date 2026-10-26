@@ -449,11 +449,11 @@ export class ConnectedDesktopTasks implements DesktopTasks {
       }, { timeoutMs: 5_000 });
       assertCurrent();
       return typeof reply.handledByClientId === "string" && reply.handledByClientId.length > 0
-        ? "owner-present" : "unknown";
+        ? "owner-present" : "discovery-unavailable";
     } catch (error) {
       assertCurrent();
       missing = discovering && error instanceof DesktopRequestRejectedError && error.reason === "no-client-found";
-      if (!missing) return "unknown";
+      if (!missing) return "discovery-unavailable";
     } finally { client.close(); }
     assertCurrent();
     const latest = (await this.listTasks()).find(candidate => sameTask(candidate, task));

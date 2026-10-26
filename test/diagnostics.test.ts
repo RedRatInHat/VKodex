@@ -5,15 +5,20 @@ import { captureDiagnostic, diagnosticEvent, diagnosticError, diagnosticId, diag
 
 test("drain diagnostics retain approved reasons, incident correlation and hashed proof subjects", () => {
   const records: DiagnosticRecord[] = [];
-  withDiagnosticSink(record => { records.push(record); }, () => diagnosticEvent("connection.lifecycle", {
-    stage: "execution-drain", outcome: "failure", reason: "goal-active", elapsedMs: 40_000,
-    incidentId: "fixture-incident", subjectThreadId: "private-subject", retryAfterMs: 1_000,
-  }));
+  withDiagnosticSink(record => { records.push(record); }, () => {
+    diagnosticEvent("connection.lifecycle", {
+      stage: "execution-drain", outcome: "failure", reason: "goal-active", elapsedMs: 40_000,
+      incidentId: "fixture-incident", subjectThreadId: "private-subject", retryAfterMs: 1_000,
+    });
+    diagnosticEvent("connection.lifecycle", { stage: "native-observation-recovery", outcome: "failure",
+      reason: "discovery-unavailable" });
+  });
   assert.equal(records[0]?.stage, "execution-drain");
   assert.equal(records[0]?.reason, "goal-active");
   assert.equal(records[0]?.incidentId, diagnosticId("fixture-incident"));
   assert.equal(records[0]?.subjectThreadId, diagnosticId("private-subject"));
   assert.equal(records[0]?.retryAfterMs, 1_000);
+  assert.equal(records[1]?.reason, "discovery-unavailable");
 });
 
 test("diagnostic allowlist excludes payloads, secret-bearing errors and arbitrary scalars", () => {

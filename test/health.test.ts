@@ -113,13 +113,17 @@ test("health reports the precise drain wait and distinguishes a historical fence
 });
 
 test("native observation recovery health separates opening from verified and historical snapshots", async t => {
-  let state: "opened" | "ready" | "recovered" | "unavailable" = "opened";
+  let state: "opened" | "ready" | "recovered" | "unavailable" | "discovery-unavailable" = "opened";
   const s = setupWithBindings(t, () => [{ id: "native-recovery", title: "Native fixture", source: ".codex",
     status: "idle", connected: state === "ready", lastConfirmedAt: state === "ready" ? 100_000 : null,
     failure: null, nativeObservationRecovery: { state, at: 90_000 } }]);
   const check = async () => (await s.monitor.check(true)).checks.find(item =>
     item.name === "codex_native_observation_recovery:native-recovery")!;
   assert.equal((await check()).state, "degraded", "opening a window is not a passive owner snapshot");
+  state = "discovery-unavailable";
+  const transient = await check();
+  assert.equal(transient.state, "degraded");
+  assert.match(transient.detail, /запуск клиента не выполнялся.*повторит проверку/);
   state = "ready";
   assert.equal((await check()).state, "ok");
   state = "recovered";

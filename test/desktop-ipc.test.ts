@@ -5655,7 +5655,7 @@ test("native observation recovery opens only after an exact missing-owner discov
       () => new DesktopIpcClient(() => server, 100), undefined, undefined, undefined,
       { launcher: { canOpenNativeObservation: () => true, open: async () => { opens++; } } });
     const result = await adapter.openNativeObservation(task, () => { guards++; });
-    assert.equal(result, scenario === "missing" ? "opened" : scenario === "found" ? "owner-present" : "unknown", scenario);
+    assert.equal(result, scenario === "missing" ? "opened" : scenario === "found" ? "owner-present" : "discovery-unavailable", scenario);
     assert.equal(opens, scenario === "missing" ? 1 : 0, scenario);
     assert.ok(guards >= 3);
     assert.deepEqual(server.received.filter(message => message.type === "request").map(message => message.method),
@@ -5700,7 +5700,7 @@ test("native observation recovery rejects a changed catalog home and a missing-c
   assert.equal(await adapter.openNativeObservation(task, () => {}), "unsupported");
   assert.equal(clients, 0);
   listed = task;
-  assert.equal(await adapter.openNativeObservation(task, () => {}), "unknown");
+  assert.equal(await adapter.openNativeObservation(task, () => {}), "discovery-unavailable");
   assert.equal(clients, 1);
   assert.equal(opens, 0);
 });
