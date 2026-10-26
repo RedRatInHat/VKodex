@@ -23,6 +23,11 @@ import { comparablePath } from "../core/paths.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "./config.js";
 import { MutableQueuedInputTurnError, QueueHistoryReadError } from "../desktop/input-reconciliation.js";
 
+/** Windows may add the extended-path prefix on native resume. Not a new file. */
+function sameRolloutPath(a: string, b: string): boolean {
+  return a === b || !!a && !!b && comparablePath(a) === comparablePath(b);
+}
+
 export interface BridgeRuntimeAdapters {
   /** Trusted startup gate, installed before any command callback. No unlock API. */
   readonly startupAdmission?: Readonly<{ readonly kind: "predecessor-maintenance"; readonly fenceId: string;
@@ -136,7 +141,7 @@ export class BridgeRuntime {
   private nativeObservationRecoveryScopeMatches(binding: Binding): boolean {
     const attempt = this.nativeObservationRecovery(binding);
     return !!attempt && attempt.taskKey === taskKey(binding)
-      && attempt.rolloutPath === (binding.rolloutPath ?? "")
+      && sameRolloutPath(attempt.rolloutPath, binding.rolloutPath ?? "")
       && attempt.generation === this.store.streamGeneration(binding.id);
   }
   private nativeObservationRecoveryStatus(binding: Binding): "ready" | "recovered" | "unavailable" |
@@ -153,7 +158,7 @@ export class BridgeRuntime {
   private markNativeObservationRecovered(binding: Binding, generation: number): void {
     const attempt = this.nativeObservationRecovery(binding);
     if (!attempt || attempt.taskKey !== taskKey(binding)
-      || attempt.rolloutPath !== (binding.rolloutPath ?? "") || attempt.generation !== generation
+      || !sameRolloutPath(attempt.rolloutPath, binding.rolloutPath ?? "") || attempt.generation !== generation
       || attempt.state === "recovered"
       || this.store.managedOwner(binding)
       || !this.connections.isReadOnly(binding.id) || !this.connections.connected(binding.id)
@@ -199,7 +204,7 @@ export class BridgeRuntime {
       const latest = this.store.getBinding(original.id);
       const activeTransfer = this.store.transfer(original.id);
       return !this.stopped && !this.startupAdmission && !!latest?.attached && latest.peerId === original.peerId
-        && sameTask(latest, original) && latest.rolloutPath === original.rolloutPath
+        && sameTask(latest, original) && sameRolloutPath(latest.rolloutPath ?? "", original.rolloutPath ?? "")
         && this.store.streamGeneration(original.id) === generation
         && !this.connections.connected(original.id) && !this.desktop.isCreationActive?.(latest)
         && !this.store.managedOwner(latest) && this.nativeObservationLaunchAllowed(latest)
@@ -1452,8 +1457,8 @@ export class BridgeRuntime {
       this.files?.observe(binding.id, "unavailable");
       return;
     }
-    this.store.ensureBinding(task);
-    this.connectBinding(binding, task, "observe");
+    const refreshed = this.store.ensureBinding(task);
+    this.connectBinding(refreshed, task, "observe");
     this.closeInactiveSubscriptions();
   }
 

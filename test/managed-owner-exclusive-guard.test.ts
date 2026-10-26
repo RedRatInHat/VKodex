@@ -266,6 +266,54 @@ test('native health preserves recovery budget across restart, generation and leg
   } finally { await runtime.stop(); store.close(); }
 });
 
+test('native recovery recognizes equivalent Windows rollout paths after opening but rejects a different file', async () => {
+  for (const equivalent of [true, false]) {
+    const store = new BridgeStore(); const peerId = 2_000_000_024;
+    const candidate = { hostId: 'local', threadId: 'native-path-refresh', sourceId: '', title: 'Native fixture',
+      workspace: 'C:\\Fixture', rolloutPath: 'C:\\Fixture\\sessions\\task.jsonl', updatedAt: 1 };
+    const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 24);
+    const now = Date.now(); let online = false, opens = 0;
+    let listed = candidate;
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    const snapshot = { kind: 'app-server', threadId: candidate.threadId, title: candidate.title,
+      cwd: candidate.workspace, model: 'fixture-model', effort: 'low', runtimeStatus: 'active',
+      context: null, questions: [], turns: [] };
+    const native: TaskStateTransport = { readOnly: true, subscribe: (requested, onState) => ({ task: requested,
+      readOnly: true, start: async () => { if (!online) throw new TaskNotOpenError(); onState(snapshot, true); },
+      verifyOwner: async () => {}, diagnostic: () => ({ kind: 'native-observer' as const }), close() {} }), close() {} };
+    const desktop = { listTasks: async () => [listed], requireNativeExecution() {},
+      openNativeObservation: async (_task: TaskRef, assertCurrent: () => void, reserveOpen: () => boolean) => {
+        assertCurrent(); assert.equal(reserveOpen(), true); opens++; online = true;
+        listed = { ...candidate, rolloutPath: equivalent ? `\\\\?\\${candidate.rolloutPath}`
+          : 'C:\\Fixture\\sessions\\different.jsonl' };
+        return 'opened' as const;
+      } } as unknown as CodexTasks;
+    const chat = { send: async () => ({ peerId, conversationMessageId: 1 }),
+      edit: async () => {}, delete: async () => {} } as unknown as BridgeChat;
+    const runtime = new BridgeRuntime({ ownerId: 101, groupId: 202 }, desktop, chat, store,
+      { states: native, passiveStates: native, observe: observeAppServerTaskState,
+        history: { enable() {}, disable() {}, poll: async () => null } }, () => now,
+      undefined, undefined, 10_000_000,
+      async () => ({ state: 'degraded', checkedAt: now, pid: 42, uptimeSeconds: 60, checks: [] }));
+    try {
+      await runtime.tick(true, binding.id);
+      await runtime.tick(true, binding.id);
+      const recovered = store.getValue<{ state: string; openAttempts: number }>(`native-observation-recovery:${binding.id}`)!;
+      assert.equal(recovered.state, equivalent ? 'recovered' : 'opened',
+        equivalent ? 'the same file spelling must not strand a verified native recovery' : 'another file is not the same recovery scope');
+      assert.equal(recovered.openAttempts, 1);
+      if (equivalent) {
+        assert.equal(store.nativeExecutionRequired(store.getBinding(binding.id)!), true,
+          'native policy uses the refreshed catalog Binding, not stale raw path spelling');
+        assert.equal((runtime as unknown as { runtimeHealth(): { bindings: readonly {
+          connected: boolean; nativeObservationRecovery?: { state: string } }[] } }).runtimeHealth()
+          .bindings[0]?.nativeObservationRecovery?.state, 'ready');
+      }
+      assert.equal(opens, 1);
+    } finally { await runtime.stop(); store.close(); }
+  }
+});
+
 test('a passive snapshot cannot mark native recovery ready after an exclusive claim appears', async () => {
   const store = new BridgeStore(); const peerId = 2_000_000_021; const now = Date.now();
   const candidate = { hostId: 'local', threadId: 'native-claim-race', sourceId: '', title: 'Native fixture',
