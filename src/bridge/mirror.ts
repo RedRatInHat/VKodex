@@ -152,6 +152,7 @@ export class TaskMirror {
     }
     const binding = this.store.getBinding(bindingId);
     if (!binding?.attached || binding.peerId === null) return;
+    if (event.type === "progress" && this.store.bindingDisplayMode(bindingId) === "final-only") return;
     const peerId = binding.peerId;
     this.store.atomic(() => {
       if (event.type === "progress") {

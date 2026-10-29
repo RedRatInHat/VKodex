@@ -6741,3 +6741,144 @@ test("a process crash during question submission preserves the uncertain state",
   assert.equal(s.desktop.questionAnswers.length, 0);
   assert.equal(s.desktop.submissions.length, 0);
 });
+
+test("final-only display hides relay progress and activity while other bindings retain their output", async t => {
+  const s = setup(t); const relay = s.attach();
+  const otherTask = { ...task, threadId: "ordinary-task" };
+  const other = s.store.ensureBinding(otherTask);
+  const otherPeer = peerId + 1;
+  s.store.setChat(other.id, otherPeer, 18);
+  assert.equal(s.store.bindingDisplayMode(other.id), "standard");
+  s.store.setBindingDisplayMode(relay.id, "final-only");
+  const activity = new TaskActivity(s.store, s.now);
+  for (const binding of [relay, other]) {
+    s.mirror.accept(binding.id, { type: "progress", id: "progress", turnId: "turn", text: "service commentary" });
+    activity.observe(binding.id, "running", "turn");
+  }
+  const pending = s.store.pendingDeliveries();
+  assert.equal(pending.filter(d => d.bindingId === relay.id).length, 0);
+  assert.ok(pending.some(d => d.bindingId === other.id && d.kind === "commentary"));
+  assert.ok(pending.some(d => d.bindingId === other.id && d.kind === "activity"));
+  await s.worker.flush();
+  assert.equal(s.chat.sent.filter(m => m.peerId === peerId).length, 0);
+  for (const binding of [relay, other]) {
+    activity.observe(binding.id, "idle", "turn");
+    s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "final text", showMenu: false });
+  }
+  assert.ok(s.store.pendingDeliveries().some(d => d.bindingId === other.id && d.kind === "activity" && d.view.text === "Готово."));
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.filter(m => m.peerId === peerId).map(m => m.view.text), ["final text"]);
+  assert.ok(s.chat.sent.some(m => m.peerId === otherPeer && m.view.text === "service commentary"));
+  assert.ok(s.chat.sent.some(m => m.peerId === otherPeer && m.view.text === "final text"));
+});
+
+test("final-only display cancels queued service output and prevents an existing activity timer from returning", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  s.mirror.accept(binding.id, { type: "progress", id: "queued", turnId: "turn", text: "queued commentary" });
+  activity.observe(binding.id, "running", "turn");
+  s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "root answer", showMenu: false });
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  s.advance(30_000); activity.tick();
+  activity.observe(binding.id, "idle", "turn");
+  assert.equal(s.store.getValue(`activity:${binding.id}`), null);
+  assert.deepEqual(s.store.pendingDeliveries().map(d => d.kind), ["send"]);
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(m => m.view.text), ["root answer"]);
+  assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("final-only display is rechecked after an awaited access check and drains late service rows", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.mirror.accept(binding.id, { type: "progress", id: "race", turnId: "turn", text: "must not be sent" });
+  s.gate.check = async () => {
+    // Simulate a separate settings writer while the delivery awaits access.
+    s.store.setValue(`binding-display-mode:${binding.id}`, "final-only");
+    return true;
+  };
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 0);
+  await s.worker.flush();
+  assert.equal(s.store.pendingDeliveries().length, 0);
+  s.mirror.accept(binding.id, { type: "final", id: "answer", turnId: "turn", text: "final survives", showMenu: false });
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(m => m.view.text), ["final survives"]);
+});
+
+test("leaving final-only display restores future commentary and activity without replaying muted output", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  s.mirror.accept(binding.id, { type: "progress", id: "muted", turnId: "old", text: "muted" });
+  activity.observe(binding.id, "running", "old");
+  s.store.setBindingDisplayMode(binding.id, "standard");
+  s.mirror.accept(binding.id, { type: "progress", id: "new", turnId: "new", text: "new commentary" });
+  activity.observe(binding.id, "running", "new");
+  assert.ok(s.store.pendingDeliveries().some(d => d.kind === "activity"));
+  await s.worker.flush();
+  assert.ok(s.chat.sent.some(m => m.view.text === "new commentary"));
+  assert.equal(s.chat.sent.some(m => m.view.text === "muted"), false);
+});
+
+test("final-only display preserves approval and failure activity without a preceding visible running indicator", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  const cases = [
+    ["approval", "Нужен ответ в Codex."], ["failed", "Ход завершился с ошибкой."],
+    ["interrupted", "Ход остановлен."], ["unavailable", "Нет связи с Codex."],
+  ] as const;
+  for (const [status, text] of cases) {
+    activity.observe(binding.id, "running", status);
+    activity.observe(binding.id, status, status);
+    activity.observe(binding.id, status, status);
+    const pending = s.store.pendingDeliveries();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]!.view.activityStatus, status);
+    assert.equal(pending[0]!.view.text, text);
+    await s.worker.flush();
+    assert.equal(s.store.getValue(`display-skipped:${pending[0]!.id}:${pending[0]!.revision}`), null);
+  }
+  assert.deepEqual(s.chat.sent.map(m => m.view.text), cases.map(([, text]) => text));
+});
+
+test("enabling final-only display keeps an already queued actionable activity edit", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "running", "turn");
+  await s.worker.flush();
+  activity.observe(binding.id, "failed", "turn");
+  const pending = s.store.pendingDeliveries()[0]!;
+  assert.equal(pending.view.activityStatus, "failed");
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  assert.equal(s.store.pendingDeliveries().length, 1);
+  await s.worker.flush();
+  assert.equal(s.chat.edits.at(-1)!.view.text, "Ход завершился с ошибкой.");
+  assert.equal(s.store.getValue(`display-skipped:${pending.id}:${pending.revision}`), null);
+});
+
+test("final-only skipped revision remains distinguishable from an earlier VK acknowledgement", async t => {
+  const s = setup(t); const binding = s.attach(); const activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "running", "turn");
+  const acknowledged = s.store.pendingDeliveries()[0]!;
+  await s.worker.flush();
+  s.advance(30_000); activity.tick();
+  const suppressed = s.store.pendingDeliveries()[0]!;
+  assert.ok(suppressed.revision > acknowledged.revision);
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  assert.equal(s.store.pendingDeliveries().length, 0);
+  assert.ok(s.store.deliveryHandle(suppressed.key));
+  assert.equal(s.store.getValue(`display-skipped:${acknowledged.id}:${acknowledged.revision}`), null);
+  assert.deepEqual(s.store.getValue(`display-skipped:${suppressed.id}:${suppressed.revision}`), {
+    state: "skipped", mode: "final-only", kind: "activity", activityStatus: "running", mayHaveBeenAttempted: true,
+  });
+  await s.worker.flush();
+  assert.equal(s.chat.edits.length, 0);
+});
+
+test("final-only activity policy uses status metadata and leaves unclassified legacy alerts visible", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.enqueue("important", peerId, { text: "Готово.", activityStatus: "approval" }, binding.id, "activity");
+  s.store.enqueue("legacy", peerId, { text: "legacy status" }, binding.id, "activity");
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  await s.worker.flush();
+  assert.deepEqual(s.chat.sent.map(m => m.view.text), ["Готово.", "legacy status"]);
+  const params = vkSendParams(peerId, { text: "Нужен ответ в Codex.", activityStatus: "approval" }, 1);
+  assert.equal(Object.hasOwn(params, "activityStatus"), false);
+});

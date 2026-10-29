@@ -46,8 +46,12 @@ export class DeliveryWorker {
 
   async idle(): Promise<void> { await this.flushing; }
 
+  private suppressed(delivery: Delivery): boolean {
+    return this.store.presentationSuppressed(delivery);
+  }
+
   private active(delivery: Delivery): boolean {
-    if (!this.store.isPending(delivery)) return false;
+    if (!this.store.isPending(delivery) || this.suppressed(delivery)) return false;
     if (!delivery.bindingId) return true;
     const binding = this.store.getBinding(delivery.bindingId);
     return !!binding?.attached && binding.peerId === delivery.peerId;
@@ -57,6 +61,7 @@ export class DeliveryWorker {
     if (this.now() < (this.store.getValue<number>("vk-delivery-paused-until") ?? 0)) return;
     let attempted = 0;
     for (const delivery of this.store.pendingDeliveries()) {
+      if (this.suppressed(delivery)) { this.store.skipPresentation(delivery); continue; }
       const streamed = delivery.kind === "commentary" || delivery.kind === "activity";
       if (this.now() < (this.retries.get(delivery.id)?.after ?? 0)) continue;
       if (!this.active(delivery)) continue;

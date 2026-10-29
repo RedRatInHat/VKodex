@@ -1,9 +1,13 @@
-import type { DesktopTask, TaskRef, TaskGoal, TransferCheckpoint } from "../core/codex-tasks.js";
+import type { DesktopTask, TaskRef, TaskGoal, TransferCheckpoint, TaskDetails } from "../core/codex-tasks.js";
 import type { RemoteAttachment } from "../domain/models.js";
 
 export interface MessageHandle { readonly peerId: number; readonly conversationMessageId: number }
 export interface Button { readonly label: string; readonly action: string }
-export interface View { readonly text: string; readonly buttons?: readonly Button[]; readonly silent?: boolean; readonly attachments?: readonly string[] }
+export interface View {
+  readonly text: string; readonly buttons?: readonly Button[]; readonly silent?: boolean; readonly attachments?: readonly string[];
+  /** Internal delivery metadata; VK serialization excludes it. */
+  readonly activityStatus?: TaskDetails["status"];
+}
 
 export const VK_MAX_INLINE_BUTTONS = 10;
 export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
@@ -80,6 +84,8 @@ export interface VkDocumentRecord {
   readonly uploadedAt: number;
   readonly fileKey: string;
 }
+
+export type BindingDisplayMode = "standard" | "final-only";
 
 export interface Binding extends TaskRef {
   readonly sourceLabel?: string;

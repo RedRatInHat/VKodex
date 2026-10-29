@@ -3,8 +3,8 @@ import path from "node:path";
 import { statSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
-import type { Binding, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
+import { taskKey, type DesktopTask, type TaskDetails, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
+import type { Binding, BindingDisplayMode, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../core/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
@@ -596,6 +596,41 @@ export class BridgeStore {
     });
   }
   setPaused(id: string, paused: boolean): void { this.db.prepare("UPDATE bridge_bindings SET paused = ? WHERE id = ?").run(Number(paused), id); }
+
+  bindingDisplayMode(id: string): BindingDisplayMode {
+    return this.getValue<BindingDisplayMode>(`binding-display-mode:${id}`) === "final-only" ? "final-only" : "standard";
+  }
+
+  /** Assistant presentation only; input routing and final text are unchanged. */
+  setBindingDisplayMode(id: string, mode: BindingDisplayMode): void {
+    if (mode !== "standard" && mode !== "final-only") throw new TypeError("Invalid binding display mode");
+    if (!this.getBinding(id)) throw new TypeError("Unknown binding");
+    this.atomic(() => {
+      this.setValue(`binding-display-mode:${id}`, mode);
+      if (mode === "final-only") for (const delivery of this.pendingDeliveries()) {
+        if (delivery.bindingId === id) this.skipPresentation(delivery);
+      }
+    });
+  }
+
+  presentationSuppressed(delivery: Delivery): boolean {
+    return !!delivery.bindingId && this.bindingDisplayMode(delivery.bindingId) === "final-only"
+      && (delivery.kind === "commentary" || delivery.kind === "activity"
+        && (delivery.view.activityStatus === "running" || delivery.view.activityStatus === "idle"));
+  }
+
+  /** Settles the queue without claiming a VK acknowledgement for this revision. */
+  skipPresentation(delivery: Delivery): void {
+    this.atomic(() => {
+      if (!this.presentationSuppressed(delivery) || !this.isPending(delivery)) return;
+      const attempted = this.db.prepare("SELECT first_view, handle FROM bridge_delivery WHERE id = ?").get(delivery.id) as { first_view: string | null; handle: string | null };
+      this.setValue(`display-skipped:${delivery.id}:${delivery.revision}`, {
+        state: "skipped", mode: "final-only", kind: delivery.kind, activityStatus: delivery.view.activityStatus ?? null,
+        mayHaveBeenAttempted: attempted.first_view !== null || attempted.handle !== null,
+      });
+      this.completed(delivery);
+    });
+  }
 
   observeTaskSender(bindingId: string, senderId: number): number {
     if (!Number.isSafeInteger(senderId) || senderId === 0) throw new Error("Invalid VK sender ID");
@@ -1629,8 +1664,8 @@ export class BridgeStore {
         AND substr(key, 1, ?) = ?`).run(bindingId, prefix.length, prefix);
   }
 
-  settleActivity(key: string, text: string, refresh = false): void {
-    const view = JSON.stringify({ text, silent: true } satisfies View);
+  settleActivity(key: string, text: string, refresh = false, activityStatus?: TaskDetails["status"]): void {
+    const view = JSON.stringify({ text, silent: true, ...(activityStatus ? { activityStatus } : {}) } satisfies View);
     this.db.prepare(`UPDATE bridge_delivery SET view = ?, revision = revision + 1,
       delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END
       WHERE key = ? AND kind = 'activity' AND (view <> ? OR ? = 1)`).run(view, key, view, Number(refresh));

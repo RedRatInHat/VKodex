@@ -42,7 +42,7 @@ export class TaskActivity {
   }
 
   private render(state: ActivityState, peerId: number, bindingId: string, frame: string): void {
-    this.store.enqueue(state.key, peerId, { text: this.frame(frame), silent: true }, bindingId, "activity", state.turnId);
+    this.store.enqueue(state.key, peerId, { text: this.frame(frame), silent: true, activityStatus: state.status }, bindingId, "activity", state.turnId);
   }
 
   private settle(state: ActivityState, peerId: number, bindingId: string, status: TaskDetails["status"], refresh = false): void {
@@ -52,7 +52,7 @@ export class TaskActivity {
     } else if (status === "running") {
       this.store.deleteActivity(state.key);
       return;
-    } else this.store.settleActivity(state.key, labels[status], refresh);
+    } else this.store.settleActivity(state.key, labels[status], refresh, status);
     this.store.prioritizeDelivery(state.key);
   }
 
@@ -69,6 +69,18 @@ export class TaskActivity {
     if (!binding?.attached || binding.peerId === null) {
       this.running.delete(bindingId); this.observed.delete(bindingId);
       if (saved) this.retire(saved);
+      return;
+    }
+    if (this.store.bindingDisplayMode(bindingId) === "final-only") {
+      this.running.delete(bindingId); this.observed.delete(bindingId);
+      if (status === "running" || status === "idle") {
+        this.store.setValue(valueKey, null); return;
+      }
+      const alert: ActivityState = previous?.kind !== "commentary" && previous?.status === status && previous.turnId === turnId
+        ? previous : { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
+      this.store.setValue(valueKey, alert);
+      this.store.enqueue(alert.key, binding.peerId, { text: labels[status], silent: true, activityStatus: status }, bindingId, "activity", turnId);
+      this.store.prioritizeDelivery(alert.key);
       return;
     }
     if (previous?.kind === "commentary") {
@@ -115,6 +127,9 @@ export class TaskActivity {
       if (!binding?.attached || binding.peerId === null || this.store.streamGeneration(bindingId) !== activity.state.generation) {
         this.running.delete(bindingId); this.retire(activity.state);
         continue;
+      }
+      if (this.store.bindingDisplayMode(bindingId) === "final-only") {
+        this.observe(bindingId, "idle", activity.state.turnId); continue;
       }
       const messageId = this.store.deliveryMessageId(activity.state.key);
       const deliveryOrder = this.store.deliveryOrder(activity.state.key);
