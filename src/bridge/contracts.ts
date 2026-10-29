@@ -6,7 +6,7 @@ export interface Button { readonly label: string; readonly action: string }
 export interface View {
   readonly text: string; readonly buttons?: readonly Button[]; readonly silent?: boolean; readonly attachments?: readonly string[];
   /** Internal delivery metadata; VK serialization excludes it. */
-  readonly activityStatus?: TaskDetails["status"];
+  readonly activityStatus?: TaskDetails["status"] | "recovered";
 }
 
 export const VK_MAX_INLINE_BUTTONS = 10;

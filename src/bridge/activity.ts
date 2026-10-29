@@ -60,6 +60,22 @@ export class TaskActivity {
     if (state.kind !== "commentary") this.store.retireActivity(state.key);
   }
 
+  /** Only a scoped live snapshot confirms transport recovery; rollout status
+   * observations may continue while that transport remains unavailable. */
+  connected(bindingId: string): void {
+    const binding = this.store.getBinding(bindingId);
+    const key = `connection-notice:${bindingId}`;
+    // Adopt a still-open notice from the earlier presentation implementation.
+    const previous = this.store.getValue<ActivityState>(key)
+      ?? this.store.getValue<ActivityState>(`activity:${bindingId}`);
+    if (!binding?.attached || binding.peerId === null || this.store.bindingDisplayMode(bindingId) !== "final-only"
+      || previous?.generation !== this.store.streamGeneration(bindingId) || previous.kind === "commentary"
+      || previous.status !== "unavailable") return;
+    this.store.settleActivity(previous.key, "Связь с задачей Codex восстановлена.", false, "recovered");
+    this.store.prioritizeDelivery(previous.key);
+    this.store.setValue(key, { ...previous, status: "idle" } satisfies ActivityState);
+  }
+
   observe(bindingId: string, status: TaskDetails["status"], turnId: string | null = null): void {
     const binding = this.store.getBinding(bindingId);
     const valueKey = `activity:${bindingId}`;
@@ -74,12 +90,27 @@ export class TaskActivity {
     if (this.store.bindingDisplayMode(bindingId) === "final-only") {
       this.running.delete(bindingId); this.observed.delete(bindingId);
       if (status === "running" || status === "idle") {
+        if (previous?.status === "unavailable" && previous.kind !== "commentary"
+          && this.store.getValue(`connection-notice:${bindingId}`) === null)
+          this.store.setValue(`connection-notice:${bindingId}`, previous);
         this.store.setValue(valueKey, null); return;
+      }
+      if (status === "unavailable") {
+        const noticeKey = `connection-notice:${bindingId}`;
+        const savedNotice = this.store.getValue<ActivityState>(noticeKey);
+        const notice = savedNotice?.generation === generation ? savedNotice
+          : previous?.status === "unavailable" && previous.kind !== "commentary" ? previous : null;
+        const alert: ActivityState = notice ? { ...notice, status }
+          : { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
+        this.store.setValue(noticeKey, alert);
+        this.store.enqueue(alert.key, binding.peerId, { text: labels[status], silent: true, activityStatus: status }, bindingId, "activity", alert.turnId);
+        this.store.prioritizeDelivery(alert.key);
+        return;
       }
       const alert: ActivityState = previous?.kind !== "commentary" && previous?.status === status && previous.turnId === turnId
         ? previous : { key: `activity:${bindingId}:${randomUUID()}`, generation, turnId, status };
       this.store.setValue(valueKey, alert);
-      this.store.enqueue(alert.key, binding.peerId, { text: labels[status], silent: true, activityStatus: status }, bindingId, "activity", turnId);
+      this.store.enqueue(alert.key, binding.peerId, { text: labels[status], silent: true, activityStatus: status }, bindingId, "activity", alert.turnId);
       this.store.prioritizeDelivery(alert.key);
       return;
     }

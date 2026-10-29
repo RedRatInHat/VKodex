@@ -1517,6 +1517,7 @@ export class BridgeRuntime {
                 observation.activeTurnId ? [observation.activeTurnId] : []);
               this.store.setValue(checkpointKey, observation.checkpoint);
               this.store.setValue(`task-details:${binding.id}`, observation.details);
+              this.activity.connected(binding.id);
               this.activity.observe(binding.id, observation.details.status, observation.activeTurnId);
               this.recordLease(binding.id, "attached", observation.activeTurnId);
               return; // Projection is not an old operation/queue settlement receipt.
@@ -1576,6 +1577,7 @@ export class BridgeRuntime {
               this.store.enqueue(`task-failure:${binding.id}:${observation.latestTurnId}`, current.peerId!, { text: failure, buttons: [MENU_BUTTON] }, binding.id);
             }
             this.files?.observe(binding.id, details.status);
+            this.activity.connected(binding.id);
             this.activity.observe(binding.id, details.status, observation.activeTurnId);
             this.recordLease(binding.id, "attached", observation.activeTurnId);
             if (details.status === "running" || details.status === "approval") {

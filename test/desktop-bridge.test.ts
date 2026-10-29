@@ -6882,3 +6882,92 @@ test("final-only activity policy uses status metadata and leaves unclassified le
   const params = vkSendParams(peerId, { text: "Нужен ответ в Codex.", activityStatus: "approval" }, 1);
   assert.equal(Object.hasOwn(params, "activityStatus"), false);
 });
+
+test("final-only connection notice recovers and reconnects on the same handle across restart", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  let activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "idle");
+  activity.disconnected(binding.id); await s.worker.flush();
+  const handle = s.chat.sent[0]!.handle;
+  activity.observe(binding.id, "idle");
+  assert.equal(s.store.pendingDeliveries().length, 0, "history alone does not prove recovery");
+  activity.connected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  assert.deepEqual(s.chat.edits.at(-1)?.handle, handle);
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Связь с задачей Codex восстановлена.");
+  const edits = s.chat.edits.length;
+  activity.observe(binding.id, "running", "new-turn"); activity.tick(); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1); assert.equal(s.chat.edits.length, edits);
+  activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "unavailable", "other-turn"); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  assert.deepEqual(s.chat.edits.at(-1)?.handle, handle);
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Нет связи с Codex.");
+  activity.disconnected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  activity.observe(binding.id, "running", "third-turn"); activity.connected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Связь с задачей Codex восстановлена.");
+  assert.equal(s.store.pendingDeliveries().length, 0);
+});
+
+test("final-only brief unsent outage cancels quietly and retains its notice identity", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  const activity = new TaskActivity(s.store, s.now);
+  activity.disconnected(binding.id);
+  const key = s.store.pendingDeliveries()[0]!.key;
+  activity.observe(binding.id, "idle"); activity.connected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 0);
+  activity.disconnected(binding.id);
+  assert.equal(s.store.pendingDeliveries()[0]!.key, key);
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  assert.equal(s.chat.sent[0]!.view.text, "Нет связи с Codex.");
+});
+
+test("final-only connection notice does not overwrite an approval or lose its identity", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  const activity = new TaskActivity(s.store, s.now);
+  activity.disconnected(binding.id); await s.worker.flush();
+  const connectionHandle = s.chat.sent[0]!.handle;
+  activity.connected(binding.id); activity.observe(binding.id, "approval", "turn");
+  await s.worker.flush();
+  const approvalHandle = s.chat.sent[1]!.handle;
+  activity.disconnected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 2);
+  assert.deepEqual(s.chat.edits.at(-1)?.handle, connectionHandle);
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Нет связи с Codex.");
+  assert.equal(s.chat.edits.some(e => e.handle === approvalHandle), false);
+  activity.connected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Связь с задачей Codex восстановлена.");
+  assert.deepEqual(s.chat.edits.at(-1)?.handle, connectionHandle);
+});
+
+test("final-only recovered notice cannot edit a detached or previous-generation scope", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  const activity = new TaskActivity(s.store, s.now);
+  activity.disconnected(binding.id); await s.worker.flush();
+  s.store.setAttached(binding.id, false); activity.connected(binding.id);
+  s.store.setAttached(binding.id, true);
+  s.store.setValue(`stream-generation:${binding.id}`, 1); activity.connected(binding.id);
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1); assert.equal(s.chat.edits.length, 0);
+});
+
+test("final-only legacy connection notice survives fallback idle before live recovery", async t => {
+  const s = setup(t); const binding = s.attach();
+  const activity = new TaskActivity(s.store, s.now);
+  activity.observe(binding.id, "running", "turn"); await s.worker.flush();
+  activity.disconnected(binding.id); await s.worker.flush();
+  const handle = s.chat.sent[0]!.handle;
+  s.store.setBindingDisplayMode(binding.id, "final-only");
+  activity.observe(binding.id, "idle");
+  assert.equal(s.store.pendingDeliveries().length, 0);
+  activity.connected(binding.id); await s.worker.flush();
+  assert.equal(s.chat.sent.length, 1);
+  assert.deepEqual(s.chat.edits.at(-1)?.handle, handle);
+  assert.equal(s.chat.edits.at(-1)?.view.text, "Связь с задачей Codex восстановлена.");
+});

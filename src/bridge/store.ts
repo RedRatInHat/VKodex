@@ -3,7 +3,7 @@ import path from "node:path";
 import { statSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
-import { taskKey, type DesktopTask, type TaskDetails, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
+import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BindingDisplayMode, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../core/paths.js";
@@ -1664,7 +1664,7 @@ export class BridgeStore {
         AND substr(key, 1, ?) = ?`).run(bindingId, prefix.length, prefix);
   }
 
-  settleActivity(key: string, text: string, refresh = false, activityStatus?: TaskDetails["status"]): void {
+  settleActivity(key: string, text: string, refresh = false, activityStatus?: View["activityStatus"]): void {
     const view = JSON.stringify({ text, silent: true, ...(activityStatus ? { activityStatus } : {}) } satisfies View);
     this.db.prepare(`UPDATE bridge_delivery SET view = ?, revision = revision + 1,
       delivered_revision = CASE WHEN first_view IS NULL AND handle IS NULL THEN revision + 1 ELSE delivered_revision END

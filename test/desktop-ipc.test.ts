@@ -449,6 +449,48 @@ test("runtime schedules a fresh health check after clock rollback", async t => {
   assert.equal(checks, 2);
 });
 
+test("rollout idle does not recover final-only outage, while a live snapshot does", async t => {
+  const callbacks: { onState: (state: IpcObject, initial: boolean) => void; onError: (error: Error) => void }[] = [];
+  const transport: TaskStateTransport = {
+    readOnly: true,
+    subscribe(task, onState, onError) {
+      callbacks.push({ onState, onError });
+      let closed = false;
+      return { task, start: async () => { if (!closed) onState(state(), true); }, verifyOwner: async () => {},
+        close: () => { closed = true; } };
+    },
+    close() {},
+  };
+  const history = {
+    enable() {}, disable() {},
+    async poll() {
+      return { events: [{ type: "status", id: "fallback-terminal", turnId: "fallback-turn", status: "completed" }],
+        historyRebuilt: false, checkpoint: null, failure: null };
+    },
+  } as unknown as TaskHistoryRecovery;
+  const s = runtimeSetup(t, undefined, transport, undefined, undefined, history);
+  s.store.ensureBinding({ hostId: ref.hostId, threadId: ref.threadId, title: "Fixture", workspace: "/fixture", updatedAt: 1,
+    rolloutPath: "/fixture/rollout.jsonl" });
+  s.store.setBindingDisplayMode(s.binding.id, "final-only");
+  await s.runtime.tick();
+  assert.equal(callbacks.length, 1, "the initial scoped live snapshot establishes the connection");
+
+  callbacks[0]!.onError(new Error("fixture stream interrupted"));
+  await s.runtime.tick();
+  await s.runtime.tick();
+  assert.equal(s.sent.filter(message => message.view.text === "Нет связи с Codex.").length, 1,
+    "rollout idle status must leave one final-only outage notice unsettled");
+  assert.equal(s.edits.some(edit => edit.view.text === "Связь с задачей Codex восстановлена."), false,
+    "rollout status is not a recovery signal");
+
+  s.advance(6_000);
+  await s.runtime.tick();
+  assert.equal(callbacks.length, 2, "the runtime retries the live scoped subscription");
+  assert.equal(s.sent.filter(message => message.view.text === "Нет связи с Codex.").length, 1);
+  assert.equal(s.edits.at(-1)?.view.text, "Связь с задачей Codex восстановлена.",
+    "a valid live snapshot recovers the existing notice");
+});
+
 test("predecessor maintenance health tolerates the actual fenced profile route without a cold probe", async t => {
   let starts = 0, requests = 0;
   const owner = new AppServerProfileOwner("", { start: async () => { starts++; },
