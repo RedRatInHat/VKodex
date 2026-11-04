@@ -15,7 +15,7 @@ import { BridgeHealthMonitor, type QueueHistoryProgress, type RuntimeHealthState
 import { predecessorExitObservationSummary } from "../desktop/predecessor-exit-observation.js";
 import { predecessorMaintenanceRestorationSummary } from "../desktop/predecessor-maintenance.js";
 import type { BridgeHealthSnapshot } from "./contracts.js";
-import { MENU_BUTTON } from "./contracts.js";
+import { isTaskMenuRequest, MENU_BUTTON } from "./contracts.js";
 import { taskFailureText } from "./panels.js";
 import { systemLoadText } from "./system-load.js";
 import { archiveRestartIntent, archiveRestartIntentSync, readRestartIntent, type RestartIntent, type RestartTaskSnapshot } from "../desktop/restart-intent.js";
@@ -684,7 +684,7 @@ export class BridgeRuntime {
       // A duplicate retains the original durable payload and event identity.
       if (input.peerId === this.access.ownerId && input.senderId !== this.access.ownerId
         || input.peerId !== this.access.ownerId && [this.access.groupId, -this.access.groupId].includes(input.senderId)
-        || input.action && input.senderId !== this.access.ownerId) return;
+        || input.action && input.senderId !== this.access.ownerId && !isTaskMenuRequest(input)) return;
       this.store.receiveInput(input, this.now());
       return;
     }

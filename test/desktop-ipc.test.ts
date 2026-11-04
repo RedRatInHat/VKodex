@@ -419,6 +419,8 @@ test("Publishing predecessor maintenance preserves MS idle ACK and Android runni
       await s.runtime.handle({ ...saved, eventId: "fresh-control", text: "/stop" });
       await s.runtime.handle({ ...saved, eventId: "fresh-control", text: "/stop" });
       await s.runtime.handle({ ...saved, peerId: s.access.ownerId, eventId: "manager-control", text: "/new" });
+      await s.runtime.handle({ ...saved, senderId: 999, eventId: "member-menu", text: "", action: "menu" });
+      await s.runtime.handle({ ...saved, senderId: 999, eventId: "member-mutation", text: "", action: "owner-token" });
       await s.runtime.tick();
       assert.equal(recoverCalls, 0, "maintenance must not rewrite saved inbox recovery states");
       assert.equal(creatorCallbacks, 0, "creator callbacks are not command ingress during maintenance");
@@ -427,8 +429,9 @@ test("Publishing predecessor maintenance preserves MS idle ACK and Android runni
       assert.deepEqual(s.store.queuedInputs(s.binding.id), before);
       assert.deepEqual(s.store.inputBatches().map(batch => batch.parts), [[saved]]);
       for (const [peer, id] of [[s.peerId, "saved-prompt"], [s.peerId, "fresh-control"],
-        [s.access.ownerId, "manager-control"]] as const)
+        [s.access.ownerId, "manager-control"], [s.peerId, "member-menu"]] as const)
         assert.equal(s.store.inputState(JSON.stringify([peer, id])), "received", "deferred is not rejected or consumed");
+      assert.equal(s.store.inputState(JSON.stringify([s.peerId, "member-mutation"])), null);
       const health = (s.runtime as unknown as { runtimeHealth(): import("../src/bridge/health.js").RuntimeHealthState &
         { startupAdmission?: typeof admission } }).runtimeHealth();
       assert.deepEqual(health.startupAdmission, admission);

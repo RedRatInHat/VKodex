@@ -3,7 +3,7 @@ import path from "node:path";
 import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import { comparablePath } from "../core/paths.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
-import { taskChatTitle } from "./contracts.js";
+import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { formatHealthSummary } from "./health.js";
@@ -246,6 +246,24 @@ export class TaskPanels {
     for (const binding of this.store.bindings()) {
       if (!binding.attached || binding.peerId === null) this.live.delete(binding.id);
     }
+  }
+
+  /** Shared snapshot, independent of the owner's pending rename/goal/model screen. */
+  async sharedMenu(input: BridgeInput): Promise<void> {
+    const binding = this.bound(input.peerId, this.store.byPeer(input.peerId)?.id ?? null);
+    let note = "";
+    try { await this.refresh(binding); }
+    catch { note = "Не удалось обновить состояние Codex. Показаны последние известные данные."; }
+    // An asynchronous inspect must not publish a different task after a rebind.
+    const current = this.bound(input.peerId, binding.id);
+    if (!sameTask(current, binding) || current.rolloutPath !== binding.rolloutPath)
+      throw new ActionRejectedError("Привязка задачи изменилась. Открой /menu заново.");
+    this.store.enqueue(`shared-menu:${input.peerId}:${input.eventId}`, input.peerId,
+      boundedInteractiveView({
+        text: [taskCardText(current, this.details(binding.id)), note,
+          "Режим просмотра. Управление задачей доступно владельцу VKodex."].filter(Boolean).join("\n\n"),
+        buttons: [{ label: "Обновить", action: MENU_BUTTON.action }], silent: true,
+      }), binding.id, "panel");
   }
 
   async text(input: BridgeInput): Promise<boolean> {

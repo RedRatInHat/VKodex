@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { InputBatcher } from "./input-batcher.js";
 import { ActionRejectedError, ModelUnavailableForAccountError, DesktopUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, type DesktopProject, type DesktopSource, type DesktopTask, type CodexTasks, type TaskRef } from "../core/codex-tasks.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, NewTaskDraft, OwnerAccess, TaskListFilter, View } from "./contracts.js";
-import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
+import { isTaskMenuRequest, MENU_BUTTON, taskChatTitle } from "./contracts.js";
 import { AccessGate } from "./delivery.js";
 import { BridgeStore } from "./store.js";
 import { TaskPanels } from "./panels.js";
@@ -122,7 +122,7 @@ export class TaskManager {
     const managerPeer = input.peerId === this.access.ownerId;
     if (managerPeer && input.senderId !== this.access.ownerId) return Promise.resolve();
     if (!managerPeer && [this.access.groupId, -this.access.groupId].includes(input.senderId)) return Promise.resolve();
-    if (input.action && input.senderId !== this.access.ownerId) return Promise.resolve();
+    if (input.action && input.senderId !== this.access.ownerId && !isTaskMenuRequest(input)) return Promise.resolve();
     const key = JSON.stringify([input.peerId, input.eventId]);
     if (this.activeInputs.has(key) || !this.store.receiveInput(input)) return Promise.resolve();
     diagnosticEvent("input.received", { peerId: input.peerId, eventId: input.eventId });
@@ -212,7 +212,7 @@ export class TaskManager {
     // itself is accepted, regardless of its VK user ID.
     if (managerPeer && input.senderId !== this.access.ownerId) return;
     if (!managerPeer && [this.access.groupId, -this.access.groupId].includes(input.senderId)) return;
-    if (input.action && input.senderId !== this.access.ownerId) return;
+    if (input.action && input.senderId !== this.access.ownerId && !isTaskMenuRequest(input)) return;
     const inboxKey = JSON.stringify([input.peerId, input.eventId]);
     if (!this.store.claimInput(inboxKey)) return;
     const mergedKeys = (input.mergedEventIds ?? []).map(id => JSON.stringify([input.peerId, id]));
@@ -249,7 +249,7 @@ export class TaskManager {
           streamGeneration: this.store.streamGeneration(binding.id) }); } catch { /* trace metadata only */ }
         // Local/help/recovery commands must remain usable when the owner is
         // unavailable. Only prompt-bearing input requires an observed writer.
-        const needsTaskInput = !input.action && input.conversationTitle === undefined
+        const needsTaskInput = !isTaskMenuRequest(input) && !input.action && input.conversationTitle === undefined
           && (input.editOfMessageId !== undefined || !!input.attachments?.length
             || input.senderId !== this.access.ownerId || !input.text.trimStart().startsWith("/")
             || /^\/queue(?:\s|$)/u.test(input.text.trim()));
@@ -298,6 +298,10 @@ export class TaskManager {
       const incomingId = /^message:(\d+)$/u.exec(input.eventId);
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
       if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
+      if (!managerPeer && input.senderId !== this.access.ownerId && isTaskMenuRequest(input)) {
+        await this.panels.sharedMenu(input);
+        finish(); return;
+      }
       if (!managerPeer && !input.action && await this.questions.text(input)) { finish(); return; }
       if (input.attachments?.length) {
         if (managerPeer) throw new ActionRejectedError("Менеджер VKodex не принимает вложения. Если у задачи нет VK-беседы, сначала подключи её через список задач.");

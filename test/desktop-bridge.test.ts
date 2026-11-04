@@ -528,7 +528,8 @@ test("final menu shortcut is on the last chunk and opens fresh peer-scoped panel
   await s.handle("", access.ownerId, MENU_BUTTON.action); assert.match(panelView(s, access.ownerId).text, /Мост работает/u);
   const count = s.chat.sent.length;
   await s.manager.handle({ ...s.input("", peerId, MENU_BUTTON.action), senderId: 999 }); await s.worker.flush();
-  assert.equal(s.chat.sent.length, count); assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.chat.sent.length, count + 1); assert.equal(s.desktop.submissions.length, 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Режим просмотра/u);
 });
 
 test("manager menu separates the project overview from task browsing", async t => {
@@ -2979,6 +2980,61 @@ test("linked non-owner messages are attributed prompts while the manager stays p
   assert.equal(s.chat.sent.length, 1);
   assert.equal(s.chat.sent[0]!.peerId, access.ownerId);
   assert.match(s.chat.sent[0]!.view.text, /не связана/u);
+});
+
+test("shared task menu text is local and read-only even without a prompt connection", async t => {
+  const s = setup(t); s.attach();
+  let preparations = 0;
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate,
+    undefined, undefined, undefined, undefined, undefined, undefined,
+    async () => { preparations++; throw new TaskNotOpenError(); });
+  for (const text of ["/menu", "/status", "Меню"]) {
+    await manager.handle({ ...s.input(text, peerId), senderId: 999 });
+    await s.worker.flush();
+    const view = s.chat.sent.at(-1)!.view;
+    assert.match(view.text, /Existing desktop task/u);
+    assert.match(view.text, /Контекст: 25.0%/u);
+    assert.match(view.text, /Режим просмотра/u);
+    assert.deepEqual(view.buttons, [{ label: "Обновить", action: MENU_BUTTON.action }]);
+  }
+  assert.equal(preparations, 0);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.chat.memberReads, 0);
+});
+
+test("shared menu shortcut preserves the owner's pending panel and private manager", async t => {
+  const s = setup(t); s.attach(); await s.handle("/menu", peerId);
+  await clickPanel(s, "Переименовать");
+  const ownerPanel = s.store.getValue(`panel:${peerId}`);
+  await s.manager.handle({ ...s.input("", peerId, MENU_BUTTON.action), senderId: 999 });
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, /Режим просмотра/u);
+  assert.deepEqual(s.store.getValue(`panel:${peerId}`), ownerPanel);
+  const count = s.chat.sent.length;
+  await s.manager.handle({ ...s.input("/menu"), senderId: 999 });
+  await s.manager.handle({ ...s.input("", access.ownerId, MENU_BUTTON.action), senderId: 999 });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, count);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.desktop.renames.length, 0);
+});
+
+test("shared menu falls back to task data offline and refuses a rebind during refresh", async t => {
+  const s = setup(t); s.attach(); await s.handle("/menu", peerId);
+  s.desktop.inspectError = new TaskNotOpenError();
+  await s.manager.handle({ ...s.input("/menu", peerId), senderId: 999 });
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, /последние известные данные/u);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Модель: model-a/u);
+  const count = s.chat.sent.length;
+  s.desktop.inspectTask = async () => {
+    s.store.stopStreaming(s.store.byPeer(peerId)!.id);
+    return s.desktop.details;
+  };
+  await s.manager.handle({ ...s.input("/menu", peerId), senderId: 999 });
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, count, "a detached task must not publish a stale shared card");
+  assert.equal(s.desktop.submissions.length, 0);
 });
 
 test("a blocked task conversation does not hold the manager or another conversation", async t => {

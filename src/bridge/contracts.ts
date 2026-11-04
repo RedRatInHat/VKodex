@@ -11,6 +11,13 @@ export interface View {
 
 export const VK_MAX_INLINE_BUTTONS = 10;
 export const MENU_BUTTON: Button = { label: "Меню", action: "menu" };
+/** Only a standalone menu request is safe to handle without prompt preparation. */
+export function isTaskMenuRequest(input: BridgeInput): boolean {
+  if (input.editOfMessageId !== undefined || input.conversationTitle !== undefined
+    || input.hasAttachments || input.attachments?.length) return false;
+  return input.action !== undefined ? input.action === MENU_BUTTON.action
+    : ["/menu", "/status", "Меню"].includes(input.text.trim());
+}
 /** A file-specific VK rejection: automatic retries of identical bytes cannot help. */
 export class FileUploadRejectedError extends Error {}
 /** VK upload servers report this when the document storage is full. */
