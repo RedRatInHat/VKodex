@@ -78,6 +78,7 @@ export class RolloutTaskHistoryRecovery implements TaskHistoryRecovery {
       const nextCheckpoint: TaskObservationCheckpoint = {
         since: checkpoint?.since ?? (Number.isFinite(enabledSince) ? enabledSince : now),
         lastObservedAt: now,
+        ...(checkpoint?.asyncMessagesSince !== undefined ? { asyncMessagesSince: checkpoint.asyncMessagesSince } : {}),
         activeAtAttach: checkpoint?.activeAtAttach ?? [],
         active: checkpoint?.active ?? [],
         seen: checkpoint?.seen ?? {},

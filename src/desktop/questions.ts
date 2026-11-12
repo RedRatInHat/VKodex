@@ -52,12 +52,11 @@ export function pendingCodexQuestions(state: IpcObject): CodexQuestions[] {
     const answered = new Set(items.flatMap(item => item.type === "userMessage" ? parseAsyncQuestionReply(item.content)
       : item.type === "steeringUserMessage" && item.status === "accepted" ? parseAsyncQuestionReply(item.input) : []).map(answer => answer.questionItemId));
     for (const item of items) {
-      if (item.type !== "agentMessage" || item.delivery !== "async" || typeof item.id !== "string") continue;
-      const rows = Array.isArray(item.questions) && item.questions.length ? item.questions : [{ title: item.text }];
+      if (item.type !== "agentMessage" || item.delivery !== "async" || typeof item.id !== "string" || !Array.isArray(item.questions)) continue;
       const questions: CodexQuestion[] = [];
-      for (const [index, q] of rows.entries()) {
+      for (const [index, q] of item.questions.entries()) {
         if (!isObject(q) || typeof q.title !== "string" || !q.title.trim()) continue;
-        const id = Array.isArray(item.questions) && item.questions.length ? JSON.stringify(["request_user_input_async", item.id, index]) : item.id;
+        const id = JSON.stringify(["request_user_input_async", item.id, index]);
         if (answered.has(id)) continue;
         questions.push({ id, title: q.title, secret: false,
           options: (Array.isArray(q.options) ? q.options : []).filter((o): o is string => typeof o === "string").map(label => ({ label })) });

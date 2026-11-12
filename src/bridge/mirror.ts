@@ -216,7 +216,8 @@ export class TaskMirror {
       // Reserve room for the footer so it cannot become a separate VK message.
       const chunks = chunkText(event.text, this.chunkSize - prefix.length - footer.length);
       chunks.forEach((chunk, index) => {
-        this.store.enqueue(`event:${binding.id}:${event.id}:${index}`, peerId, {
+        const deliveryType = event.type === "message" ? "message" : "event";
+        this.store.enqueue(`${deliveryType}:${binding.id}:${event.id}:${index}`, peerId, {
           text: `${prefix}${chunk}${index === chunks.length - 1 ? footer : ""}`,
           ...(event.type === "user" ? { silent: true } : {}),
           ...(showMenu && index === chunks.length - 1 ? { buttons: [MENU_BUTTON] } : {}),

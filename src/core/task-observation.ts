@@ -13,6 +13,8 @@ export interface RolloutCursorCheckpoint {
 export interface TaskObservationCheckpoint {
   readonly since: number;
   readonly lastObservedAt?: number;
+  /** Excludes async notifications already seen by older bridge versions as question cards. */
+  readonly asyncMessagesSince?: number;
   readonly activeAtAttach: readonly string[];
   readonly active?: readonly string[];
   readonly seen: Readonly<Record<string, string>>;

@@ -120,6 +120,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   const previouslyActive = new Set(previous?.active ?? []);
   const rebaseline = previous !== null && options.rebaseline === true;
   const lastObservedAt = previous?.lastObservedAt;
+  const asyncMessagesSince = previous?.asyncMessagesSince ?? lastObservedAt ?? now;
   const seen: Record<string, string> = { ...previous?.seen };
   const previousSemantic = previous?.semanticByIdentity ?? {};
   const semanticByIdentity: Record<string, string> = { ...previousSemantic };
@@ -183,7 +184,15 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
         const text = answers.length ? answers.map(a => `Ответ на вопрос Codex «${a.question}»: ${a.answer}`).join("\n") : userText(item.content);
         if (text && !isAutomationHeartbeatInput(text)) emitSemantic({ type: "user", id, turnId, text, ...(operationId ? { operationId } : {}) }, startedWhileDisconnected);
       } else if (item.type === "agentMessage" && typeof item.text === "string") {
-        if (item.delivery === "async") continue; // Rendered as an actionable question card.
+        if (item.delivery === "async") {
+          // Async is a delivery mode. Only an explicit question list creates controls.
+          const hasNoQuestions = item.questions == null || Array.isArray(item.questions) && item.questions.length === 0;
+          if (hasNoQuestions && typeof item.completedAtMs === "number" && Number.isSafeInteger(item.completedAtMs)
+            && item.completedAtMs > asyncMessagesSince && item.text.trim()) {
+            emitSemantic({ type: "message", id, turnId, text: item.text }, true);
+          }
+          continue;
+        }
         // The first snapshot is a baseline even when the turn is already active.
         // Replaying its accumulated commentary would flood a newly linked VK chat
         // with progress that happened before the user connected it. A later edit
@@ -210,7 +219,7 @@ export function projectSnapshot(state: IpcObject, previous: ProjectionCheckpoint
   }
   const activeTurn = activeTurns.filter(eligible).at(-1);
   const active = activeTurn ? [String(activeTurn.turnId)] : [];
-  return { checkpoint: { since, lastObservedAt: now, activeAtAttach, active, seen, semanticByIdentity,
+  return { checkpoint: { since, lastObservedAt: now, asyncMessagesSince, activeAtAttach, active, seen, semanticByIdentity,
     ...(quietTurns.size ? { quietTurnIds: [...quietTurns].slice(-256) } : {}), ...(rolloutPath ? { rolloutPath } : {}),
     ...(rolloutPath && previous?.rolloutPath && comparablePath(previous.rolloutPath) === rolloutPath && previous.rolloutCursor
       ? { rolloutCursor: previous.rolloutCursor } : {}) }, events };

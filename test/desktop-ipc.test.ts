@@ -6432,6 +6432,37 @@ test("native questions distinguish blocking requests, async questions, and appro
   assert.equal(taskDetails(state([asyncItem])).status, "running");
 });
 
+test("a Desktop async notification reaches VK during the turn without question controls", async t => {
+  const s = runtimeSetup(t);
+  s.store.setBindingDisplayMode(s.binding.id, "final-only");
+  const old = { type: "agentMessage", id: "previous-notice", delivery: "async", phase: "final_answer",
+    text: "Previous notification", questions: null, completedAtMs: 1_500 };
+  const live = { ...old, id: "notice", text: "The run is still active.", completedAtMs: 2_500 };
+  const baseline = observeTaskState(state([old]), null, 2_000);
+  const observed = observeTaskState(state([old, live]), baseline.checkpoint, 3_000);
+  assert.deepEqual(observed.questions, []);
+  assert.deepEqual(observed.events.filter(event => event.type !== "status"), [
+    { type: "message", id: "notice", turnId: "fixture-turn", text: live.text },
+  ]);
+  assert.equal(observed.details.status, "running");
+  assert.deepEqual(observeTaskState(state([old, live]), observed.checkpoint, 4_000).events, []);
+  const mirror = new TaskMirror(s.store);
+  mirror.acceptObservation(s.binding.id, observed.events, observed.inputTurnIds);
+  mirror.acceptObservation(s.binding.id, observed.events, observed.inputTurnIds);
+  await s.runtime.tick(false);
+  assert.deepEqual(s.sent.filter(item => item.peerId === s.peerId), [{ peerId: s.peerId, view: { text: live.text } }]);
+  assert.deepEqual(s.store.finalDeliveries(s.binding.id, "fixture-turn"), []);
+});
+
+test("an upgraded Desktop checkpoint does not replay previously delivered async text", () => {
+  const old = { type: "agentMessage", id: "previous-notice", delivery: "async", phase: "final_answer",
+    text: "Previously shown as a question", questions: null, completedAtMs: 1_500 };
+  const legacyCheckpoint = { since: 1_000, lastObservedAt: 2_000, activeAtAttach: ["fixture-turn"], seen: {} };
+  const observed = observeTaskState(state([old]), legacyCheckpoint, 3_000);
+  assert.equal(observed.events.some(event => event.type === "message"), false);
+  assert.deepEqual(observed.questions, []);
+});
+
 test("blocking question answers use the owner request ID and native answer map", async () => {
   const server = new Server(); server.dataState = { ...state(), requests: [questionRequest] };
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
@@ -6445,14 +6476,15 @@ test("blocking question answers use the owner request ID and native answer map",
 });
 
 test("async answers use Codex's question-reply envelope and never start a new turn", async () => {
-  const server = new Server(); server.dataState = state([{ type: "agentMessage", id: "async-q", delivery: "async", text: "Question?" }]);
+  const server = new Server(); server.dataState = state([{ type: "agentMessage", id: "async-q", delivery: "async", text: "", questions: [{ title: "Question?" }] }]);
   const question = pendingCodexQuestions(server.dataState)[0]!;
   const desktop = new ConnectedDesktopTasks({ listTasks: async () => [{ ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }], listProjects: async () => [] }, () => new DesktopIpcClient(() => server, 100));
-  await desktop.answerQuestions(ref, question, { "async-q": "Yes" }, "async-op", async () => {});
+  const questionId = JSON.stringify(["request_user_input_async", "async-q", 0]);
+  await desktop.answerQuestions(ref, question, { [questionId]: "Yes" }, "async-op", async () => {});
   const write = server.received.find(m => m.method === "thread-follower-steer-turn")!;
   const p = write.params as IpcObject;
   assert.equal(p.clientUserMessageId, "async-op");
-  assert.deepEqual(parseAsyncQuestionReply(p.input), [{ questionItemId: "async-q", question: "Question?", answer: "Yes" }]);
+  assert.deepEqual(parseAsyncQuestionReply(p.input), [{ questionItemId: questionId, question: "Question?", answer: "Yes" }]);
   assert.equal(server.received.some(m => m.method === "thread-follower-start-turn"), false);
 });
 
