@@ -14,6 +14,7 @@ import os from "node:os";
 import { comparablePath } from "../core/paths.js";
 import { TaskQuestions } from "./questions.js";
 import { diagnosticEvent, diagnosticError, diagnosticScope, diagnosticOperation, diagnosticHasOperation, diagnosticUpdate } from "./diagnostics.js";
+import { commandModel, commandPage, commandProject, commandSource } from "./command-selectors.js";
 
 // Leave room for both page arrows, the two special scopes and refresh.
 const PROJECT_PAGE_SIZE = 5;
@@ -32,10 +33,15 @@ const managerHelp = [
   "/load, /pc — текущая нагрузка компьютера",
   "/limits — лимиты аккаунта Codex",
   "/list — задачи по проектам",
+  "/list <projects|all|none|ID проекта> [страница]",
+  "/sources, /projects [страница] — каталоги и ID проектов",
+  "/attach <ID задачи> [каталог] — получить ссылку на VK-беседу",
+  "/resume <ID задачи> [каталог], /detach <ID задачи> [каталог] — включить или отключить трансляцию",
   "/new — создать новую задачу",
+  "/new <каталог> <ID проекта|none> <local|worktree> <модель> <уровень> — затем название и промпт с новой строки",
   "/cancel — отменить мастер создания",
   "",
-  "Остальные действия доступны кнопками меню.",
+  "Ответь /buttons на сообщение с кнопками, чтобы получить их текстовые команды.",
 ].join("\n");
 
 const taskHelp = [
@@ -44,15 +50,24 @@ const taskHelp = [
   "/menu, /status — карточка задачи",
   "/help — эта справка",
   "/limits — лимиты аккаунта Codex",
+  "/limits reset [каталог] — открыть подтверждение сброса",
   "/goal — цель задачи, бюджет и управление продолжением",
+  "/goal pause, /goal resume, /goal clear, /goal set <keep|none|число> <текст>",
+  "/models [страница], /model <модель> [уровень] — например /model sol6.1 high",
+  "/rename <название>, /rename-vk — имя задачи и повтор синхронизации VK",
+  "/move project <ID|none>, /move source <каталог> [ID проекта|none], /move resume|cancel|conflict",
+  "/archive — открыть подтверждение архивации",
+  "/link, /path, /export — ссылка, рабочая папка и видимая переписка",
   "/files — проверить готовые исходящие файлы",
   "/files unknown — показать неподтверждённые загрузки документов",
   "/files verify <операция> <ключ файла> <doc...> — сверить документ VK без повторной загрузки",
   "/open — явно открыть эту задачу в настроенном Codex",
+  "/sources, /projects [страница] — каталоги и ID проектов",
   "/stop — остановить текущий ход",
   "/queue <промпт> — добавить запрос в штатную очередь Codex",
   "/questions — показать открытые вопросы Codex и обновить кнопки",
   "/detach — отключить трансляцию, не останавливая задачу",
+  "Ответь /buttons на сообщение с кнопками, чтобы получить их текстовые команды.",
   "",
   "Обычный текст, фотографии и документы продолжают эту задачу.",
   "Правка последнего сообщения VK заменяет отдельный live-ход; уточнения внутри идущего хода не переписываются.",
@@ -298,6 +313,19 @@ export class TaskManager {
       const incomingId = /^message:(\d+)$/u.exec(input.eventId);
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
       if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
+      if (!input.action && input.senderId === this.access.ownerId && input.editOfMessageId === undefined) {
+        const text = input.text.trim();
+        if (/^\/buttons?(?:\s|$)/u.test(text)) {
+          if (input.attachments?.length) throw new ActionRejectedError("Команду нельзя отправить вместе с вложением.");
+          if (text === "/buttons") {
+            this.describeButtons(input);
+            finish(); return;
+          }
+          const token = /^\/button\s+(menu|[a-f0-9-]{36})$/u.exec(text)?.[1];
+          if (!token) throw new ActionRejectedError("Формат: /button <код>. Ответь /buttons на сообщение с кнопками, чтобы получить коды.");
+          input = { ...input, action: token };
+        }
+      }
       if (!managerPeer && input.senderId !== this.access.ownerId && isTaskMenuRequest(input)) {
         await this.panels.sharedMenu(input);
         finish(); return;
@@ -348,12 +376,38 @@ export class TaskManager {
     } finally { taskInputScope?.close(); }
   }
 
+  private describeButtons(input: BridgeInput): void {
+    if (!input.replyToMessageId) throw new ActionRejectedError("Отправь /buttons ответом на сообщение VKodex с кнопками.");
+    const buttons = this.store.deliveredButtons(input.peerId, input.replyToMessageId)
+      .filter(button => button.action === MENU_BUTTON.action || this.store.scopedAction(button.action, input.peerId, input.peerId === this.access.ownerId));
+    if (!buttons.length) throw new ActionRejectedError("Нет доступных кнопок. Открой или дождись обновления нужного меню.");
+    const binding = this.store.byPeer(input.peerId);
+    this.store.enqueue(`button-commands:${input.peerId}:${input.eventId}`, input.peerId,
+      { text: buttons.map(button => `${button.label}\n/button ${button.action}`).join("\n\n"), silent: true }, binding?.id ?? null);
+  }
+
   private async handleManager(input: BridgeInput): Promise<void> {
     const text = input.text.trim();
     if (text === "/help") { this.reply(input, { text: managerHelp }); return; }
     if (["/load", "/pc"].includes(text)) { this.reply(input, { text: await this.loadReport() }); return; }
     if (["/start", "/list"].includes(text)) { await this.chooseProject(input, 0); return; }
+    if (/^\/list\s/u.test(text)) {
+      const match = /^\/list\s+(\S+)(?:\s+(\S+))?$/u.exec(text);
+      if (!match) throw new ActionRejectedError("Формат: /list <projects|all|none|ID проекта> [страница].");
+      const selector = match[1]!;
+      const page = commandPage(match[2]);
+      if (selector === "projects") await this.chooseProject(input, page);
+      else if (selector === "all" || selector === "none") await this.list(input, page, { kind: selector === "all" ? "all" : "unassigned" }, true);
+      else await this.list(input, page, { kind: "project", projectId: selector }, true);
+      return;
+    }
+    const bindingCommand = /^\/(attach|resume|detach)(?:\s|$)/u.exec(text);
+    if (bindingCommand) {
+      await this.bindingCommand(input, bindingCommand[1]!, text);
+      return;
+    }
     if (text === "/new") { await this.newTask(input); return; }
+    if (/^\/new\s/u.test(text)) { await this.newTaskFromCommand(input, text); return; }
     if (text === "/cancel") { this.cancel(input); return; }
     const draft = this.store.getDraft();
     // An absolute POSIX workspace path also starts with "/". Do not treat it
@@ -392,6 +446,22 @@ export class TaskManager {
       return;
     }
     this.reply(input, { text: "Это менеджер задач. /menu — меню и состояние моста, /health — полная проверка, /load — нагрузка ПК, /list — задачи по проектам, /new — новая задача, /cancel — отмена ввода.", buttons: [MENU_BUTTON] });
+  }
+
+  private async bindingCommand(input: BridgeInput, command: string, text: string): Promise<void> {
+    const match = /^\/\w+\s+(?:codex:\/\/threads\/)?([\w-]+)(?:\s+(\S+))?$/u.exec(text);
+    if (!match) throw new ActionRejectedError(`Формат: /${command} <ID задачи> [каталог].`);
+    const sourceId = match[2] === undefined ? undefined : commandSource(this.sources(), match[2]).id;
+    if (command === "attach") {
+      const tasks = (await this.desktop.listTasks()).filter(task => task.threadId === match[1] && (sourceId === undefined || (task.sourceId ?? "") === sourceId));
+      if (tasks.length !== 1) throw new ActionRejectedError(tasks.length ? "В нескольких каталогах найден этот ID. Укажи каталог из /sources." : "Задача с таким ID не найдена.");
+      await this.open(input, tasks[0]!);
+      return;
+    }
+    const bindings = this.store.bindings().filter(binding => binding.peerId !== null
+      && binding.threadId === match[1] && (sourceId === undefined || (binding.sourceId ?? "") === sourceId));
+    if (bindings.length !== 1) throw new ActionRejectedError(bindings.length ? "В нескольких каталогах найден этот ID. Укажи каталог из /sources." : "Связанная беседа не найдена.");
+    await this.handleAction(input, command === "resume" ? { type: "resume", bindingId: bindings[0]!.id } : { type: "detach", bindingId: bindings[0]!.id });
   }
 
   private button(label: string, action: ManagerAction): Button { return { label: label.slice(0, 40), action: this.store.action(action, Date.now(), this.access.ownerId) }; }
@@ -542,7 +612,7 @@ export class TaskManager {
     this.reply(input, { text: lines.join("\n"), buttons });
   }
 
-  private async list(input: BridgeInput, page: number, filter: TaskListFilter): Promise<void> {
+  private async list(input: BridgeInput, page: number, filter: TaskListFilter, showCommands = false): Promise<void> {
     const catalog = await this.desktop.listTasks();
     let tasks = catalog;
     let heading = "Все подряд";
@@ -562,7 +632,13 @@ export class TaskManager {
     if (start + 6 < tasks.length) buttons.push(this.button("Далее", { type: "list", page: start / 6 + 1, filter }));
     buttons.push(this.button("Выбрать проект", { type: "browseProjects", page: 0 }), this.button("Обновить", { type: "list", page: start / 6, filter }));
     const warnings = this.desktop.catalogWarnings?.() ?? [];
-    const body = visible.length ? `Задачи Codex · ${start + 1}–${start + visible.length} из ${tasks.length}\n\n${visible.map((task, i) => `${start + i + 1}. ${shortTitle(task.title, 120)}${task.sourceLabel ? `\nКаталог: ${task.sourceLabel}` : ""}`).join("\n\n")}` : "В этом списке нет задач.";
+    const lines = visible.map((task, i) => {
+      const title = `${start + i + 1}. ${shortTitle(task.title, 120)}`;
+      const source = task.sourceLabel ? `\nКаталог: ${task.sourceLabel}` : "";
+      const command = showCommands ? `\n/attach ${task.threadId} ${task.sourceId || ".codex"}` : "";
+      return title + source + command;
+    });
+    const body = visible.length ? `Задачи Codex · ${start + 1}–${start + visible.length} из ${tasks.length}\n\n${lines.join("\n\n")}` : "В этом списке нет задач.";
     this.reply(input, { text: `${heading}\n\n${body}${warnings.length ? `\n\n${warnings.join("\n")}` : ""}`, buttons });
   }
 
@@ -616,6 +692,29 @@ export class TaskManager {
     if (draft && !["created", "source"].includes(draft.stage)) throw new ActionRejectedError("Сначала заверши текущий ввод или отправь /cancel.");
     this.store.saveDraft({ id: randomUUID(), stage: "source" });
     await this.newSources(input, 0);
+  }
+
+  private async newTaskFromCommand(input: BridgeInput, text: string): Promise<void> {
+    const match = /^\/new[ \t]+(\S+)[ \t]+(\S+)[ \t]+(local|worktree)[ \t]+(\S+)[ \t]+(\S+)[ \t]*\r?\n([^\r\n]+)\r?\n([\s\S]+)$/u.exec(text);
+    if (!match) throw new ActionRejectedError("Формат: /new <каталог> <ID проекта|none> <local|worktree> <модель> <уровень>. Название и промпт отправь с новой строки в том же сообщении.");
+    if (!this.desktop.capabilities.createTask) throw new ActionRejectedError("Создание задач недоступно в текущем подключении.");
+    const title = match[6]!.trim(); const prompt = match[7]!.trim();
+    if (!title || title.length > 120 || /[\x00-\x1f]/u.test(title) || !prompt || prompt.length > 16_000) {
+      throw new ActionRejectedError("Название должно содержать от 1 до 120 символов, промпт — от 1 до 16000.");
+    }
+    const environment = match[3] === "worktree" ? "worktree" : "local";
+    const automaticWorkspace = match[2] === "none";
+    if (automaticWorkspace && environment !== "local") throw new ActionRejectedError("Для отдельного worktree выбери существующий проект.");
+    const source = commandSource(this.sources(), match[1]!);
+    const project = automaticWorkspace ? null : commandProject(await this.desktop.listProjects(source.id), match[2]!);
+    const selection = commandModel(await this.desktop.listModels({ hostId: "local", threadId: "", sourceId: source.id }), match[4]!, match[5]!);
+    const existing = this.store.getDraft();
+    if (existing && !["created", "source"].includes(existing.stage)) throw new ActionRejectedError("Сначала заверши текущий ввод или отправь /cancel.");
+    const id = randomUUID();
+    this.store.saveDraft({ id, stage: "confirm", sourceId: source.id, sourceLabel: source.label,
+      projectId: project?.id ?? null, projectTitle: project?.title ?? "Без проекта", environment, title, prompt, ...selection,
+      ...(automaticWorkspace ? { automaticWorkspace, workspace: this.automaticWorkspace(title, id) } : {}) });
+    await this.create(input, id);
   }
 
   private async newSources(input: BridgeInput, requestedPage: number): Promise<void> {

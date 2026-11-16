@@ -1360,6 +1360,7 @@ test("project move option persists the selected project without creating a task"
 test("model selection stays in the same task, preserves the running model and is one-shot", async t => {
   const s = setup(t); s.attach(); s.desktop.details = { ...s.desktop.details, status: "running" };
   await s.handle("/menu", peerId); await clickPanel(s, "Модель / рассуждение"); await clickPanel(s, "Model B");
+  assert.equal(s.desktop.modelSources.length, 1);
   const action = panelView(s).buttons!.find(button => button.label === "high")!.action;
   await clickPanel(s, "high");
   assert.equal(s.desktop.selections.length, 1);
@@ -1369,6 +1370,80 @@ test("model selection stays in the same task, preserves the running model and is
   assert.match(panelView(s).text, /Следующий ход: model-b · high/u);
   await s.handle("", peerId, action);
   assert.equal(s.desktop.selections.length, 1);
+});
+
+test("a VK model command selects the account's model once, without a menu or chat turn", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.details = { ...s.desktop.details, status: "running" };
+  s.desktop.models.push({ id: "gpt-6.1-sol", title: "GPT-6.1 Sol", efforts: ["medium", "high"], defaultEffort: "medium" });
+  const input = s.input("/model sol6.1 high", peerId);
+  await s.manager.handle(input);
+  await s.manager.handle(input);
+  await s.worker.flush();
+  assert.deepEqual(s.desktop.selections, [{ task: binding, model: "gpt-6.1-sol", effort: "high" }]);
+  assert.equal(s.desktop.modelSources.length, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.desktop.details.model, "model-a");
+  assert.equal(s.store.getValue(`panel:${peerId}`), null);
+  assert.deepEqual(s.chat.sent.map(message => message.view.text), ["Для следующего хода: gpt-6.1-sol · high."]);
+  await s.handle("/model gpt-6.1-sol xhigh", peerId);
+  assert.equal(s.desktop.selections.length, 1);
+  assert.match(s.chat.sent.at(-1)!.view.text, /доступны уровни: medium, high/u);
+});
+
+test("a VK model shortcut refuses a rebinding during model discovery", async t => {
+  const s = setup(t); const binding = s.attach();
+  const list = s.desktop.listModels.bind(s.desktop);
+  s.desktop.listModels = async ref => {
+    s.store.stopStreaming(binding.id);
+    s.store.setAttached(binding.id, true);
+    return list(ref);
+  };
+  await s.handle("/model model-b high", peerId);
+  assert.equal(s.desktop.selections.length, 0);
+  assert.match(s.chat.sent.at(-1)!.view.text, /Привязка задачи изменилась/u);
+});
+
+test("VK owner-only shortcuts preserve the button's peer, screen and one-shot confirmation", async t => {
+  const s = setup(t); s.attach();
+  const other = s.store.ensureBinding({ ...task, threadId: "other" }); s.store.setChat(other.id, peerId + 1, 18);
+  await s.handle("/archive", peerId);
+  const preview = s.chat.sent.at(-1)!;
+  const token = preview.view.buttons!.find(button => button.label === "Архивировать")!.action;
+  assert.match(preview.view.text, new RegExp(`/button ${token}`, "u"));
+  assert.equal(s.desktop.archives.length, 0);
+  await s.manager.handle({ ...s.input("/buttons", peerId), replyToMessageId: preview.handle.conversationMessageId });
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, new RegExp(`/button ${token}`, "u"));
+  await s.handle(`/button ${token}`, peerId + 1);
+  await s.manager.handle({ ...s.input(`/button ${token}`, peerId), senderId: access.ownerId + 1 });
+  assert.equal(s.desktop.archives.length, 0);
+  await s.handle("/menu", peerId);
+  await s.handle(`/button ${token}`, peerId);
+  assert.equal(s.desktop.archives.length, 0);
+  await s.handle("/archive", peerId);
+  const current = panelView(s).buttons!.find(button => button.label === "Архивировать")!.action;
+  await s.handle(`/button ${current}`, peerId);
+  await s.handle(`/button ${current}`, peerId);
+  assert.equal(s.desktop.archives.length, 1);
+  assert.equal(s.store.byPeer(peerId)?.attached, false);
+});
+
+test("manager shortcuts open a catalog page and create a task from a single parameterized request", async t => {
+  const s = setup(t);
+  await s.handle("/list all 1");
+  assert.match(s.chat.sent.at(-1)!.view.text, /\/attach task-a \.codex/u);
+  await s.handle("/new .codex project-a local model-b high\nTask from VK\nFirst line\nSecond line");
+  assert.equal(s.desktop.creations.length, 1);
+  const created = s.desktop.creations[0]!;
+  assert.equal(created.projectId, "project-a");
+  assert.equal(created.environment, "local");
+  assert.equal(created.title, "Task from VK");
+  assert.equal(created.model, "model-b");
+  assert.equal(created.effort, "high");
+  assert.equal(created.prompt, "First line\nSecond line");
+  assert.equal(s.store.getDraft()?.stage, "created");
+  assert.equal(s.chat.creates, 1);
 });
 
 test("model buttons cannot cross conversations or be replayed after cancellation", async t => {

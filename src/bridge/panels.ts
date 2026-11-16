@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
+import { ActionRejectedError, DesktopUnavailableError, NativeGoalReceiptUnavailableError, TaskNotOpenError, UncertainActionError, sameTask, taskKey, type AccountUsage, type CodexTasks, type DesktopModel, type DesktopProject, type GoalContinuationReceipt, type TaskDetails, type TaskGoal, type TaskGoalStatus } from "../core/codex-tasks.js";
 import { comparablePath } from "../core/paths.js";
 import type { Binding, BridgeChat, BridgeHealthSnapshot, BridgeInput, Button, ManagerAction, OwnerAccess, PanelAction, TaskTransferRecord, View } from "./contracts.js";
 import { MENU_BUTTON, taskChatTitle } from "./contracts.js";
@@ -9,6 +9,7 @@ import { BridgeStore } from "./store.js";
 import { formatHealthSummary } from "./health.js";
 import { boundedInteractiveView } from "./interactive-view.js";
 import { TaskTransfers, transferStatus, type TransferredGoalUsage } from "./transfers.js";
+import { commandModel, commandPage, commandProject, commandSource, modelAlias } from "./command-selectors.js";
 
 interface PanelState {
   id: string;
@@ -17,6 +18,7 @@ interface PanelState {
   view: "home" | "projects" | "limitsReset" | "move" | "moveProject" | "moveSource" | "moveSourceProject" | "moveSourceConfirm" | "moveSourceConflict" | "models" | "efforts" | "goal" | "goalObjective" | "goalBudget" | "goalBudgetInput" | "goalClear" | "rename" | "renameConfirm" | "archive" | "share";
   page: number;
   model?: string;
+  modelOptions?: readonly DesktopModel[];
   title?: string;
   goalObjective?: string;
   goalTokenBudget?: number | null;
@@ -300,6 +302,7 @@ export class TaskPanels {
       await this.home(input.peerId, undefined, true);
       return true;
     }
+    if (input.senderId === this.access.ownerId && input.editOfMessageId === undefined && await this.shortcut(input, text)) return true;
     // Help and unknown slash commands belong to TaskManager. In particular,
     // they must not be consumed as a pending rename value.
     if (text.startsWith("/") && text !== "/cancel") return false;
@@ -339,6 +342,131 @@ export class TaskPanels {
     const state = this.state(input.peerId);
     if (!state || state.id !== action.screenId || state.expiresAt <= Date.now()) throw new ActionRejectedError("Это меню устарело. Открой /menu заново.");
     if ((action.bindingId ?? null) !== state.bindingId) throw new ActionRejectedError("Кнопка относится к другой задаче.");
+    await this.runAction(input, action, state);
+  }
+
+  private async shortcut(input: BridgeInput, text: string): Promise<boolean> {
+    if (!text.startsWith("/")) return false;
+    const [verb, ...words] = text.split(/\s+/u);
+    if (verb === "/sources" && !words.length) {
+      const sources = this.desktop.listSources?.() ?? [{ id: "", label: "Основной" }];
+      this.reply(input, { text: sources.map(source => `${source.label} · ${source.id || ".codex"}`).join("\n") });
+      return true;
+    }
+    if (verb === "/projects" && words.length <= 1) {
+      const page = commandPage(words[0]);
+      const binding = this.store.byPeer(input.peerId);
+      const projects = await this.desktop.listProjects(binding ? binding.sourceId ?? "" : undefined);
+      this.reply(input, { text: `Проекты Codex · ${projects.length}\n\n${projects.slice(page * 10, page * 10 + 10)
+        .map(project => `${short(project.title)}\n${project.id}`).join("\n\n").slice(0, 3_500) || "На этой странице проектов нет."}` });
+      return true;
+    }
+    const binding = this.store.byPeer(input.peerId);
+    const raw = text.slice((verb ?? "").length).trimStart();
+    const [first, second, third] = words;
+    const state: PanelState = { id: "", messageKey: "", bindingId: binding?.id ?? null, view: "home", page: 0, expiresAt: 0, tokens: {} };
+    if (verb === "/limits" && first === "reset") {
+      if (words.length > 2 || !second && !binding) throw new ActionRejectedError("Формат: /limits reset <каталог из /sources>.");
+      const sourceId = second ? commandSource(this.desktop.listSources?.() ?? [], second).id : binding!.sourceId ?? "";
+      await this.runAction(input, { type: "panel", screenId: state.id, command: "limitsReset", sourceId }, state);
+      return true;
+    }
+    if (!binding) return false;
+    const generation = this.store.streamGeneration(binding.id);
+    const action = { type: "panel" as const, screenId: "", bindingId: binding.id };
+    const run = (command: PanelAction["command"], args?: Partial<PanelAction>, projectSelector?: string): Promise<void> => {
+      this.assertShortcutBinding(input, binding, generation);
+      return this.runAction(input, { ...action, command, ...args }, state, projectSelector);
+    };
+    switch (verb) {
+      case "/model": {
+        if (!first || words.length > 2) throw new ActionRejectedError("Формат: /model <модель> [уровень]. Список: /models.");
+        if (!this.desktop.capabilities.selectModel) throw new ActionRejectedError("Выбор модели недоступен в текущем подключении.");
+        if (this.store.transferBlocksInput(binding.id)) throw new ActionRejectedError("Перенос ещё выполняется. /menu покажет этап.");
+        const selection = commandModel(await this.desktop.listModels(binding), first, second);
+        state.model = selection.model;
+        await run("select", selection);
+        return true;
+      }
+      case "/models":
+        if (words.length > 1) throw new ActionRejectedError("Формат: /models [страница].");
+        await run("models", { page: commandPage(first) });
+        return true;
+      case "/rename":
+        if (!raw) { await run("rename"); return true; }
+        if (/^[^\r\n\x00-\x1f]{1,120}$/u.test(raw)) {
+          state.view = "renameConfirm"; state.title = raw;
+          await run("renameApply", { title: raw });
+          return true;
+        }
+        throw new ActionRejectedError("Название должно быть одной строкой от 1 до 120 символов.");
+      case "/rename-vk": {
+        const rename = this.renameState(binding);
+        if (raw || !rename) throw new ActionRejectedError("Формат: /rename-vk. Повтор доступен после незавершённого переименования VK.");
+        await run("renameVk", { title: rename.title });
+        return true;
+      }
+      case "/archive": case "/share": case "/path": case "/link": case "/export":
+        if (raw) throw new ActionRejectedError(`У команды ${verb} нет параметров.`);
+        await run(verb === "/archive" ? "archive" : verb === "/share" ? "share" : verb === "/path" ? "path" : verb === "/link" ? "link" : "export");
+        return true;
+      case "/goal": {
+        if (first === "set") {
+          const match = /^set\s+(keep|none|[1-9]\d*)\s+([\s\S]+)$/u.exec(raw);
+          if (!match || match[2]!.length > 8_000 || /\x00/u.test(match[2]!)) throw new ActionRejectedError("Формат: /goal set <keep|none|число> <текст цели до 8000 символов>.");
+          const budget = match[1]!;
+          if (/^\d/u.test(budget) && Number(budget) > 100_000_000) throw new ActionRejectedError("Бюджет цели должен быть от 1 до 100 000 000 токенов.");
+          const current = await this.goal(binding);
+          state.view = "goalBudget"; state.goalObjective = match[2]!.trim(); state.goalBaselineKey = goalIntentKey(current);
+          await run("goalApply", { tokenBudget: budget === "keep" ? current?.tokenBudget ?? null : budget === "none" ? null : Number(budget) });
+          return true;
+        }
+        if (words.length !== 1 || !["pause", "resume", "clear"].includes(first ?? "")) {
+          throw new ActionRejectedError("Формат: /goal pause, /goal resume, /goal clear или /goal set <бюджет> <текст>.");
+        }
+        state.view = "goal"; state.goalBaselineKey = goalIntentKey(await this.goal(binding));
+        await run(first === "pause" ? "goalPause" : first === "resume" ? "goalResume" : "goalClear");
+        return true;
+      }
+      case "/move":
+        if (!first) { await run("move"); return true; }
+        if (first === "project") {
+          const selector = raw.slice(first.length).trim();
+          if (!selector) await run("moveProject");
+          else {
+            const projectId = selector === "none" ? null : commandProject(await this.desktop.listProjects(binding.sourceId ?? ""), selector).id;
+            state.view = "moveProject";
+            await run("moveProjectApply", { projectId });
+          }
+          return true;
+        }
+        if (first === "source" && words.length <= 3) {
+          if (!second) await run("moveSource");
+          else {
+            if (!this.desktop.capabilities.transferTask || !this.desktop.transferTask) throw new ActionRejectedError("Перенос между каталогами Codex недоступен.");
+            const source = commandSource(this.desktop.listSources?.() ?? [], second);
+            state.view = "moveSource";
+            await run("moveSourceSelect", { sourceId: source.id }, third);
+          }
+          return true;
+        }
+        if (words.length === 1 && ["resume", "cancel", "conflict"].includes(first)) {
+          await run(first === "resume" ? "moveSourceResume" : first === "cancel" ? "moveSourceCancel" : "moveSourceConflict");
+          return true;
+        }
+        throw new ActionRejectedError("Формат: /move project [ID|none], /move source [каталог [ID проекта|none]], /move resume, /move cancel или /move conflict.");
+      default: return false;
+    }
+  }
+
+  private assertShortcutBinding(input: BridgeInput, binding: Binding, generation: number): void {
+    const current = this.bound(input.peerId, binding.id);
+    if (!sameTask(current, binding) || this.store.streamGeneration(current.id) !== generation) {
+      throw new ActionRejectedError("Привязка задачи изменилась. Обнови /menu и повтори команду.");
+    }
+  }
+
+  private async runAction(input: BridgeInput, action: PanelAction, state: PanelState, projectSelector?: string): Promise<void> {
     if (action.command === "home") { await this.home(input.peerId); return; }
     if (action.command === "health" && input.peerId === this.access.ownerId) {
       if (!this.healthCheck) throw new ActionRejectedError("Активная health-проверка недоступна в этом запуске.");
@@ -361,10 +489,11 @@ export class TaskPanels {
         const next = this.newState(input.peerId, state.bindingId, "limitsReset");
         next.resetSourceId = action.sourceId; next.resetSourceLabel = usage.sourceLabel ?? "не указан";
         next.resetAccountLabel = usage.accountLabel ?? "не определён"; next.resetOperationId = randomUUID();
+        const confirm = this.button(input.peerId, next, "Сбросить лимит", "limitsResetApply", { sourceId: action.sourceId });
         this.show(input.peerId, next, {
           text: `Использовать один кредит сброса лимита?\n\nКаталог: ${next.resetSourceLabel}\nАккаунт: ${next.resetAccountLabel}\nДоступно кредитов: ${usage.resetCredits}\n\nБудут сброшены только окна, которые Codex сейчас считает подходящими. Операция необратима.`,
-          buttons: [this.button(input.peerId, next, "Сбросить лимит", "limitsResetApply", { sourceId: action.sourceId }), this.button(input.peerId, next, "Отмена", "limits")],
-        });
+          buttons: [confirm, this.button(input.peerId, next, "Отмена", "limits")],
+        }, input.action ? undefined : confirm);
         return;
       }
       if (state.view !== "limitsReset" || action.sourceId === undefined || action.sourceId !== state.resetSourceId || !state.resetOperationId) {
@@ -401,9 +530,16 @@ export class TaskPanels {
       this.show(input.peerId, next, { text: `Проекты Codex · ${projects.length}\n\n${projects.map(project => `${short(project.title)}\n${project.workspace}`).join("\n\n").slice(0, 3_000)}\n\n${this.desktop.capabilities.createTask ? "Новая задача создаётся через меню менеджера." : "Создание новых задач через это подключение пока недоступно."}`, buttons: [this.button(input.peerId, next, "Меню", "home")] }); return;
     }
     const binding = this.bound(input.peerId, state.bindingId);
-    if (this.store.transferBlocksInput(binding.id) && ["moveProjectApply", "select", "renameApply", "archiveApply", "goalApply", "goalPause", "goalResume", "goalClearApply"].includes(action.command)) {
-      throw new ActionRejectedError("Перенос ещё выполняется. Изменения задачи доступны после его завершения; /menu показывает этап.");
-    }
+    const generation = this.store.streamGeneration(binding.id);
+    const changesTask = ["moveProjectApply", "select", "renameApply", "archiveApply", "goalApply", "goalPause", "goalResume", "goalClearApply"].includes(action.command);
+    const assertReady = (): void => {
+      this.assertShortcutBinding(input, binding, generation);
+      if (changesTask && this.store.transferBlocksInput(binding.id)) {
+        throw new ActionRejectedError("Перенос ещё выполняется. Изменения задачи доступны после его завершения; /menu показывает этап.");
+      }
+    };
+    const consume = (): void => { assertReady(); if (input.action) this.consume(input); };
+    assertReady();
     switch (action.command) {
       case "openDesktop": {
         if (!this.desktop.revealTask && !this.desktop.ensureOpen) throw new ActionRejectedError("Открытие задачи недоступно в текущем подключении.");
@@ -441,13 +577,16 @@ export class TaskPanels {
       }
       case "moveProjectApply": {
         if (!this.desktop.capabilities.moveTask || state.view !== "moveProject" || action.projectId === undefined) throw new ActionRejectedError("Выбор проекта устарел.");
-        this.consume(input); this.waiting(binding, "Проверяю перенос задачи в Codex…");
+        consume(); this.waiting(binding, "Проверяю перенос задачи в Codex…");
         await this.desktop.moveTask(binding, action.projectId);
         const moved = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
         if (!moved || moved.projectId !== action.projectId) throw new UncertainActionError();
         this.store.ensureBinding(moved);
-        const project = action.projectId === null ? null : (await this.desktop.listProjects()).find(item => item.id === action.projectId);
-        await this.home(input.peerId, project ? `Задача перемещена в проект «${short(project.title)}».` : "Задача теперь без проекта.");
+        const project = action.projectId === null ? null : (await this.desktop.listProjects(binding.sourceId ?? "")).find(item => item.id === action.projectId);
+        const note = action.projectId === null ? "Задача теперь без проекта." : project
+          ? `Задача перемещена в проект «${short(project.title)}».` : "Перенос в выбранный проект подтверждён.";
+        if (input.action) await this.home(input.peerId, note);
+        else this.reply(input, { text: note });
         break;
       }
       case "moveSource": {
@@ -469,16 +608,23 @@ export class TaskPanels {
           ? await this.desktop.transferProjectId(current) : current.projectId;
         if (sourceProjectId === undefined) throw new ActionRejectedError("Не удалось проверить проект исходной задачи. Перенос не начат.");
         if (sourceProjectId === null) {
-          await this.renderTransferProjects(binding, source.id, source.label, 0);
+          if (projectSelector === undefined) await this.renderTransferProjects(binding, source.id, source.label, 0);
+          else {
+            const project = projectSelector === "none" ? null : commandProject(await this.desktop.listProjects(source.id), projectSelector);
+            assertReady();
+            await this.showTransferConfirmation(binding, source.id, source.label, project, undefined, project?.id ?? null, !input.action);
+          }
           break;
         }
+        if (projectSelector !== undefined) throw new ActionRejectedError("Для задачи с проектом VKodex подбирает тот же проект в новом каталоге. Укажи только каталог.");
         const sourceProject = (await this.desktop.listProjects(binding.sourceId ?? ""))
           .find(project => project.id === sourceProjectId || project.legacyIds?.includes(sourceProjectId));
         if (!sourceProject) throw new ActionRejectedError("Проект исходной задачи не найден в её каталоге. Перенос не начат.");
         const matches = (await this.desktop.listProjects(source.id)).filter(project => sameProject(sourceProject, project));
         if (matches.length > 1) throw new ActionRejectedError("В каталоге назначения несколько одинаковых проектов. Перенос не начат.");
         if (!matches.length && !this.desktop.createProject) throw new ActionRejectedError("Соответствующего проекта нет, а создание проекта в каталоге назначения недоступно.");
-        await this.showTransferConfirmation(binding, source.id, source.label, matches[0] ?? null, sourceProject);
+        assertReady();
+        await this.showTransferConfirmation(binding, source.id, source.label, matches[0] ?? null, sourceProject, undefined, !input.action);
         break;
       }
       case "moveSourceProject": {
@@ -514,7 +660,7 @@ export class TaskPanels {
             throw new ActionRejectedError("Проект исходной задачи изменился после подтверждения. Открой перенос заново.");
           }
         }
-        this.consume(input);
+        consume();
         let targetProjectId = state.targetProjectId;
         if (!existing || ["complete", "cancelled"].includes(existing.phase)) {
           if (state.sourceProjectId) targetProjectId = await this.ensureTransferProject(binding, state);
@@ -538,11 +684,11 @@ export class TaskPanels {
       case "moveSourceResume": {
         const record = this.store.transfer(binding.id);
         if (!record || ["complete", "cancelled"].includes(record.phase)) throw new ActionRejectedError("Незавершённого переноса нет.");
-        this.consume(input); this.transfers.resume(binding.id);
+        consume(); this.transfers.resume(binding.id);
         await this.home(input.peerId); break;
       }
       case "moveSourceCancel": {
-        this.consume(input); this.transfers.cancel(binding.id);
+        consume(); this.transfers.cancel(binding.id);
         await this.home(input.peerId, "Перенос отменён. Исходная задача снова принимает запросы. Скопированная история, если есть, сохранена; цель автоматически не запускается.");
         break;
       }
@@ -552,29 +698,33 @@ export class TaskPanels {
           throw new ActionRejectedError("Конфликт переноса уже изменился. Обнови /menu.");
         }
         const next = this.newState(input.peerId, binding.id, "moveSourceConflict");
+        const confirm = this.button(input.peerId, next, "Оставить обе копии", "moveSourceConflictApply");
         this.show(input.peerId, next, { text: "После копирования и исходная, и целевая задачи получили собственные изменения. Автоматически объединить две истории Codex нельзя.\n\nОставить обе копии? VK-беседа продолжит целевую задачу. Исходная задача останется неархивированной и доступной в прежнем каталоге; её цель не возобновится автоматически. Операция переноса будет закрыта без удаления данных.",
-          buttons: [this.button(input.peerId, next, "Оставить обе копии", "moveSourceConflictApply"), this.button(input.peerId, next, "Назад", "home")] });
+          buttons: [confirm, this.button(input.peerId, next, "Назад", "home")] }, input.action ? undefined : confirm);
         break;
       }
       case "moveSourceConflictApply": {
         if (state.view !== "moveSourceConflict") throw new ActionRejectedError("Подтверждение разрешения конфликта устарело.");
-        this.consume(input); this.transfers.keepBoth(binding.id);
+        consume(); this.transfers.keepBoth(binding.id);
         await this.home(input.peerId, "Конфликт закрыт без удаления данных. VK продолжает целевую задачу; исходная копия сохранена в прежнем каталоге и не архивирована.");
         break;
       }
-      case "models": await this.models(binding, action.page ?? 0); break;
+      case "models": await this.models(binding, action.page ?? 0, state.modelOptions); break;
       case "efforts": {
-        const model = (await this.desktop.listModels(binding)).find(model => model.id === action.model);
+        const models = state.modelOptions ?? await this.desktop.listModels(binding);
+        const model = models.find(model => model.id === action.model);
         if (!model) throw new ActionRejectedError("Модель больше не доступна. Обнови список.");
-        const next = this.newState(input.peerId, binding.id, "efforts"); next.model = model.id;
+        const next = this.newState(input.peerId, binding.id, "efforts"); next.model = model.id; next.modelOptions = models;
         this.show(input.peerId, next, { text: `${model.title}\nВыбери уровень рассуждения. Настройки применятся со следующего хода; текущий ход не прерывается.\nПо умолчанию: ${model.defaultEffort}`, buttons: model.efforts.slice(0, 8).map(effort => this.button(input.peerId, next, effort, "select", { model: model.id, effort })).concat(this.button(input.peerId, next, "Модели", "models"), this.button(input.peerId, next, "Отмена", "home")) }); break;
       }
       case "select": {
         if (!this.desktop.capabilities.selectModel || !action.model || !action.effort || state.model !== action.model) throw new ActionRejectedError("Выбор модели недоступен.");
-        this.consume(input);
-        this.waiting(binding, "Проверяю применение модели в Codex…");
+        consume();
         await this.desktop.selectModel(binding, action.model, action.effort);
-        await this.home(input.peerId, `Для следующего хода: ${action.model} · ${action.effort}.`); break;
+        const note = `Для следующего хода: ${action.model} · ${action.effort}.`;
+        if (input.action) await this.home(input.peerId, note);
+        else this.reply(input, { text: note });
+        break;
       }
       case "goal": {
         const next = this.newState(input.peerId, binding.id, "goal");
@@ -613,8 +763,7 @@ export class TaskPanels {
       }
       case "goalApply": {
         if (state.view !== "goalBudget" || !state.goalObjective || action.tokenBudget === undefined || state.goalBaselineKey === undefined) throw new ActionRejectedError("Настройка цели устарела. Открой /goal и повтори.");
-        this.consume(input);
-        await this.applyGoal(binding, state.goalObjective, action.tokenBudget, state.goalBaselineKey);
+        await this.applyGoal(binding, state.goalObjective, action.tokenBudget, state.goalBaselineKey, consume);
         break;
       }
       case "goalPause": {
@@ -623,7 +772,7 @@ export class TaskPanels {
         if (!current || current.status !== "active") throw new ActionRejectedError("Активной цели нет. Обнови /goal.");
         if (goalIntentKey(current) !== state.goalBaselineKey || goalIntentKey(await this.goal(binding)) !== state.goalBaselineKey)
           throw new ActionRejectedError("Цель изменилась до постановки на паузу. Обнови /goal.");
-        this.consume(input);
+        consume();
         const updated = await this.desktop.setGoal!(binding, { status: "paused" });
         if (updated.status !== "paused" || updated.threadId !== current.threadId
           || updated.objective !== current.objective || updated.createdAt !== current.createdAt
@@ -642,8 +791,8 @@ export class TaskPanels {
         if (!current || !["paused", "blocked", "usageLimited", "budgetLimited"].includes(current.status)) throw new ActionRejectedError("Эту цель сейчас нельзя возобновить. Обнови /goal.");
         if (goalIntentKey(current) !== state.goalBaselineKey)
           throw new ActionRejectedError("Цель изменилась после открытия меню. Обнови /goal.");
+        consume();
         const attempt = this.beginGoalContinuation(binding, current);
-        this.consume(input);
         const note = await this.goalContinuationNote(binding, current, attempt);
         const next = this.newState(input.peerId, binding.id, "goal");
         await this.renderGoal(binding, next, note);
@@ -657,7 +806,8 @@ export class TaskPanels {
           throw new ActionRejectedError("Цель изменилась после открытия меню. Обнови /goal.");
         const next = this.newState(input.peerId, binding.id, "goalClear");
         next.goalBaselineKey = state.goalBaselineKey;
-        this.show(input.peerId, next, { text: "Снять цель с этой задачи Codex?\n\nУчёт цели будет удалён. История задачи, файлы и VK-беседа сохранятся. Текущий ход сначала нужно завершить или остановить.", buttons: [this.button(input.peerId, next, "Снять цель", "goalClearApply"), this.button(input.peerId, next, "Отмена", "goal")] });
+        const confirm = this.button(input.peerId, next, "Снять цель", "goalClearApply");
+        this.show(input.peerId, next, { text: "Снять цель с этой задачи Codex?\n\nУчёт цели будет удалён. История задачи, файлы и VK-беседа сохранятся. Текущий ход сначала нужно завершить или остановить.", buttons: [confirm, this.button(input.peerId, next, "Отмена", "goal")] }, input.action ? undefined : confirm);
         break;
       }
       case "goalClearApply": {
@@ -667,7 +817,7 @@ export class TaskPanels {
         const current = await this.goal(binding);
         if (!current || goalIntentKey(current) !== state.goalBaselineKey)
           throw new ActionRejectedError("Цель изменилась после подтверждения. Обнови /goal; цель не снята.");
-        this.consume(input);
+        consume();
         if (!await this.desktop.clearGoal!(binding)) throw new ActionRejectedError("Цель уже была снята. Обнови /goal.");
         if (await this.goal(binding) !== null) throw new UncertainActionError();
         const continuation = this.goalContinuationMarker(binding);
@@ -685,7 +835,7 @@ export class TaskPanels {
       case "renameApply": {
         if (state.view !== "renameConfirm" || !action.title || action.title !== state.title) throw new ActionRejectedError("Подтверждение переименования устарело.");
         const generation = this.store.streamGeneration(binding.id);
-        this.consume(input); this.waiting(binding, "Проверяю переименование в Codex…");
+        consume(); this.waiting(binding, "Проверяю переименование в Codex…");
         const result = await this.desktop.renameTask(binding, action.title);
         const renamed = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
         if (!renamed || renamed.title !== action.title) throw new UncertainActionError();
@@ -698,7 +848,7 @@ export class TaskPanels {
         const rename = this.renameState(binding);
         if (state.view !== "home" || !rename || rename.vkTitleUpdated || action.title !== rename.title) throw new ActionRejectedError("Повтор переименования устарел. Открой /menu заново.");
         const generation = this.store.streamGeneration(binding.id);
-        this.consume(input); this.waiting(binding, "Проверяю название VK-беседы…");
+        consume(); this.waiting(binding, "Проверяю название VK-беседы…");
         const current = (await this.desktop.listTasks()).find(task => sameTask(task, binding));
         if (!current || current.title !== rename.title) {
           if (current) this.store.ensureBinding(current);
@@ -711,12 +861,14 @@ export class TaskPanels {
         if (!this.desktop.capabilities.archiveTask) throw new ActionRejectedError("Архивирование недоступно в текущем подключении.");
         await this.refresh(binding); this.canArchive(binding);
         const next = this.newState(input.peerId, binding.id, "archive");
-        this.show(input.peerId, next, { text: `Архивировать «${short(binding.title)}» в Codex?\n\nТрансляция будет отключена. VK-беседа и рабочие файлы сохранятся. Вернуть задачу из архива можно в десктопе.`, buttons: [this.button(input.peerId, next, "Архивировать", "archiveApply"), this.button(input.peerId, next, "Отмена", "home")] }); break;
+        const confirm = this.button(input.peerId, next, "Архивировать", "archiveApply");
+        this.show(input.peerId, next, { text: `Архивировать «${short(binding.title)}» в Codex?\n\nТрансляция будет отключена. VK-беседа и рабочие файлы сохранятся. Вернуть задачу из архива можно в десктопе.`, buttons: [confirm, this.button(input.peerId, next, "Отмена", "home")] }, input.action ? undefined : confirm);
+        break;
       }
       case "archiveApply": {
         if (state.view !== "archive") throw new ActionRejectedError("Подтверждение архива устарело.");
         await this.refresh(binding); this.canArchive(binding);
-        this.consume(input); this.waiting(binding, "Запрос на архивирование отправлен. Результат появится в менеджере; после архива трансляция сюда отключится.");
+        consume(); this.waiting(binding, "Запрос на архивирование отправлен. Результат появится в менеджере; после архива трансляция сюда отключится.");
         await this.desktop.archiveTask(binding);
         this.store.setAttached(binding.id, false); this.live.delete(binding.id);
         this.store.enqueue(`archive:${input.action}`, this.access.ownerId, { text: `Задача «${short(binding.title)}» архивирована в Codex. Трансляция отключена; VK-беседа и файлы сохранены.` }); break;
@@ -739,13 +891,15 @@ export class TaskPanels {
       case "link": this.reply(input, { text: `Локальная ссылка на задачу:\n${taskDeepLink(binding.threadId)}\n\nОткрывается в Codex на устройстве с этой задачей. Это не публичная ссылка.` }); break;
       case "export": {
         if (!this.desktop.capabilities.exportMarkdown) throw new ActionRejectedError("Экспорт недоступен в этом подключении.");
-        this.consume(input); this.waiting(binding, "Готовлю Markdown-файл видимой переписки…");
+        consume();
+        if (input.action) this.waiting(binding, "Готовлю Markdown-файл видимой переписки…");
         const markdown = await this.desktop.exportMarkdown(binding);
         if (!await this.gate.check(input.peerId, true)) throw new ActionRejectedError("Экспорт остановлен: изменился доступ к беседе.");
         const attachment = await this.chat.uploadDocument(input.peerId, "codex-conversation.md", markdown);
         // Persist the upload result before sending. Delivery retries never upload a second document.
         this.reply(input, { text: "Видимая переписка Codex в Markdown. Снимок на момент запроса; без команд и скрытых рассуждений.", attachments: [attachment] });
-        await this.home(input.peerId, "Markdown-файл подготовлен."); break;
+        if (input.action) await this.home(input.peerId, "Markdown-файл подготовлен.");
+        break;
       }
       default: throw new ActionRejectedError("Кнопка недоступна в этой беседе.");
     }
@@ -808,7 +962,7 @@ export class TaskPanels {
   }
 
   private async showTransferConfirmation(binding: Binding, sourceId: string, sourceLabel: string,
-    targetProject: DesktopProject | null, sourceProject?: DesktopProject, projectlessSelection?: string | null): Promise<void> {
+    targetProject: DesktopProject | null, sourceProject?: DesktopProject, projectlessSelection?: string | null, textConfirmation = false): Promise<void> {
     const next = this.newState(binding.peerId!, binding.id, "moveSourceConfirm");
     next.targetSourceId = sourceId; next.targetSourceLabel = sourceLabel;
     if (sourceProject) {
@@ -820,12 +974,13 @@ export class TaskPanels {
     next.targetProjectTitle = sourceProject?.title ?? targetProject?.title ?? "Без проекта";
     const projectNote = sourceProject && !targetProject ? " (будет создан в каталоге назначения)" : "";
     const account = await this.targetAccount(sourceId);
+    const confirm = this.button(binding.peerId!, next, "Перенести", "moveSourceApply", {
+      sourceId, ...(next.targetProjectId !== undefined ? { projectId: next.targetProjectId } : {}),
+    });
     this.show(binding.peerId!, next, {
       text: `Перенести задачу в «${sourceLabel}»?\n\nАккаунт назначения: ${account}\nПроект: ${next.targetProjectTitle}${projectNote}\n\nБудет создан новый thread ID с историей по последний завершённый ход. После проверки клиента, названия, проекта и цели эта VK-беседа переключится на него, а исходная задача будет архивирована. Активная цель сохранится на паузе; в новом аккаунте останется только неизрасходованный бюджет. Рабочие файлы не перемещаются. Во время переноса новые запросы в эту задачу не отправляются.`,
-      buttons: [this.button(binding.peerId!, next, "Перенести", "moveSourceApply", {
-        sourceId, ...(next.targetProjectId !== undefined ? { projectId: next.targetProjectId } : {}),
-      }), this.button(binding.peerId!, next, "Отмена", "home")],
-    });
+      buttons: [confirm, this.button(binding.peerId!, next, "Отмена", "home")],
+    }, textConfirmation ? confirm : undefined);
   }
 
   private async ensureTransferProject(binding: Binding, state: PanelState): Promise<string> {
@@ -879,11 +1034,12 @@ export class TaskPanels {
   }
 
   private async applyGoal(binding: Binding, objective: string, tokenBudget: number | null,
-    expectedGoalKey: string | null): Promise<void> {
+    expectedGoalKey: string | null, beforeWrite?: () => void): Promise<void> {
     const current = await this.goal(binding);
     const latest = await this.goal(binding);
     if (goalIntentKey(current) !== expectedGoalKey || goalIntentKey(latest) !== expectedGoalKey)
       throw new ActionRejectedError("Цель изменилась до сохранения. Обнови /goal и проверь её состояние.");
+    beforeWrite?.();
     const activating = !current || current.status === "complete";
     // A new objective must exist before an empty-input continuation, but an
     // unconfirmed continuation must never leave it advertised as active.
@@ -1004,17 +1160,20 @@ export class TaskPanels {
     }
   }
 
-  private async models(binding: Binding, requestedPage: number): Promise<void> {
+  private async models(binding: Binding, requestedPage: number, snapshot?: readonly DesktopModel[]): Promise<void> {
     if (!this.desktop.capabilities.selectModel) throw new ActionRejectedError("Выбор модели недоступен в текущем подключении.");
-    const models = await this.desktop.listModels(binding);
+    const models = snapshot ?? await this.desktop.listModels(binding);
     const page = Math.max(0, Math.min(Math.floor(requestedPage), Math.ceil(models.length / 6) - 1));
-    const next = this.newState(binding.peerId!, binding.id, "models"); next.page = page;
+    const next = this.newState(binding.peerId!, binding.id, "models"); next.page = page; next.modelOptions = models;
     const visible = models.slice(page * 6, page * 6 + 6);
     const buttons = visible.map(model => this.button(binding.peerId!, next, model.title, "efforts", { model: model.id }));
     if (page > 0) buttons.push(this.button(binding.peerId!, next, "Предыдущие", "models", { page: page - 1 }));
     if ((page + 1) * 6 < models.length) buttons.push(this.button(binding.peerId!, next, "Следующие", "models", { page: page + 1 }));
     buttons.push(this.button(binding.peerId!, next, "Отмена", "home"));
-    this.show(binding.peerId!, next, { text: `Модели Codex · ${page + 1}/${Math.ceil(models.length / 6)}\n\n${visible.map(model => `${model.title}\n${model.id}`).join("\n\n")}\n\nПосле модели выбери уровень рассуждения. Текущий ход продолжит работу со старыми настройками.`, buttons });
+    this.show(binding.peerId!, next, { text: `Модели Codex · ${page + 1}/${Math.max(1, Math.ceil(models.length / 6))}\n\n${visible.map(model => {
+      const alias = modelAlias(model.id);
+      return `${model.title}\n${model.id}${alias ? ` · ${alias}` : ""}\n${model.efforts.join(", ")}`;
+    }).join("\n\n")}\n\n/model <модель> [уровень] — выбрать настройки следующего хода одной командой.`, buttons });
   }
 
   private async refresh(binding: Binding): Promise<void> {
@@ -1105,10 +1264,11 @@ export class TaskPanels {
   private button(peerId: number, state: PanelState, label: string, command: PanelAction["command"], extra: Partial<Pick<PanelAction, "page" | "model" | "effort" | "title" | "projectId" | "sourceId" | "tokenBudget">> = {}): Button {
     return this.token(peerId, state, label, { type: "panel", screenId: state.id, command, ...(state.bindingId ? { bindingId: state.bindingId } : {}), ...extra });
   }
-  private show(peerId: number, state: PanelState, view: View): void {
+  private show(peerId: number, state: PanelState, view: View, textConfirmation?: Button): void {
     if (state.view === "home") state.expiresAt = Date.now() + 30 * 60_000;
     this.store.setValue(`panel:${peerId}`, state);
-    this.store.enqueue(state.messageKey, peerId, boundedInteractiveView({ ...view, silent: true }), state.bindingId, "panel");
+    const text = textConfirmation ? `${view.text}\n\nПодтвердить командой: /button ${textConfirmation.action}` : view.text;
+    this.store.enqueue(state.messageKey, peerId, boundedInteractiveView({ ...view, text, silent: true }), state.bindingId, "panel");
   }
   private renderTask(binding: Binding, state: PanelState): void {
     if (binding.peerId === null) return;

@@ -4,7 +4,7 @@ import { statSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { taskKey, type DesktopTask, type PromptRejectionContext, type TaskCreationUpdate, type TaskRef } from "../core/codex-tasks.js";
-import type { Binding, BindingDisplayMode, BridgeInput, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
+import type { Binding, BindingDisplayMode, BridgeInput, Button, Delivery, ManagerAction, MessageHandle, NewTaskDraft, TaskTransferRecord, View } from "./contracts.js";
 import { VK_MAX_INLINE_BUTTONS } from "./contracts.js";
 import { comparablePath } from "../core/paths.js";
 import type { LocalInputFile } from "../domain/models.js";
@@ -1687,6 +1687,15 @@ export class BridgeStore {
 
   isPriorityDelivery(delivery: Delivery): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM bridge_delivery WHERE id = ? AND priority_revision >= ?").get(delivery.id, delivery.revision));
+  }
+
+  deliveredButtons(peerId: number, conversationMessageId: number): readonly Button[] {
+    const row = this.db.prepare(`SELECT key, view FROM bridge_delivery
+      WHERE peer_id = ? AND kind IN ('send', 'panel') AND handle IS NOT NULL
+        AND revision = delivered_revision AND json_extract(handle, '$.conversationMessageId') = ?
+      ORDER BY id DESC LIMIT 1`).get(peerId, conversationMessageId) as { key: string; view: string } | undefined;
+    if (!row || this.getValue<string>(`delivered-view:${row.key}`) !== row.view) return [];
+    return (JSON.parse(row.view) as View).buttons ?? [];
   }
 
   retireActivity(key: string): void {
