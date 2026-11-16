@@ -18,8 +18,12 @@ export interface QueueHistoryProgress {
     "history_read_too_large" | "scan_error" | "active_turn" | null;
   /** A complete read-only scan found no exact terminal turn; never settles the ACK. */
   readonly lastCompletedNoTerminalProofAt?: number | null;
+  readonly queueObservation?: { readonly at: number; readonly generation: number; readonly empty: boolean | null };
   readonly nextAt: number;
 }
+
+export const HISTORICAL_QUEUE_ACK_AGE_MS = 24 * 60 * 60_000;
+export const QUEUE_OBSERVATION_INTERVAL_MS = 10 * 60_000;
 
 export interface RuntimeHealthState {
   readonly predecessorMaintenanceRestoration?: Readonly<{ state: "unchanged" | "binding-scope-changed" | "unavailable" }>;
@@ -397,7 +401,10 @@ export class BridgeHealthMonitor {
         checks.push({ name: `codex_route_evidence:${binding.id}`, state: "ok",
           detail: `«${binding.title.slice(0, 120)}»: маршрут ${label}; локальное поколение маршрута процесса ${route.routeGeneration ?? "неизвестно"}${route.nativeOwnerClientId ? `; native owner client ${route.nativeOwnerClientId}` : ""}. Это доказательство маршрута, а не физического writer.` });
       }
-      if (!binding.connected && binding.route?.failureClass) {
+      const routeFailure = this.store.routeFailure(binding.id);
+      const activeOrCommandFailure = ["running", "approval"].includes(binding.status)
+        || routeFailure?.origin === "command" || (binding.status === "unavailable" && routeFailure?.activeTurn === true);
+      if (!binding.connected && binding.route?.failureClass && activeOrCommandFailure) {
         const route = binding.route;
         const selection = route.selection === "native-discovered" ? "native после обнаружения клиента"
           : route.selection === "native-after-owner-rejection" ? "native после отказа профильного владельца"
@@ -410,8 +417,8 @@ export class BridgeHealthMonitor {
         checks.push({ name: `codex_route_attempt:${binding.id}`, state: "degraded",
           detail: `«${binding.title.slice(0, 120)}»: маршрут ${selection}; класс отказа: ${failure}; локальное поколение попытки ${route.routeGeneration ?? "неизвестно"}. Причина очищена от деталей транспорта; это не доказательство физического writer.` });
       }
-      const routeFailure = this.store.getValue<{ at: number; kind: "no-active-owner" }>(`route-failure:${binding.id}`);
-      if (binding.nativeObservationRecovery) {
+      if (binding.nativeObservationRecovery && (activeOrCommandFailure ||
+        ["ready", "recovered"].includes(binding.nativeObservationRecovery.state))) {
         const recovery = binding.nativeObservationRecovery;
         checks.push({ name: `codex_native_observation_recovery:${binding.id}`,
           state: recovery.state === "ready" || recovery.state === "recovered" ? "ok" : "degraded",
@@ -425,7 +432,7 @@ export class BridgeHealthMonitor {
               ? "Native-владелец ещё не подтверждён. Повторное открытие ограничено интервалом или лимитом попыток; health продолжает проверять подключение без новых окон и повторов рабочего запроса."
             : `Восстановление native-наблюдения: ${recovery.state}; открытие клиента и локальная аренда не доказывают готовность. Отклонённый VK-запрос не повторялся.` });
       }
-      if (routeFailure?.kind === "no-active-owner") {
+      if (routeFailure?.origin === "command") {
         const at = Number.isSafeInteger(routeFailure.at) && Math.abs(routeFailure.at) <= 8.64e15
           ? new Date(routeFailure.at).toISOString() : "неизвестно";
         checks.push({ name: `codex_route:${binding.id}`, state: "failed",
@@ -461,16 +468,29 @@ export class BridgeHealthMonitor {
           detail: `«${binding.title.slice(0, 120)}» (${binding.source}): принятый VK-запрос остаётся без подтверждения завершения ${Math.round(acceptedAge / 1_000)} с при состоянии Codex «${binding.status}». Мост сверяет историю и не повторяет запрос автоматически.` });
       }
       const queued = this.store.queuedInputs(binding.id);
-      const queuedAge = queued.length ? Math.max(0, checkedAt - Math.min(...queued.map(item => item.acceptedAt))) : 0;
-      // /health is sent through VK as one message; keep this diagnostic bounded.
-      for (const [index, operation] of queued.slice(0, 4).entries()) {
-        let current: QueueHistoryProgress | null = null;
+      const storedBinding = this.store.getBinding(binding.id);
+      const queuedChecks = queued.map(operation => {
         try {
           const progress = this.store.getValue<QueueHistoryProgress>(`queue-history:${binding.id}:${operation.operationId}`);
-          const storedBinding = this.store.getBinding(binding.id);
-          if (storedBinding && progress && typeof progress === "object" && progress.taskKey === taskKey(storedBinding))
-            current = progress;
-        } catch { /* Invalid optional diagnostics must not break the health report. */ }
+          return { operation, current: storedBinding && progress?.taskKey === taskKey(storedBinding) ? progress : null };
+        } catch { return { operation, current: null }; }
+      });
+      const generation = this.store.streamGeneration(binding.id);
+      const historical = queuedChecks.filter(({ operation, current }) => {
+        const observation = current?.queueObservation;
+        return checkedAt - operation.acceptedAt >= HISTORICAL_QUEUE_ACK_AGE_MS
+          && Number.isSafeInteger(current?.lastCompletedNoTerminalProofAt)
+          && (current?.lastCompletedNoTerminalProofAt ?? 0) >= operation.acceptedAt
+          && (current?.lastCompletedNoTerminalProofAt ?? Infinity) <= checkedAt
+          && observation?.empty === true && observation.generation === generation
+          && Number.isSafeInteger(observation.at) && observation.at >= operation.acceptedAt
+          && observation.at <= checkedAt && checkedAt - observation.at <= 2 * QUEUE_OBSERVATION_INTERVAL_MS;
+      });
+      const historicalIds = new Set(historical.map(({ operation }) => operation.operationId));
+      const awaiting = queued.filter(operation => !historicalIds.has(operation.operationId));
+      const queuedAge = awaiting.length ? Math.max(0, checkedAt - Math.min(...awaiting.map(item => item.acceptedAt))) : 0;
+      // /health is sent through VK as one message; keep this diagnostic bounded.
+      for (const [index, { current }] of queuedChecks.slice(0, 4).entries()) {
         const pages = current && Number.isSafeInteger(current.pages) ? Math.min(5_000, Math.max(0, current.pages)) : 0;
         const failure = current?.lastFailure === "history_unavailable" ||
           current?.lastFailure === "history_read_rejected" ||
@@ -491,9 +511,11 @@ export class BridgeHealthMonitor {
       }
       if (queued.length > 4) checks.push({ name: `codex_queue_scan_more:${binding.id}`, state: "ok",
         detail: `Ещё ${queued.length - 4} ACK ожидают сверки; подробности ограничены первыми 4.` });
-      if (queued.length && queuedAge > 2 * 60_000 && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
+      if (historical.length) checks.push({ name: `codex_queue_history:${binding.id}`, state: "ok",
+        detail: `«${binding.title.slice(0, 120)}» (${binding.source}): старых квитанций с неизвестным исходом: ${historical.length}. Последняя проверка показала пустую очередь Codex; история не подтвердила завершение. Квитанции сохранены.` });
+      if (awaiting.length && queuedAge > 2 * 60_000 && ["idle", "failed", "interrupted", "unavailable"].includes(binding.status)) {
         checks.push({ name: `codex_native_queue:${binding.id}`, state: binding.status === "unavailable" ? "degraded" : "failed",
-          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): для ${queued.length} VK-запрос(а) сохранены локальные подтверждения thread/queue/add; переход в ход не подтверждён в течение ${Math.round(queuedAge / 1_000)} с (состояние «${binding.status}»). Текущее наличие в очереди Codex не проверено. VKodex не запускает и не повторяет их самостоятельно.` });
+          detail: `«${binding.title.slice(0, 120)}» (${binding.source}): для ${awaiting.length} VK-запрос(а) сохранены локальные подтверждения thread/queue/add; переход в ход не подтверждён в течение ${Math.round(queuedAge / 1_000)} с (состояние «${binding.status}»). Требуется доказательство исхода из очереди или истории Codex. VKodex не запускает и не повторяет запросы самостоятельно.` });
       }
       const actionableFailure = binding.failure !== null
         && (binding.connected || binding.streamMode !== "detached" || ["running", "approval"].includes(binding.status));
@@ -610,7 +632,12 @@ export class BridgeHealthMonitor {
       const missing = results.filter(status => status === "missing").length;
       const unknown = results.filter(status => status === "unknown").length;
       const affected = tasks.filter((_, index) => results[index] !== "ready").slice(0, 3).map(task => `«${task.title.slice(0, 80)}»`).join(", ");
-      return { name: `codex_owner_adapter:${source}`, state: missing || unknown ? "degraded" : "ok",
+      const blockedArchive = tasks.some((task, index) => {
+        if (results[index] === "ready") return false;
+        const transfer = this.store.transfer(task.id);
+        return transfer?.phase === "switched" || transfer?.blockedReason === "archiveOwner";
+      });
+      return { name: `codex_owner_adapter:${source}`, state: blockedArchive || unknown ? "degraded" : "ok",
         detail: missing || unknown
           ? `${label}: адаптер владельца не подтверждён для ${missing + unknown} из ${tasks.length} подключённых задач (отсутствует: ${missing}, проверка не удалась: ${unknown}). ${affected}. Архивация источника при переносе может быть недоступна.`
           : `${label}: адаптер владельца отвечает для ${tasks.length} подключённых задач.` } satisfies HealthCheckResult;

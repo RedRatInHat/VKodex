@@ -152,6 +152,11 @@ export class RoutedCodexTasks implements CodexTasks {
       throw new DesktopUnavailableError("Сверка терминальной истории недоступна для этого исполнителя.");
     return this.base.scanTerminalQueuedInput(task, clientId, cursor);
   }
+  readNativeQueueEmpty(task: TaskRef, operationId: string): Promise<boolean | null> {
+    const owner = this.operationOwner(task, operationId);
+    if (owner?.routingPolicy === "exclusive") return Promise.resolve(null);
+    return this.base.readNativeQueueEmpty?.(task, operationId) ?? Promise.resolve(null);
+  }
   async findQueuedSubmission(task: TaskRef, operationId: string): Promise<string | null> {
     const owner = this.operationOwner(task, operationId);
     if (owner) {

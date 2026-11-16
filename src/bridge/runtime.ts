@@ -11,7 +11,7 @@ import { BridgeStore } from "./store.js";
 import { ActionRejectedError, DesktopUnavailableError, TaskNotOpenError, sameTask, taskKey, type CodexTasks, type TaskCreationUpdate, type TaskDetails, type TaskRef } from "../core/codex-tasks.js";
 import { TaskActivity } from "./activity.js";
 import { TaskFiles, type InboundFileLimits } from "./files.js";
-import { BridgeHealthMonitor, type QueueHistoryProgress, type RuntimeHealthState } from "./health.js";
+import { BridgeHealthMonitor, HISTORICAL_QUEUE_ACK_AGE_MS, QUEUE_OBSERVATION_INTERVAL_MS, type QueueHistoryProgress, type RuntimeHealthState } from "./health.js";
 import { predecessorExitObservationSummary } from "../desktop/predecessor-exit-observation.js";
 import { predecessorMaintenanceRestorationSummary } from "../desktop/predecessor-maintenance.js";
 import type { BridgeHealthSnapshot } from "./contracts.js";
@@ -151,9 +151,8 @@ export class BridgeRuntime {
     if (attempt.state !== "recovered") return attempt.state;
     if (this.store.managedOwner(binding)) return "unavailable";
     if (this.nativeObservationRecoveryReady(binding)) return "ready";
-    const failure = this.store.getValue<{ at?: number; kind?: string }>(`route-failure:${binding.id}`);
-    return failure?.kind === "no-active-owner" && typeof failure.at === "number"
-      && failure.at >= (attempt.recoveredAt ?? 0) ? "unavailable" : "recovered";
+    const failure = this.store.routeFailure(binding.id);
+    return failure && failure.at >= (attempt.recoveredAt ?? 0) ? "unavailable" : "recovered";
   }
   private markNativeObservationRecovered(binding: Binding, generation: number): void {
     const attempt = this.nativeObservationRecovery(binding);
@@ -181,9 +180,8 @@ export class BridgeRuntime {
     if ([...this.maintenance.values()].filter(job => job.phase === "native-observation-recovery").length >= 2) return;
     const transfer = this.store.transfer(binding.id);
     if (transfer && !["complete", "cancelled"].includes(transfer.phase)) return;
-    const failure = this.store.getValue<{ at: number; kind: string; streamGeneration?: number }>(`route-failure:${binding.id}`);
-    if (failure?.kind !== "no-active-owner" || !Number.isSafeInteger(failure.at)
-      || failure.streamGeneration !== generation) return;
+    const failure = this.store.routeFailure(binding.id);
+    if (!failure) return;
     const events = this.store.connectionDiagnostics(binding.id, binding);
     // Current scoped failure authorizes discovery, not a historical error sequence.
     // The adapter still requires an exact broker miss before opening a window.
@@ -548,6 +546,7 @@ export class BridgeRuntime {
   private reconcileHistoricalQueuedInput(): void {
     if (this.stopped || !this.desktop.scanTerminalQueuedInput || this.queueReconciliation ||
       !intervalElapsed(this.now(), this.lastQueueReconciliationAt, 30_000)) return;
+    const now = this.now();
     const pending = this.store.bindings().filter(candidate => candidate.attached && candidate.peerId !== null)
       .flatMap(candidate => this.store.queuedInputs(candidate.id).map(operation => {
         const key = `queue-history:${candidate.id}:${operation.operationId}`;
@@ -556,35 +555,55 @@ export class BridgeRuntime {
         // must not silently suppress all future verification of its ACK.
         const checkpoint = saved && typeof saved === "object" && saved.taskKey === taskKey(candidate)
           && Number.isSafeInteger(saved.nextAt) && saved.nextAt >= 0 ? saved : null;
-        return { binding: candidate, operation, checkpointKey: key,
-          checkpoint };
-      })).filter(item => !item.checkpoint || item.checkpoint.nextAt <= this.now() ||
-        Number.isSafeInteger(item.checkpoint.lastAttemptAt) && item.checkpoint.lastAttemptAt > this.now());
+        const observation = checkpoint?.queueObservation;
+        const probe = !!this.desktop.readNativeQueueEmpty && checkpoint !== null
+          && now - operation.acceptedAt >= HISTORICAL_QUEUE_ACK_AGE_MS
+          && Number.isSafeInteger(checkpoint.lastCompletedNoTerminalProofAt)
+          && (checkpoint.lastCompletedNoTerminalProofAt ?? 0) >= operation.acceptedAt
+          && (checkpoint.lastCompletedNoTerminalProofAt ?? Infinity) <= now
+          && (observation?.generation !== this.store.streamGeneration(candidate.id) ||
+            !Number.isSafeInteger(observation.at) || intervalElapsed(now, observation.at, QUEUE_OBSERVATION_INTERVAL_MS));
+        return { binding: candidate, operation, checkpointKey: key, checkpoint, probe };
+      })).filter(item => item.probe || !item.checkpoint || item.checkpoint.nextAt <= now ||
+        Number.isSafeInteger(item.checkpoint.lastAttemptAt) && item.checkpoint.lastAttemptAt > now);
     if (!pending.length) return;
-    const { binding, operation, checkpointKey, checkpoint } = pending[this.queueReconciliationCursor % pending.length]!;
+    const { binding, operation, checkpointKey, checkpoint, probe } = pending[this.queueReconciliationCursor % pending.length]!;
     this.queueReconciliationCursor++;
     const key = taskKey(binding), generation = this.store.streamGeneration(binding.id);
     this.lastQueueReconciliationAt = this.now();
+    const currentOperation = (): boolean => {
+      const current = this.store.getBinding(binding.id);
+      return !this.stopped && !!current?.attached && current.peerId === binding.peerId && taskKey(current) === key
+        && this.store.streamGeneration(binding.id) === generation
+        && this.store.queuedInputs(binding.id).some(item => item.operationId === operation.operationId);
+    };
+    if (probe && checkpoint) {
+      const work = Promise.resolve().then(() => this.desktop.readNativeQueueEmpty!(binding, operation.operationId))
+        .catch(() => null).then(empty => {
+          if (currentOperation()) this.store.setValue(checkpointKey, {
+            ...checkpoint, queueObservation: { empty, generation, at: this.now() },
+          } satisfies QueueHistoryProgress);
+        }).finally(() => { if (this.queueReconciliation === work) this.queueReconciliation = null; });
+      this.queueReconciliation = work;
+      return;
+    }
     const attemptAt = this.now();
     const pages = Math.min(5_000, Math.max(0, checkpoint?.pages ?? checkpoint?.cursor?.pages ?? 0));
     const previousNegativeAt = checkpoint?.lastCompletedNoTerminalProofAt;
     const lastCompletedNoTerminalProofAt = typeof previousNegativeAt === "number"
       && Number.isSafeInteger(previousNegativeAt) && previousNegativeAt >= 0
       ? previousNegativeAt : null;
+    const observation = checkpoint?.queueObservation ? { queueObservation: checkpoint.queueObservation } : {};
     this.store.setValue(checkpointKey, { taskKey: key, cursor: checkpoint?.cursor ?? null,
       pages, lastAttemptAt: attemptAt, lastFailure: checkpoint?.lastFailure ?? null,
-      lastCompletedNoTerminalProofAt, nextAt: checkpoint?.nextAt ?? attemptAt } satisfies QueueHistoryProgress);
+      ...observation, lastCompletedNoTerminalProofAt, nextAt: checkpoint?.nextAt ?? attemptAt } satisfies QueueHistoryProgress);
     const work = this.desktop.scanTerminalQueuedInput(binding, operation.operationId, checkpoint?.cursor ?? null).then(result => {
-      if (this.stopped) return;
-      const current = this.store.getBinding(binding.id);
-      if (!current?.attached || current.peerId !== binding.peerId || taskKey(current) !== key ||
-        this.store.streamGeneration(binding.id) !== generation ||
-        !this.store.queuedInputs(binding.id).some(item => item.operationId === operation.operationId)) return;
+      if (!currentOperation()) return;
       this.store.atomic(() => {
         if (!result.done) {
           this.store.setValue(checkpointKey, { taskKey: key, cursor: result.cursor,
             pages: Math.min(5_000, Math.max(0, result.cursor.pages)), lastAttemptAt: attemptAt,
-            lastFailure: null, lastCompletedNoTerminalProofAt, nextAt: this.now() + 30_000 } satisfies QueueHistoryProgress);
+            lastFailure: null, ...observation, lastCompletedNoTerminalProofAt, nextAt: this.now() + 30_000 } satisfies QueueHistoryProgress);
         } else if (result.turnId) {
           this.store.settleQueuedInput(binding.id, operation.operationId);
           this.store.setValue(checkpointKey, null);
@@ -592,21 +611,18 @@ export class BridgeRuntime {
         } else {
           this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
             pages, lastAttemptAt: attemptAt, lastFailure: null,
-            lastCompletedNoTerminalProofAt: this.now(), nextAt: this.now() + 60 * 60_000 } satisfies QueueHistoryProgress);
+            ...observation, lastCompletedNoTerminalProofAt: this.now(), nextAt: this.now() + 60 * 60_000 } satisfies QueueHistoryProgress);
         }
       });
     }).catch(error => {
       // A changed or incomplete native history invalidates the cursor. Keep the ACK.
-      const current = this.store.getBinding(binding.id);
-      if (current?.attached && current.peerId === binding.peerId && taskKey(current) === key &&
-        this.store.streamGeneration(binding.id) === generation &&
-        this.store.queuedInputs(binding.id).some(item => item.operationId === operation.operationId))
+      if (currentOperation())
         this.store.setValue(checkpointKey, { taskKey: key, cursor: null,
           pages, lastAttemptAt: attemptAt,
           lastFailure: error instanceof MutableQueuedInputTurnError ? "active_turn"
             : error instanceof QueueHistoryReadError ? `history_${error.reason}`
               : error instanceof DesktopUnavailableError ? "history_unavailable" : "scan_error",
-          lastCompletedNoTerminalProofAt,
+          ...observation, lastCompletedNoTerminalProofAt,
           nextAt: this.now() + (error instanceof MutableQueuedInputTurnError ? 30_000 : 60 * 60_000) } satisfies QueueHistoryProgress);
     })
       .finally(() => { if (this.queueReconciliation === work) this.queueReconciliation = null; });
@@ -744,12 +760,14 @@ export class BridgeRuntime {
         this.connections.maintain(binding.id);
         if (!this.connections.connected(binding.id, Infinity)) {
           diagnosticEvent("input.prepare", { stage: "ready", outcome: "failure", reason: "connection-not-ready", ready: false });
-          this.store.setValue(`route-failure:${binding.id}`, { at: this.now(), kind: "no-active-owner",
-            streamGeneration: generation });
+          this.store.noteRouteFailure(binding.id, this.now(), "command");
           throw new TaskNotOpenError();
         }
         if (nativeOnly) {
-          if (!this.nativeConnectionReady(binding)) throw new TaskNotOpenError();
+          if (!this.nativeConnectionReady(binding)) {
+            this.store.noteRouteFailure(binding.id, this.now(), "command");
+            throw new TaskNotOpenError();
+          }
           this.requireNativeExecution(binding, generation);
         }
       }
@@ -1114,6 +1132,11 @@ export class BridgeRuntime {
   private hasPendingTaskWork(bindingId: string): boolean {
     return this.store.acceptedTurns(bindingId).length > 0 || this.store.queuedInputs(bindingId).length > 0
       || this.store.unresolvedPromptOperations(bindingId).length > 0;
+  }
+
+  private isObservingActiveTurn(bindingId: string): boolean {
+    const status = this.store.getValue<TaskDetails>(`task-details:${bindingId}`)?.status;
+    return status === "running" || status === "approval";
   }
 
   private async maintainExecutionLifecycle(binding: Binding, matches: () => boolean): Promise<void> {
@@ -1619,8 +1642,12 @@ export class BridgeRuntime {
           ...diagnosticError(error) });
         const current = this.store.getBinding(binding.id);
         if (this.stopped || !currentGeneration() || !current?.attached || !sameTask(current, task)) return;
-        if (transport === this.passiveStates && error instanceof TaskNotOpenError)
-          this.store.setValue(`route-failure:${binding.id}`, { at: this.now(), kind: "no-active-owner", streamGeneration: generation });
+        if (transport === this.passiveStates && error instanceof TaskNotOpenError) {
+          const activeTurn = this.isObservingActiveTurn(binding.id);
+          if (activeTurn || this.nativeExecutionRequired(current) || this.store.observationHandoff(current)) {
+            this.store.noteRouteFailure(binding.id, this.now(), "observation", activeTurn);
+          }
+        }
         if (this.connections.matches(binding.id, task)) this.closeSubscription(binding.id);
         this.manager.panels.disconnected(binding.id, error instanceof TaskNotOpenError);
         this.enableRolloutFallback(current, connectStartedAt);

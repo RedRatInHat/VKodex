@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BridgeHealthMonitor, type RuntimeHealthState } from "../src/bridge/health.js";
+import { BridgeHealthMonitor, HISTORICAL_QUEUE_ACK_AGE_MS, QUEUE_OBSERVATION_INTERVAL_MS, type RuntimeHealthState } from "../src/bridge/health.js";
 import { BridgeStore } from "../src/bridge/store.js";
 import { TaskMirror } from "../src/bridge/mirror.js";
 import { STAGED_FILE_PILOT_DISABLED, type StagedFilePilot } from "../src/bridge/config.js";
@@ -114,11 +114,14 @@ test("health reports the precise drain wait and distinguishes a historical fence
 
 test("native observation recovery health separates opening from verified and historical snapshots", async t => {
   let state: "opened" | "ready" | "recovered" | "unavailable" | "discovery-unavailable" | "activation-unconfirmed" = "opened";
+  let status = "idle";
   const s = setupWithBindings(t, () => [{ id: "native-recovery", title: "Native fixture", source: ".codex",
-    status: "idle", connected: state === "ready", lastConfirmedAt: state === "ready" ? 100_000 : null,
+    status, connected: state === "ready", lastConfirmedAt: state === "ready" ? 100_000 : null,
     failure: null, nativeObservationRecovery: { state, at: 90_000 } }]);
   const check = async () => (await s.monitor.check(true)).checks.find(item =>
     item.name === "codex_native_observation_recovery:native-recovery")!;
+  assert.equal(await check(), undefined, "opening an idle chat is not a health failure");
+  status = "running";
   assert.equal((await check()).state, "degraded", "opening a window is not a passive owner snapshot");
   state = "discovery-unavailable";
   const transient = await check();
@@ -131,10 +134,13 @@ test("native observation recovery health separates opening from verified and his
   state = "ready";
   assert.equal((await check()).state, "ok");
   state = "recovered";
+  status = "idle";
   const historical = await check();
   assert.equal(historical.state, "ok", "normal idle stream release retains verified historical recovery");
   assert.match(historical.detail, /свежесть текущего соединения проверяется отдельно/u);
   state = "unavailable";
+  status = "unavailable";
+  s.store.noteRouteFailure("native-recovery", 100_000, "observation", true);
   assert.equal((await check()).state, "degraded", "a later route failure is not currently ready");
 });
 
@@ -390,7 +396,7 @@ test("health distinguishes a live task stream from a missing native owner adapte
   }), undefined, () => now, undefined, () => true);
   const missing = await monitor.check(true);
   assert.equal(missing.checks.find(check => check.name === "codex_streams")?.state, "ok");
-  assert.equal(missing.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "degraded");
+  assert.equal(missing.checks.find(check => check.name === "codex_owner_adapter:primary")?.state, "ok");
   assert.match(missing.checks.find(check => check.name === "codex_owner_adapter:primary")!.detail, /Other task/u);
   adapter = "ready";
   const recovered = await monitor.check(true);
@@ -670,7 +676,7 @@ test("health reports a detached task whose command routes rejected before dispat
   const store = new BridgeStore(); t.after(() => store.close());
   const task = (await new HealthDesktop().listTasks())[0]!;
   const binding = store.ensureBinding(task); store.setChat(binding.id, 2_000_000_001, 1); store.setAttached(binding.id, true);
-  store.setValue(`route-failure:${binding.id}`, { at: 90_000, kind: "no-active-owner" });
+  store.setValue(`route-failure:${binding.id}`, { at: 90_000, kind: "no-active-owner", streamGeneration: 0 });
   const now = 100_000;
   const monitor = new BridgeHealthMonitor(access, new HealthDesktop(), new HealthChat(), store, () => ({
     startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
@@ -678,10 +684,48 @@ test("health reports a detached task whose command routes rejected before dispat
     failedBindings: 0, bindings: [{ id: binding.id, title: binding.title, source: ".codex", status: "idle",
       connected: false, streamMode: "detached" as const, lastConfirmedAt: null, failure: null }],
   }), undefined, () => now);
+  const legacy = await monitor.check(true);
+  assert.equal(legacy.checks.some(check => check.name === `codex_route:${binding.id}`), false);
+  store.noteRouteFailure(binding.id, 91_000, "command");
+  store.noteRouteFailure(binding.id, 92_000, "observation");
   const report = await monitor.check(true);
   const route = report.checks.find(check => check.name === `codex_route:${binding.id}`)!;
   assert.equal(route.state, "failed");
   assert.match(route.detail, /отклонён до отправки.*адаптер/u);
+  assert.match(route.detail, /1970-01-01T00:01:31\.000Z/u);
+});
+
+test("old queue ACKs with fresh scoped empty-queue proof move out of active health alerts", async t => {
+  const store = new BridgeStore(); t.after(() => store.close());
+  const desktop = new HealthDesktop();
+  const binding = store.ensureBinding((await desktop.listTasks())[0]!);
+  store.setChat(binding.id, 2_000_000_001, 1);
+  const op = "old-receipt";
+  const recordedAt = 100_000;
+  let now = recordedAt + HISTORICAL_QUEUE_ACK_AGE_MS + 10_000;
+  store.recordOperation(op, binding, "old-inbox", binding.id, recordedAt);
+  store.finishOperation(op, "accepted");
+  store.rememberQueuedInput(binding.id, op, "old-queue-id", recordedAt);
+  const key = `queue-history:${binding.id}:${op}`;
+  const save = (empty: boolean | null, generation: number) => store.setValue(key, {
+    taskKey: taskKey(binding), lastCompletedNoTerminalProofAt: now - 5, queueObservation: { empty, generation, at: now },
+  });
+  const monitor = new BridgeHealthMonitor(access, desktop, new HealthChat(), store, () => ({
+    startedAt: 1, lastTickAt: now, updateStartedAt: null, stopped: false,
+    activeBindings: 1, connectedBindings: 1, requiredBindings: 0, connectedRequiredBindings: 0,
+    bindings: [{ id: binding.id, title: binding.title, source: ".codex", status: "idle", connected: true, lastConfirmedAt: now, failure: null }],
+  }), undefined, () => now);
+  const alert = async () => (await monitor.check(true)).checks.find(check => check.name === `codex_native_queue:${binding.id}`);
+  save(true, 1);
+  assert.equal((await alert())?.state, "failed");
+  save(null, 0);
+  assert.equal((await alert())?.state, "failed");
+  save(true, 0);
+  assert.equal(await alert(), undefined);
+  assert.match((await monitor.check(true)).checks.find(check => check.name === `codex_queue_history:${binding.id}`)?.detail ?? "", /неизвестным исходом/u);
+  assert.equal(store.queuedInputs(binding.id).length, 1);
+  now += 2 * QUEUE_OBSERVATION_INTERVAL_MS + 1;
+  assert.equal((await alert())?.state, "failed");
 });
 
 test("health detects an accepted VK turn stranded behind an idle or unavailable task", async t => {
@@ -745,7 +789,7 @@ test("health detects native queued VK input stranded behind an idle task", async
   const stranded = (await monitor.check(true)).checks.find(check => check.name === `codex_native_queue:${binding.id}`)!;
   assert.equal(stranded.state, "failed");
   assert.match(stranded.detail, /Fixture.*локальные подтверждения thread\/queue\/add/u);
-  assert.match(stranded.detail, /Текущее наличие в очереди Codex не проверено/u);
+  assert.match(stranded.detail, /Требуется доказательство исхода из очереди или истории Codex/u);
   assert.doesNotMatch(stranded.detail, /остаются в штатной очереди/u);
   store.settleQueuedInput(binding.id, "queued-op");
   assert.equal((await monitor.check(true)).checks.some(check => check.name === `codex_native_queue:${binding.id}`), false);

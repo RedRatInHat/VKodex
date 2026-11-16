@@ -21,8 +21,8 @@ import { contextChanged, readTransferContext } from "./app-server-transfer.js";
 export { nativeCodexPath } from "../codex/native-cli.js";
 import { nativeCodexPath } from "../codex/native-cli.js";
 
-export type LocalAppServerMethod = "model/list" | "project/create" | "thread/queue/add" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
-const methods = new Set<LocalAppServerMethod>(["model/list","project/create","thread/queue/add","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
+export type LocalAppServerMethod = "model/list" | "project/create" | "thread/queue/add" | "thread/queue/list" | "thread/read" | "thread/turns/list" | "thread/name/set" | "thread/archive" | "thread/metadata/update" | "thread/goal/get" | "thread/goal/set" | "thread/goal/clear" | "account/read" | "account/rateLimits/read" | "account/rateLimitResetCredit/consume";
+const methods = new Set<LocalAppServerMethod>(["model/list","project/create","thread/queue/add","thread/queue/list","thread/read", "thread/turns/list", "thread/name/set", "thread/archive", "thread/metadata/update", "thread/goal/get", "thread/goal/set", "thread/goal/clear", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"]);
 
 function rejectedMetadata(method: LocalAppServerMethod, error: unknown): ActionRejectedError {
   if (method === "thread/queue/add") return new ActionRejectedError("Codex отклонил добавление в штатную очередь. Проверь версию Codex и состояние задачи. В текущий ход запрос не отправлялся.");
@@ -54,7 +54,7 @@ export class MetadataRpc {
   async call(method: LocalAppServerMethod, params: IpcObject): Promise<IpcObject> {
     if (!methods.has(method)) throw new ActionRejectedError("Операция не относится к метаданным Codex.");
     const child = this.launch();
-    const mutating = !["model/list","thread/read", "thread/turns/list", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
+    const mutating = !["model/list", "thread/read", "thread/turns/list", "thread/queue/list", "thread/goal/get", "account/read", "account/rateLimits/read"].includes(method);
     return new Promise((resolve, reject) => {
       let fragments: Buffer[] = []; let bufferedBytes = 0;
       let submitted = false; let finished = false;
@@ -381,6 +381,14 @@ export class ProfileDesktopMetadata implements DesktopMetadata {
       ? await findRecentTerminalQueuedInputTurn(task.threadId, clientId, list) : null;
     return recent ? { done: true, turnId: recent }
       : scanTerminalQueuedInputTurn(task.threadId, clientId, list, cursor);
+  }
+  async readNativeQueueEmpty(task: TaskRef, _operationId: string): Promise<boolean | null> {
+    if (task.hostId !== "local" || !task.threadId) return null;
+    const rpc = new MetadataRpc(this.sourceHome(task), undefined, 5_000);
+    const page = await rpc.call("thread/queue/list", { threadId: task.threadId, limit: 1 });
+    if (page.threadId !== undefined && page.threadId !== task.threadId || !Array.isArray(page.data)
+      || !(page.nextCursor === null || typeof page.nextCursor === "string")) return null;
+    return page.data.length ? false : page.nextCursor === null ? true : null;
   }
   async queue(request: SubmitTaskRequest, input: readonly IpcObject[]): Promise<string> {
     const metadata = this.createMetadata(this.sourceHome(request.task));

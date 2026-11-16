@@ -635,6 +635,10 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     return this.metadata.scanTerminalQueuedInput(task, clientId, cursor);
   }
 
+  readNativeQueueEmpty(task: TaskRef, operationId: string): Promise<boolean | null> {
+    return this.metadata?.readNativeQueueEmpty?.(task, operationId) ?? Promise.resolve(null);
+  }
+
   async queue(request: SubmitTaskRequest): Promise<string> {
     if (!this.metadata?.queue) throw new ActionRejectedError("Штатная очередь недоступна в этом подключении Codex.");
     if ((!request.text.trim() && !request.inputFiles?.length) || request.text.length > 64_000) throw new ActionRejectedError("Пришли /queue и текст запроса (до 64000 символов) или вложение.");

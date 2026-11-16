@@ -5901,7 +5901,8 @@ test("VK health does not queue readiness probes behind an in-flight message writ
       gateway.health(),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("health queued behind message write")), 200)),
     ]);
-    assert.equal(result.find(check => check.name === "vk_api")?.state, "degraded");
+    assert.equal(result.find(check => check.name === "vk_api")?.state, "ok");
+    assert.match(result.find(check => check.name === "vk_api")?.detail ?? "", /отложена/u);
     assert.deepEqual(methods, ["messages.send"]);
   } finally {
     releaseSend?.();

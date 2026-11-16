@@ -2183,6 +2183,31 @@ test("runtime settles a historical queue ACK only after exact terminal native pr
   assert.equal(calls, 2);
 });
 
+test("a completed negative history scan can refresh native queue evidence without consuming the ACK", async t => {
+  const s = runtimeSetup(t);
+  const id = "old-unresolved-ack";
+  s.store.recordOperation(id, s.binding, "old-unresolved-inbox", s.binding.id, 10);
+  s.store.finishOperation(id, "accepted");
+  s.store.rememberQueuedInput(s.binding.id, id, "native-old-id", 10);
+  s.advance(25 * 60 * 60_000);
+  const checkpointKey = `queue-history:${s.binding.id}:${id}`;
+  s.store.setValue(checkpointKey, { taskKey: taskKey(s.binding), pages: 39, cursor: null,
+    lastFailure: null, lastAttemptAt: 100_000, lastCompletedNoTerminalProofAt: 100_000,
+    nextAt: 200 * 60 * 60_000 });
+  s.desktop.scanTerminalQueuedInput = async () => assert.fail("a native queue observation does not repeat the completed scan");
+  s.desktop.readNativeQueueEmpty = async (task, operationId) => {
+    assert.equal(task.threadId, s.binding.threadId);
+    assert.equal(operationId, id);
+    return true;
+  };
+  (s.runtime as unknown as { reconcileHistoricalQueuedInput(): void }).reconcileHistoricalQueuedInput();
+  await new Promise(resolve => setImmediate(resolve));
+  const checkpoint = s.store.getValue<{ queueObservation?: { empty: boolean; generation: number } }>(checkpointKey);
+  assert.equal(checkpoint?.queueObservation?.empty, true);
+  assert.equal(checkpoint?.queueObservation?.generation, s.store.streamGeneration(s.binding.id));
+  assert.equal(s.store.queuedInputs(s.binding.id).length, 1);
+});
+
 test("historical queue RPC refusal is diagnosed without retaining its raw error", async t => {
   const s = runtimeSetup(t);
   const operationId = "refused-history-operation";
@@ -4335,11 +4360,25 @@ test("a saved pre-dispatch route failure is probed until ownership recovers with
   const s = runtimeSetup(t);
   s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
   s.store.setValue(`task-stream-mode:${s.binding.id}`, "detached");
-  s.store.setValue(`route-failure:${s.binding.id}`, { at: 1, kind: "no-active-owner" });
+  s.store.setValue(`route-failure:${s.binding.id}`, { at: 1, kind: "no-active-owner", origin: "command", streamGeneration: 0 });
   await s.runtime.tick();
   assert.ok(s.follows().length >= 1);
   assert.equal(s.store.getValue(`route-failure:${s.binding.id}`), null);
   assert.equal(s.server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))), false);
+});
+
+test("a closed idle task discovered in the background does not fabricate a rejected command", async t => {
+  const passive: TaskStateTransport = { readOnly: true,
+    subscribe: task => ({ task, readOnly: true, start: async () => { throw new TaskNotOpenError(); },
+      verifyOwner: async () => {}, close() {} }),
+    close() {} };
+  const s = runtimeSetup(t, undefined, undefined, undefined, undefined, undefined, undefined, undefined, passive);
+  s.store.setValue(`task-details:${s.binding.id}`, { status: "idle", workspace: "/fixture", model: null, effort: null, nextModel: null, nextEffort: null, context: null });
+  await s.runtime.tick();
+  assert.equal(s.store.getValue(`route-failure:${s.binding.id}`), null);
+  s.server.rejectDiscovery = true;
+  await s.runtime.handle({ eventId: "closed-command", peerId: s.peerId, senderId: 101, text: "Fixture" });
+  assert.equal(s.store.routeFailure(s.binding.id)?.origin, "command");
 });
 
 test("a VK prompt keeps an idle reacquisition leased until turn/start is dispatched", async t => {

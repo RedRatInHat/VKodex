@@ -102,7 +102,7 @@ test('health opens a missing native observation once after owner-busy command re
       reason: 'owner-busy', routeGeneration: 3 }, nativeTask);
     store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
       reason: 'task-not-open', routeGeneration: 3 }, nativeTask);
-    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
     await runtime.tick(true, binding.id);
     assert.equal(launches, 2, 'only a new outage after verified recovery can open the client again');
     assert.equal(writes, 0);
@@ -124,7 +124,7 @@ test('native health recovery rejects stale, foreign, quarantined and superseded 
       reason: 'task-not-open', routeGeneration: 1 }, candidate);
     if (blocked === 'confirmed') store.recordConnectionDiagnostic(binding.id, {
       at: now, phase: 'resume', outcome: 'confirmed', routeGeneration: 2 }, candidate);
-    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner',
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command',
       ...(blocked === 'legacy' ? {} : { streamGeneration: 0 }) });
     if (blocked === 'generation') store.setValue(`stream-generation:${binding.id}`, 1);
     if (blocked === 'detached') store.setAttached(binding.id, false);
@@ -168,7 +168,7 @@ test('native health recovery stays single-flight, bounds unconfirmed opens and k
       reason: 'owner-busy', routeGeneration: generation }, candidate);
     store.recordConnectionDiagnostic(binding.id, { at: at + 1, phase: 'resume', outcome: 'failed',
       reason: 'task-not-open', routeGeneration: generation }, candidate);
-    store.setValue(`route-failure:${binding.id}`, { at: at + 2, kind: 'no-active-owner', streamGeneration: 0 });
+    store.setValue(`route-failure:${binding.id}`, { at: at + 2, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
   };
   evidence(now - 2, 1);
   const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
@@ -218,7 +218,7 @@ test('native health preserves recovery budget across restart, generation and leg
     workspace: 'C:\\Fixture', updatedAt: 1 };
   const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 23);
   let now = Date.now(), probes = 0, launches = 0;
-  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
   const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
     readOnly: true, start: async () => { throw new TaskNotOpenError(); },
     verifyOwner: async () => {}, close() {} }), close() {} };
@@ -251,7 +251,7 @@ test('native health preserves recovery budget across restart, generation and leg
     const { openAttempts: _attempts, lastOpenAt: _lastOpen, ...legacy } = saved;
     store.setValue(`native-observation-recovery:${binding.id}`, { ...legacy, state: 'unknown' });
     store.setValue(`stream-generation:${binding.id}`, 1);
-    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 1 });
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 1 });
     await runtime.stop(); runtime = makeRuntime(); now += 61_000;
     await runtime.tick(true, binding.id);
     assert.equal(probes, 3, 'legacy unknown results permit fresh discovery after restart');
@@ -274,7 +274,7 @@ test('native recovery recognizes equivalent Windows rollout paths after opening 
     const binding = store.ensureBinding(candidate); store.setChat(binding.id, peerId, 24);
     const now = Date.now(); let online = false, opens = 0;
     let listed = candidate;
-    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
     const snapshot = { kind: 'app-server', threadId: candidate.threadId, title: candidate.title,
       cwd: candidate.workspace, model: 'fixture-model', effort: 'low', runtimeStatus: 'active',
       context: null, questions: [], turns: [] };
@@ -323,7 +323,7 @@ test('a passive snapshot cannot mark native recovery ready after an exclusive cl
     reason: 'owner-busy', routeGeneration: 1 }, candidate);
   store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
     reason: 'task-not-open', routeGeneration: 1 }, candidate);
-  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+  store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
   let snapshots = 0;
   const snapshot = { kind: 'app-server', threadId: candidate.threadId, title: candidate.title,
     cwd: candidate.workspace, model: 'fixture-model', effort: 'low', runtimeStatus: 'active',
@@ -365,7 +365,7 @@ test('native opening rechecks task, transfer and foreground fences after asynchr
       reason: 'owner-busy', routeGeneration: 1 }, candidate);
     store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
       reason: 'task-not-open', routeGeneration: 1 }, candidate);
-    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+    store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
     let launches = 0, scopeChecks = 0; let runtime!: BridgeRuntime;
     const native: TaskStateTransport = { readOnly: true, subscribe: requested => ({ task: requested,
       readOnly: true, start: async () => { throw new TaskNotOpenError(); },
@@ -408,7 +408,7 @@ test('native opening rechecks task, transfer and foreground fences after asynchr
           reason: 'owner-busy', routeGeneration: 2 }, candidate);
         store.recordConnectionDiagnostic(binding.id, { at: now - 1, phase: 'resume', outcome: 'failed',
           reason: 'task-not-open', routeGeneration: 2 }, candidate);
-        store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', streamGeneration: 0 });
+        store.setValue(`route-failure:${binding.id}`, { at: now, kind: 'no-active-owner', origin: 'command', streamGeneration: 0 });
         await runtime.tick(true, binding.id);
         assert.equal(launches, 2, 'unknown postlaunch effect consumes its budget before a bounded retry');
         assert.equal(scopeChecks, 2);

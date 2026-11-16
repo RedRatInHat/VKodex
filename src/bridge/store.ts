@@ -643,6 +643,23 @@ export class BridgeStore {
 
   streamGeneration(id: string): number { return this.getValue<number>(`stream-generation:${id}`) ?? 0; }
 
+  routeFailure(bindingId: string): { at: number; origin: "command" | "observation"; activeTurn: boolean } | null {
+    const saved = this.getValue<{ at: number; kind: string; origin?: string; streamGeneration: number; activeTurn?: boolean }>(`route-failure:${bindingId}`);
+    if (saved?.kind !== "no-active-owner" || !Number.isSafeInteger(saved.at) ||
+      saved.streamGeneration !== this.streamGeneration(bindingId) ||
+      saved.origin !== "command" && saved.origin !== "observation") return null;
+    return { at: saved.at, origin: saved.origin, activeTurn: saved.activeTurn === true };
+  }
+
+  noteRouteFailure(bindingId: string, at: number, origin: "command" | "observation", activeTurn = false): void {
+    if (origin === "observation") {
+      const previous = this.routeFailure(bindingId);
+      if (previous && (previous.origin === "command" || previous.activeTurn || !activeTurn)) return;
+    }
+    this.setValue(`route-failure:${bindingId}`, { at, kind: "no-active-owner", origin, activeTurn,
+      streamGeneration: this.streamGeneration(bindingId) });
+  }
+
   /** Desired command route, not proof that an old executor has exited. */
   nativeExecutionRequired(binding: TaskRef): boolean {
     const policy = this.getValue<{ taskKey: string; rolloutPath: string; generation: number }>(`native-execution:${taskKey(binding)}`);

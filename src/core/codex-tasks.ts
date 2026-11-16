@@ -229,6 +229,8 @@ export interface DesktopMetadata {
   /** Bounded read-only native history scan; only done with a turn ID is terminal proof. */
   scanTerminalQueuedInput?(task: TaskRef, clientId: string,
     cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan>;
+  /** Health-only evidence from the native queue; null means unavailable. */
+  readNativeQueueEmpty?(task: TaskRef, operationId: string): Promise<boolean | null>;
   /** Durable stock queue acceptance, distinct from a started turn ID. */
   findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
   findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
@@ -350,6 +352,7 @@ export interface CodexTasks {
   findAcceptedInput?(task: TaskRef, operationId: string): Promise<string | null>;
   scanTerminalQueuedInput?(task: TaskRef, clientId: string,
     cursor: QueuedInputHistoryCursor | null): Promise<QueuedInputHistoryScan>;
+  readNativeQueueEmpty?(task: TaskRef, operationId: string): Promise<boolean | null>;
   findQueuedSubmission?(task: TaskRef, operationId: string): Promise<string | null>;
   findQueuedSubmissionOutcome?(task: TaskRef, operationId: string): Promise<QueuedSubmissionOutcome | null>;
   editLastUserTurn?(request: EditLastUserTurnRequest): Promise<EditLastUserTurnResult>;
