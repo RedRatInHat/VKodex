@@ -3,7 +3,7 @@ import { BridgeStore } from "../../bridge/store.js";
 import { boundedInteractiveView } from "../../bridge/interactive-view.js";
 import type { Logger } from "pino";
 import type { BridgeChat, BridgeInput, HealthCheckResult, MessageHandle, View } from "../../bridge/contracts.js";
-import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, type VkDocumentRecord } from "../../bridge/contracts.js";
+import { ChatRateLimitError, FileUploadPreSaveError, FileUploadRejectedError, FileUploadStorageFullError, VK_MAX_INLINE_BUTTONS, isTaskMenuRequest, type VkDocumentRecord } from "../../bridge/contracts.js";
 import type { DesktopBridgeConfig } from "../../bridge/config.js";
 import { ActionRejectedError, UncertainActionError } from "../../core/codex-tasks.js";
 import { isObject } from "../../desktop/ipc-client.js";
@@ -261,12 +261,15 @@ export class DesktopVkGateway implements BridgeChat {
     };
     this.vk.updates.on("message", this.receiveMessage);
     this.vk.updates.on("message_event", async (context: MessageEventContext) => {
-      if (context.userId !== this.config.access.ownerId) return;
       const payload: unknown = context.eventPayload;
       if (!isObject(payload) || typeof payload.action !== "string" || payload.action.length > 100) return;
+      const input: BridgeInput = { eventId: `callback:${context.eventId}`, peerId: context.peerId,
+        senderId: context.userId, text: "", action: payload.action };
+      if (context.userId !== this.config.access.ownerId &&
+        (context.peerId < 2_000_000_000 || !isTaskMenuRequest(input))) return;
       // Acknowledgment closes the VK spinner; it does not claim that the action succeeded.
       await context.answer({ type: "show_snackbar", text: "Проверяю запрос…" }).catch(() => {});
-      await onInput({ eventId: `callback:${context.eventId}`, peerId: context.peerId, senderId: context.userId, text: "", action: payload.action });
+      await onInput(input);
     });
     try {
       await this.vk.updates.startPolling();

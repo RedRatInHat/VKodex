@@ -3094,6 +3094,41 @@ test("shared menu shortcut preserves the owner's pending panel and private manag
   assert.equal(s.desktop.renames.length, 0);
 });
 
+test("VK participant menu callbacks and refresh reach the shared task card", async t => {
+  const s = setup(t); s.attach(); await s.handle("/menu", peerId);
+  const ownerAction = panelView(s).buttons![0]!.action;
+  const ownerPanel = s.store.getValue(`panel:${peerId}`);
+  const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
+  const answer = t.mock.method(vk.api, "callWithRequest", async () => 1);
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk);
+  await gateway.start(input => s.manager.handle(input));
+  const callback = (eventId: string, action: string, peer = peerId) => vk.updates.handleWebhookUpdate({
+    type: "message_event", group_id: access.groupId, event_id: eventId, v: "5.199", object: {
+      user_id: 999, peer_id: peer, event_id: eventId, conversation_message_id: 50, payload: { action },
+    },
+  });
+  await callback("participant-menu", MENU_BUTTON.action);
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, /Режим просмотра/u);
+  assert.equal(s.chat.sent.at(-1)!.peerId, peerId);
+  assert.equal(answer.mock.callCount(), 1, "VK receives an acknowledgement for a permitted menu click");
+  const refresh = s.chat.sent.at(-1)!.view.buttons![0]!.action;
+  await callback("participant-refresh", refresh);
+  await s.worker.flush();
+  assert.match(s.chat.sent.at(-1)!.view.text, /Режим просмотра/u);
+  assert.equal(answer.mock.callCount(), 2);
+  const delivered = s.chat.sent.length;
+  await callback("participant-owner-action", ownerAction);
+  await callback("participant-manager-menu", MENU_BUTTON.action, access.ownerId);
+  await s.worker.flush();
+  assert.equal(s.chat.sent.length, delivered);
+  assert.equal(answer.mock.callCount(), 2);
+  assert.deepEqual(s.store.getValue(`panel:${peerId}`), ownerPanel);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(s.desktop.selections.length, 0);
+  assert.equal(s.desktop.questionAnswers.length, 0);
+});
+
 test("shared menu falls back to task data offline and refuses a rebind during refresh", async t => {
   const s = setup(t); s.attach(); await s.handle("/menu", peerId);
   s.desktop.inspectError = new TaskNotOpenError();
