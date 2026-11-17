@@ -64,7 +64,7 @@ const taskHelp = [
   "/open — явно открыть эту задачу в настроенном Codex",
   "/sources, /projects [страница] — каталоги и ID проектов",
   "/stop — остановить текущий ход",
-  "/queue <промпт> — добавить запрос в штатную очередь Codex",
+  "/queue <промпт> — добавить запрос с текстом и/или вложениями в штатную очередь Codex",
   "/questions — показать открытые вопросы Codex и обновить кнопки",
   "/detach — отключить трансляцию, не останавливая задачу",
   "Ответь /buttons на сообщение с кнопками, чтобы получить их текстовые команды.",
@@ -222,6 +222,8 @@ export class TaskManager {
 
   private async dispatch(input: BridgeInput): Promise<void> {
     const managerPeer = input.peerId === this.access.ownerId;
+    const text = input.text.trim();
+    const queuePrefix = !input.action && !managerPeer ? /^\/queue(?:\s+|$)/u.exec(text)?.[0] : undefined;
     // The private manager remains owner-only. A linked task conversation is a
     // shared prompt surface: every inbound message not sent by the community
     // itself is accepted, regardless of its VK user ID.
@@ -247,7 +249,7 @@ export class TaskManager {
       }
       try { taskInputScope?.assertReady(); }
       catch (error) { preparationRefused = true; diagnosticEvent("input.prepare", { stage: "verify", outcome: "failure", ...diagnosticError(error) }); throw error; }
-      return this.handleTask(input, () => taskInputScope?.assertReady());
+      return this.handleTask(input, queuePrefix, () => taskInputScope?.assertReady());
     };
     try {
       if (!managerPeer) {
@@ -266,8 +268,7 @@ export class TaskManager {
         // unavailable. Only prompt-bearing input requires an observed writer.
         const needsTaskInput = !isTaskMenuRequest(input) && !input.action && input.conversationTitle === undefined
           && (input.editOfMessageId !== undefined || !!input.attachments?.length
-            || input.senderId !== this.access.ownerId || !input.text.trimStart().startsWith("/")
-            || /^\/queue(?:\s|$)/u.test(input.text.trim()));
+            || input.senderId !== this.access.ownerId || !text.startsWith("/") || queuePrefix !== undefined);
         if (needsTaskInput && this.beforeTaskInput) {
           preparedTask = { binding, generation: this.store.streamGeneration(binding.id) };
           diagnosticEvent("input.prepare", { stage: "prepare", outcome: "start" });
@@ -314,7 +315,6 @@ export class TaskManager {
       if (incomingId) this.store.observePeerMessage(input.peerId, Number(incomingId[1]));
       if (input.hasAttachments && input.editOfMessageId === undefined) throw new ActionRejectedError(input.attachmentError ?? "Не удалось обработать вложения. Сообщение не отправлено; пришли фотографию или документ.");
       if (!input.action && input.senderId === this.access.ownerId && input.editOfMessageId === undefined) {
-        const text = input.text.trim();
         if (/^\/buttons?(?:\s|$)/u.test(text)) {
           if (input.attachments?.length) throw new ActionRejectedError("Команду нельзя отправить вместе с вложением.");
           if (text === "/buttons") {
@@ -330,10 +330,10 @@ export class TaskManager {
         await this.panels.sharedMenu(input);
         finish(); return;
       }
-      if (!managerPeer && !input.action && await this.questions.text(input)) { finish(); return; }
+      if (!managerPeer && !input.action && queuePrefix === undefined && await this.questions.text(input)) { finish(); return; }
       if (input.attachments?.length) {
         if (managerPeer) throw new ActionRejectedError("Менеджер VKodex не принимает вложения. Если у задачи нет VK-беседы, сначала подключи её через список задач.");
-        if (input.action || input.text.trim().startsWith("/")) throw new ActionRejectedError("Команду или кнопку нельзя отправить вместе с вложением. Пришли файл отдельным сообщением без команды.");
+        if (input.action || (text.startsWith("/") && queuePrefix === undefined)) throw new ActionRejectedError("Команду или кнопку нельзя отправить вместе с вложением. Для запроса с файлом используй /queue или пришли файл без команды.");
         if (!this.files) throw new ActionRejectedError("Передача вложений сейчас не настроена в VKodex. Сообщение не отправлено.");
       }
       if (input.action) {
@@ -860,11 +860,11 @@ export class TaskManager {
     this.reply(input, { text: `${task.title}\n${url}${handoffNote}`, buttons: [this.button("Отключить трансляцию", { type: "detach", bindingId: binding.id })] });
   }
 
-  private async handleTask(input: BridgeInput, assertReady: () => void = () => {}): Promise<void> {
+  private async handleTask(input: BridgeInput, queuePrefix: string | undefined, assertReady: () => void): Promise<void> {
     const binding: Binding | null = this.store.byPeer(input.peerId);
     if (!binding || input.action) return;
-    const queued = /^\/queue(?:\s|$)/u.test(input.text.trim());
-    const text = queued ? input.text.trim().replace(/^\/queue(?:\s+|$)/u, "").trim() : input.text.trim();
+    const queued = queuePrefix !== undefined;
+    const text = input.text.trim().slice(queuePrefix?.length ?? 0);
     const ownerCommand = input.senderId === this.access.ownerId;
     if (this.store.transferBlocksInput(binding.id) && !["/help", "/detach", "/stop", "/files"].includes(text)) {
       throw new ActionRejectedError("Сообщение не отправлено: задача переносится между каталогами. /menu покажет текущий этап. Повтори запрос после завершения переноса.");

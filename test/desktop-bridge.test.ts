@@ -5845,6 +5845,47 @@ test("queue strips only its prefix, preserves command-like prompt, and never ste
   assert.equal(s.desktop.queued.length, 1);
 });
 
+test("VK queues a prompt and photo in a single Codex request", async t => {
+  const s = setup(t); const binding = s.attach();
+  s.desktop.details = { ...s.desktop.details, status: "running" };
+  const root = await mkdtemp(path.join(os.tmpdir(), "vkodex-queue-photo-"));
+  const files = new TaskFiles(root, s.store, s.chat, s.gate);
+  const manager = new TaskManager(access, s.desktop, s.chat, s.store, s.gate, files);
+  const vk = new VK({ token: "fixture-token" }); t.mock.method(vk.updates, "startPolling", async () => {});
+  const download = t.mock.method(globalThis, "fetch", async () => new Response("fixture photo"));
+  const gateway = new DesktopVkGateway(loadDesktopBridgeConfig({ VK_GROUP_TOKEN: "fixture-token", VK_GROUP_ID: "202", VK_OWNER_ID: "101" }), vk, undefined, undefined, async () => "Owner User");
+  await gateway.start(input => manager.handle(input));
+  const update = { type: "message_new", group_id: access.groupId, event_id: "fixture-queue-photo", v: "5.199", object: {
+    message: { id: 0, conversation_message_id: 23, peer_id: peerId, from_id: access.ownerId, date: 100, out: 0,
+      text: "/queue\nCompare this image", attachments: [{ type: "photo", photo: { id: 1, owner_id: 101, album_id: -3, date: 100,
+        sizes: [{ type: "x", width: 100, height: 100, url: "https://sun1.userapi.com/photo" }] } }] }, client_info: {},
+  } };
+  await vk.updates.handleWebhookUpdate(update);
+  await vk.updates.handleWebhookUpdate(update);
+  assert.equal(s.desktop.queued.length, 1);
+  assert.equal(s.desktop.submissions.length, 0);
+  assert.equal(download.mock.callCount(), 1);
+  const request = s.desktop.queued[0]!;
+  assert.equal(request.text, "Compare this image");
+  assert.equal(request.inputFiles?.length, 1);
+  const photo = request.inputFiles![0]!;
+  assert.equal(await readFile(photo.path, "utf8"), "fixture photo");
+  assert.deepEqual(desktopTaskInput(request).input[1], { type: "localImage", path: photo.path });
+  assert.deepEqual(s.store.queuedInputs(binding.id).map(item => item.operationId), [request.operationId]);
+  assert.equal(files.pendingQueuedOperations(binding.id).has(request.operationId), true);
+
+  s.desktop.questions = pendingCodexQuestions(questionState());
+  manager.questions.observeQuestions(binding, s.desktop.questions);
+  await s.worker.flush();
+  const card = s.chat.sent.find(message => message.view.text.includes("Question 1?"))!;
+  await manager.handle({ ...s.input("/queue", peerId), attachments: [{ key: "image", kind: "image", fileName: "photo.jpg",
+    url: "https://sun1.userapi.com/photo" }], replyToMessageId: card.handle.conversationMessageId });
+  assert.equal(s.desktop.queued.length, 2, "an explicit /queue reply with a photo remains a new queued request");
+  assert.equal(s.desktop.queued[1]!.text, "");
+  assert.equal(s.desktop.queued[1]!.inputFiles?.[0]?.kind, "image");
+  assert.equal(s.desktop.questionAnswers.length, 0);
+});
+
 test("uncertain native queue insertion never falls back to a turn or retries", async t => {
   const s = setup(t); s.attach(); s.desktop.queueError = new UncertainActionError();
   const input = s.input("/queue later", peerId);
