@@ -782,7 +782,7 @@ export class ConnectedDesktopTasks implements DesktopTasks {
   compatibility(): DesktopCompatibility { return this.compatibilityState; }
 
   async checkCompatibility(): Promise<DesktopCompatibility> {
-    this.compatibilityState = { state: "checking", message: "Проверяю подключение и stream protocol v11." };
+    this.compatibilityState = { state: "checking", message: "Проверяю подключение и совместимость live stream Codex (v11, v13)." };
     const probe = this.createClient();
     try { await probe.connect(); }
     catch {
@@ -796,14 +796,14 @@ export class ConnectedDesktopTasks implements DesktopTasks {
     let tasks: readonly TaskRef[];
     try { tasks = (await this.listTasks()).slice(0, 3); }
     catch {
-      this.compatibilityState = { state: "unverified", message: "Named pipe работает, но каталог задач недоступен для проверки stream protocol v11." };
+      this.compatibilityState = { state: "unverified", message: "Named pipe работает, но каталог задач недоступен для проверки live stream Codex." };
       return this.compatibilityState;
     }
     for (const task of tasks) {
       const client = this.createClient(); const subscription = new TaskSubscription(client, task, () => {}, () => {}, false);
       try {
         await subscription.start(1_500);
-        this.compatibilityState = { state: "ok", message: "Live stream protocol v11 подтверждён открытой задачей." };
+        this.compatibilityState = { state: "ok", message: "Live stream Codex подтверждён открытой задачей; поддерживаются v11 и v13." };
         return this.compatibilityState;
       } catch (error) {
         if (error instanceof DesktopUnavailableError && /Версия событий/u.test(error.message)) versionFailure = true;
@@ -811,8 +811,8 @@ export class ConnectedDesktopTasks implements DesktopTasks {
       if (versionFailure) break;
     }
     this.compatibilityState = versionFailure
-      ? { state: "failed", message: "Версия live stream Codex несовместима с protocol v11; изменяющие live-команды заблокированы до обновления VKodex." }
-      : { state: "unverified", message: "Named pipe работает, но среди последних задач нет открытой для проверки stream protocol v11." };
+      ? { state: "failed", message: "Версия live stream Codex несовместима с поддерживаемыми v11 и v13; изменяющие live-команды заблокированы до обновления VKodex." }
+      : { state: "unverified", message: "Named pipe работает, но среди последних задач нет открытой для проверки live stream Codex." };
     return this.compatibilityState;
   }
 }

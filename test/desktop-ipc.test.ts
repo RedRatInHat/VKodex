@@ -3739,6 +3739,27 @@ test("runtime clears a legacy privacy pause without checking membership", async 
   assert.deepEqual(s.follows(), [true]);
 });
 
+test("Desktop v13 snapshots and patches preserve the existing task subscription", async t => {
+  const server = new Server();
+  server.dataState = { ...state(), title: "Desktop v13 task", rolloutPath: "C:/profiles/primary/sessions/task.jsonl", latestThreadSettings: {} };
+  server.onFollow = () => server.snapshot(13);
+  const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
+  const observed: IpcObject[] = [];
+  const subscription = new TaskSubscription(client, { ...ref, rolloutPath: "C:/profiles/primary/sessions/task.jsonl" },
+    value => observed.push(value), error => assert.fail(error.message));
+  t.after(() => subscription.close());
+  await subscription.start(100);
+  assert.equal(observed.length, 1);
+  assert.deepEqual(subscription.current?.latestThreadSettings, {});
+  server.send({ type: "broadcast", method: "thread-stream-state-changed", version: 13, sourceClientId: "owner",
+    targetClientIds: ["bridge-client"], params: { hostId: ref.hostId, conversationId: ref.threadId,
+      change: { type: "patches", baseRevision: 1, revision: 2, patches: [{ op: "replace", path: ["title"], value: "Updated v13 title" }] } } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(subscription.current?.title, "Updated v13 title");
+  assert.equal(observed.length, 2);
+  assert.equal(server.received.some(message => ["thread-follower-start-turn", "thread-follower-steer-turn"].includes(String(message.method))), false);
+});
+
 test("unsupported stream version fails closed without silently accepting state", async t => {
   const server = new Server(); const client = new DesktopIpcClient(() => server, 50); t.after(() => client.close());
   server.onFollow = () => server.snapshot(999);
@@ -4231,13 +4252,16 @@ test("project creation becomes uncertain when its post-create catalog read fails
   assert.equal(creates, 1);
 });
 
-test("compatibility canary confirms stream protocol v11 through an open task", async () => {
-  const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }; const servers: Server[] = [];
-  const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
-    const server = new Server(); servers.push(server); return new DesktopIpcClient(() => server, 100);
-  });
-  const status = await adapter.checkCompatibility();
-  assert.equal(status.state, "ok"); assert.match(status.message, /v11/u); assert.equal(servers.length, 2);
+test("compatibility canary confirms the supported Desktop stream versions through an open task", async () => {
+  for (const version of [11, 13]) {
+    const task = { ...ref, title: "Fixture", workspace: "/fixture", updatedAt: 1 }; const servers: Server[] = [];
+    const adapter = new ConnectedDesktopTasks({ listTasks: async () => [task], listProjects: async () => [] }, () => {
+      const server = new Server(); server.onFollow = () => server.snapshot(version);
+      servers.push(server); return new DesktopIpcClient(() => server, 100);
+    });
+    const status = await adapter.checkCompatibility();
+    assert.equal(status.state, "ok"); assert.match(status.message, /v11.*v13/u); assert.equal(servers.length, 2);
+  }
 });
 
 test("a transient named-pipe initialize refusal remains unverified and can recover", async () => {

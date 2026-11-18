@@ -119,7 +119,7 @@ export class TaskSubscription {
           if (this.closed || message.sourceClientId !== this.ownerId || message.method !== "thread-stream-state-changed") return;
           const params = message.params;
           if (!isObject(params) || params.hostId !== this.task.hostId || params.conversationId !== this.task.threadId) return;
-          if (message.version !== 11) {
+          if (message.version !== 11 && message.version !== 13) {
             report("protocol-mismatch", "failure", { reason: "protocol-mismatch" });
             clearTimeout(timer);
             const error = new DesktopUnavailableError("Версия событий десктопа не поддерживается.");
